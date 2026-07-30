@@ -1,0 +1,76 @@
+{
+  "id": "5eebaa83",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport java.util.concurrent.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    private final ExecutorService pool = Executors.newFixedThreadPool(4);\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String callback = req.getParameter(\"callback\");\n\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n\n        // Validate format parameter\n        if (format != null && !format.matches(\"^(json|xml|csv)$\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        try {\n            String result = fetchReport(reportId, format);\n            \n            if (callback != null && !callback.isEmpty()) {\n                // JSONP support for legacy dashboard widgets\n                resp.setContentType(\"application/javascript\");\n                resp.getWriter().write(callback + \"(\" + result + \");\");\n            } else {\n                resp.setContentType(\"application/json\");\n                resp.getWriter().write(result);\n            }\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    private String fetchReport(String reportId, String format) throws SQLException {\n        // Using parameterized query - safe from SQLi\n        String sql = \"SELECT id, title, content, created_at FROM reports WHERE id = ?\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            stmt.setString(1, reportId);\n            ResultSet rs = stmt.executeQuery();\n            \n            if (rs.next()) {\n                StringBuilder json = new StringBuilder();\n                json.append(\"{\\\"id\\\":\\\"\").append(escapeJson(rs.getString(\"id\")))\n                    .append(\"\\\",\\\"title\\\":\\\"\").append(escapeJson(rs.getString(\"title\")))\n                    .append(\"\\\",\\\"content\\\":\\\"\").append(escapeJson(rs.getString(\"content\")))\n                    .append(\"\\\",\\\"created\\\":\\\"\").append(escapeJson(rs.getString(\"created_at\")))\n                    .append(\"\\\"}\");\n                return json.toString();\n            }\n            return \"{\\\"error\\\":\\\"not found\\\"}\";\n        }\n    }\n\n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\")\n                    .replace(\"\\\"\", \"\\\\\\\"\")\n                    .replace(\"\\n\", \"\\\\n\")\n                    .replace(\"\\r\", \"\\\\r\")\n                    .replace(\"\\t\", \"\\\\t\");\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Async report generation with user-supplied template path\n        String templateName = req.getParameter(\"template\");\n        if (templateName == null) {\n            resp.sendError(400);\n            return;\n        }\n        \n        // Normalize path separators and check for traversal\n        String normalized = templateName.replace('\\\\', '/');\n        if (normalized.contains(\"..\") || normalized.startsWith(\"/\")) {\n            resp.sendError(403, \"Invalid template path\");\n            return;\n        }\n\n        String basePath = getServletContext().getRealPath(\"/WEB-INF/templates/\");\n        File templateFile = new File(basePath, normalized);\n        \n        // Verify canonical path is under base\n        if (!templateFile.getCanonicalPath().startsWith(\n                new File(basePath).getCanonicalPath())) {\n            resp.sendError(403, \"Path traversal detected\");\n            return;\n        }\n\n        if (!templateFile.exists()) {\n            resp.sendError(404, \"Template not found\");\n            return;\n        }\n\n        resp.setStatus(202);\n        resp.getWriter().write(\"{\\\"status\\\":\\\"queued\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "Same Go microservice deployed on EKS 1.28 in namespace 'platform-services'. Calico CNI with GlobalNetworkPolicy enforcement. A namespace-scoped NetworkPolicy 'deny-metadata-egress' is applied with spec.podSelector matching all pods ({}), spec.policyTypes ['Egress'], spec.egress allowing only DNS (UDP/53 to kube-dns) and internal cluster CIDR (10.0.0.0/8) on ports 443,8080,5432. The policy does NOT have an explicit deny rule for 169.254.169.254 \u2014 instead it relies on the implicit deny-all-egress behavior when policyTypes includes Egress and no egress rule matches the metadata IP (169.254.169.254 is in the link-local range 169.254.0.0/16, which is outside 10.0.0.0/8). Additionally, the node's iptables FORWARD chain has a Calico-inserted rule that drops packets from pod network namespaces to 169.254.169.254:80 with comment 'cali:metadata-protection'. IMDS is still v1 on the nodes.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "platform-services",
+      "cni_plugin": "calico 3.26.1",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress",
+          "namespace": "platform-services"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "kube-system"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "UDP",
+                  "port": 53
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "10.0.0.0/8"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 443
+                },
+                {
+                  "protocol": "TCP",
+                  "port": 8080
+                },
+                {
+                  "protocol": "TCP",
+                  "port": 5432
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "calico_global_policy": "iptables FORWARD chain rule: -A cali-fw-pod -d 169.254.169.254/32 -j DROP -m comment --comment 'cali:metadata-protection'",
+      "imds_version": "v1 (HttpTokens: optional)",
+      "node_iam_permissions": [
+        "s3:*",
+        "sts:AssumeRole"
+      ],
+      "pod_service_account": "default"
+    }
+  }
+}

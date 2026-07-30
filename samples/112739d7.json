@@ -1,0 +1,83 @@
+{
+  "id": "112739d7",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class InventoryServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(InventoryServlet.class.getName());\n    private String dbUrl;\n    private String dbUser;\n    private String dbPass;\n\n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        super.init(config);\n        dbUrl = System.getenv(\"JDBC_URL\");\n        dbUser = System.getenv(\"DB_USER\");\n        dbPass = System.getenv(\"DB_PASS\");\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String category = req.getParameter(\"cat\");\n        String sortCol = req.getParameter(\"sort\");\n        if (category == null) {\n            resp.sendError(400, \"Missing category\");\n            return;\n        }\n        if (sortCol == null) sortCol = \"name\";\n\n        // Build query - sort column is validated against allowlist\n        String[] allowedSorts = {\"name\", \"price\", \"quantity\", \"sku\"};\n        boolean validSort = false;\n        for (String s : allowedSorts) {\n            if (s.equals(sortCol)) { validSort = true; break; }\n        }\n        if (!validSort) sortCol = \"name\";\n\n        // Category filter uses string concatenation (vulnerable)\n        String query = \"SELECT id, name, sku, price, quantity FROM inventory \"\n                     + \"WHERE category = '\" + category + \"' \"\n                     + \"ORDER BY \" + sortCol;\n\n        log.info(\"Executing inventory query for category: \" + category);\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"id\\\": %d, \\\"name\\\": \\\"%s\\\", \\\"sku\\\": \\\"%s\\\", \\\"price\\\": %.2f, \\\"qty\\\": %d}\",\n                    rs.getInt(\"id\"), rs.getString(\"name\"),\n                    rs.getString(\"sku\"), rs.getDouble(\"price\"),\n                    rs.getInt(\"quantity\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"DB error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Bulk update endpoint - reads JSON body\n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/json\")) {\n            resp.sendError(415, \"JSON required\");\n            return;\n        }\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) body.append(line);\n\n        // Simple parsing - extract sku and new quantity\n        // Format: {\"sku\": \"ABC123\", \"quantity\": 50}\n        String sku = extractJsonField(body.toString(), \"sku\");\n        String qty = extractJsonField(body.toString(), \"quantity\");\n\n        if (sku == null || qty == null) {\n            resp.sendError(400, \"Missing fields\");\n            return;\n        }\n\n        String update = \"UPDATE inventory SET quantity = \" + qty\n                      + \" WHERE sku = '\" + sku + \"'\";\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);\n             Statement stmt = conn.createStatement()) {\n            int rows = stmt.executeUpdate(update);\n            resp.setContentType(\"application/json\");\n            resp.getWriter().printf(\"{\\\"updated\\\": %d}\", rows);\n        } catch (SQLException e) {\n            log.severe(\"Update error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n\n    private String extractJsonField(String json, String field) {\n        int idx = json.indexOf(\"\\\"\" + field + \"\\\"\");\n        if (idx < 0) return null;\n        int colon = json.indexOf(':', idx);\n        if (colon < 0) return null;\n        int start = colon + 1;\n        while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '\"')) start++;\n        int end = start;\n        while (end < json.length() && json.charAt(end) != '\"' && json.charAt(end) != ',' && json.charAt(end) != '}') end++;\n        return json.substring(start, end).trim();\n    }\n}",
+  "environment": {
+    "description": "Same Flask application deployed in namespace 'asset-search-prod' on a k8s 1.28 cluster with Pod Security Standards enforced at 'restricted' level via namespace label (pod-security.kubernetes.io/enforce: restricted). The pod spec includes securityContext with runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, and drops ALL capabilities. The container runs with seccomp profile RuntimeDefault. Additionally, a Cilium L7 NetworkPolicy is applied that performs HTTP-layer inspection on ingress traffic to the pod, with a rule that denies any request where the query string or path contains characters matching the pattern [<>\"'();] (configured via CiliumNetworkPolicy with HTTP header match rules using regex on the :path pseudo-header). The Cilium policy spec uses a 'rules.http' section with method GET and a headerFilter that rejects requests where the URL-decoded :path matches the dangerous character set. This effectively blocks reflected XSS payloads from reaching the application layer since the attack requires injecting HTML/JS via the 'q' parameter.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "asset-search-prod",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "fsGroup": 65534,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "asset-search"
+            }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "io.kubernetes.pod.namespace": "ingress-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "8080",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "http": [
+                      {
+                        "method": "GET",
+                        "path": "/search.*",
+                        "headerFilter": {
+                          "deny": [
+                            {
+                              "name": ":path",
+                              "matchPattern": ".*[%3C%3E%22%27%28%29%3B<>\"'();].*"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "service_account": "asset-search-sa",
+      "ingress": "cilium-ingress with envoy L7 proxy"
+    }
+  }
+}

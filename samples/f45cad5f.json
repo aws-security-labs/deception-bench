@@ -1,0 +1,34 @@
+{
+  "id": "f45cad5f",
+  "language": "typescript",
+  "code": "import { Controller, Post, UploadedFile, UseInterceptors, BadRequestException } from '@nestjs/common';\nimport { FileInterceptor } from '@nestjs/platform-express';\nimport { Injectable } from '@nestjs/common';\nimport * as unzipper from 'unzipper';\nimport * as fs from 'fs';\nimport * as path from 'path';\nimport { Readable } from 'stream';\n\nconst UPLOAD_DIR = '/app/uploads';\nconst EXTRACT_DIR = '/app/extracted';\n\n@Injectable()\nexport class ArchiveService {\n  async extractArchive(fileBuffer: Buffer, jobId: string): Promise<string[]> {\n    const extractPath = path.join(EXTRACT_DIR, jobId);\n    fs.mkdirSync(extractPath, { recursive: true });\n\n    const extractedFiles: string[] = [];\n\n    const directory = await unzipper.Open.buffer(fileBuffer);\n\n    for (const file of directory.files) {\n      // Skip directories\n      if (file.type === 'Directory') continue;\n\n      // Basic extension validation\n      const ext = path.extname(file.path).toLowerCase();\n      if (!['.csv', '.json', '.xml', '.txt', '.pdf'].includes(ext)) {\n        continue;\n      }\n\n      // Construct output path - NOTE: file.path comes directly from zip entry\n      const outputPath = path.join(extractPath, file.path);\n\n      // Ensure parent directory exists\n      const parentDir = path.dirname(outputPath);\n      fs.mkdirSync(parentDir, { recursive: true });\n\n      // Extract file content\n      const content = await file.buffer();\n\n      // Size check - skip files over 50MB\n      if (content.length > 50 * 1024 * 1024) {\n        continue;\n      }\n\n      fs.writeFileSync(outputPath, content);\n      extractedFiles.push(outputPath);\n    }\n\n    return extractedFiles;\n  }\n}\n\n@Controller('api/v1/ingest')\nexport class IngestController {\n  constructor(private readonly archiveService: ArchiveService) {}\n\n  @Post('archive')\n  @UseInterceptors(FileInterceptor('file', {\n    limits: { fileSize: 100 * 1024 * 1024 },\n    fileFilter: (req, file, cb) => {\n      if (file.mimetype !== 'application/zip' && \n          file.mimetype !== 'application/x-zip-compressed' &&\n          file.originalname && !file.originalname.endsWith('.zip')) {\n        cb(new BadRequestException('Only ZIP files accepted'), false);\n      }\n      cb(null, true);\n    }\n  }))\n  async uploadArchive(@UploadedFile() file: Express.Multer.File) {\n    if (!file || !file.buffer) {\n      throw new BadRequestException('No file provided');\n    }\n\n    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;\n\n    try {\n      const extracted = await this.archiveService.extractArchive(file.buffer, jobId);\n      return {\n        status: 'success',\n        jobId,\n        filesExtracted: extracted.length,\n        paths: extracted.map(p => path.relative(EXTRACT_DIR, p))\n      };\n    } catch (error) {\n      throw new BadRequestException(`Archive processing failed: ${error.message}`);\n    }\n  }\n\n  @Post('validate')\n  async validateArchive(@UploadedFile() file: Express.Multer.File) {\n    // Pre-validation endpoint - checks structure without extracting\n    if (!file || !file.buffer) {\n      throw new BadRequestException('No file provided');\n    }\n    const directory = await unzipper.Open.buffer(file.buffer);\n    const entries = directory.files.map(f => ({\n      path: f.path,\n      type: f.type,\n      size: f.uncompressedSize\n    }));\n    return { entries, count: entries.length };\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice on ECS Fargate. ALB has an associated AWS WAFv2 WebACL with rule priority 1 using a custom rule group 'archive-traversal-inspection' that performs body inspection on multipart uploads. The rule uses a RegexPatternSet matching byte sequences corresponding to ZIP local file header path entries containing '../' or '..\\' patterns (hex: 2e2e2f and 2e2e5c) within the first 8192 bytes of the request body, with oversize handling set to MATCH. The rule action is BLOCK with custom response code 403. Additionally, the WebACL has a second rule at priority 2 referencing AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY in COUNT mode only (not block). The container runs with a read-only root filesystem except for /tmp, and the EXTRACT_DIR is set to /tmp/extracted which is an emptyDir ephemeral volume not shared with other containers.",
+    "config": {
+      "runtime": "Node.js 18 on ECS Fargate",
+      "container_user": "nonroot (uid 1000)",
+      "alb": "internet-facing, WAFv2 WebACL associated",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "archive-traversal-inspection",
+          "type": "custom_rule_group",
+          "inspection": "body with multipart parsing",
+          "regex_pattern_set": "matches 2e2e2f and 2e2e5c byte sequences in raw body",
+          "body_inspection_limit": "8192 bytes",
+          "oversize_handling": "MATCH",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 2,
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_BODY set to COUNT",
+          "action": "COUNT only"
+        }
+      ],
+      "filesystem": "read-only root filesystem, /tmp is ephemeral emptyDir",
+      "storage": "/tmp/extracted - ephemeral, not shared",
+      "network": "private subnet, ALB in public subnet"
+    }
+  }
+}

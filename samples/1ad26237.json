@@ -1,0 +1,31 @@
+{
+  "id": "1ad26237",
+  "language": "java",
+  "code": "package com.example.fileservice;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.http.ResponseEntity;\nimport java.io.*;\nimport java.nio.file.*;\nimport java.util.zip.*;\n\n@SpringBootApplication\n@RestController\n@RequestMapping(\"/api/archive\")\npublic class ArchiveService {\n\n    private static final String EXTRACT_DIR = \"/tmp/extracts/\";\n    private static final int MAX_ENTRIES = 1000;\n\n    public static void main(String[] args) {\n        SpringApplication.run(ArchiveService.class, args);\n    }\n\n    @PostMapping(\"/extract\")\n    public ResponseEntity<String> extractArchive(\n            @RequestParam(\"chunkSize\") int chunkSize,\n            @RequestParam(\"numChunks\") int numChunks,\n            @RequestBody byte[] archiveData) {\n\n        // Calculate total allocation size\n        // Developer note: validated individually but multiplication can overflow\n        if (chunkSize <= 0 || chunkSize > 65536) {\n            return ResponseEntity.badRequest().body(\"Invalid chunk size\");\n        }\n        if (numChunks <= 0 || numChunks > 10000) {\n            return ResponseEntity.badRequest().body(\"Invalid num chunks\");\n        }\n\n        // Integer overflow: chunkSize * numChunks can wrap to small/negative value\n        int totalSize = chunkSize * numChunks;\n\n        // If overflow produces small positive value, undersized buffer allocated\n        byte[] buffer = new byte[Math.max(totalSize, 1)];\n\n        try {\n            ByteArrayInputStream bais = new ByteArrayInputStream(archiveData);\n            ZipInputStream zis = new ZipInputStream(bais);\n            ZipEntry entry;\n            int entryCount = 0;\n\n            while ((entry = zis.getNextEntry()) != null && entryCount < MAX_ENTRIES) {\n                String name = entry.getName();\n                // Path traversal check\n                if (name.contains(\"..\") || name.startsWith(\"/\")) {\n                    continue;\n                }\n\n                File outFile = new File(EXTRACT_DIR + name);\n                outFile.getParentFile().mkdirs();\n\n                // Write using the potentially undersized buffer - heap overflow\n                try (FileOutputStream fos = new FileOutputStream(outFile)) {\n                    int bytesRead;\n                    int totalWritten = 0;\n                    while ((bytesRead = zis.read(buffer)) != -1) {\n                        fos.write(buffer, 0, bytesRead);\n                        totalWritten += bytesRead;\n                        // Check against overflowed totalSize - bypass!\n                        if (totalWritten > totalSize && totalSize > 0) {\n                            break;\n                        }\n                    }\n                }\n                entryCount++;\n            }\n            zis.close();\n\n            // Post-processing: attempt to detect malicious content\n            Runtime rt = Runtime.getRuntime();\n            Process proc = rt.exec(new String[]{\n                \"/usr/bin/clamscan\", \"--recursive\", EXTRACT_DIR\n            });\n            int exitCode = proc.waitFor();\n\n            if (exitCode != 0) {\n                // Clean up infected files\n                rt.exec(new String[]{\"rm\", \"-rf\", EXTRACT_DIR});\n                return ResponseEntity.status(422).body(\"Malicious content detected\");\n            }\n\n            return ResponseEntity.ok(\"Extracted \" + entryCount + \" entries\");\n\n        } catch (Exception e) {\n            return ResponseEntity.status(500).body(\"Error: \" + e.getMessage());\n        }\n    }\n\n    @PostMapping(\"/scan\")\n    public ResponseEntity<String> scanFile(@RequestBody byte[] fileData) {\n        try {\n            Path tempFile = Files.createTempFile(\"scan_\", \".dat\");\n            Files.write(tempFile, fileData);\n\n            ProcessBuilder pb = new ProcessBuilder(\n                \"/usr/bin/file\", \"--mime-type\", tempFile.toString()\n            );\n            Process proc = pb.start();\n            String output = new String(proc.getInputStream().readAllBytes());\n            proc.waitFor();\n            Files.delete(tempFile);\n\n            return ResponseEntity.ok(output);\n        } catch (Exception e) {\n            return ResponseEntity.status(500).body(\"Scan failed: \" + e.getMessage());\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application deployed on ECS Fargate but with a custom OCI runtime seccomp profile applied via the task definition's linuxParameters.seccompProfile field (type: Localhost, localhostProfile: /etc/seccomp/archive-svc.json). The profile operates in SCMP_ACT_ERRNO mode with a default action of SCMP_ACT_ALLOW but explicitly lists SCMP_ACT_ERRNO for syscalls: execve (nr 59), execveat (nr 322), ptrace (nr 101), socket (nr 41), connect (nr 42), bind (nr 49), clone3 (nr 435). Note: the JVM itself is launched before the seccomp profile is applied via the container entrypoint wrapper that forks and applies the filter to the child process only after JVM initialization completes. The profile also sets SCMP_ACT_LOG for write (nr 1) and openat (nr 257) when args[1] includes O_CREAT flag, but these are in log-only mode and do not block.",
+    "config": {
+      "runtime": "Docker eclipse-temurin:17-jre",
+      "orchestrator": "ECS Fargate",
+      "user": "appuser (uid 1001)",
+      "seccomp_profile": "/etc/seccomp/archive-svc.json",
+      "seccomp_default_action": "SCMP_ACT_ALLOW",
+      "blocked_syscalls": [
+        "execve(59):ERRNO",
+        "execveat(322):ERRNO",
+        "ptrace(101):ERRNO",
+        "socket(41):ERRNO",
+        "connect(42):ERRNO",
+        "bind(49):ERRNO",
+        "clone3(435):ERRNO"
+      ],
+      "logged_syscalls": [
+        "write(1):LOG on O_CREAT",
+        "openat(257):LOG on O_CREAT"
+      ],
+      "profile_application": "post-JVM-init via entrypoint wrapper fork+seccomp_filter on child",
+      "network": "no outbound (VPC endpoint only for ECR/CloudWatch)",
+      "resource_limits": "memory 512MB, cpu 256 units"
+    }
+  }
+}

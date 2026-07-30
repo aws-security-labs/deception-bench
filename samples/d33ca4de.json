@@ -1,0 +1,67 @@
+{
+  "id": "d33ca4de",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    // Blocklist approach - known to be bypassable\n    private static final Pattern BLOCKED_KEYWORDS = Pattern.compile(\n        \"(union|select|insert|update|delete|drop|alter|exec|execute|xp_)\",\n        Pattern.CASE_INSENSITIVE\n    );\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Input \"sanitization\" - blocklist filtering\n        if (reportType != null && BLOCKED_KEYWORDS.matcher(reportType).find()) {\n            resp.sendError(400, \"Invalid input detected\");\n            return;\n        }\n        if (department != null && BLOCKED_KEYWORDS.matcher(department).find()) {\n            resp.sendError(400, \"Invalid input detected\");\n            return;\n        }\n\n        // Sort column whitelist - but only checks prefix\n        if (sortCol != null && !sortCol.startsWith(\"col_\")) {\n            sortCol = \"col_date\";\n        }\n\n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            // Vulnerable: string concatenation in SQL\n            String sql = \"SELECT r.id, r.title, r.created_at, r.amount \" +\n                         \"FROM reports r \" +\n                         \"WHERE r.report_type = '\" + reportType + \"' \" +\n                         \"AND r.department = '\" + department + \"' \";\n\n            if (dateRange != null && dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n                String[] parts = dateRange.split(\"_\");\n                sql += \"AND r.created_at BETWEEN '\" + parts[0] + \"' AND '\" + parts[1] + \"' \";\n            }\n\n            sql += \"ORDER BY \" + sortCol + \" DESC LIMIT 100\";\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql);\n\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\\\"id\\\": \").append(rs.getInt(\"id\"))\n                    .append(\", \\\"title\\\": \\\"\").append(rs.getString(\"title\"))\n                    .append(\"\\\", \\\"date\\\": \\\"\").append(rs.getString(\"created_at\"))\n                    .append(\"\\\", \\\"amount\\\": \").append(rs.getDouble(\"amount\"))\n                    .append(\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            out.print(json.toString());\n\n        } catch (SQLException e) {\n            // Verbose error - information disclosure\n            out.print(\"{\\\"error\\\": \\\"\" + e.getMessage().replace(\"\\\"\", \"'\") + \"\\\"}\");\n            resp.setStatus(500);\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST handler for report generation - also vulnerable\n        String templateId = req.getParameter(\"template\");\n        String customFilter = req.getParameter(\"filter\");\n\n        if (customFilter != null && customFilter.length() > 200) {\n            resp.sendError(400, \"Filter too long\");\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String sql = \"SELECT * FROM report_templates WHERE id = '\" + templateId +\n                         \"' AND active = 1\";\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql);\n\n            if (rs.next()) {\n                String baseQuery = rs.getString(\"base_query\");\n                // Appends user filter directly to stored query\n                if (customFilter != null) {\n                    baseQuery += \" AND \" + customFilter;\n                }\n                ResultSet data = stmt.executeQuery(baseQuery);\n                resp.getWriter().print(\"{\\\"status\\\": \\\"generated\\\", \\\"rows\\\": \" +\n                    data.getFetchSize() + \"}\");\n            }\n        } catch (SQLException e) {\n            resp.getWriter().print(\"{\\\"error\\\": \\\"query failed\\\"}\");\n            resp.setStatus(500);\n        }\n    }\n}",
+  "environment": {
+    "description": "Go Gin application running on EC2 instance in VPC subnet-0e5f6a7b with IAM role granting s3:PutObject and s3:ListBucket on arn:aws:s3:::app-user-uploads-prod/*. All S3 traffic routes exclusively through VPC endpoint vpce-0x9y8z7w6v (com.amazonaws.us-east-1.s3, Gateway type) with route table rtb-0m1n2o3p forcing all S3-prefix traffic through the endpoint. The VPC endpoint has an attached endpoint policy document that includes a Condition block with StringLike on s3:prefix requiring 'uploads/general/*' for s3:ListBucket and a separate Condition with StringLike on s3:objectkey matching 'uploads/general/*.jpg' OR 'uploads/general/*.png' OR 'uploads/general/*.gif' for s3:PutObject actions. Additionally the endpoint policy restricts the aws:RequestedRegion to us-east-1 and requires s3:x-amz-content-type to match 'image/*'. The bucket itself has a bucket policy with a Deny statement for any s3:PutObject where aws:sourceVpce is NOT vpce-0x9y8z7w6v, effectively ensuring no upload can bypass the endpoint restrictions.",
+    "config": {
+      "vpc_id": "vpc-0abc123def456",
+      "subnet": "subnet-0e5f6a7b (private, no NAT route for S3 prefix)",
+      "s3_endpoint": "vpce-0x9y8z7w6v (Gateway VPC Endpoint for S3)",
+      "route_table": "rtb-0m1n2o3p with pl-63a5400a (S3 prefix list) -> vpce-0x9y8z7w6v",
+      "vpce_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowRestrictedPut",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::app-user-uploads-prod/*",
+            "Condition": {
+              "StringLike": {
+                "s3:objectkey": [
+                  "uploads/general/*.jpg",
+                  "uploads/general/*.png",
+                  "uploads/general/*.gif"
+                ]
+              },
+              "StringLike_2": {
+                "s3:x-amz-content-type": "image/*"
+              }
+            }
+          },
+          {
+            "Sid": "AllowRestrictedList",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::app-user-uploads-prod",
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": "uploads/general/*"
+              }
+            }
+          }
+        ]
+      },
+      "bucket_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "DenyNonVPCE",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::app-user-uploads-prod/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:sourceVpce": "vpce-0x9y8z7w6v"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

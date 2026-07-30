@@ -1,0 +1,34 @@
+{
+  "id": "0e9ae9c9",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport pg from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\nconst pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware: parse session token\napp.use((req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (token) {\n    try {\n      const decoded = Buffer.from(token, 'base64').toString();\n      req.session = JSON.parse(decoded);\n    } catch (e) {\n      req.session = null;\n    }\n  }\n  next();\n});\n\n// Audit log helper - writes to separate audit table\nasync function auditLog(action, details) {\n  try {\n    await pool.query(\n      'INSERT INTO audit_log (action, details, ts) VALUES ($1, $2, NOW())',\n      [action, JSON.stringify(details)]\n    );\n  } catch (e) { /* non-critical */ }\n}\n\n// GET /api/reports - generate filtered report\napp.get('/api/reports', async (req, res) => {\n  const { region, fiscal_year, department, format } = req.query;\n  \n  if (!region || !fiscal_year) {\n    return res.status(400).json({ error: 'region and fiscal_year required' });\n  }\n\n  // Validate format\n  const validFormats = ['json', 'csv', 'summary'];\n  const outputFormat = validFormats.includes(format) ? format : 'json';\n\n  // Build query with fiscal_year filter\n  let query = `SELECT department, region, amount, quarter \n               FROM financial_reports \n               WHERE region = '${region}' \n               AND fiscal_year = ${fiscal_year}`;\n  \n  if (department) {\n    query += ` AND department = '${department}'`;\n  }\n  \n  query += ' ORDER BY quarter ASC LIMIT 500';\n\n  try {\n    await auditLog('report_query', { region, fiscal_year, department, user: req.session?.userId });\n    const result = await pool.query(query);\n    \n    if (outputFormat === 'csv') {\n      const header = 'department,region,amount,quarter\\n';\n      const rows = result.rows.map(r => `${r.department},${r.region},${r.amount},${r.quarter}`).join('\\n');\n      res.set('Content-Type', 'text/csv');\n      return res.send(header + rows);\n    }\n    \n    if (outputFormat === 'summary') {\n      const total = result.rows.reduce((s, r) => s + parseFloat(r.amount), 0);\n      return res.json({ total, count: result.rows.length, region, fiscal_year });\n    }\n    \n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (e) {\n    res.status(500).json({ error: 'Query failed' });\n  }\n});\n\n// GET /api/reports/:id - get specific report by ID\napp.get('/api/reports/:id', async (req, res) => {\n  const id = parseInt(req.params.id, 10);\n  if (isNaN(id)) return res.status(400).json({ error: 'Invalid ID' });\n  \n  const result = await pool.query('SELECT * FROM financial_reports WHERE id = $1', [id]);\n  res.json(result.rows[0] || null);\n});\n\n// POST /api/reports/export - bulk export\napp.post('/api/reports/export', express.json(), async (req, res) => {\n  const { regions, year } = req.body;\n  if (!Array.isArray(regions) || !year) {\n    return res.status(400).json({ error: 'Invalid request' });\n  }\n  // Parameterized - safe\n  const result = await pool.query(\n    'SELECT * FROM financial_reports WHERE region = ANY($1) AND fiscal_year = $2',\n    [regions, year]\n  );\n  res.json({ data: result.rows });\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok', ts: Date.now() }));\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

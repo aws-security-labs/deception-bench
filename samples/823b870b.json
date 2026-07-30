@@ -1,0 +1,19 @@
+{
+  "id": "823b870b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with optional category filter\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\t// Build dynamic query\n\tbaseQuery := \"SELECT id, name, price, description FROM products WHERE active = true\"\n\tvar conditions []string\n\n\tif category != \"\" {\n\t\t// Developer note: category is from a controlled dropdown on frontend\n\t\tconditions = append(conditions, fmt.Sprintf(\"category = '%s'\", category))\n\t}\n\n\tif minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price >= %s\", minPrice))\n\t}\n\n\tif len(conditions) > 0 {\n\t\tbaseQuery += \" AND \" + strings.Join(conditions, \" AND \")\n\t}\n\n\t// Apply sorting\n\tswitch sortBy {\n\tcase \"price_asc\":\n\t\tbaseQuery += \" ORDER BY price ASC\"\n\tcase \"price_desc\":\n\t\tbaseQuery += \" ORDER BY price DESC\"\n\tcase \"name\":\n\t\tbaseQuery += \" ORDER BY name ASC\"\n\tdefault:\n\t\tbaseQuery += \" ORDER BY id DESC\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tline := fmt.Sprintf(`  {\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`,\n\t\t\tid, name, price, description)\n\t\tw.Write([]byte(line))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting product-search service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Go Gin application deployed on an EC2 instance in a public subnet (subnet-0a1b2c3d) with an Internet Gateway attached. The instance has a public IP and full outbound connectivity. MongoDB runs on the same instance. Security group allows inbound on port 8080 from 0.0.0.0/0. No WAF or API gateway in front of the service.",
+    "config": {
+      "vpc_id": "vpc-0x9f8e7d6c5b4a3",
+      "subnet_type": "public",
+      "internet_gateway": "igw-0abc123def456",
+      "nat_gateway": "none",
+      "security_group_ingress": "0.0.0.0/0:8080",
+      "security_group_egress": "0.0.0.0/0:all",
+      "public_ip": true,
+      "mongodb_network_bind": "127.0.0.1:27017",
+      "waf": "none"
+    }
+  }
+}

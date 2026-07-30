@@ -1,0 +1,49 @@
+{
+  "id": "aa5173d7",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String TEMPLATE_DIR = \"/opt/reports/templates/\";\n    private static final Set<String> VALID_REPORTS = Set.of(\"quarterly\", \"annual\", \"audit\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String clientId = req.getParameter(\"client_id\");\n        String fiscal_year = req.getParameter(\"year\");\n        \n        // Validate report type against allowlist\n        if (reportType == null || !VALID_REPORTS.contains(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Client ID format check\n        if (clientId == null || !clientId.matches(\"^[A-Z]{2}[0-9]{6}$\")) {\n            resp.sendError(400, \"Invalid client ID format\");\n            return;\n        }\n        \n        // Build template path - reportType is validated above\n        String templatePath = TEMPLATE_DIR + reportType + \".xml\";\n        String template = readFile(templatePath);\n        \n        // Substitute variables into template\n        Map<String, String> vars = new HashMap<>();\n        vars.put(\"CLIENT_ID\", clientId);\n        vars.put(\"FISCAL_YEAR\", fiscal_year);\n        vars.put(\"GENERATED_AT\", new java.text.SimpleDateFormat(\"yyyy-MM-dd\").format(new Date()));\n        vars.put(\"SERVER_NODE\", System.getenv(\"HOSTNAME\"));\n        \n        StringSubstitutor sub = new StringSubstitutor(vars);\n        String result = sub.replace(template);\n        \n        resp.setContentType(\"application/xml\");\n        resp.getWriter().write(result);\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Custom report generation with user-supplied XSLT\n        String clientId = req.getParameter(\"client_id\");\n        String xsltContent = req.getParameter(\"stylesheet\");\n        String dataSource = req.getParameter(\"datasource\");\n        \n        if (clientId == null || !clientId.matches(\"^[A-Z]{2}[0-9]{6}$\")) {\n            resp.sendError(400, \"Invalid client ID\");\n            return;\n        }\n        \n        if (xsltContent == null || xsltContent.length() > 8192) {\n            resp.sendError(400, \"Stylesheet required (max 8KB)\");\n            return;\n        }\n        \n        // Apply XSLT transformation\n        try {\n            javax.xml.transform.TransformerFactory tf = \n                javax.xml.transform.TransformerFactory.newInstance();\n            javax.xml.transform.Source xsltSource = \n                new javax.xml.transform.stream.StreamSource(\n                    new StringReader(xsltContent));\n            javax.xml.transform.Transformer transformer = tf.newTransformer(xsltSource);\n            \n            // Load data from configured source\n            String dataPath = \"/opt/reports/data/\" + clientId + \"/\" + \n                             (dataSource != null ? dataSource : \"default\") + \".xml\";\n            javax.xml.transform.Source xmlSource = \n                new javax.xml.transform.stream.StreamSource(new File(dataPath));\n            \n            StringWriter output = new StringWriter();\n            javax.xml.transform.Result xmlResult = \n                new javax.xml.transform.stream.StreamResult(output);\n            transformer.transform(xmlSource, xmlResult);\n            \n            resp.setContentType(\"application/xml\");\n            resp.getWriter().write(output.toString());\n        } catch (javax.xml.transform.TransformerException e) {\n            resp.sendError(500, \"Transform failed: \" + e.getMessage());\n        }\n    }\n    \n    private String readFile(String path) throws IOException {\n        StringBuilder sb = new StringBuilder();\n        try (BufferedReader br = new BufferedReader(new FileReader(path))) {\n            String line;\n            while ((line = br.readLine()) != null) {\n                sb.append(line).append(\"\\n\");\n            }\n        }\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same IoT gateway code deployed on identical hardware but managed through AWS IoT Greengrass v2 with container isolation. The Greengrass component recipe specifies a Linux process-level namespace configuration with a custom OCI runtime spec. The runtime spec includes a syscall filter definition (compatible with libseccomp 2.5.x notation) that operates in SCMP_ACT_ERRNO mode for the following syscall groups: process_execution (covers __NR_execve, __NR_execveat, __NR_fexecve), process_tracing (__NR_ptrace, __NR_process_vm_readv, __NR_process_vm_writev), and raw_network (__NR_socket, __NR_socketpair, __NR_connect, __NR_bind). The filter is applied via prctl(PR_SET_SECCOMP) before the Python interpreter loads the application module, meaning the interpreter itself is already loaded but cannot spawn child processes or open new network connections. The MQTT message ingestion occurs through Greengrass IPC (unix domain socket inherited before seccomp activation), so message receipt still functions. Additionally, the component runs under a dedicated posix user (ggc_user:ggc_group) with no sudo capabilities and the container filesystem is mounted read-only except for /tmp (noexec,nosuid).",
+    "config": {
+      "runtime": "aws-greengrass-v2",
+      "component_recipe_version": "2.7.0",
+      "isolation_mode": "GreengrassContainer",
+      "seccomp_filter": {
+        "default_action": "SCMP_ACT_ALLOW",
+        "blocked_syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "ptrace",
+              "process_vm_readv",
+              "process_vm_writev"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "socket",
+              "socketpair",
+              "connect",
+              "bind"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ],
+        "applied_via": "prctl_before_app_load"
+      },
+      "filesystem": "rootfs read-only, /tmp mounted noexec,nosuid",
+      "user": "ggc_user (uid 1000, no sudo, no capabilities)",
+      "mqtt_ingestion": "greengrass IPC over inherited unix socket"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "id": "7d53a194",
+  "language": "java",
+  "code": "package com.acme.reporting.controller;\n\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.expression.Expression;\nimport org.springframework.expression.ExpressionParser;\nimport org.springframework.expression.spel.standard.SpelExpressionParser;\nimport org.springframework.expression.spel.support.StandardEvaluationContext;\nimport org.springframework.web.bind.annotation.*;\nimport com.acme.reporting.service.FeatureFlagService;\nimport com.acme.reporting.model.ReportContext;\nimport com.acme.reporting.model.UserSession;\nimport javax.servlet.http.HttpServletRequest;\nimport java.util.Map;\nimport java.util.HashMap;\n\n@RestController\n@RequestMapping(\"/api/v2/reports\")\npublic class DynamicReportController {\n\n    @Autowired\n    private FeatureFlagService featureFlagService;\n\n    private final ExpressionParser parser = new SpelExpressionParser();\n\n    @PostMapping(\"/generate\")\n    public Map<String, Object> generateReport(\n            @RequestBody Map<String, String> payload,\n            @RequestHeader(\"X-User-Id\") String userId,\n            HttpServletRequest request) {\n\n        Map<String, Object> response = new HashMap<>();\n        String template = payload.get(\"filterExpression\");\n        String reportType = payload.getOrDefault(\"type\", \"standard\");\n\n        // Legacy dynamic filter path - uses SpEL for backward compat\n        // New path uses structured query builder (report-engine-v2)\n        if (featureFlagService.isEnabled(\"report-engine-v2\", userId)) {\n            return generateWithStructuredEngine(payload, userId);\n        }\n\n        // Legacy path: evaluate SpEL expression from user input\n        ReportContext ctx = new ReportContext(userId, reportType);\n        StandardEvaluationContext evalContext = new StandardEvaluationContext(ctx);\n        evalContext.setVariable(\"userId\", userId);\n        evalContext.setVariable(\"reportType\", reportType);\n\n        try {\n            Expression exp = parser.parseExpression(template);\n            Object result = exp.getValue(evalContext);\n            response.put(\"status\", \"success\");\n            response.put(\"filterResult\", result);\n            response.put(\"engine\", \"legacy-spel\");\n        } catch (Exception e) {\n            response.put(\"status\", \"error\");\n            response.put(\"message\", \"Invalid filter expression\");\n        }\n\n        return response;\n    }\n\n    private Map<String, Object> generateWithStructuredEngine(\n            Map<String, String> payload, String userId) {\n        Map<String, Object> response = new HashMap<>();\n        // Safe structured query builder - no expression evaluation\n        response.put(\"status\", \"success\");\n        response.put(\"engine\", \"structured-v2\");\n        response.put(\"data\", \"[filtered results]\");\n        return response;\n    }\n}\n\n// FeatureFlagService.java\npackage com.acme.reporting.service;\n\nimport com.launchdarkly.sdk.LDUser;\nimport com.launchdarkly.sdk.server.LDClient;\nimport org.springframework.stereotype.Service;\n\n@Service\npublic class FeatureFlagService {\n\n    private final LDClient ldClient;\n\n    public FeatureFlagService(LDClient ldClient) {\n        this.ldClient = ldClient;\n    }\n\n    public boolean isEnabled(String flagKey, String userId) {\n        LDUser user = new LDUser.Builder(userId).build();\n        return ldClient.boolVariation(flagKey, user, false);\n    }\n}\n\n// ReportContext.java\npackage com.acme.reporting.model;\n\npublic class ReportContext {\n    private String userId;\n    private String reportType;\n    private String[] allowedDepartments = {\"sales\", \"engineering\", \"finance\"};\n\n    public ReportContext(String userId, String reportType) {\n        this.userId = userId;\n        this.reportType = reportType;\n    }\n\n    public String getUserId() { return userId; }\n    public String getReportType() { return reportType; }\n    public String[] getAllowedDepartments() { return allowedDepartments; }\n}",
+  "environment": {
+    "description": "Same EC2 monolith deployed in staging VPC (us-west-2). LaunchDarkly project 'acme-staging' has flag 'report-engine-v2' configured with targeting rule: default variation = true, off variation = true (flag serves 'true' regardless of targeting state or kill switch position due to fallthrough and off-variation both set to variation index 0 which maps to boolean true). The SDK initialization uses streaming mode with 'stale-flags-fallback' wrapper that returns the last known value from DynamoDB cache (TTL 24h) if LD edge goes unreachable \u2014 cached value for this flag is also 'true' since initial rollout 90 days ago. No WAF or network-level filtering is applied to this environment.",
+    "config": {
+      "instance_type": "m5.xlarge",
+      "ami": "ami-0c55b159cbfafe1f0",
+      "spring_boot_version": "2.5.4",
+      "jdk": "11",
+      "launchdarkly_sdk_key": "sdk-staging-xyz789",
+      "launchdarkly_project": "acme-staging",
+      "flag_report_engine_v2_default_variation": true,
+      "flag_report_engine_v2_off_variation": true,
+      "flag_report_engine_v2_fallthrough_variation_index": 0,
+      "flag_variations": [
+        true,
+        false
+      ],
+      "stale_flag_fallback": "dynamodb-cache",
+      "dynamodb_cache_ttl_hours": 24,
+      "cached_value_report_engine_v2": true,
+      "security_group": "sg-9f8e7d6c5b4a (0.0.0.0/0:8080)",
+      "waf": "none",
+      "network_filtering": "none"
+    }
+  }
+}

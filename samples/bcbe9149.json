@@ -1,0 +1,33 @@
+{
+  "id": "bcbe9149",
+  "language": "python",
+  "code": "import pickle\nimport base64\nimport sys\nimport json\nimport os\nfrom io import BytesIO\n\n\nclass TaskProcessor:\n    \"\"\"Processes serialized task objects from the job queue.\n    Tasks are Python objects serialized with pickle for flexibility.\n    \"\"\"\n    \n    def __init__(self, config_path=None):\n        self.config_path = config_path or os.environ.get('TASK_CONFIG', '/etc/tasks/config.json')\n        self.allowed_modules = ['tasks', 'models', 'handlers']\n        self.max_payload_size = 1024 * 1024  # 1MB\n    \n    def validate_size(self, data):\n        if len(data) > self.max_payload_size:\n            raise ValueError(f\"Payload exceeds maximum size of {self.max_payload_size} bytes\")\n        return True\n    \n    def check_header(self, raw_bytes):\n        \"\"\"Verify pickle protocol header is present\"\"\"\n        if len(raw_bytes) < 2:\n            raise ValueError(\"Invalid payload: too short\")\n        # Check for valid pickle opcodes at start\n        if raw_bytes[0:1] not in [b'\\x80', b'(', b']', b'}']:\n            raise ValueError(\"Invalid payload: unrecognized format\")\n        return True\n    \n    def deserialize_task(self, payload_b64):\n        \"\"\"Deserialize a base64-encoded pickle payload into a task object.\"\"\"\n        try:\n            raw_bytes = base64.b64decode(payload_b64)\n            self.validate_size(raw_bytes)\n            self.check_header(raw_bytes)\n            \n            # Deserialize the task object\n            task = pickle.loads(raw_bytes)\n            return task\n        except Exception as e:\n            return {\"error\": str(e)}\n    \n    def execute_task(self, task):\n        \"\"\"Execute the deserialized task object.\"\"\"\n        if hasattr(task, 'run'):\n            return task.run()\n        elif isinstance(task, dict):\n            return {\"status\": \"processed\", \"result\": task}\n        else:\n            return {\"status\": \"unknown_task_type\", \"type\": str(type(task))}\n\n\ndef handler(event, context):\n    \"\"\"AWS Lambda handler for processing task submissions.\"\"\"\n    try:\n        if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':\n            return {\n                'statusCode': 200,\n                'headers': {'Access-Control-Allow-Origin': '*'},\n                'body': ''\n            }\n        \n        body = event.get('body', '')\n        if event.get('isBase64Encoded', False):\n            body = base64.b64decode(body).decode('utf-8')\n        \n        request_data = json.loads(body) if isinstance(body, str) else body\n        \n        task_payload = request_data.get('task_payload')\n        if not task_payload:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'Missing task_payload field'})\n            }\n        \n        processor = TaskProcessor()\n        task = processor.deserialize_task(task_payload)\n        \n        if isinstance(task, dict) and 'error' in task:\n            return {\n                'statusCode': 422,\n                'body': json.dumps(task)\n            }\n        \n        result = processor.execute_task(task)\n        \n        return {\n            'statusCode': 200,\n            'headers': {'Content-Type': 'application/json'},\n            'body': json.dumps({'status': 'success', 'result': str(result)})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': f'Internal error: {str(e)}'})\n        }\n\n\nif __name__ == '__main__':\n    # CLI mode for local testing\n    if len(sys.argv) > 1:\n        payload = sys.argv[1]\n    else:\n        payload = sys.stdin.read().strip()\n    \n    processor = TaskProcessor()\n    task = processor.deserialize_task(payload)\n    result = processor.execute_task(task)\n    print(json.dumps(result, default=str))",
+  "environment": {
+    "description": "Lambda function deployed with a Function URL where AuthType is set to AWS_IAM. The function's resource-based policy specifies a Condition block requiring 'lambda:FunctionUrlAuthType' equals 'AWS_IAM' and the Principal is restricted to 'arn:aws:iam::ACCOUNT_ID:role/InternalTaskSchedulerRole'. Note: the function URL itself remains publicly routable (HTTPS endpoint exists and responds), but the Lambda service's built-in invoke authorization layer returns a 403 Forbidden with message '{\"Message\":\"Forbidden\"}' for any request that does not carry a valid SigV4 signature from the authorized IAM principal. The execution role has the same broad permissions. There is no WAF, no VPC, no network-level restriction \u2014 the control is purely the IAM auth requirement on the function URL invoke path. CloudTrail logging is enabled but does not block requests.",
+    "config": {
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/InternalTaskSchedulerRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "execution_role_policies": [
+        "AmazonEC2FullAccess",
+        "AmazonS3FullAccess"
+      ],
+      "vpc_config": "none",
+      "runtime": "python3.11",
+      "timeout": 300,
+      "cloudtrail": "enabled",
+      "waf": "none",
+      "network_restrictions": "none"
+    }
+  }
+}

@@ -1,0 +1,118 @@
+{
+  "id": "772be193",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\n// getDocuments retrieves documents with optional filtering\n// The ORM was too slow for our full-text search needs so we use raw SQL here\nfunc getDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Base query scoped to user's documents\n\tbaseQuery := \"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = \" + userID\n\n\t// Apply optional filters from query params\n\tclassification := r.URL.Query().Get(\"classification\")\n\tif classification != \"\" {\n\t\t// Validate classification is one of allowed values\n\t\tallowed := map[string]bool{\"public\": true, \"internal\": true, \"confidential\": true, \"secret\": true}\n\t\tif !allowed[strings.ToLower(classification)] {\n\t\t\thttp.Error(w, \"invalid classification\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += \" AND classification = '\" + classification + \"'\"\n\t}\n\n\t// Sort parameter - this enables flexible ordering for the UI\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tif sortCol != \"\" {\n\t\t// We restrict to known columns to prevent injection via ORDER BY\n\t\tvalidCols := map[string]bool{\"id\": true, \"title\": true, \"classification\": true}\n\t\tif !validCols[sortCol] {\n\t\t\tsortCol = \"id\"\n\t\t}\n\t\tbaseQuery += \" ORDER BY \" + sortCol\n\t}\n\n\t// Limit results\n\tlimit := r.URL.Query().Get(\"limit\")\n\tif limit != \"\" {\n\t\tbaseQuery += \" LIMIT \" + limit\n\t}\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// createDocument inserts a new document (uses parameterized query)\nfunc createDocument(w http.ResponseWriter, r *http.Request) {\n\tvar d Document\n\tif err := json.NewDecoder(r.Body).Decode(&d); err != nil {\n\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\t_, err := db.Exec(\"INSERT INTO documents (title, content, owner_id, classification) VALUES ($1, $2, $3, $4)\",\n\t\td.Title, d.Content, d.OwnerID, d.Classify)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusCreated)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tfmt.Fprintf(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents\", getDocuments)\n\thttp.HandleFunc(\"/api/documents/create\", createDocument)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an AWS Application Load Balancer (ALB). The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) AWSManagedRulesKnownBadInputsRuleSet in BLOCK mode, (3) a custom rule with ByteMatchStatement targeting query string values for the patterns UNION, union, SELECT, select, OR 1, or 1, --, with SearchString positional constraint CONTAINS and TextTransformation URL_DECODE followed by LOWERCASE, action BLOCK. The WebACL default action is ALLOW. ECS task role has no network egress policy restricting outbound (the container can reach the internet). The ALB target group health check hits /health. CloudWatch logging is enabled for WAF but plays no blocking role.",
+    "config": {
+      "load_balancer": "AWS ALB (Layer 7)",
+      "waf_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "note": "SizeRestrictions_QUERYSTRING is set to COUNT (not BLOCK)"
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 3,
+            "name": "custom-sqli-query-block",
+            "statement": {
+              "OrStatement": {
+                "Statements": [
+                  {
+                    "ByteMatchStatement": {
+                      "SearchString": "union",
+                      "FieldToMatch": {
+                        "QueryString": {}
+                      },
+                      "PositionalConstraint": "CONTAINS",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "URL_DECODE"
+                        },
+                        {
+                          "Priority": 1,
+                          "Type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "ByteMatchStatement": {
+                      "SearchString": "select",
+                      "FieldToMatch": {
+                        "QueryString": {}
+                      },
+                      "PositionalConstraint": "CONTAINS",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "URL_DECODE"
+                        },
+                        {
+                          "Priority": 1,
+                          "Type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "ByteMatchStatement": {
+                      "SearchString": "--",
+                      "FieldToMatch": {
+                        "QueryString": {}
+                      },
+                      "PositionalConstraint": "CONTAINS",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "URL_DECODE"
+                        },
+                        {
+                          "Priority": 1,
+                          "Type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "ByteMatchStatement": {
+                      "SearchString": "or 1",
+                      "FieldToMatch": {
+                        "QueryString": {}
+                      },
+                      "PositionalConstraint": "CONTAINS",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "URL_DECODE"
+                        },
+                        {
+                          "Priority": 1,
+                          "Type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "runtime": "Python 3.11, gunicorn 21.2.0, ECS Fargate",
+      "database": "SQLite 3.40 ephemeral in task storage",
+      "network": "VPC with NAT gateway, no egress restriction"
+    }
+  }
+}

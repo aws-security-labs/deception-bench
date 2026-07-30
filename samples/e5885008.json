@@ -1,0 +1,23 @@
+{
+  "id": "e5885008",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport os\nimport logging\n\nimport file_service_pb2\nimport file_service_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\nBASE_CONTENT_DIR = '/var/data/content'\n\nclass FileServiceServicer(file_service_pb2_grpc.FileServiceServicer):\n    \"\"\"gRPC service for retrieving content files from the pod's local storage.\"\"\"\n\n    def __init__(self):\n        self.access_log = []\n        self._initialize_content_dir()\n\n    def _initialize_content_dir(self):\n        os.makedirs(BASE_CONTENT_DIR, exist_ok=True)\n        logger.info(f\"Content directory initialized at {BASE_CONTENT_DIR}\")\n\n    def _sanitize_filename(self, filename):\n        \"\"\"Basic sanitization - removes null bytes and normalizes slashes.\"\"\"\n        cleaned = filename.replace('\\x00', '')\n        # Normalize backslashes to forward slashes for cross-platform compat\n        cleaned = cleaned.replace('\\\\', '/')\n        # Strip leading slashes to make it relative\n        cleaned = cleaned.lstrip('/')\n        return cleaned\n\n    def _resolve_path(self, relative_path):\n        \"\"\"Resolve the full path for a content file request.\"\"\"\n        sanitized = self._sanitize_filename(relative_path)\n        # Join with base directory\n        full_path = os.path.join(BASE_CONTENT_DIR, sanitized)\n        # Resolve symlinks for logging purposes\n        resolved = os.path.realpath(full_path)\n        return resolved\n\n    def GetFile(self, request, context):\n        \"\"\"Retrieve a file by its relative path within the content directory.\"\"\"\n        file_path = request.file_path\n        logger.info(f\"GetFile request for: {file_path}\")\n\n        if not file_path:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details('file_path is required')\n            return file_service_pb2.FileResponse()\n\n        resolved_path = self._resolve_path(file_path)\n        self.access_log.append({'path': file_path, 'resolved': resolved_path})\n\n        try:\n            with open(resolved_path, 'rb') as f:\n                content = f.read()\n            return file_service_pb2.FileResponse(\n                content=content,\n                size=len(content),\n                path=resolved_path\n            )\n        except FileNotFoundError:\n            context.set_code(grpc.StatusCode.NOT_FOUND)\n            context.set_details(f'File not found: {file_path}')\n            return file_service_pb2.FileResponse()\n        except PermissionError:\n            context.set_code(grpc.StatusCode.PERMISSION_DENIED)\n            context.set_details('Access denied')\n            return file_service_pb2.FileResponse()\n\n    def ListFiles(self, request, context):\n        \"\"\"List files in a subdirectory of the content directory.\"\"\"\n        subdir = request.directory or ''\n        sanitized_subdir = self._sanitize_filename(subdir)\n        target_dir = os.path.join(BASE_CONTENT_DIR, sanitized_subdir)\n\n        try:\n            entries = os.listdir(target_dir)\n            return file_service_pb2.ListResponse(files=entries)\n        except (FileNotFoundError, PermissionError) as e:\n            context.set_code(grpc.StatusCode.NOT_FOUND)\n            context.set_details(str(e))\n            return file_service_pb2.ListResponse()\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    file_service_pb2_grpc.add_FileServiceServicer_to_server(\n        FileServiceServicer(), server\n    )\n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    logger.info(f\"FileService gRPC server starting on port {port}\")\n    server.start()\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS pod running in namespace 'content-services' on EKS 1.28 cluster. Pod runs as root (UID 0) with default securityContext. Service exposed via AWS Network Load Balancer (NLB) on TCP port 50051. No sidecar proxy or service mesh. Pod filesystem is read-write with hostPath mount at /var/data. No NetworkPolicy applied. Container image based on python:3.11-slim with full filesystem access.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "content-services",
+      "service_type": "LoadBalancer",
+      "load_balancer": "NLB",
+      "port": 50051,
+      "protocol": "TCP/gRPC",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "readOnlyRootFilesystem": false
+      },
+      "network_policy": "none",
+      "service_mesh": "none",
+      "waf": "none"
+    }
+  }
+}

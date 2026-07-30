@@ -1,0 +1,65 @@
+{
+  "id": "59f43aeb",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class InventoryServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"InventoryServlet\");\n    private String dbUrl;\n    private String dbUser;\n    private String dbPass;\n\n    @Override\n    public void init() throws ServletException {\n        dbUrl = System.getenv(\"JDBC_URL\");\n        dbUser = System.getenv(\"DB_USER\");\n        dbPass = System.getenv(\"DB_PASS\");\n    }\n\n    // Parameterized - safe\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String body = req.getReader().lines().reduce(\"\", String::concat);\n        JSONObject json = new JSONObject(body);\n        String sku = json.getString(\"sku\");\n        int qty = json.getInt(\"quantity\");\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);\n             PreparedStatement ps = conn.prepareStatement(\n                 \"UPDATE inventory SET quantity = ? WHERE sku = ?\")) {\n            ps.setInt(1, qty);\n            ps.setString(2, sku);\n            ps.executeUpdate();\n            resp.setStatus(200);\n            resp.getWriter().write(\"{\\\"status\\\":\\\"updated\\\"}\");\n        } catch (SQLException e) {\n            log.severe(e.getMessage());\n            resp.sendError(500);\n        }\n    }\n\n    // Search endpoint - vulnerable to SQL injection via ORDER BY\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String category = req.getParameter(\"category\");\n        String sortCol = req.getParameter(\"sort\");\n        String sortDir = req.getParameter(\"dir\");\n        if (category == null) { resp.sendError(400); return; }\n        if (sortCol == null) sortCol = \"name\";\n        if (sortDir == null) sortDir = \"ASC\";\n\n        // Developer note: PreparedStatement can't parameterize ORDER BY\n        // Using allowlist... but the check has a flaw\n        String[] allowedCols = {\"name\", \"sku\", \"quantity\", \"price\", \"updated_at\"};\n        boolean colValid = false;\n        for (String c : allowedCols) {\n            if (c.equalsIgnoreCase(sortCol)) { colValid = true; break; }\n        }\n        // BUG: sortDir is not validated, only sortCol is checked\n        if (!colValid) sortCol = \"name\";\n\n        String sql = \"SELECT sku, name, quantity, price, updated_at FROM inventory \"\n                   + \"WHERE category = ? ORDER BY \" + sortCol + \" \" + sortDir;\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);\n             PreparedStatement ps = conn.prepareStatement(sql)) {\n            ps.setString(1, category);\n            ResultSet rs = ps.executeQuery();\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject item = new JSONObject();\n                item.put(\"sku\", rs.getString(\"sku\"));\n                item.put(\"name\", rs.getString(\"name\"));\n                item.put(\"quantity\", rs.getInt(\"quantity\"));\n                item.put(\"price\", rs.getDouble(\"price\"));\n                item.put(\"updated_at\", rs.getString(\"updated_at\"));\n                results.put(item);\n            }\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            log.warning(\"Query error: \" + e.getMessage());\n            resp.sendError(500, \"{\\\"error\\\":\\\"query failed\\\"}\");\n        }\n    }\n\n    // Health check endpoint\n    @Override\n    protected void doPut(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setStatus(200);\n        resp.getWriter().write(\"{\\\"healthy\\\":true}\");\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. AWS WAF WebACL is associated with the ALB. The WebACL includes two rule groups evaluated in order: (1) a custom rule group 'query-string-length-cap' with a SizeConstraint on QueryString limiting to 64 bytes with action BLOCK at priority 0, and (2) a custom regex rule 'dept-param-charset' that applies a RegexPatternSet match on the 'department' query string parameter value, allowing only ^[A-Za-z0-9 _-]{1,50}$ with BLOCK action on non-match at priority 1. The WebACL default action is ALLOW. CloudWatch metrics confirm both rules are actively evaluating. The container runs read-only root filesystem with /var/data mounted as an EFS volume.",
+    "config": {
+      "waf_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "query-string-length-cap",
+            "priority": 0,
+            "action": "BLOCK",
+            "statement": {
+              "size_constraint": {
+                "field_to_match": {
+                  "query_string": {}
+                },
+                "comparison_operator": "GT",
+                "size": 64,
+                "text_transformation": "URL_DECODE"
+              }
+            }
+          },
+          {
+            "name": "dept-param-charset",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": {
+                  "single_query_argument": {
+                    "name": "department"
+                  }
+                },
+                "text_transformation": [
+                  "URL_DECODE",
+                  "HTML_ENTITY_DECODE"
+                ],
+                "regex_pattern_set": {
+                  "patterns": [
+                    "^[A-Za-z0-9 _-]{1,50}$"
+                  ]
+                }
+              },
+              "negated": true
+            }
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "container_config": {
+        "readonly_root_filesystem": true,
+        "efs_mount": "/var/data"
+      }
+    }
+  }
+}

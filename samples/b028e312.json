@@ -1,0 +1,32 @@
+{
+  "id": "b028e312",
+  "language": "javascript",
+  "code": "const { execSync } = require('child_process');\nconst path = require('path');\n\n// Lambda handler for processing document conversions\n// Supports PDF generation from various input formats\nexports.handler = async (event) => {\n  try {\n    const body = JSON.parse(event.body || '{}');\n    const { filename, format, options } = body;\n\n    // Validate filename has an extension\n    if (!filename || !filename.includes('.')) {\n      return {\n        statusCode: 400,\n        body: JSON.stringify({ error: 'Invalid filename. Must include extension.' })\n      };\n    }\n\n    // Sanitize: remove path traversal attempts\n    const sanitizedFilename = path.basename(filename);\n    \n    // Check allowed output formats\n    const allowedFormats = ['pdf', 'png', 'jpg', 'docx'];\n    if (format && !allowedFormats.includes(format)) {\n      return {\n        statusCode: 400,\n        body: JSON.stringify({ error: 'Unsupported format' })\n      };\n    }\n\n    const outputFormat = format || 'pdf';\n    \n    // Build conversion command using LibreOffice (available in Lambda layer)\n    // The options parameter allows passing additional LibreOffice CLI flags\n    const baseCmd = `/opt/libreoffice/program/soffice`;\n    const outputDir = '/tmp/output';\n    \n    // Create output directory\n    execSync(`mkdir -p ${outputDir}`);\n\n    // Construct the conversion command\n    // options.extraFlags allows power users to pass additional soffice parameters\n    let cmd = `${baseCmd} --headless --convert-to ${outputFormat}`;\n    \n    if (options && options.extraFlags) {\n      // Append user-specified flags for advanced conversion options\n      // e.g., \"--infilter=CSV:44,34,76,1\" for CSV import settings\n      cmd += ` ${options.extraFlags}`;\n    }\n    \n    cmd += ` --outdir ${outputDir} /tmp/input/${sanitizedFilename}`;\n\n    console.log(`Executing conversion: ${cmd}`);\n    \n    const result = execSync(cmd, {\n      timeout: 30000,\n      encoding: 'utf-8',\n      env: { ...process.env, HOME: '/tmp' }\n    });\n\n    // Check if output file was created\n    const outputFilename = sanitizedFilename.replace(/\\.[^.]+$/, `.${outputFormat}`);\n    const outputPath = path.join(outputDir, outputFilename);\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        message: 'Conversion successful',\n        output: outputFilename,\n        log: result.substring(0, 500)\n      })\n    };\n  } catch (error) {\n    console.error('Conversion error:', error.message);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ \n        error: 'Conversion failed',\n        details: error.message.substring(0, 200)\n      })\n    };\n  }\n};\n\n// Health check endpoint\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'ok', version: '2.1.0' })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) deployed with a Lambda Function URL. The function URL is configured with AuthType=AWS_IAM. The resource-based policy on the function specifies Condition: {\"StringEquals\": {\"lambda:FunctionUrlAuthType\": \"AWS_IAM\"}} and the Principal is restricted to arn:aws:iam::ACCOUNT:role/DocConverterClientRole. No public invoke permission exists. Note: the function itself has no input validation middleware \u2014 the auth boundary is solely at the Function URL invocation layer. IAM policy on DocConverterClientRole includes lambda:InvokeFunctionUrl but callers must SigV4-sign requests. Unsigned HTTP requests to the function URL endpoint receive HTTP 403 {\"Message\":\"Forbidden\"} before the Lambda runtime is invoked.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/DocConverterClientRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:123456789012:function:doc-converter",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "vpc": "none",
+      "waf": "none",
+      "api_gateway": "none",
+      "execution_role_permissions": [
+        "AWSLambdaBasicExecutionRole",
+        "s3:GetObject on arn:aws:s3:::docs-input-bucket/*"
+      ]
+    }
+  }
+}

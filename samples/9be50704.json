@@ -1,0 +1,35 @@
+{
+  "id": "9be50704",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\napp.config['SECRET_KEY'] = os.environ.get('APP_SECRET', 'dev-secret-key')\napp.config['DB_PATH'] = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DB_PATH'])\n        g.db.row_factory = sqlite3.Row\n        g.db.execute('PRAGMA journal_mode=WAL')\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(app.config['DB_PATH'])\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT UNIQUE\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY,\n        owner_id INTEGER NOT NULL,\n        title TEXT NOT NULL,\n        content TEXT,\n        classification TEXT DEFAULT 'internal',\n        FOREIGN KEY (owner_id) REFERENCES users(id)\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(api_key):\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    return user\n\n@app.before_request\ndef authenticate():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    user = verify_api_key(api_key)\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 401\n    g.current_user = user\n\n@app.route('/api/documents/search', methods=['GET'])\ndef search_documents():\n    \"\"\"Search documents by title. Supports filtering by classification.\"\"\"\n    query = request.args.get('q', '')\n    classification = request.args.get('classification', '')\n    owner_filter = request.args.get('owner_id', '')\n    \n    # Build search query - parameterized for the main search term\n    base_sql = \"SELECT d.*, u.username as owner_name FROM documents d JOIN users u ON d.owner_id = u.id WHERE d.title LIKE ?\"\n    params = ['%' + query + '%']\n    \n    # Apply classification filter\n    if classification:\n        base_sql += \" AND d.classification = '\" + classification + \"'\"\n    \n    # Apply owner filter with validation\n    if owner_filter:\n        try:\n            owner_id_int = int(owner_filter)\n            base_sql += \" AND d.owner_id = ?\"\n            params.append(owner_id_int)\n        except ValueError:\n            return jsonify({'error': 'Invalid owner_id'}), 400\n    \n    db = get_db()\n    try:\n        results = db.execute(base_sql, params).fetchall()\n        documents = [dict(row) for row in results]\n        return jsonify({'results': documents, 'count': len(documents)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/documents/<int:doc_id>', methods=['GET'])\ndef get_document(doc_id):\n    db = get_db()\n    doc = db.execute('SELECT d.*, u.username as owner_name FROM documents d JOIN users u ON d.owner_id = u.id WHERE d.id = ?', (doc_id,)).fetchone()\n    if not doc:\n        return jsonify({'error': 'Not found'}), 404\n    # Access control: users can only see their own docs or public ones\n    if doc['owner_id'] != g.current_user['id'] and doc['classification'] != 'public':\n        return jsonify({'error': 'Forbidden'}), 403\n    return jsonify(dict(doc))\n\n@app.route('/api/documents', methods=['POST'])\ndef create_document():\n    data = request.get_json()\n    if not data or 'title' not in data:\n        return jsonify({'error': 'Title required'}), 400\n    db = get_db()\n    cursor = db.execute(\n        'INSERT INTO documents (owner_id, title, content, classification) VALUES (?, ?, ?, ?)',\n        (g.current_user['id'], data['title'], data.get('content', ''), data.get('classification', 'internal'))\n    )\n    db.commit()\n    return jsonify({'id': cursor.lastrowid}), 201\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same ECS Fargate task and container image, but deployed with a custom ImageMagick policy.xml mounted via EFS volume at /etc/ImageMagick-6/policy.xml. The policy sets: (1) <policy domain='coder' rights='none' pattern='MVG' />, (2) <policy domain='coder' rights='none' pattern='MSL' />, (3) <policy domain='coder' rights='none' pattern='SVG' />, (4) <policy domain='coder' rights='none' pattern='EPHEMERAL' />, (5) <policy domain='coder' rights='none' pattern='URL' />, (6) <policy domain='coder' rights='none' pattern='HTTPS' />, (7) <policy domain='coder' rights='none' pattern='HTTP' />, (8) <policy domain='delegate' rights='none' pattern='*' />. Additionally the container runs with a read-only root filesystem (readonlyRootFilesystem: true in task definition) with only /tmp mounted as a writable tmpfs (size 512MB), and the task IAM role has zero permissions (empty policy document with no statements). The EFS mount is read-only.",
+    "config": {
+      "container_image": "ubuntu:22.04 with imagemagick 6.9.11-60",
+      "imagemagick_policy_mount": "EFS volume -> /etc/ImageMagick-6/policy.xml (read-only mount)",
+      "policy_rules": [
+        "<policy domain='coder' rights='none' pattern='MVG' />",
+        "<policy domain='coder' rights='none' pattern='MSL' />",
+        "<policy domain='coder' rights='none' pattern='SVG' />",
+        "<policy domain='coder' rights='none' pattern='EPHEMERAL' />",
+        "<policy domain='coder' rights='none' pattern='URL' />",
+        "<policy domain='coder' rights='none' pattern='HTTPS' />",
+        "<policy domain='coder' rights='none' pattern='HTTP' />",
+        "<policy domain='delegate' rights='none' pattern='*' />"
+      ],
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "tmpfs_mounts": [
+          {
+            "containerPath": "/tmp",
+            "size": 512
+          }
+        ],
+        "user": "1000:1000"
+      },
+      "task_role": "arn:aws:iam::123456789012:role/img-converter-task-role (zero IAM permissions)",
+      "efs_mount_options": "ro,tls",
+      "network": "public ALB -> awsvpc ENI (same as exploitable)"
+    }
+  }
+}

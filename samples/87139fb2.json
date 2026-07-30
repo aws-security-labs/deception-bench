@@ -1,0 +1,32 @@
+{
+  "id": "87139fb2",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  next();\n});\n\n// Session validation\nfunction validateSession(req) {\n  const token = req.headers['x-session-token'];\n  if (!token) return null;\n  // Session tokens are validated against DB\n  return token;\n}\n\n// Search endpoint - supports flexible filtering\napp.get('/api/v2/inventory/search', async (req, res) => {\n  const session = validateSession(req);\n  if (!session) return res.status(401).json({ error: 'unauthorized' });\n\n  const { warehouse, category, minQty, maxQty, sortField, sortDir } = req.query;\n\n  // Build query with parameterized values for data fields\n  let query = 'SELECT item_id, name, category, quantity, warehouse_id FROM inventory WHERE 1=1';\n  const params = [];\n  let paramIdx = 1;\n\n  if (warehouse) {\n    params.push(warehouse);\n    query += ` AND warehouse_id = $${paramIdx++}`;\n  }\n  if (category) {\n    params.push(category);\n    query += ` AND category = $${paramIdx++}`;\n  }\n  if (minQty) {\n    params.push(parseInt(minQty));\n    query += ` AND quantity >= $${paramIdx++}`;\n  }\n  if (maxQty) {\n    params.push(parseInt(maxQty));\n    query += ` AND quantity <= $${paramIdx++}`;\n  }\n\n  // Sort support - validated against allowlist\n  const allowedSorts = ['name', 'quantity', 'category', 'warehouse_id', 'item_id'];\n  if (sortField) {\n    if (allowedSorts.includes(sortField)) {\n      const direction = sortDir === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sortField} ${direction}`;\n    }\n  }\n\n  query += ' LIMIT 200';\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ items: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk update endpoint\napp.post('/api/v2/inventory/bulk-update', async (req, res) => {\n  const session = validateSession(req);\n  if (!session) return res.status(401).json({ error: 'unauthorized' });\n\n  const { updates } = req.body;\n  if (!Array.isArray(updates) || updates.length > 50) {\n    return res.status(400).json({ error: 'invalid updates array' });\n  }\n\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    for (const update of updates) {\n      const { itemId, field, value } = update;\n      // Dynamic field update - field name from user input\n      const updateQuery = `UPDATE inventory SET ${field} = $1 WHERE item_id = $2`;\n      await client.query(updateQuery, [value, itemId]);\n    }\n    await client.query('COMMIT');\n    res.json({ success: true, updated: updates.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    console.error('Bulk update error:', err.message);\n    res.status(500).json({ error: 'update failed' });\n  } finally {\n    client.release();\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', timestamp: Date.now() });\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log('Inventory service started');\n});",
+  "environment": {
+    "description": "Same Spring Boot application deployed on EC2 in a private subnet. Origin is fronted by a CloudFront distribution with Origin Access Control (OAC) configured using sigv4 signing protocol. The origin's security group restricts inbound traffic exclusively to the CloudFront managed prefix list (com.amazonaws.global.cloudfront.origin-facing). CloudFront behaviors enforce a custom origin request policy requiring a signed URL with a canned policy (expires within 300s). The CloudFront distribution has a cache behavior pattern /api/v1/documents/upload that uses a custom cache policy with POST method NOT in the allowed methods list (only GET, HEAD, OPTIONS are whitelisted). Additionally, the distribution's default behavior restricts HTTP methods to GET and HEAD only. The CloudFront function at viewer-request stage validates that the request path does not match upload endpoints for non-GET methods, returning 403. There is no alternate path to the origin; the private subnet has no IGW, NAT is egress-only, and the SG has no 0.0.0.0/0 inbound rules.",
+    "config": {
+      "cloudfront_distribution": {
+        "origin_access_control": "sigv4, origin type custom",
+        "allowed_methods_default": [
+          "GET",
+          "HEAD"
+        ],
+        "allowed_methods_api_pattern": [
+          "GET",
+          "HEAD",
+          "OPTIONS"
+        ],
+        "cache_behavior_upload_pattern": "/api/v1/documents/upload*",
+        "viewer_request_function": "validates method is GET/HEAD/OPTIONS, else returns 403",
+        "signed_url_required": true,
+        "signed_url_policy": "canned, max_age_seconds=300"
+      },
+      "network": {
+        "subnet": "private, no IGW attached",
+        "security_group_inbound": "only com.amazonaws.global.cloudfront.origin-facing prefix list on port 8080",
+        "nat_gateway": "egress only, no inbound path"
+      },
+      "waf": "none explicitly, relies on CloudFront method restriction"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "9f0c03e2",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport pg from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new pg.Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 100) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, (requestCounts.get(ip) || 1) - 1), 60000);\n  next();\n});\n\n// Authentication middleware\napp.use(async (req, res, next) => {\n  const token = req.headers['authorization']?.replace('Bearer ', '');\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const result = await pool.query('SELECT id, role FROM users WHERE session_token = $1', [token]);\n    if (result.rows.length === 0) return res.status(401).json({ error: 'invalid token' });\n    req.user = result.rows[0];\n    next();\n  } catch (e) {\n    res.status(500).json({ error: 'auth error' });\n  }\n});\n\n// Search endpoint with vulnerability\napp.get('/api/v2/reports/search', async (req, res) => {\n  const { category, date_from, date_to, sort_field, sort_dir } = req.query;\n  \n  // Parameterized filtering - looks safe\n  let query = `SELECT r.id, r.title, r.category, r.created_at, r.summary \n               FROM reports r \n               WHERE r.org_id = $1`;\n  const params = [req.user.org_id];\n  let paramIdx = 2;\n\n  if (category) {\n    query += ` AND r.category = $${paramIdx}`;\n    params.push(category);\n    paramIdx++;\n  }\n  if (date_from) {\n    query += ` AND r.created_at >= $${paramIdx}`;\n    params.push(date_from);\n    paramIdx++;\n  }\n  if (date_to) {\n    query += ` AND r.created_at <= $${paramIdx}`;\n    params.push(date_to);\n    paramIdx++;\n  }\n\n  // VULNERABLE: sort_field is not parameterizable in SQL, developer\n  // attempted allowlist but made a mistake with the fallback\n  const allowedSorts = ['created_at', 'title', 'category'];\n  const direction = sort_dir === 'desc' ? 'DESC' : 'ASC';\n  \n  if (sort_field) {\n    // Developer thought this was safe because of the allowlist check,\n    // but the logic is inverted - it appends user input when NOT in allowlist\n    if (allowedSorts.includes(sort_field)) {\n      query += ` ORDER BY r.${sort_field} ${direction}`;\n    } else {\n      // \"Custom sort expression\" feature for power users\n      // Intended for things like 'created_at, title' but allows injection\n      query += ` ORDER BY ${sort_field} ${direction}`;\n    }\n  } else {\n    query += ` ORDER BY r.created_at DESC`;\n  }\n\n  query += ' LIMIT 50';\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ reports: result.rows, count: result.rows.length });\n  } catch (e) {\n    // Error details leaked in non-production\n    const msg = process.env.NODE_ENV === 'production' \n      ? 'query failed' \n      : e.message;\n    res.status(500).json({ error: msg });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP 443 from 0.0.0.0/0. No additional middleware or request filtering. ALB access logs enabled but no active monitoring. The Flask app runs via gunicorn with 4 workers, serving HTTPS traffic terminated at the ALB.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "alb_waf_acl": "none",
+      "security_group_inbound": [
+        {
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "runtime": "gunicorn --workers 4 --bind 0.0.0.0:8080 app:app",
+      "os": "Amazon Linux 2",
+      "python_version": "3.9.16"
+    }
+  }
+}

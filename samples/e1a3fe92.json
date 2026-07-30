@@ -1,0 +1,34 @@
+{
+  "id": "e1a3fe92",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport pg from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new pg.Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: request ID tracking\napp.use((req, res, next) => {\n  req.requestId = crypto.randomUUID();\n  res.setHeader('X-Request-Id', req.requestId);\n  next();\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\n// Search documents endpoint\napp.get('/api/documents/search', async (req, res) => {\n  try {\n    const { q, author, date_from, date_after, limit } = req.query;\n    \n    let baseQuery = 'SELECT id, title, author, created_at, snippet FROM documents WHERE 1=1';\n    const params = [];\n    let paramIdx = 1;\n\n    if (q) {\n      params.push(`%${q}%`);\n      baseQuery += ` AND (title ILIKE $${paramIdx} OR content ILIKE $${paramIdx})`;\n      paramIdx++;\n    }\n\n    if (author) {\n      params.push(author);\n      baseQuery += ` AND author = $${paramIdx}`;\n      paramIdx++;\n    }\n\n    if (date_from) {\n      params.push(date_from);\n      baseQuery += ` AND created_at >= $${paramIdx}`;\n      paramIdx++;\n    }\n\n    // VULNERABILITY: date_after is concatenated directly\n    if (date_after) {\n      baseQuery += ` AND created_at > '${date_after}'`;\n    }\n\n    // limit handling - looks unsafe but is actually parsed to int\n    const safeLimit = parseInt(limit) || 25;\n    baseQuery += ` ORDER BY created_at DESC LIMIT ${safeLimit}`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ request_id: req.requestId, results: result.rows });\n  } catch (err) {\n    console.error(`[${req.requestId}] Search error:`, err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Get document by ID\napp.get('/api/documents/:id', async (req, res) => {\n  try {\n    const docId = parseInt(req.params.id);\n    if (isNaN(docId)) return res.status(400).json({ error: 'Invalid ID' });\n    \n    const result = await pool.query(\n      'SELECT id, title, author, content, created_at FROM documents WHERE id = $1',\n      [docId]\n    );\n    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });\n    res.json(result.rows[0]);\n  } catch (err) {\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Create document (requires auth header)\napp.post('/api/documents', async (req, res) => {\n  const authToken = req.headers['x-api-token'];\n  if (!authToken || authToken.length < 32) {\n    return res.status(401).json({ error: 'Unauthorized' });\n  }\n  // Token validation uses timing-safe comparison... but against env var\n  const expected = process.env.API_TOKEN || '';\n  if (!crypto.timingSafeEqual(Buffer.from(authToken.padEnd(64)), Buffer.from(expected.padEnd(64)))) {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n\n  const { title, content, author } = req.body;\n  try {\n    const result = await pool.query(\n      'INSERT INTO documents (title, content, author, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id',\n      [title, content, author]\n    );\n    res.status(201).json({ id: result.rows[0].id });\n  } catch (err) {\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\napp.listen(3000, () => console.log('Document service listening on :3000'));",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

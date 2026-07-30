@@ -1,0 +1,52 @@
+{
+  "id": "c7d22f13",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport java.util.logging.*;\n\n@WebServlet(\"/api/users\")\npublic class UserSearchServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(UserSearchServlet.class.getName());\n    \n    private Connection getConnection() throws SQLException {\n        // Connection pool managed by container\n        return ((javax.sql.DataSource) \n            getServletContext().getAttribute(\"dataSource\")).getConnection();\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, java.io.IOException {\n        \n        String department = req.getParameter(\"dept\");\n        String sortField = req.getParameter(\"sort\");\n        String activeOnly = req.getParameter(\"active\");\n        \n        if (department == null || department.isEmpty()) {\n            resp.sendError(400, \"Missing department parameter\");\n            return;\n        }\n        \n        // Validate sort field against allowlist\n        String[] allowedSorts = {\"name\", \"email\", \"hire_date\", \"employee_id\"};\n        String sanitizedSort = \"name\";\n        for (String allowed : allowedSorts) {\n            if (allowed.equals(sortField)) {\n                sanitizedSort = sortField;\n                break;\n            }\n        }\n        \n        // Build query - department is parameterized for common lookups\n        // but we need dynamic filtering for the active status check\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT employee_id, name, email, hire_date FROM employees WHERE department = ?\");\n        \n        if (activeOnly != null && !activeOnly.isEmpty()) {\n            // Legacy filter: active status stored as string codes\n            // Values expected: 'Y', 'N', 'P' (pending)\n            query.append(\" AND active_status = '\").append(activeOnly).append(\"'\");\n        }\n        \n        query.append(\" ORDER BY \").append(sanitizedSort);\n        \n        logger.info(\"User search: dept=\" + department + \" sort=\" + sanitizedSort);\n        \n        try (Connection conn = getConnection();\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n            \n            stmt.setString(1, department);\n            \n            try (ResultSet rs = stmt.executeQuery()) {\n                resp.setContentType(\"application/json\");\n                resp.setCharacterEncoding(\"UTF-8\");\n                \n                StringBuilder json = new StringBuilder(\"[\\n\");\n                boolean first = true;\n                \n                while (rs.next()) {\n                    if (!first) json.append(\",\\n\");\n                    first = false;\n                    json.append(\"  {\");\n                    json.append(\"\\\"id\\\":\").append(rs.getInt(\"employee_id\")).append(\",\");\n                    json.append(\"\\\"name\\\":\\\"\").append(escapeJson(rs.getString(\"name\"))).append(\"\\\",\");\n                    json.append(\"\\\"email\\\":\\\"\").append(escapeJson(rs.getString(\"email\"))).append(\"\\\",\");\n                    json.append(\"\\\"hire_date\\\":\\\"\").append(rs.getString(\"hire_date\")).append(\"\\\"\");\n                    json.append(\"}\");\n                }\n                \n                json.append(\"\\n]\");\n                resp.getWriter().write(json.toString());\n            }\n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n    \n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Rails 7.0 application deployed in a Kubernetes pod with a hardened security context. The container runs with a read-only root filesystem (readOnlyRootFilesystem: true) with an emptyDir volume mounted exclusively at /opt/app/storage/workspaces. The pod security context specifies runAsNonRoot: true, runAsUser: 65534, and drops ALL capabilities then adds back only CAP_NET_BIND_SERVICE. Additionally, a seccomp profile (RuntimeDefault) is applied. The container image uses a distroless Ruby base. The emptyDir volume has a sizeLimit of 50Mi and is the ONLY writable path in the container filesystem.",
+    "config": {
+      "runtime": "Kubernetes 1.28, containerd 1.7, distroless Ruby 3.2 image",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "fsGroup": 65534,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "workspace-vol",
+          "emptyDir": {
+            "sizeLimit": "50Mi"
+          },
+          "mountPath": "/opt/app/storage/workspaces"
+        },
+        {
+          "name": "tmp-vol",
+          "emptyDir": {
+            "sizeLimit": "10Mi"
+          },
+          "mountPath": "/tmp"
+        }
+      ],
+      "writable_paths": [
+        "/opt/app/storage/workspaces",
+        "/tmp"
+      ],
+      "network_policy": "ingress only from ingress-controller namespace"
+    }
+  }
+}

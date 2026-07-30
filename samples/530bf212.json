@@ -1,0 +1,33 @@
+{
+  "id": "530bf212",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"text/template\"\n)\n\nvar reportTemplate = `\\documentclass{article}\n\\usepackage{graphicx}\n\\usepackage{hyperref}\n\\begin{document}\n\\title{ {{.Title}} }\n\\author{ {{.Author}} }\n\\maketitle\n\\section{Summary}\n{{.Summary}}\n\\section{Details}\n{{.Details}}\n\\end{document}`\n\ntype ReportData struct {\n\tTitle   string\n\tAuthor  string\n\tSummary string\n\tDetails string\n}\n\nfunc generateID() string {\n\tb := make([]byte, 8)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc sanitizeField(input string) string {\n\t// Basic sanitization - remove obvious shell metacharacters\n\treplacer := strings.NewReplacer(\n\t\t\"$\", \"\",\n\t\t\"`\", \"\",\n\t\t\";\", \"\",\n\t\t\"|\", \"\",\n\t\t\"&\", \"\\\\&\",\n\t)\n\treturn replacer.Replace(input)\n}\n\nfunc handleGenerateReport(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tr.ParseForm()\n\ttitle := r.FormValue(\"title\")\n\tauthor := r.FormValue(\"author\")\n\tsummary := r.FormValue(\"summary\")\n\tdetails := r.FormValue(\"details\")\n\n\tif title == \"\" || author == \"\" {\n\t\thttp.Error(w, \"title and author required\", 400)\n\t\treturn\n\t}\n\n\t// Sanitize inputs\n\tdata := ReportData{\n\t\tTitle:   sanitizeField(title),\n\t\tAuthor:  sanitizeField(author),\n\t\tSummary: sanitizeField(summary),\n\t\tDetails: sanitizeField(details),\n\t}\n\n\tjobID := generateID()\n\tworkDir := filepath.Join(\"/tmp/reports\", jobID)\n\tos.MkdirAll(workDir, 0755)\n\n\ttexFile := filepath.Join(workDir, \"report.tex\")\n\tf, err := os.Create(texFile)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\n\ttmpl, err := template.New(\"report\").Parse(reportTemplate)\n\tif err != nil {\n\t\thttp.Error(w, \"template error\", 500)\n\t\treturn\n\t}\n\ttmpl.Execute(f, data)\n\tf.Close()\n\n\t// Compile LaTeX to PDF\n\tcmd := exec.Command(\"pdflatex\",\n\t\t\"-interaction=nonstopmode\",\n\t\t\"-output-directory=\"+workDir,\n\t\ttexFile,\n\t)\n\tcmd.Dir = workDir\n\tcmd.Env = append(os.Environ(), \"TEXMFHOME=\"+workDir)\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tlog.Printf(\"pdflatex error for job %s: %s\\n%s\", jobID, err, string(output))\n\t\thttp.Error(w, \"PDF generation failed\", 500)\n\t\treturn\n\t}\n\n\tpdfFile := filepath.Join(workDir, \"report.pdf\")\n\tpdf, err := os.Open(pdfFile)\n\tif err != nil {\n\t\thttp.Error(w, \"PDF not found\", 500)\n\t\treturn\n\t}\n\tdefer pdf.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/pdf\")\n\tw.Header().Set(\"Content-Disposition\", fmt.Sprintf(\"attachment; filename=report-%s.pdf\", jobID))\n\tio.Copy(w, pdf)\n\n\t// Cleanup\n\tos.RemoveAll(workDir)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/reports/generate\", handleGenerateReport)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\tlog.Println(\"Report service listening on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "EKS pod running in namespace 'pki-services' with default SecurityContext. Container runs as root (UID 0). Pod spec uses 'emptyDir' volume mounts. No filesystem restrictions beyond standard container isolation. The gRPC port 50051 is exposed via a ClusterIP Service with no NetworkPolicy restricting ingress. Container filesystem has standard Linux permissions with /etc/shadow readable by root. HSM integration via CloudHSM PKCS#11 library is configured but the path traversal in GetCertificate and GetKeyMetadata allows reading arbitrary files on the container filesystem.",
+    "config": {
+      "kubernetes_namespace": "pki-services",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "runAsGroup": 0
+      },
+      "container_security_context": {
+        "privileged": false,
+        "readOnlyRootFilesystem": false
+      },
+      "network_policy": "none",
+      "service_type": "ClusterIP",
+      "volume_mounts": [
+        {
+          "name": "cert-store",
+          "mountPath": "/opt/certs/public"
+        },
+        {
+          "name": "hsm-slots",
+          "mountPath": "/opt/hsm/slots"
+        }
+      ],
+      "seccomp_profile": "runtime/default",
+      "apparmor_profile": "unconfined"
+    }
+  }
+}

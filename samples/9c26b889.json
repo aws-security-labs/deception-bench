@@ -1,0 +1,35 @@
+{
+  "id": "9c26b889",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\t\"unicode\"\n\n\t_ \"github.com/lib/pq\"\n\t\"golang.org/x/text/unicode/norm\"\n)\n\n// TerraformProviderResourceHandler handles CRUD operations for custom resources\n// registered via a Terraform provider's REST API backend\ntype ResourceHandler struct {\n\tdb *sql.DB\n}\n\nfunc NewResourceHandler(db *sql.DB) *ResourceHandler {\n\treturn &ResourceHandler{db: db}\n}\n\n// sanitizeInput performs basic input sanitization\n// Strips control characters and validates length\nfunc sanitizeInput(input string) string {\n\tvar builder strings.Builder\n\tfor _, r := range input {\n\t\tif !unicode.IsControl(r) {\n\t\t\tbuilder.WriteRune(r)\n\t\t}\n\t}\n\tresult := builder.String()\n\tif len(result) > 256 {\n\t\tresult = result[:256]\n\t}\n\treturn result\n}\n\n// normalizeResourceName applies NFKC normalization to resource identifiers\n// This ensures consistent lookup regardless of Unicode representation\nfunc normalizeResourceName(name string) string {\n\t// NFKC normalization - compatibility decomposition followed by canonical composition\n\t// This maps characters like \uff07 (U+FF07 FULLWIDTH APOSTROPHE) to ' (U+0027 APOSTROPHE)\n\t// and \uff1d (U+FF1D FULLWIDTH EQUALS SIGN) to = (U+003D EQUALS SIGN)\n\tnormalized := norm.NFKC.String(name)\n\treturn normalized\n}\n\n// LookupResource queries the resource registry by normalized name\nfunc (h *ResourceHandler) LookupResource(w http.ResponseWriter, r *http.Request) {\n\tresourceName := r.URL.Query().Get(\"name\")\n\tif resourceName == \"\" {\n\t\thttp.Error(w, \"missing name parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Step 1: Sanitize - remove control chars, limit length\n\tcleaned := sanitizeInput(resourceName)\n\n\t// Step 2: Check for obvious SQL injection patterns BEFORE normalization\n\tlowerCleaned := strings.ToLower(cleaned)\n\tblockPatterns := []string{\"union\", \"select\", \"drop\", \"insert\", \"delete\", \"update\", \"--\", \";\"}\n\tfor _, pattern := range blockPatterns {\n\t\tif strings.Contains(lowerCleaned, pattern) {\n\t\t\thttp.Error(w, \"invalid characters in resource name\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Step 3: Normalize to NFKC for consistent storage/lookup\n\t// BUG: Normalization happens AFTER the SQL keyword check.\n\t// Unicode fullwidth characters like \uff35 \uff2e \uff29 \uff2f \uff2e normalize to ASCII \"UNION\"\n\t// but pass the pre-normalization keyword filter above.\n\tnormalized := normalizeResourceName(cleaned)\n\n\t// Step 4: Build query with normalized name (VULNERABLE - string interpolation)\n\tquery := fmt.Sprintf(\"SELECT id, name, config FROM tf_resources WHERE name = '%s'\", normalized)\n\n\trows, err := h.db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, config string\n\t\tif err := rows.Scan(&id, &name, &config); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"config\\\":\\\"%s\\\"}\", id, name, config))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"[%s]\", strings.Join(results, \",\"))\n}\n\nfunc main() {\n\tconnStr := \"host=localhost port=5432 user=tfprovider dbname=terraform_state sslmode=disable\"\n\tdb, err := sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdefer db.Close()\n\n\thandler := NewResourceHandler(db)\n\thttp.HandleFunc(\"/api/v1/resources/lookup\", handler.LookupResource)\n\n\tlog.Println(\"Terraform provider API backend listening on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}\n",
+  "environment": {
+    "description": "Same Terraform provider API backend deployed behind an ALB (Application Load Balancer) with AWS WAFv2 WebACL attached. The WebACL includes the AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK), plus a custom rule evaluating QUERY_STRING with text transformation 'URL_DECODE' followed by 'NORMALIZE_PATH_WIN' applied before the managed rule inspection. The WAFv2 association uses scope REGIONAL on the ALB ARN. Note: the managed SQLi rule set uses internal tokenization that operates on the post-transformation request components, meaning fullwidth Unicode characters in query parameters are evaluated after the ALB's HTTP/2 frame decoding but the WAF text transformations do NOT include explicit Unicode normalization (no 'UNICODE_NORMALIZE' transform exists in WAFv2). The rule group's detection signatures rely on libinjection-based fingerprinting which tokenizes the normalized byte stream.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL association (regional scope)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/tf-provider-protection/abc123",
+      "waf_managed_rules": [
+        {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "vendor": "AWS",
+          "override_action": "none",
+          "priority": 1
+        }
+      ],
+      "waf_custom_rules": [
+        {
+          "name": "query-string-sqli-detection",
+          "priority": 0,
+          "action": "BLOCK",
+          "statement": "SqliMatchStatement on QUERY_STRING with text_transformations: [URL_DECODE, COMPRESS_WHITE_SPACE]"
+        }
+      ],
+      "waf_text_transformations_applied": [
+        "URL_DECODE",
+        "COMPRESS_WHITE_SPACE"
+      ],
+      "compute": "EC2 t3.medium behind ALB target group",
+      "database": "RDS PostgreSQL 15.4, same VPC",
+      "note": "WAFv2 SqliMatchStatement uses libinjection which performs its own internal character normalization during SQL fingerprint detection"
+    }
+  }
+}

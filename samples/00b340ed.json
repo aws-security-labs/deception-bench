@@ -1,0 +1,25 @@
+{
+  "id": "00b340ed",
+  "language": "python",
+  "code": "import os\nimport json\nimport smtplib\nfrom email.mime.text import MIMEText\nfrom email.mime.multipart import MIMEMultipart\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nSMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.internal.corp')\nSMTP_PORT = int(os.environ.get('SMTP_PORT', '25'))\nFROM_ADDRESS = os.environ.get('FROM_ADDRESS', 'noreply@service.internal')\n\ndef send_notification(recipient, subject, body, reply_to=None):\n    \"\"\"Send email notification to user after form submission.\"\"\"\n    msg = MIMEMultipart('alternative')\n    msg['From'] = FROM_ADDRESS\n    msg['To'] = recipient\n    msg['Subject'] = subject\n    \n    # Allow custom reply-to for support routing\n    if reply_to:\n        msg['Reply-To'] = reply_to\n    \n    # Add custom header for tracking\n    msg['X-Correlation-ID'] = request.headers.get('X-Request-ID', 'none')\n    \n    text_part = MIMEText(body, 'plain')\n    msg.attach(text_part)\n    \n    try:\n        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:\n            server.sendmail(FROM_ADDRESS, [recipient], msg.as_string())\n        return True\n    except Exception as e:\n        app.logger.error(f\"SMTP error: {e}\")\n        return False\n\n@app.route('/api/contact', methods=['POST'])\ndef contact_form():\n    \"\"\"Process contact form submission and send confirmation email.\"\"\"\n    data = request.get_json()\n    \n    if not data:\n        return jsonify({'error': 'Invalid JSON'}), 400\n    \n    email = data.get('email', '')\n    name = data.get('name', '')\n    message = data.get('message', '')\n    department = data.get('department', 'general')\n    \n    # Basic validation\n    if not email or not name or not message:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    if len(email) > 254 or '@' not in email:\n        return jsonify({'error': 'Invalid email format'}), 400\n    \n    # Build subject with user-controlled department field\n    subject = f\"Contact Form: {department} - from {name}\"\n    \n    # Build confirmation body\n    body = f\"\"\"Hello {name},\\n\\nThank you for contacting us.\\n\\nYour message:\\n{message}\\n\\nDepartment: {department}\\nWe will respond within 24 hours.\\n\\nBest regards,\\nSupport Team\"\"\"\n    \n    # Send confirmation to the submitter\n    # reply_to comes directly from user input for routing purposes\n    reply_to = data.get('reply_to', f'{department}@service.internal')\n    \n    success = send_notification(email, subject, body, reply_to=reply_to)\n    \n    if success:\n        return jsonify({'status': 'sent', 'message': 'Confirmation email sent'}), 200\n    else:\n        return jsonify({'error': 'Failed to send email'}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service in private subnet (no IGW route) with traffic ingress exclusively through a Lambda function URL configured as the integration target. The Lambda function URL has AuthType set to AWS_IAM with a resource-based policy that specifies a Condition block requiring 'aws:PrincipalOrgID' matching 'o-abc123def4' \u2014 meaning only IAM principals within the specific AWS Organization can invoke the function URL. The Lambda function performs request proxying to the Fargate task via VPC-internal ALB (scheme: internal). External callers without valid SigV4 signatures from an IAM identity in org o-abc123def4 receive HTTP 403 from the Lambda function URL endpoint itself before any request reaches the container. Additionally, the Fargate task security group ingress rules only allow TCP/8080 from the internal ALB security group CIDR, and the internal ALB has no internet-facing listener.",
+    "config": {
+      "ecs_launch_type": "FARGATE",
+      "network_mode": "awsvpc",
+      "subnet_type": "private",
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "lambda_resource_policy_condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-abc123def4"
+        }
+      },
+      "lambda_proxy_target": "internal-alb.private.local:8080",
+      "internal_alb_scheme": "internal",
+      "fargate_sg_ingress": "sg-internal-alb-only",
+      "igw_route": false,
+      "nat_gateway": true,
+      "smtp_auth_required": false
+    }
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "id": "2c027896",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchRequest struct {\n\tQuery    string   `json:\"query\"`\n\tFields   []string `json:\"fields\"`\n\tOrderBy  string   `json:\"order_by\"`\n\tTenantID string   `json:\"tenant_id\"`\n}\n\ntype AuditRecord struct {\n\tAction  string `json:\"action\"`\n\tDetails string `json:\"details\"`\n}\n\nfunc init() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeIdentifier attempts to prevent injection in identifiers\nfunc sanitizeIdentifier(s string) string {\n\t// Remove obvious dangerous chars but this is NOT sufficient\n\ts = strings.ReplaceAll(s, \";\", \"\")\n\ts = strings.ReplaceAll(s, \"--\", \"\")\n\treturn s\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req SearchRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Tenant isolation via application logic\n\ttenantID := r.Header.Get(\"X-Tenant-ID\")\n\tif tenantID == \"\" {\n\t\thttp.Error(w, \"Missing tenant context\", 403)\n\t\treturn\n\t}\n\n\tallowedFields := map[string]bool{\n\t\t\"name\": true, \"email\": true, \"created_at\": true, \"status\": true,\n\t}\n\n\tselectFields := []string{}\n\tfor _, f := range req.Fields {\n\t\tif allowedFields[f] {\n\t\t\tselectFields = append(selectFields, f)\n\t\t}\n\t}\n\tif len(selectFields) == 0 {\n\t\tselectFields = []string{\"name\", \"email\"}\n\t}\n\n\t// VULNERABILITY: OrderBy is user-controlled and only lightly sanitized\n\torderClause := \"created_at DESC\"\n\tif req.OrderBy != \"\" {\n\t\torderClause = sanitizeIdentifier(req.OrderBy)\n\t}\n\n\t// Build query - parameterized WHERE but injectable ORDER BY\n\tquery := fmt.Sprintf(\n\t\t\"SELECT %s FROM customers WHERE tenant_id = $1 AND (name ILIKE $2 OR email ILIKE $2) ORDER BY %s LIMIT 50\",\n\t\tstrings.Join(selectFields, \", \"),\n\t\torderClause,\n\t)\n\n\trows, err := db.Query(query, tenantID, \"%\"+req.Query+\"%\")\n\tif err != nil {\n\t\tlog.Printf(\"Query error for tenant %s: %v\", tenantID, err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tresults := []map[string]interface{}{}\n\tcols, _ := rows.Columns()\n\tfor rows.Next() {\n\t\tvalues := make([]interface{}, len(cols))\n\t\tpointers := make([]interface{}, len(cols))\n\t\tfor i := range values {\n\t\t\tpointers[i] = &values[i]\n\t\t}\n\t\trows.Scan(pointers...)\n\t\trow := map[string]interface{}{}\n\t\tfor i, col := range cols {\n\t\t\trow[col] = values[i]\n\t\t}\n\t\tresults = append(results, row)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc auditHandler(w http.ResponseWriter, r *http.Request) {\n\t// Audit log insertion - also uses string formatting for table partitioning\n\tvar rec AuditRecord\n\tif err := json.NewDecoder(r.Body).Decode(&rec); err != nil {\n\t\thttp.Error(w, \"Invalid\", 400)\n\t\treturn\n\t}\n\tpartition := r.Header.Get(\"X-Audit-Partition\")\n\tif partition == \"\" {\n\t\tpartition = \"default\"\n\t}\n\t// Another potential injection point - partition name in table\n\ttable := fmt.Sprintf(\"audit_log_%s\", sanitizeIdentifier(partition))\n\t_, err := db.Exec(fmt.Sprintf(\"INSERT INTO %s (action, details) VALUES ($1, $2)\", table), rec.Action, rec.Details)\n\tif err != nil {\n\t\tlog.Printf(\"Audit write error: %v\", err)\n\t}\n\tw.WriteHeader(204)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/search\", searchHandler)\n\thttp.HandleFunc(\"/api/v2/audit\", auditHandler)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Spring Boot service deployed on GKE in namespace 'partner-integrations'. Istio sidecar injected with STRICT mTLS. Namespace has an Istio AuthorizationPolicy with spec.action DENY for traffic where source.namespace is not in ['partner-integrations', 'istio-system'] AND a second AuthorizationPolicy with ALLOW action requiring request.headers[x-mesh-internal]='true' for the /api/v1/internal/* path prefix. However, the /api/v1/webhooks/verify endpoint remains publicly accessible through the IngressGateway VirtualService. The critical control is a Kubernetes NetworkPolicy (metadata: name 'restrict-egress-metadata', namespace 'partner-integrations') with spec.podSelector matching app=metadata-proxy, policyTypes=['Egress'], egress rules allowing only DNS (UDP/53 to kube-dns) and TCP to CIDR 0.0.0.0/0 EXCEPT 169.254.0.0/16 and 10.0.0.0/8 via an explicit except clause in the ipBlock. Additionally, the Istio ServiceEntry resources in the mesh only whitelist *.partner-api.com for HTTPS egress from this namespace, with Istio's outbound traffic policy set to REGISTRY_ONLY.",
+    "config": {
+      "kubernetes_namespace": "partner-integrations",
+      "istio_mtls_mode": "STRICT",
+      "istio_outbound_traffic_policy": "REGISTRY_ONLY",
+      "service_entries": [
+        "*.partner-api.com on port 443"
+      ],
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "partner-integrations",
+                      "istio-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "require-mesh-header-internal",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/v1/internal/*"
+                    ]
+                  }
+                }
+              ],
+              "when": [
+                {
+                  "key": "request.headers[x-mesh-internal]",
+                  "values": [
+                    "true"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "network_policy": {
+        "name": "restrict-egress-metadata",
+        "pod_selector": {
+          "app": "metadata-proxy"
+        },
+        "policy_types": [
+          "Egress"
+        ],
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "UDP",
+                "port": 53
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "169.254.0.0/16",
+                    "10.0.0.0/8"
+                  ]
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 443
+              }
+            ]
+          }
+        ]
+      },
+      "pod_security_standard": "restricted"
+    }
+  }
+}

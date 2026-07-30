@@ -1,0 +1,58 @@
+{
+  "id": "3cbf64f0",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        is_active INTEGER DEFAULT 1\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'is_active']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query with parameterized field (field is validated above)\n    # but value is directly interpolated for LIKE pattern support\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute(\n        'SELECT id, username, email, role, is_active FROM users WHERE id = ?',\n        (user_id,)\n    ).fetchone()\n    if user is None:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',\n            (data['username'], data['email'], data.get('password_hash', 'changeme'))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/health', methods=['GET'])\ndef health_check():\n    \"\"\"Basic health check endpoint.\"\"\"\n    return jsonify({'status': 'healthy', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'\n    app.run(host='0.0.0.0', port=8080, debug=debug_mode)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The task definition mounts the SQLite database on an EFS volume. The ECS task IAM role has no outbound network permissions beyond what the VPC allows. The critical infrastructure difference: the EFS access point is configured with POSIX permissions uid=1000, gid=1000, and the access point enforces root directory /data with permissions 0755. The EFS file system policy denies all actions except elasticfilesystem:ClientMount and elasticfilesystem:ClientRead (explicitly does NOT include elasticfilesystem:ClientWrite). The mount target security group only allows NFS (2049) from the Fargate task security group. The SQLite database file on EFS is therefore mounted READ-ONLY at the filesystem level regardless of application-level connection mode. Additionally, the Fargate task runs with readonlyRootFilesystem=true in the container definition, and the only writable mount is /tmp (an ephemeral volume). The DATABASE path /var/lib/app/users.db is a bind from the EFS read-only mount.",
+    "config": {
+      "compute": "ECS Fargate, platform version 1.4.0",
+      "network": "ALB -> target group port 8080, SG allows 443 inbound from 0.0.0.0/0",
+      "waf": "none",
+      "storage": {
+        "efs_file_system_policy": {
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::123456789012:role/ecs-task-role"
+          },
+          "Action": [
+            "elasticfilesystem:ClientMount",
+            "elasticfilesystem:ClientRead"
+          ],
+          "Condition": {
+            "Bool": {
+              "elasticfilesystem:AccessedViaMountTarget": "true"
+            }
+          }
+        },
+        "efs_access_point": {
+          "root_directory": "/data",
+          "posix_user": {
+            "uid": 1000,
+            "gid": 1000
+          },
+          "creation_info": {
+            "owner_uid": 1000,
+            "owner_gid": 1000,
+            "permissions": "0755"
+          }
+        },
+        "mount_options": "ro,tls"
+      },
+      "container": {
+        "readonlyRootFilesystem": true,
+        "mountPoints": [
+          {
+            "sourceVolume": "efs-data",
+            "containerPath": "/var/lib/app",
+            "readOnly": true
+          },
+          {
+            "sourceVolume": "tmp-ephemeral",
+            "containerPath": "/tmp",
+            "readOnly": false
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "d4f980d0",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(AccountLookupServlet.class.getName());\n    private String dbUrl;\n    private String dbUser;\n    private String dbPass;\n\n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        super.init(config);\n        dbUrl = System.getenv(\"JDBC_URL\");\n        dbUser = System.getenv(\"DB_USER\");\n        dbPass = System.getenv(\"DB_PASS\");\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        if (accountId == null || accountId.isEmpty()) {\n            resp.sendError(400, \"Missing id parameter\");\n            return;\n        }\n\n        // Validate accountId is numeric\n        if (!accountId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid account ID format\");\n            return;\n        }\n\n        // fields parameter allows selecting columns - default to safe set\n        String columns = \"account_name, account_type, created_date\";\n        if (fields != null && !fields.isEmpty()) {\n            // Developer note: fields is a comma-separated list of column names\n            // We trust it since the accountId is validated above\n            columns = fields;\n        }\n\n        String query = \"SELECT \" + columns + \" FROM accounts WHERE account_id = \" + accountId;\n        logger.info(\"Executing lookup for account: \" + accountId);\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"results\\\":[\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int colCount = meta.getColumnCount();\n            boolean first = true;\n\n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                for (int i = 1; i <= colCount; i++) {\n                    if (i > 1) json.append(\",\");\n                    json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                    json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n\n        } catch (SQLException e) {\n            logger.warning(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.sendError(405, \"Method not allowed\");\n    }\n}",
+  "environment": {
+    "description": "EKS pod running on Bottlerocket nodes with a custom AppArmor profile loaded via annotations (container.apparmor.security.beta.kubernetes.io/order-consumer=localhost/order-svc-confined). The profile denies write access to all paths except /tmp/order-svc-scratch/** and explicitly denies /var/log/** with 'deny /var/log/** w,'. The pod also has a read-only root filesystem (readOnlyRootFilesystem: true) with an emptyDir volume mounted at /tmp/order-svc-scratch for ephemeral state. The application's LOG_PATH environment variable is set to /var/log/order-service/events.log but the AppArmor profile combined with the read-only filesystem prevents any write to that path. Additionally, the Bottlerocket host has SELinux in enforcing mode with container_t context applied, which independently restricts container file writes to labeled volumes only.",
+    "config": {
+      "runtime": "EKS on Bottlerocket",
+      "apparmor_profile": "order-svc-confined (deny /var/log/** w, deny /etc/** w, deny /usr/** w)",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": [
+        {
+          "name": "scratch",
+          "type": "emptyDir",
+          "mountPath": "/tmp/order-svc-scratch"
+        }
+      ],
+      "selinux_mode": "enforcing",
+      "selinux_context": "container_t",
+      "node_os": "Bottlerocket (immutable host OS)",
+      "sqs_message_validation": "none"
+    }
+  }
+}

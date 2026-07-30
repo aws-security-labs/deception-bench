@@ -1,0 +1,25 @@
+{
+  "id": "c6f907aa",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/binary\"\n\t\"log\"\n\t\"net/http\"\n\t\"sync\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nconst (\n\tMaxMessageSize = 65536\n\tHeaderSize     = 4\n\tBufferPool     = 256\n)\n\nvar upgrader = websocket.Upgrader{\n\tReadBufferSize:  1024,\n\tWriteBufferSize: 1024,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true // Accept all origins for internal service\n\t},\n}\n\ntype MessageBuffer struct {\n\tdata [512]byte\n\tused int\n}\n\nvar bufferPool = sync.Pool{\n\tNew: func() interface{} {\n\t\treturn &MessageBuffer{}\n\t},\n}\n\n// parseFrameHeader extracts the payload length from a custom binary protocol header\n// Protocol: [2 bytes magic 0xFE 0xED] [2 bytes payload length] [payload]\nfunc parseFrameHeader(raw []byte) (uint16, []byte) {\n\tif len(raw) < HeaderSize {\n\t\treturn 0, nil\n\t}\n\tif raw[0] != 0xFE || raw[1] != 0xED {\n\t\treturn 0, nil\n\t}\n\tpayloadLen := binary.BigEndian.Uint16(raw[2:4])\n\treturn payloadLen, raw[HeaderSize:]\n}\n\n// processMessage handles incoming binary frames from trusted internal clients\n// The service processes telemetry data from edge nodes in known network segments\nfunc processMessage(msg []byte) []byte {\n\tpayloadLen, payload := parseFrameHeader(msg)\n\tif payloadLen == 0 || payload == nil {\n\t\treturn nil\n\t}\n\n\tbuf := bufferPool.Get().(*MessageBuffer)\n\tdefer bufferPool.Put(buf)\n\n\t// VULNERABILITY: payloadLen is attacker-controlled uint16 (max 65535)\n\t// but buf.data is only [512]byte. No bounds check before copy.\n\t// This causes a stack buffer overflow when payloadLen > 512\n\tcopy(buf.data[:payloadLen], payload[:payloadLen])\n\tbuf.used = int(payloadLen)\n\n\t// Process the telemetry frame (simplified)\n\tresponse := make([]byte, buf.used)\n\tfor i := 0; i < buf.used; i++ {\n\t\tresponse[i] = buf.data[i] ^ 0x55 // XOR transform for ack\n\t}\n\treturn response\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tconn.SetReadLimit(MaxMessageSize)\n\n\tfor {\n\t\tmsgType, msg, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\t\tif msgType != websocket.BinaryMessage {\n\t\t\tcontinue\n\t\t}\n\n\t\tresponse := processMessage(msg)\n\t\tif response != nil {\n\t\t\tconn.WriteMessage(websocket.BinaryMessage, response)\n\t\t}\n\t}\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws/telemetry\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tlog.Println(\"Starting telemetry WebSocket service on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}",
+  "environment": {
+    "description": "Service deployed in a private subnet (10.200.0.0/24) behind an AWS Network Load Balancer (NLB) with a target group health check on /health. The NLB listener on port 8443 has an associated VPC security group (sg-0a3f8e91c) that restricts inbound traffic. However, the primary network-level restriction is implemented via VPC subnet route table configuration: the private subnet has no internet gateway route, and the NLB resides in a separate public subnet with its own security group (sg-0b7c2d44a) that has an inbound allow rule scoped to a prefix list (pl-0x8f3a21e7b) containing only three CIDR blocks: 10.50.0.0/16 (internal data center), 172.20.128.0/17 (edge node VPN pool), and 192.168.200.0/24 (NOC management). The NLB preserves client IP via proxy protocol v2, and the target group security group (sg-0a3f8e91c) only allows ingress from the NLB's ENI security group. There is no NAT gateway or bastion with public-facing access in the VPC. DNS resolution for the service endpoint is only available via Route53 private hosted zone associated with the VPC.",
+    "config": {
+      "subnet": "private_10.200.0.0/24",
+      "internet_gateway": "none_on_private_subnet",
+      "nlb_subnet": "public_with_restricted_sg",
+      "nlb_security_group": "sg-0b7c2d44a",
+      "nlb_sg_inbound_prefix_list": "pl-0x8f3a21e7b",
+      "prefix_list_cidrs": [
+        "10.50.0.0/16",
+        "172.20.128.0/17",
+        "192.168.200.0/24"
+      ],
+      "target_group_sg": "sg-0a3f8e91c_allows_only_nlb_eni_sg",
+      "proxy_protocol": "v2_client_ip_preserved",
+      "dns_resolution": "route53_private_hosted_zone_only",
+      "nat_gateway": "none",
+      "public_ip_on_service": "none"
+    }
+  }
+}

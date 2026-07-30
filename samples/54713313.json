@@ -1,0 +1,27 @@
+{
+  "id": "54713313",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport hashlib\nimport time\n\napp = Flask(__name__)\nDATABASE = '/app/data/warehouse.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef require_session(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        session_token = request.cookies.get('sid')\n        if not session_token:\n            return jsonify({'error': 'unauthorized'}), 401\n        db = get_db()\n        user = db.execute('SELECT * FROM sessions WHERE token = ?', (session_token,)).fetchone()\n        if not user:\n            return jsonify({'error': 'invalid session'}), 403\n        g.current_user = dict(user)\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/v1/shipments/track', methods=['GET'])\n@require_session\ndef track_shipment():\n    tracking_id = request.args.get('id', '')\n    # Validate tracking ID format: alphanumeric with dashes\n    if not tracking_id or len(tracking_id) > 64:\n        return jsonify({'error': 'invalid tracking id'}), 400\n    db = get_db()\n    shipment = db.execute('SELECT * FROM shipments WHERE tracking_id = ?', (tracking_id,)).fetchone()\n    if shipment:\n        return jsonify(dict(shipment))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/v1/shipments/search', methods=['GET'])\n@require_session\ndef search_shipments():\n    origin = request.args.get('origin', '')\n    dest = request.args.get('dest', '')\n    status = request.args.get('status', '')\n    date_from = request.args.get('from', '')\n    \n    # Build dynamic query based on provided filters\n    conditions = []\n    if origin:\n        conditions.append(f\"origin_port LIKE '%{origin}%'\")\n    if dest:\n        conditions.append(f\"dest_port LIKE '%{dest}%'\")\n    if status:\n        conditions.append(f\"status = '{status}'\")\n    if date_from:\n        conditions.append(f\"ship_date >= '{date_from}'\")\n    \n    where_clause = ' AND '.join(conditions) if conditions else '1=1'\n    query = f\"SELECT id, tracking_id, origin_port, dest_port, status, ship_date, carrier FROM shipments WHERE {where_clause} ORDER BY ship_date DESC LIMIT 50\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'shipments': [dict(r) for r in results], 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'query failed'}), 500\n\n@app.route('/api/v1/shipments/stats', methods=['GET'])\n@require_session\ndef shipment_stats():\n    db = get_db()\n    stats = db.execute(\n        'SELECT status, COUNT(*) as cnt FROM shipments GROUP BY status'\n    ).fetchall()\n    return jsonify({'stats': [dict(s) for s in stats]})\n\n@app.route('/api/v1/users/me', methods=['GET'])\n@require_session\ndef get_profile():\n    user_id = g.current_user['user_id']\n    db = get_db()\n    profile = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    return jsonify(dict(profile))\n\n@app.route('/healthz')\ndef health():\n    return 'ok', 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound 443 from 0.0.0.0/0. No additional managed rule groups attached to the ALB. The Flask app runs directly via gunicorn with 4 workers, exposed on port 8080. The ALB terminates TLS and forwards to the instance on port 8080.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "waf_web_acl": "none",
+      "instance_security_group": {
+        "inbound": [
+          {
+            "port": 8080,
+            "source": "alb-sg"
+          }
+        ]
+      },
+      "runtime": "gunicorn --workers 4 --bind 0.0.0.0:8080 app:app"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "b6931caa",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String customerId = req.getParameter(\"cid\");\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        if (!reportType.matches(\"^(sales|inventory|returns)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        String query = buildQuery(reportType, startDate, endDate, customerId);\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.print(\", \");\n                    out.print(\"\\\"\" + meta.getColumnLabel(i) + \"\\\": \");\n                    out.print(\"\\\"\" + escapeJson(rs.getString(i)) + \"\\\"\");\n                }\n                out.print(\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildQuery(String type, String start, String end, String cid) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM \").append(type).append(\"_report \");\n        sb.append(\"WHERE report_date BETWEEN '\").append(start).append(\"' AND '\").append(end).append(\"'\");\n        if (cid != null && !cid.isEmpty()) {\n            sb.append(\" AND customer_id = '\").append(cid).append(\"'\");\n        }\n        sb.append(\" ORDER BY report_date DESC LIMIT 1000\");\n        return sb.toString();\n    }\n\n    private String escapeJson(String val) {\n        if (val == null) return \"null\";\n        return val.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Same application deployed in a minimal container where the entrypoint invokes pivot_root(2) followed by chroot into /srv/sandbox prior to spawning the Node.js process. The sandbox directory tree contains only: /srv/sandbox/{app/,extracted/,tmp/uploads/,node_modules/,usr/local/bin/node,usr/local/lib/}. The process runs under a dedicated UID (65534/nobody) with no-new-privileges set. The container uses a read-only root filesystem with tmpfs mounts exclusively at /tmp and /app/extracted. An AppArmor profile (k8s-archive-svc) denies write to any path not matching /app/extracted/** or /tmp/uploads/**. The combination means even if path traversal resolves to e.g. /../../../etc/passwd, the chroot boundary maps that to /srv/sandbox/etc/passwd which doesn't exist, and the AppArmor write denial prevents creating files outside the two allowed path prefixes regardless of traversal.",
+    "config": {
+      "entrypoint_wrapper": "pivot_root + chroot /srv/sandbox",
+      "sandbox_contents": [
+        "/app/",
+        "/extracted/",
+        "/tmp/uploads/",
+        "/node_modules/",
+        "/usr/local/bin/node",
+        "/usr/local/lib/"
+      ],
+      "uid": 65534,
+      "no_new_privileges": true,
+      "read_only_rootfs": true,
+      "tmpfs_mounts": [
+        "/tmp",
+        "/app/extracted"
+      ],
+      "apparmor_profile": "k8s-archive-svc",
+      "apparmor_write_allow": [
+        "/app/extracted/**",
+        "/tmp/uploads/**"
+      ],
+      "apparmor_write_deny": "/** (default deny)",
+      "sensitive_files_in_sandbox": "none - no /etc/shadow, no credentials, no service tokens"
+    }
+  }
+}

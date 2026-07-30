@@ -1,0 +1,45 @@
+{
+  "id": "6edcb2ff",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// Template for rendering search results\nvar searchTmpl = template.Must(template.New(\"results\").Parse(`\n<html><body>\n<h2>Product Search Results</h2>\n<p>Showing results for category: {{.Category}}</p>\n<table>\n<tr><th>Name</th><th>Price</th><th>SKU</th></tr>\n{{range .Products}}\n<tr><td>{{.Name}}</td><td>{{.Price}}</td><td>{{.SKU}}</td></tr>\n{{end}}\n</table>\n</body></html>\n`))\n\ntype Product struct {\n\tName  string\n\tPrice float64\n\tSKU   string\n}\n\ntype SearchResult struct {\n\tCategory string\n\tProducts []Product\n}\n\n// searchHandler processes product catalog searches\n// Security note: query construction uses fmt.Sprintf for dynamic ORDER BY\n// since parameterized queries don't support dynamic column names.\n// The category filter is parameterized properly.\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"cat\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\tcategory = \"all\"\n\t}\n\tif sortCol == \"\" {\n\t\tsortCol = \"name\"\n\t}\n\n\t// NOTE: category is parameterized ($1) but sortCol is interpolated\n\t// because PostgreSQL doesn't allow parameterized ORDER BY columns\n\tquery := fmt.Sprintf(\n\t\t\"SELECT name, price, sku FROM products WHERE category = $1 ORDER BY %s LIMIT 50\",\n\t\tsortCol,\n\t)\n\n\trows, err := db.Query(query, category)\n\tif err != nil {\n\t\thttp.Error(w, \"Search failed\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tresult := SearchResult{Category: category, Products: products}\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\tsearchTmpl.Execute(w, result)\n}\n\n// healthHandler for ALB health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\n// adminResetHandler - resets product cache, requires internal token\nfunc adminResetHandler(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Internal-Token\")\n\tif token != os.Getenv(\"INTERNAL_TOKEN\") {\n\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\treturn\n\t}\n\t_, err := db.Exec(\"REFRESH MATERIALIZED VIEW product_search_cache\")\n\tif err != nil {\n\t\thttp.Error(w, \"refresh failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.Write([]byte(\"cache refreshed\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/admin/reset\", adminResetHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting product-catalog service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Lambda function deployed with identical code and Quarkus 3.2 runtime. Function URL is configured with AuthType=AWS_IAM. The function's resource-based policy contains a single statement granting lambda:InvokeFunctionUrl only to principal 'arn:aws:iam::111122223333:role/WorkflowOrchestratorRole' with condition 'StringEquals: lambda:FunctionUrlAuthType: AWS_IAM'. No additional principals are granted invoke access. The account has an SCP attached at the OU level that denies lambda:UpdateFunctionUrlConfig and lambda:AddPermission for this function ARN unless the caller is the deployment pipeline role (arn:aws:iam::111122223333:role/CDKDeployRole). Note: the deserialization vulnerability remains in the code and commons-collections 3.2.1 is still on the classpath. The function is reachable at the same HTTPS endpoint but unauthenticated requests receive HTTP 403 from the Lambda service before the handler is invoked.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/WorkflowOrchestratorRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:111122223333:function:workflow-state-processor",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "scp_deny_statements": [
+        {
+          "Effect": "Deny",
+          "Action": [
+            "lambda:UpdateFunctionUrlConfig",
+            "lambda:AddPermission"
+          ],
+          "Resource": "arn:aws:lambda:us-east-1:111122223333:function:workflow-state-processor",
+          "Condition": {
+            "StringNotEquals": {
+              "aws:PrincipalArn": "arn:aws:iam::111122223333:role/CDKDeployRole"
+            }
+          }
+        }
+      ],
+      "runtime": "provided.al2",
+      "quarkus_version": "3.2.0",
+      "classpath_includes": [
+        "commons-collections-3.2.1.jar",
+        "quarkus-amazon-lambda-http"
+      ]
+    }
+  }
+}

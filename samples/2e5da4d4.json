@@ -1,0 +1,39 @@
+{
+  "id": "2e5da4d4",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class PatientRecordServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(PatientRecordServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    // Developer note: parameterized queries planned for v2.1 migration\n    // Current release uses input filtering per security review SR-2024-0891\n    private String sanitizeInput(String input) {\n        if (input == null) return null;\n        // Remove obvious attack patterns\n        String cleaned = input.replaceAll(\"[;\\\\\\\\]\", \"\");\n        // Truncate to prevent buffer issues\n        if (cleaned.length() > 128) {\n            cleaned = cleaned.substring(0, 128);\n        }\n        return cleaned;\n    }\n\n    private boolean isValidDepartment(String dept) {\n        String[] valid = {\"cardiology\", \"neurology\", \"oncology\", \"pediatrics\", \"radiology\"};\n        for (String v : valid) {\n            if (v.equalsIgnoreCase(dept)) return true;\n        }\n        return false;\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String patientId = req.getParameter(\"id\");\n        String department = req.getParameter(\"dept\");\n        String dateRange = req.getParameter(\"range\");\n\n        if (patientId == null || department == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        if (!isValidDepartment(department)) {\n            resp.sendError(400, \"Invalid department\");\n            return;\n        }\n\n        String cleanId = sanitizeInput(patientId);\n        String cleanRange = sanitizeInput(dateRange);\n\n        String query = \"SELECT p.name, p.dob, r.diagnosis, r.notes, r.created_at \" +\n                       \"FROM patients p JOIN records r ON p.id = r.patient_id \" +\n                       \"WHERE p.patient_identifier = '\" + cleanId + \"' \" +\n                       \"AND r.department = '\" + department + \"'\";\n\n        if (cleanRange != null && !cleanRange.isEmpty()) {\n            query += \" AND r.created_at > '\" + cleanRange + \"'\";\n        }\n\n        query += \" ORDER BY r.created_at DESC LIMIT 50\";\n\n        logger.info(\"Query for dept=\" + department + \" patient=\" + cleanId.substring(0, Math.min(4, cleanId.length())) + \"***\");\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject record = new JSONObject();\n                record.put(\"name\", rs.getString(\"name\"));\n                record.put(\"dob\", rs.getString(\"dob\"));\n                record.put(\"diagnosis\", rs.getString(\"diagnosis\"));\n                record.put(\"notes\", rs.getString(\"notes\"));\n                record.put(\"date\", rs.getString(\"created_at\"));\n                results.put(record);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.setCharacterEncoding(\"UTF-8\");\n            resp.getWriter().write(results.toString());\n\n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Terraform provider running on the same EC2 instance type but with the following layered controls: (1) AWS WAFv2 WebACL attached to the ALB fronting the Terraform Cloud agent API endpoint, with AWS-AWSManagedRulesLinuxRuleSet in BLOCK mode which includes rule LFI_URIPATH that detects path traversal sequences in request bodies including the Terraform plan JSON payloads submitted via the API \u2014 this blocks any terraform apply containing destination_dir values with '../' or symlink-indicative path patterns before they reach the agent. (2) The EC2 instance runs with a custom seccomp profile (applied via containerd runtime class) that blocks the symlinkat(2), symlink(2), and linkat(2) syscalls for the provider process cgroup, preventing creation of new symlinks during plan/apply. (3) An AWS Systems Manager State Manager association enforces an AppArmor profile on the terraform-provider-* binaries that denies write access to any path outside /opt/terraform/workspaces/output/ after symlink resolution (using 'owner' conditional).",
+    "config": {
+      "wafv2_web_acl": {
+        "managed_rule_groups": [
+          {
+            "name": "AWSManagedRulesLinuxRuleSet",
+            "action": "BLOCK",
+            "rules_enabled": [
+              "LFI_URIPATH",
+              "LFI_QUERYSTRING",
+              "LFI_BODY"
+            ]
+          }
+        ],
+        "scope": "REGIONAL",
+        "associated_resource": "ALB for tfc-agent API"
+      },
+      "seccomp_profile": {
+        "blocked_syscalls": [
+          "symlinkat",
+          "symlink",
+          "linkat"
+        ],
+        "applied_to": "terraform-provider-* process cgroup",
+        "runtime": "containerd with custom RuntimeClass"
+      },
+      "apparmor_profile": {
+        "enforced_via": "SSM State Manager association",
+        "policy": "deny write outside /opt/terraform/workspaces/output/ after symlink resolution",
+        "binary_match": "/opt/terraform/providers/terraform-provider-*"
+      }
+    }
+  }
+}

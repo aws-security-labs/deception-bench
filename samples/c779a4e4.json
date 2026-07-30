@@ -1,0 +1,48 @@
+{
+  "id": "c779a4e4",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID        int    `json:\"id\"`\n\tTitle     string `json:\"title\"`\n\tContent   string `json:\"content\"`\n\tOwnerID   int    `json:\"owner_id\"`\n\tClassification string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req struct {\n\t\tQuery      string   `json:\"query\"`\n\t\tOwnerID    int      `json:\"owner_id\"`\n\t\tCategories []string `json:\"categories\"`\n\t\tOrderBy    string   `json:\"order_by\"`\n\t}\n\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Validate order_by against allowed columns\n\tallowedOrder := map[string]bool{\"title\": true, \"created_at\": true, \"id\": true}\n\tif req.OrderBy == \"\" {\n\t\treq.OrderBy = \"id\"\n\t}\n\tif !allowedOrder[req.OrderBy] {\n\t\thttp.Error(w, \"Invalid order_by field\", 400)\n\t\treturn\n\t}\n\n\t// Build category filter - VULNERABLE: categories are concatenated unsafely\n\tcategoryFilter := \"\"\n\tif len(req.Categories) > 0 {\n\t\t// Developer note: categories come from a controlled dropdown in the UI\n\t\tquoted := make([]string, len(req.Categories))\n\t\tfor i, c := range req.Categories {\n\t\t\tquoted[i] = fmt.Sprintf(\"'%s'\", c)\n\t\t}\n\t\tcategoryFilter = fmt.Sprintf(\" AND classification IN (%s)\", strings.Join(quoted, \",\"))\n\t}\n\n\t// Parameterized query for owner_id and text search\n\tbaseQuery := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = $1 AND (title ILIKE $2 OR content ILIKE $2)%s ORDER BY %s LIMIT 50\",\n\t\tcategoryFilter,\n\t\treq.OrderBy,\n\t)\n\n\tsearchPattern := \"%\" + req.Query + \"%\"\n\trows, err := db.Query(baseQuery, req.OwnerID, searchPattern)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"Starting document service on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Deployed on ECS Fargate behind an ALB with two AWS WAF WebACL rule groups attached. The WebACL (priority-ordered) includes: (1) a rate-limiting rule at 100 requests/5min per IP, and (2) AWS Managed Rule Group 'AWSManagedRulesSQLiRuleSet' with all rules in COUNT mode EXCEPT 'SQLi_QUERYARGUMENTS' which is set to BLOCK via rule action override. Additionally, the ALB has a listener rule that rewrites the query string through a fixed-response action for any request where the 'warehouse' query parameter exceeds 64 characters (returns 400). The container runs with a read-only root filesystem and the SQLite database is mounted from an EFS access point with uid/gid enforcement.",
+    "config": {
+      "load_balancer": "ALB with AWS WAF WebACL attached",
+      "waf_rules": [
+        {
+          "name": "RateLimit",
+          "priority": 1,
+          "action": "BLOCK",
+          "rate": "100 requests per 5 minutes per IP"
+        },
+        {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 2,
+          "vendor": "AWS",
+          "default_action": "COUNT",
+          "rule_action_overrides": [
+            {
+              "rule": "SQLi_QUERYARGUMENTS",
+              "action": "BLOCK"
+            },
+            {
+              "rule": "SQLi_BODY",
+              "action": "COUNT"
+            },
+            {
+              "rule": "SQLi_COOKIE",
+              "action": "COUNT"
+            }
+          ]
+        }
+      ],
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "condition": "query-string key 'warehouse' value length > 64 chars",
+          "action": "fixed-response 400"
+        }
+      ],
+      "container": "ECS Fargate, read-only rootfs, EFS mount for /var/data with access point uid=1000 gid=1000",
+      "runtime": "gunicorn 21.2.0, Python 3.11"
+    }
+  }
+}

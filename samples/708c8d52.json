@@ -1,0 +1,18 @@
+{
+  "id": "708c8d52",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/redirects_controller.rb\nmodule Api\n  module V1\n    class RedirectsController < ApplicationController\n      skip_before_action :verify_authenticity_token\n\n      # Redirect endpoint for partner integrations\n      # Accepts a target URL and optional tracking parameters\n      def create\n        target_url = params[:url]\n        tracking_id = params[:tracking_id] || generate_tracking_id\n        campaign = params[:campaign]\n\n        unless target_url.present?\n          render json: { error: 'url parameter is required' }, status: :bad_request\n          return\n        end\n\n        # Validate URL format (basic check)\n        unless target_url.match?(/\\Ahttps?:\\/\\//)\n          render json: { error: 'Invalid URL scheme' }, status: :unprocessable_entity\n          return\n        end\n\n        # Log the redirect for analytics\n        log_redirect(target_url, tracking_id, campaign)\n\n        # Set custom tracking header for downstream proxies\n        response.headers['X-Tracking-ID'] = tracking_id\n        response.headers['X-Campaign'] = campaign if campaign.present?\n        response.headers['X-Redirect-Target'] = target_url\n\n        # Perform the redirect with Location header\n        redirect_to target_url, status: :found, allow_other_host: true\n      end\n\n      private\n\n      def generate_tracking_id\n        SecureRandom.hex(16)\n      end\n\n      def log_redirect(url, tracking_id, campaign)\n        Rails.logger.info(\n          \"[Redirect] url=#{url} tracking_id=#{tracking_id} campaign=#{campaign} \" \\\n          \"ip=#{request.remote_ip} ua=#{request.user_agent}\"\n        )\n\n        # Store in Redis for real-time analytics dashboard\n        if defined?(Redis) && $redis\n          $redis.lpush('redirect_log', {\n            url: url,\n            tracking_id: tracking_id,\n            campaign: campaign,\n            timestamp: Time.current.iso8601,\n            ip: request.remote_ip\n          }.to_json)\n        end\n      end\n    end\n  end\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     resources :redirects, only: [:create]\n#   end\n# end\n\n# app/controllers/application_controller.rb\nclass ApplicationController < ActionController::API\n  before_action :set_security_headers\n\n  private\n\n  def set_security_headers\n    response.headers['X-Content-Type-Options'] = 'nosniff'\n    response.headers['X-Frame-Options'] = 'DENY'\n    # Note: CSP not set for API-only mode\n  end\nend",
+  "environment": {
+    "description": "Same Rails 6.1.7 API application deployed in a Kubernetes pod with a custom seccomp profile (redirect-api-seccomp-v3.json) applied via pod security context annotation. The profile operates in SCMP_ACT_ERRNO mode for syscalls: execve, execveat, ptrace, process_vm_readv, process_vm_writev, socket (AF_INET6 only blocked), clone3. Default action is SCMP_ACT_ALLOW. The pod runs with a read-only root filesystem and drops all capabilities except NET_BIND_SERVICE. Node-level iptables rules restrict outbound connections to the Redis sidecar and the cluster DNS only.",
+    "config": {
+      "rails_version": "6.1.7",
+      "ruby_version": "3.1.2",
+      "server": "puma 5.6",
+      "deployment": "Kubernetes 1.28",
+      "seccomp_profile": "redirect-api-seccomp-v3.json (blocks execve, execveat, ptrace, process_vm_readv, process_vm_writev, clone3; AF_INET6 socket blocked)",
+      "pod_security_context": "readOnlyRootFilesystem: true, drop: ALL, add: [NET_BIND_SERVICE]",
+      "network_policy": "egress limited to redis-sidecar:6379 and kube-dns:53",
+      "capabilities_dropped": "ALL except NET_BIND_SERVICE"
+    }
+  }
+}

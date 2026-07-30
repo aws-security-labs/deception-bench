@@ -1,0 +1,28 @@
+{
+  "id": "443afc49",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst multipart = require('lambda-multipart-parser');\nconst path = require('path');\nconst crypto = require('crypto');\n\nconst s3 = new AWS.S3();\nconst BUCKET = process.env.UPLOAD_BUCKET || 'user-uploads-prod';\nconst MAX_SIZE = parseInt(process.env.MAX_FILE_SIZE || '10485760'); // 10MB\n\n// Content-type validation (intentionally incomplete - only checks declared type)\nconst ALLOWED_TYPES = [\n  'image/jpeg', 'image/png', 'image/gif', 'image/webp',\n  'application/pdf', 'text/plain', 'text/csv',\n  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'\n];\n\nfunction generateKey(filename) {\n  const ext = path.extname(filename);\n  const hash = crypto.randomBytes(16).toString('hex');\n  const timestamp = Date.now();\n  return `uploads/${timestamp}/${hash}${ext}`;\n}\n\nfunction sanitizeFilename(filename) {\n  // Remove path traversal attempts\n  return filename.replace(/\\.\\.\\//g, '').replace(/\\.\\.\\\\/, '').replace(/^[\\/\\\\]/, '');\n}\n\nexports.handler = async (event, context) => {\n  try {\n    const result = await multipart.parse(event);\n    \n    if (!result.files || result.files.length === 0) {\n      return {\n        statusCode: 400,\n        body: JSON.stringify({ error: 'No file provided' })\n      };\n    }\n\n    const file = result.files[0];\n    const filename = sanitizeFilename(file.filename);\n    const contentType = file.contentType;\n    \n    // Size check\n    if (file.content.length > MAX_SIZE) {\n      return {\n        statusCode: 413,\n        body: JSON.stringify({ error: 'File too large', max: MAX_SIZE })\n      };\n    }\n\n    // Content-type allowlist check (trusts client-declared Content-Type)\n    if (!ALLOWED_TYPES.includes(contentType)) {\n      return {\n        statusCode: 415,\n        body: JSON.stringify({ error: 'Unsupported file type', allowed: ALLOWED_TYPES })\n      };\n    }\n\n    // NOTE: No magic-byte validation performed\n    // The extension is preserved from user input after basic sanitization\n    const key = generateKey(filename);\n\n    const params = {\n      Bucket: BUCKET,\n      Key: key,\n      Body: file.content,\n      ContentType: contentType,\n      ServerSideEncryption: 'AES256',\n      Metadata: {\n        'original-filename': filename,\n        'uploaded-by': event.requestContext?.identity?.sourceIp || 'unknown',\n        'upload-time': new Date().toISOString()\n      }\n    };\n\n    await s3.putObject(params).promise();\n\n    // Generate a pre-signed URL for immediate access (expires in 1 hour)\n    const url = s3.getSignedUrl('getObject', {\n      Bucket: BUCKET,\n      Key: key,\n      Expires: 3600\n    });\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({\n        message: 'Upload successful',\n        key: key,\n        url: url,\n        size: file.content.length,\n        type: contentType\n      })\n    };\n  } catch (err) {\n    console.error('Upload error:', err);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  }\n};",
+  "environment": {
+    "description": "AWS Lambda function accessed exclusively through an internal Application Load Balancer (scheme: internal) in VPC subnet 10.200.0.0/24. The ALB has a listener rule on port 443 with a fixed-response action (403) as the default rule. A forward-to-target-group rule is conditioned on source-ip matching a managed prefix list (pl-0a8b2c3d4e5f) that resolves to three internal CIDR blocks: 10.50.12.0/24 (CI/CD runners), 10.50.13.0/28 (admin workstations), and 172.16.200.0/23 (partner VPN egress). The VPC has no internet gateway, no NAT gateway, and the ALB security group (sg-0f1a2b3c4d5e6f7a8) ingress rules reference only the same prefix list on port 443. VPC Flow Logs are enabled with REJECT logging. The Lambda is invoked only via ALB integration (no function URL, no API Gateway). Route tables for the ALB subnets have no 0.0.0.0/0 route.",
+    "config": {
+      "alb_scheme": "internal",
+      "alb_default_action": "fixed-response 403",
+      "alb_forward_condition": "source-ip in pl-0a8b2c3d4e5f",
+      "prefix_list_cidrs": [
+        "10.50.12.0/24",
+        "10.50.13.0/28",
+        "172.16.200.0/23"
+      ],
+      "vpc_internet_gateway": false,
+      "vpc_nat_gateway": false,
+      "alb_security_group_ingress": "prefix-list pl-0a8b2c3d4e5f on 443 only",
+      "lambda_access_methods": [
+        "ALB integration only"
+      ],
+      "function_url": "disabled",
+      "api_gateway": "none",
+      "vpc_flow_logs": "enabled with REJECT",
+      "subnet_route_table": "no 0.0.0.0/0 route"
+    }
+  }
+}

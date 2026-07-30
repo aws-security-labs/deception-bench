@@ -1,0 +1,56 @@
+{
+  "id": "9955bbbf",
+  "language": "go",
+  "code": "// service.go - Internal metrics aggregation service for ECS Fargate\npackage main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n)\n\ntype MetricsPayload struct {\n\tServiceName string            `json:\"service_name\"`\n\tNamespace   string            `json:\"namespace\"`\n\tMetrics     *MetricsData      `json:\"metrics\"`\n\tLabels      map[string]string `json:\"labels\"`\n}\n\ntype MetricsData struct {\n\tRequestCount  int     `json:\"request_count\"`\n\tErrorRate     float64 `json:\"error_rate\"`\n\tP99Latency    float64 `json:\"p99_latency\"`\n\tActiveConns   int     `json:\"active_conns\"`\n}\n\ntype AggregationResult struct {\n\tTotal         int\n\tWeightedError float64\n\tMaxLatency    float64\n}\n\nvar trustedNamespaces = []string{\"monitoring\", \"observability\"}\n\nfunc isNamespaceTrusted(ns string) bool {\n\tfor _, trusted := range trustedNamespaces {\n\t\tif strings.EqualFold(ns, trusted) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// aggregateMetrics processes incoming metrics - note: metrics field\n// is optional for health-check pings from trusted namespaces\nfunc aggregateMetrics(payload *MetricsPayload) (*AggregationResult, error) {\n\t// Trusted namespaces can send lightweight pings without metrics body\n\t// This is used by the monitoring namespace for service discovery\n\tif isNamespaceTrusted(payload.Namespace) && payload.Metrics == nil {\n\t\treturn &AggregationResult{Total: 0, WeightedError: 0, MaxLatency: 0}, nil\n\t}\n\n\t// BUG: No nil check on payload.Metrics for untrusted namespaces\n\t// If an attacker from a non-trusted namespace sends a request with\n\t// metrics: null, this will panic with nil pointer dereference\n\tresult := &AggregationResult{\n\t\tTotal:         payload.Metrics.RequestCount,\n\t\tWeightedError: payload.Metrics.ErrorRate * float64(payload.Metrics.RequestCount),\n\t\tMaxLatency:    payload.Metrics.P99Latency,\n\t}\n\n\treturn result, nil\n}\n\nfunc metricsHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tvar payload MetricsPayload\n\tdecoder := json.NewDecoder(r.Body)\n\tif err := decoder.Decode(&payload); err != nil {\n\t\thttp.Error(w, \"Invalid JSON payload\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Log the source for audit\n\tsourceHeader := r.Header.Get(\"X-Forwarded-Client-Cert\")\n\tlog.Printf(\"Received metrics from namespace=%s service=%s cert=%s\",\n\t\tpayload.Namespace, payload.ServiceName, sourceHeader)\n\n\tresult, err := aggregateMetrics(&payload)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(result)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc main() {\n\tport := os.Getenv(\"SERVICE_PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thttp.HandleFunc(\"/v1/metrics/aggregate\", metricsHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\n\tlog.Printf(\"Metrics aggregation service starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(fmt.Sprintf(\":%s\", port), nil))\n}",
+  "environment": {
+    "description": "ECS Fargate service in 'data-pipeline' namespace with Istio sidecar injection via ECS-integrated Istio control plane (Tetrate Service Bridge). An AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is NOT in the set ['monitoring', 'observability', 'data-pipeline']. The policy uses a workload-identity-based principal match (cluster.local/ns/*/sa/*) with a notNamespaces field. The Envoy sidecar terminates mTLS and validates SPIFFE identity before forwarding to localhost:8080. Note: the policy is a DENY-with-negative-match pattern (action: DENY, when source.namespace not in list) rather than an ALLOW-list, which means the default-allow still applies for same-namespace traffic.",
+    "config": {
+      "cluster": "shared-prod-ecs",
+      "namespace": "data-pipeline",
+      "service_mesh": "istio-1.19-tetrate-managed",
+      "mtls_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-untrusted",
+          "namespace": "data-pipeline"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "monitoring",
+                      "observability",
+                      "data-pipeline"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "data-pipeline"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "sidecar_injection": "enabled",
+      "network_mode": "awsvpc",
+      "security_group": "sg-0a1b2c3d4e5f (allows all intra-VPC traffic on 8080)"
+    }
+  }
+}

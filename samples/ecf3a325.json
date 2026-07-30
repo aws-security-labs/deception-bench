@@ -1,0 +1,37 @@
+{
+  "id": "ecf3a325",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"sync\"\n\t\"unsafe\"\n)\n\n/*\n#include <stdlib.h>\n#include <string.h>\n\ntypedef struct {\n\tchar* data;\n\tint len;\n\tint refcount;\n} Buffer;\n\nBuffer* create_buffer(const char* input, int len) {\n\tBuffer* buf = (Buffer*)malloc(sizeof(Buffer));\n\tbuf->data = (char*)malloc(len + 1);\n\tmemcpy(buf->data, input, len);\n\tbuf->data[len] = '\\0';\n\tbuf->len = len;\n\tbuf->refcount = 1;\n\treturn buf;\n}\n\nvoid release_buffer(Buffer* buf) {\n\tif (buf == NULL) return;\n\tbuf->refcount--;\n\tif (buf->refcount <= 0) {\n\t\tfree(buf->data);\n\t\tbuf->data = NULL;\n\t\tfree(buf);\n\t}\n}\n*/\nimport \"C\"\n\ntype CacheEntry struct {\n\tbuf    unsafe.Pointer\n\tfreed  bool\n\tmu     sync.Mutex\n}\n\nvar (\n\tcache     = make(map[string]*CacheEntry)\n\tcacheMu   sync.RWMutex\n)\n\nfunc handleStore(w http.ResponseWriter, r *http.Request) {\n\tkey := r.URL.Query().Get(\"key\")\n\tvalue := r.URL.Query().Get(\"value\")\n\tif key == \"\" || value == \"\" {\n\t\thttp.Error(w, \"missing key or value\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tcBuf := C.create_buffer(C.CString(value), C.int(len(value)))\n\n\tcacheMu.Lock()\n\tcache[key] = &CacheEntry{buf: unsafe.Pointer(cBuf), freed: false}\n\tcacheMu.Unlock()\n\n\tfmt.Fprintf(w, \"stored key=%s\\n\", key)\n}\n\nfunc handleDelete(w http.ResponseWriter, r *http.Request) {\n\tkey := r.URL.Query().Get(\"key\")\n\tif key == \"\" {\n\t\thttp.Error(w, \"missing key\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tcacheMu.RLock()\n\tentry, exists := cache[key]\n\tcacheMu.RUnlock()\n\n\tif !exists {\n\t\thttp.Error(w, \"key not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\t// Race condition: no lock held during free operation\n\t// Two concurrent DELETE requests can double-free the buffer\n\tif !entry.freed {\n\t\tC.release_buffer((*C.Buffer)(entry.buf))\n\t\tentry.freed = true\n\t}\n\n\tfmt.Fprintf(w, \"deleted key=%s\\n\", key)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thttp.HandleFunc(\"/store\", handleStore)\n\thttp.HandleFunc(\"/delete\", handleDelete)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tfmt.Printf(\"Starting server on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label 'pod-security.kubernetes.io/enforce: restricted' (v1.28). Additionally, a ValidatingAdmissionPolicy (CEL-based) rejects any pod spec containing spec.containers[*].securityContext.privileged=true OR spec.volumes[*].hostPath. The cluster also runs a mutating webhook that injects a seccomp RuntimeDefault profile annotation on all pods in the namespace. Container built with CGO_ENABLED=1 but the restricted PSS forces runAsNonRoot: true, drops ALL capabilities, and disallows privilege escalation. Note: the double-free is still triggerable at the application layer but exploitation (heap spray to achieve code execution, then container escape via /proc/1/root or hostPath) is blocked because the container cannot mount host filesystem paths, cannot run as root, has no capabilities for ptrace/namespace manipulation, and seccomp filters block mount/ptrace/unshare syscalls needed for post-exploitation.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "validating_admission_policy": {
+        "name": "deny-privileged-and-hostpath",
+        "cel_expression": "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))",
+        "cel_expression_2": "object.spec.containers.all(c, !has(c.securityContext.privileged) || c.securityContext.privileged == false)"
+      },
+      "mutating_webhook": "inject-seccomp-runtime-default",
+      "enforced_security_context": {
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "build_flags": "CGO_ENABLED=1 -buildmode=pie",
+      "allocator": "glibc-2.35-default"
+    }
+  }
+}

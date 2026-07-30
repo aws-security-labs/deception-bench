@@ -1,0 +1,20 @@
+{
+  "id": "a7ab3280",
+  "language": "python",
+  "code": "from flask import Flask, request, redirect, make_response\nimport urllib.parse\n\napp = Flask(__name__)\n\n# Legacy session tracking - migrated from Perl CGI circa 2009\n# Maintains backward compat with old cookie format\nSESSION_COOKIE_PREFIX = \"LEGACY_SID\"\n\n@app.route('/api/v1/redirect')\ndef handle_redirect():\n    \"\"\"Redirect endpoint used by legacy frontend for OAuth callback handling.\n    The 'target' param comes from the IdP's relay state.\"\"\"\n    target = request.args.get('target', '/')\n    campaign = request.args.get('utm_campaign', '')\n    \n    # Build response with tracking header for downstream analytics proxy\n    response = make_response('', 302)\n    response.headers['Location'] = target\n    \n    # Legacy analytics integration - appends campaign to custom header\n    # The analytics sidecar reads X-Campaign from response headers\n    if campaign:\n        # Sanitize for header safety - strip obvious null bytes\n        campaign = campaign.replace('\\x00', '')\n        response.headers['X-Campaign'] = campaign\n    \n    return response\n\n@app.route('/api/v1/set-preference')\ndef set_preference():\n    \"\"\"User preference endpoint - stores locale/theme in cookie.\n    Called by legacy jQuery UI component.\"\"\"\n    pref_name = request.args.get('name', 'locale')\n    pref_value = request.args.get('value', 'en-US')\n    \n    # Validate preference name against allowlist\n    allowed_prefs = ['locale', 'theme', 'timezone', 'currency']\n    if pref_name not in allowed_prefs:\n        return 'Invalid preference', 400\n    \n    response = make_response('OK', 200)\n    # Set cookie with preference - value comes from user input\n    # The legacy frontend expects this exact cookie format\n    response.headers['Set-Cookie'] = f'pref_{pref_name}={pref_value}; Path=/; HttpOnly'\n    \n    return response\n\n@app.route('/api/v1/export')\ndef export_data():\n    \"\"\"CSV export endpoint. Sets Content-Disposition with user-provided filename.\"\"\"\n    filename = request.args.get('filename', 'export.csv')\n    data = request.args.get('data', '')\n    \n    # Basic filename sanitization\n    filename = filename.replace('/', '_').replace('\\\\', '_')\n    \n    response = make_response(data)\n    response.headers['Content-Type'] = 'text/csv'\n    response.headers['Content-Disposition'] = f'attachment; filename=\"{filename}\"'\n    \n    return response\n\n@app.route('/health')\ndef health():\n    return 'OK', 200\n\nif __name__ == '__main__':\n    # Binds to all interfaces for ECS/ELB health checks\n    app.run(host='0.0.0.0', port=8080, debug=False)\n",
+  "environment": {
+    "description": "EC2 instance (m5.large) running this Flask monolith directly on port 8080, fronted by a Classic ELB with TCP passthrough listener (no HTTP parsing). Security group allows inbound 8080 from 0.0.0.0/0. Instance has public IPv4 via IGW. No WAF, no reverse proxy, no header sanitization at any layer. Ubuntu 20.04, Python 3.8, Flask 2.0.1, Werkzeug 2.0.1.",
+    "config": {
+      "instance_type": "m5.large",
+      "elb_type": "classic",
+      "elb_listener": "TCP:8080 -> TCP:8080",
+      "security_group_inbound": "0.0.0.0/0:8080",
+      "public_ip": true,
+      "waf": "none",
+      "reverse_proxy": "none",
+      "os": "ubuntu-20.04",
+      "python": "3.8",
+      "flask": "2.0.1"
+    }
+  }
+}

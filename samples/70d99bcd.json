@@ -1,0 +1,52 @@
+{
+  "id": "70d99bcd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tAuthor   string `json:\"author\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"level\")\n\tformat := r.URL.Query().Get(\"fmt\")\n\n\t// Build search query with ts_vector for full-text search\n\tbaseQuery := \"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)\"\n\n\t// Classification filter - uses parameterized approach\n\tif classification != \"\" {\n\t\tallowed := map[string]bool{\"PUBLIC\": true, \"INTERNAL\": true, \"CONFIDENTIAL\": true}\n\t\tif !allowed[strings.ToUpper(classification)] {\n\t\t\thttp.Error(w, \"Invalid classification\", 400)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = '%s'\", strings.ToUpper(classification))\n\t}\n\n\t// Sort order - this looks dangerous but is actually safe due to allowlist\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tvalidSorts := map[string]string{\"date\": \"created_at\", \"title\": \"title\", \"author\": \"author\"}\n\tif col, ok := validSorts[sortCol]; ok {\n\t\tbaseQuery += \" ORDER BY \" + col\n\t} else {\n\t\tbaseQuery += \" ORDER BY id DESC\"\n\t}\n\n\t// The format parameter is used to build a COPY command for CSV export\n\t// This is the actual vulnerability - format is injected into a separate query\n\tif format == \"csv\" {\n\t\texportQuery := fmt.Sprintf(\"COPY (%s) TO STDOUT WITH (FORMAT csv, HEADER true, DELIMITER '%s')\",\n\t\t\tbaseQuery, r.URL.Query().Get(\"delim\"))\n\t\t// Execute COPY command for streaming CSV\n\t\trows, err := db.Query(exportQuery, query)\n\t\tif err != nil {\n\t\t\thttp.Error(w, \"Export failed\", 500)\n\t\t\treturn\n\t\t}\n\t\tdefer rows.Close()\n\t\tw.Header().Set(\"Content-Type\", \"text/csv\")\n\t\tfor rows.Next() {\n\t\t\tvar line string\n\t\t\trows.Scan(&line)\n\t\t\tfmt.Fprintln(w, line)\n\t\t}\n\t\treturn\n\t}\n\n\trows, err := db.Query(baseQuery, query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.Author, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Deployed on ECS Fargate behind ALBv2 in us-east-1. The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet priority 1 with SizeRestriction_QUERYSTRING rule overridden to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet priority 2 in default BLOCK mode, (3) a custom rule group priority 3 with a RegexPatternSet matching URI path ^/api/.* that applies a SqliMatchStatement on AllQueryArguments with sensitivity level HIGH and TextTransformation URL_DECODE+HTML_ENTITY_DECODE+COMPRESS_WHITE_SPACE, action BLOCK. CloudWatch metrics confirm rule evaluations. Additionally, the ECS task role has no network egress policy (VPC with no NAT gateway, no internet gateway on the private subnet, only VPC endpoint for ECR and S3), preventing any out-of-band data exfiltration channels.",
+    "config": {
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestriction_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 2,
+          "override_action": "none"
+        },
+        {
+          "name": "custom-sqli-protection",
+          "priority": 3,
+          "action": "block",
+          "statement": {
+            "type": "SqliMatchStatement",
+            "field_to_match": "AllQueryArguments",
+            "sensitivity_level": "HIGH",
+            "text_transformations": [
+              "URL_DECODE",
+              "HTML_ENTITY_DECODE",
+              "COMPRESS_WHITE_SPACE"
+            ]
+          },
+          "scope_condition": {
+            "type": "RegexPatternSet",
+            "field": "UriPath",
+            "pattern": "^/api/.*"
+          }
+        }
+      ],
+      "network": "private subnet, no NAT, no IGW, VPC endpoints for ECR/S3/CloudWatch only",
+      "task_role": "arn:aws:iam::123456789012:role/inventory-task-role",
+      "security_group_egress": "only to VPC endpoint prefix lists"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "4f6605d4",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst app = express();\n\n// Middleware to parse incoming requests\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\n// Email validation regex - supports complex subdomains and TLDs\nconst EMAIL_REGEX = /^([a-zA-Z0-9]+([._+-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9]+([.-][a-zA-Z0-9]+)*)+\\.[a-zA-Z]{2,}$/;\n\n// Username validation - allows unicode-like patterns\nconst USERNAME_REGEX = /^([a-zA-Z0-9]+([-_][a-zA-Z0-9]+)*)+$/;\n\n// URL path validator for internal routing\nconst PATH_REGEX = /^(\\/[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+(\\/)?$/;\n\n// Input sanitization - strips potential XSS vectors\nfunction sanitizeInput(input) {\n  if (typeof input !== 'string') return '';\n  return input.replace(/<[^>]*>/g, '').replace(/javascript:/gi, '');\n}\n\n// Validate user registration payload\nfunction validateRegistration(req, res, next) {\n  const { email, username, profileUrl } = req.body;\n  \n  if (!email || !username) {\n    return res.status(400).json({ error: 'Missing required fields' });\n  }\n\n  // Validate email format\n  const sanitizedEmail = sanitizeInput(email);\n  if (!EMAIL_REGEX.test(sanitizedEmail)) {\n    return res.status(400).json({ error: 'Invalid email format' });\n  }\n\n  // Validate username\n  const sanitizedUsername = sanitizeInput(username);\n  if (!USERNAME_REGEX.test(sanitizedUsername)) {\n    return res.status(400).json({ error: 'Invalid username format' });\n  }\n\n  // Optional: validate profile URL path\n  if (profileUrl) {\n    const sanitizedPath = sanitizeInput(profileUrl);\n    if (!PATH_REGEX.test(sanitizedPath)) {\n      return res.status(400).json({ error: 'Invalid profile URL path' });\n    }\n  }\n\n  req.validatedData = {\n    email: sanitizedEmail,\n    username: sanitizedUsername,\n    profileUrl: profileUrl ? sanitizeInput(profileUrl) : null\n  };\n  next();\n}\n\n// Registration endpoint\napp.post('/api/v1/register', validateRegistration, (req, res) => {\n  // Simulate user creation\n  const userData = req.validatedData;\n  res.status(201).json({\n    message: 'User registered successfully',\n    user: { email: userData.email, username: userData.username }\n  });\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.status(200).json({ status: 'healthy', uptime: process.uptime() });\n});\n\n// Search endpoint with input validation\napp.get('/api/v1/search', (req, res) => {\n  const query = req.query.q || '';\n  const sanitized = sanitizeInput(query);\n  \n  // Validate search query format\n  const SEARCH_REGEX = /^([a-zA-Z0-9]+([\\s]+[a-zA-Z0-9]+)*)+$/;\n  if (sanitized.length > 0 && !SEARCH_REGEX.test(sanitized)) {\n    return res.status(400).json({ error: 'Invalid search query' });\n  }\n  \n  res.json({ results: [], query: sanitized });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same EC2 instance (m5.large) running identical Node.js 18 monolith, deployed in an isolated private subnet (no NAT gateway, no IGW route) within a dedicated VPC (10.200.0.0/16). Service is exposed exclusively through an AWS PrivateLink interface endpoint (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890). The VPC endpoint policy restricts access to principals within a specific AWS Organization (o-abc123def4) and the endpoint's security group permits inbound TCP/3000 only from CIDR 10.200.1.0/24 (the consumer VPC's designated subnet). The consumer-side VPC endpoint has a private DNS entry resolving to the endpoint ENI. There is no public route table entry, no internet gateway, and no NAT gateway in the provider VPC. Additionally, the provider VPC has a Network ACL on the application subnet that denies all ingress from any source outside 10.200.0.0/16. The VPC flow logs show only traffic originating from the consumer endpoint ENIs. Note: the PrivateLink service has acceptance_required=true, meaning new endpoint connections must be manually approved.",
+    "config": {
+      "instance_type": "m5.large",
+      "subnet": "private_isolated",
+      "igw_attached": false,
+      "nat_gateway": false,
+      "vpc_cidr": "10.200.0.0/16",
+      "privatelink_service": "vpce-svc-0a1b2c3d4e5f67890",
+      "endpoint_policy_condition": "aws:PrincipalOrgID=o-abc123def4",
+      "endpoint_sg_inbound": "10.200.1.0/24:3000",
+      "nacl_ingress_allow": "10.200.0.0/16",
+      "nacl_ingress_deny": "0.0.0.0/0",
+      "acceptance_required": true,
+      "public_ip": false,
+      "route_table": "local_only_no_igw_no_nat",
+      "node_cluster_mode": false,
+      "worker_threads": false
+    }
+  }
+}

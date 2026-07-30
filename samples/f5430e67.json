@@ -1,0 +1,34 @@
+{
+  "id": "f5430e67",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt'}\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef get_output_path(input_path, fmt='pdf'):\n    base = os.path.splitext(input_path)[0]\n    return f\"{base}.{fmt}\"\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\", \"version\": \"2.4.1\"})\n\n@app.route('/convert', methods=['POST'])\ndef convert_document():\n    if 'file' not in request.files:\n        return jsonify({\"error\": \"No file provided\"}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({\"error\": \"Empty filename\"}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({\"error\": \"File type not allowed\"}), 415\n    \n    output_format = request.form.get('format', 'pdf')\n    extra_args = request.form.get('options', '')\n    \n    # Generate unique filename to avoid collisions\n    filename = secure_filename(file.filename)\n    file_hash = hashlib.md5(file.read()).hexdigest()[:8]\n    file.seek(0)\n    \n    input_path = os.path.join(UPLOAD_DIR, f\"{file_hash}_{filename}\")\n    file.save(input_path)\n    \n    # Build LibreOffice conversion command\n    # The --headless flag ensures no GUI is spawned\n    cmd = f\"libreoffice --headless --convert-to {output_format} --outdir {UPLOAD_DIR} {input_path}\"\n    \n    # Allow power users to pass additional LibreOffice macro options\n    if extra_args:\n        cmd = f\"{cmd} {extra_args}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=UPLOAD_DIR\n        )\n        \n        if result.returncode != 0:\n            return jsonify({\n                \"error\": \"Conversion failed\",\n                \"details\": result.stderr.decode('utf-8', errors='replace')[:500]\n            }), 500\n        \n        output_path = get_output_path(input_path, output_format)\n        \n        if not os.path.exists(output_path):\n            # Try alternative naming convention\n            alt_path = os.path.join(UPLOAD_DIR, \n                os.path.splitext(os.path.basename(input_path))[0] + '.' + output_format)\n            if os.path.exists(alt_path):\n                output_path = alt_path\n            else:\n                return jsonify({\"error\": \"Output file not found\"}), 500\n        \n        return send_file(output_path, as_attachment=True,\n                        download_name=f\"converted.{output_format}\")\n    \n    except subprocess.TimeoutExpired:\n        return jsonify({\"error\": \"Conversion timed out\"}), 504\n    finally:\n        # Cleanup input file\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/batch', methods=['POST'])\ndef batch_convert():\n    \"\"\"Convert multiple files. Accepts multipart form with multiple 'files' fields.\"\"\"\n    files = request.files.getlist('files')\n    if not files:\n        return jsonify({\"error\": \"No files provided\"}), 400\n    \n    results = []\n    for f in files[:10]:  # Limit to 10 files\n        if allowed_file(f.filename):\n            results.append({\"file\": f.filename, \"status\": \"queued\"})\n        else:\n            results.append({\"file\": f.filename, \"status\": \"rejected\"})\n    \n    return jsonify({\"batch_id\": hashlib.md5(os.urandom(16)).hexdigest(), \"results\": results})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed behind an Envoy sidecar proxy (v1.28) with a custom ext_authz filter chain. The ext_authz gRPC service implements a token pre-validation step that decodes the JWT header (without verification) and enforces an algorithm allowlist before the request reaches the application. The allowlist is configured as an opaque protobuf field `permitted_alg_set` with value `[\"RS256\"]` in the filter metadata under namespace `envoy.filters.http.ext_authz`. Requests where the JWT header's `alg` field is not in the permitted set receive a 401 response from the Envoy proxy before reaching the upstream Node.js service. Additionally, the Envoy route configuration includes a `request_headers_to_remove` directive that strips any `x-forwarded-*` headers, and response headers include `Content-Security-Policy: script-src 'self'` with `require-sri-for script` directive appended via Envoy's `response_headers_to_add` at the route level, ensuring SRI enforcement even if the browser would otherwise ignore it for same-origin scripts.",
+    "config": {
+      "proxy": "envoy 1.28 sidecar",
+      "ext_authz_filter": {
+        "grpc_service": "jwt-prevalidator.auth.svc.cluster.local:50051",
+        "filter_metadata": {
+          "namespace": "envoy.filters.http.ext_authz",
+          "permitted_alg_set": [
+            "RS256"
+          ]
+        },
+        "failure_mode_allow": false
+      },
+      "response_headers_to_add": [
+        {
+          "header": {
+            "key": "Content-Security-Policy",
+            "value": "script-src 'self'; require-sri-for script"
+          }
+        }
+      ],
+      "request_headers_to_remove": [
+        "x-forwarded-for",
+        "x-forwarded-proto"
+      ],
+      "upstream_bind": "127.0.0.1:3000"
+    }
+  }
+}

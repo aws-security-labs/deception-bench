@@ -1,0 +1,53 @@
+{
+  "id": "ab22508b",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { Redis } from 'ioredis';\n\nconst app = express();\nconst redis = new Redis(process.env.REDIS_URL);\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\napp.use(express.json());\n\n// Rate limiting middleware\nasync function rateLimiter(req, res, next) {\n  const key = `rl:${req.ip}:${req.path}`;\n  const count = await redis.incr(key);\n  if (count === 1) await redis.expire(key, 60);\n  if (count > 100) return res.status(429).json({ error: 'rate limited' });\n  next();\n}\n\n// Session validation\nasync function validateSession(req, res, next) {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  const session = await redis.get(`sess:${token}`);\n  if (!session) return res.status(401).json({ error: 'invalid session' });\n  req.user = JSON.parse(session);\n  next();\n}\n\n// Audit logging\nasync function auditLog(action, userId, details) {\n  await pool.query(\n    'INSERT INTO audit_log(action, user_id, details, ts) VALUES($1, $2, $3, NOW())',\n    [action, userId, JSON.stringify(details)]\n  );\n}\n\napp.use(rateLimiter);\n\n// Public endpoint - product search with faceted filtering\napp.get('/api/v2/products/search', async (req, res) => {\n  try {\n    const { q, category, min_price, max_price, sort_by, order } = req.query;\n    \n    let baseQuery = `SELECT p.id, p.name, p.price, p.category, p.rating \n                     FROM products p WHERE p.active = true`;\n    let params = [];\n    let paramIdx = 1;\n\n    if (q) {\n      params.push(`%${q}%`);\n      baseQuery += ` AND p.name ILIKE $${paramIdx++}`;\n    }\n    if (category) {\n      params.push(category);\n      baseQuery += ` AND p.category = $${paramIdx++}`;\n    }\n    if (min_price) {\n      params.push(parseFloat(min_price));\n      baseQuery += ` AND p.price >= $${paramIdx++}`;\n    }\n    if (max_price) {\n      params.push(parseFloat(max_price));\n      baseQuery += ` AND p.price <= $${paramIdx++}`;\n    }\n\n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['price', 'rating', 'name', 'created_at'];\n    const sortField = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY p.${sortField} ${sortOrder} LIMIT 50`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ products: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'search failed' });\n  }\n});\n\n// Authenticated endpoint - order history with custom reporting\napp.get('/api/v2/orders/report', validateSession, async (req, res) => {\n  try {\n    const { start_date, end_date, group_by } = req.query;\n    const userId = req.user.id;\n\n    // Build reporting query with user-specified grouping\n    let reportQuery = `SELECT ${group_by}, COUNT(*) as order_count, \n                       SUM(total_amount) as revenue\n                       FROM orders WHERE user_id = $1`;\n    let params = [userId];\n    let paramIdx = 2;\n\n    if (start_date) {\n      params.push(start_date);\n      reportQuery += ` AND created_at >= $${paramIdx++}::timestamp`;\n    }\n    if (end_date) {\n      params.push(end_date);\n      reportQuery += ` AND created_at <= $${paramIdx++}::timestamp`;\n    }\n\n    reportQuery += ` GROUP BY ${group_by}`;\n\n    await auditLog('report_generated', userId, { group_by, start_date, end_date });\n    const result = await pool.query(reportQuery, params);\n    res.json({ report: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'report generation failed' });\n  }\n});\n\napp.listen(3000);",
+  "environment": {
+    "description": "Same application code deployed on ECS Fargate behind ALBv2. The ALB has two listener rule conditions evaluated in priority order. Priority 1 rule matches path pattern '/api/users/search' with a fixed action that invokes an associated WAFv2 WebACL. The WebACL contains a single custom rule group (not AWS managed) named 'org-input-validation-rg' with priority 0, which has a RegexPatternSet match condition on query string values using the pattern set 'qs-dangerous-chars-ps' (patterns: [\"['\\\";\\\\-]{2}\", \"(?i)(union|select|insert|drop|alter|exec)\\\\s\", \"\\\\bOR\\\\b.*=.*\", \"--\"]) with TextTransformation URL_DECODE followed by LOWERCASE applied, action BLOCK. Additionally, the ECS task role has no network egress policy (preventing out-of-band data exfiltration via DNS/HTTP), enforced by a VPC endpoint-only configuration with no NAT gateway and no internet gateway route in the private subnet route table.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, platform version 1.4.0",
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "name": "api-protection-acl",
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "org-input-validation-rg",
+            "priority": 0,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/qs-dangerous-chars-ps/a1b2c3d4",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": {
+        "subnet_type": "private, no NAT gateway",
+        "route_table": "local VPC routes only, no 0.0.0.0/0 route",
+        "vpc_endpoints": [
+          "s3-gateway",
+          "ecr-dkr",
+          "ecr-api",
+          "logs",
+          "ssm"
+        ],
+        "dns_resolution": "VPC internal resolver only, no external forwarding"
+      },
+      "ecs_task_role": "arn:aws:iam::123456789012:role/app-task-role (no outbound network permissions relevant)"
+    }
+  }
+}

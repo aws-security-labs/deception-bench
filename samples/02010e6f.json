@@ -1,0 +1,34 @@
+{
+  "id": "02010e6f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tCategory string `json:\"category\"`\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\n\t// Build base query with parameterized category filter\n\tbaseQuery := \"SELECT id, name, price, category FROM products WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\tif minPrice != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND price >= $%d\", argIdx)\n\t\targs = append(args, minPrice)\n\t\targIdx++\n\t}\n\n\tif maxPrice != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND price <= $%d\", argIdx)\n\t\targs = append(args, maxPrice)\n\t\targIdx++\n\t}\n\n\t// Apply sorting - validated against allowlist... or so we think\n\tif sortBy != \"\" {\n\t\tallowedSorts := []string{\"name\", \"price\", \"category\"}\n\t\tsortValid := false\n\t\tfor _, allowed := range allowedSorts {\n\t\t\tif strings.EqualFold(sortBy, allowed) {\n\t\t\t\tsortValid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif sortValid {\n\t\t\tbaseQuery += \" ORDER BY \" + sortBy\n\t\t} else {\n\t\t\t// Fallback: use user input for custom expressions\n\t\t\t// e.g., \"price DESC\" or \"name ASC\"\n\t\t\tbaseQuery += \" ORDER BY \" + sortBy\n\t\t}\n\t}\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// getProductDetail retrieves a single product - uses parameterized query\nfunc getProductDetail(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tvar p Product\n\terr := db.QueryRow(\"SELECT id, name, price, category FROM products WHERE id = $1\", id).Scan(&p.ID, &p.Name, &p.Price, &p.Category)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", 404)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\n// healthCheck endpoint for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/detail\", getProductDetail)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

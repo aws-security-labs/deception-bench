@@ -1,0 +1,37 @@
+{
+  "id": "1e8bab2b",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products with optional filters.\n    Supports: category, min_price, max_price, sort_by, q\n    \"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '999999')\n    sort_by = request.args.get('sort_by', 'name')\n    q = request.args.get('q', '')\n\n    # Validate numeric inputs\n    try:\n        min_price_val = float(min_price)\n        max_price_val = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'Invalid price range'}), 400\n\n    # Whitelist sort columns\n    allowed_sorts = ['name', 'price', 'created_at', 'rating']\n    if sort_by not in allowed_sorts:\n        sort_by = 'name'\n\n    # Build query - category filter uses parameterized query\n    base_query = \"SELECT id, name, description, price, category, rating FROM products WHERE price >= %s AND price <= %s\"\n    params = [min_price_val, max_price_val]\n\n    if category:\n        base_query += \" AND category = %s\"\n        params.append(category)\n\n    # Full-text search - VULNERABLE: q is concatenated directly\n    if q:\n        base_query += \" AND (name ILIKE '%\" + q + \"%' OR description ILIKE '%\" + q + \"%')\"\n\n    base_query += f\" ORDER BY {sort_by} LIMIT 50\"\n\n    conn = get_db()\n    cur = conn.cursor()\n    try:\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        products = []\n        for row in rows:\n            products.append({\n                'id': row[0], 'name': row[1], 'description': row[2],\n                'price': float(row[3]), 'category': row[4], 'rating': float(row[5])\n            })\n        return jsonify({'results': products, 'count': len(products)})\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, name, description, price, category, rating FROM products WHERE id = %s\", (product_id,))\n    row = cur.fetchone()\n    if not row:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify({'id': row[0], 'name': row[1], 'description': row[2],\n                    'price': float(row[3]), 'category': row[4], 'rating': float(row[5])})\n\n@app.route('/api/products/<int:product_id>/reviews', methods=['POST'])\ndef add_review(product_id):\n    data = request.get_json()\n    if not data or 'text' not in data or 'rating' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    rating = int(data['rating'])\n    if rating < 1 or rating > 5:\n        return jsonify({'error': 'Rating must be 1-5'}), 400\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"INSERT INTO reviews (product_id, review_text, rating) VALUES (%s, %s, %s) RETURNING id\",\n        (product_id, data['text'], rating)\n    )\n    conn.commit()\n    review_id = cur.fetchone()[0]\n    return jsonify({'id': review_id, 'status': 'created'}), 201\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application container image deployed on EKS. The pod runs with a gVisor (runsc) runtime class via RuntimeClassName: gvisor. Additionally, an OPA Gatekeeper ConstraintTemplate 'K8sBlockHostPIDNamespace' is active but unrelated. The node's iptables FORWARD chain has a default DROP policy with explicit ACCEPT only for established connections and DNS (UDP/53). The pod has a Seccomp profile loaded from a ConfigMap that uses SCMP_ACT_ERRNO for the execve, execveat, and fork/clone family syscalls (specifically: execve, execveat, clone, clone3, fork, vfork are all set to SCMP_ACT_ERRNO). The container image includes ImageMagick and exiftool binaries but the seccomp profile prevents any new process execution from within the container.",
+    "config": {
+      "runtime": "EKS with gVisor (runsc) RuntimeClass",
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "clone",
+              "clone3",
+              "fork",
+              "vfork"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      },
+      "opa_gatekeeper": "K8sBlockHostPIDNamespace constraint active",
+      "network_policy": "default-deny egress except DNS and port 443 to internal services",
+      "selinux": "not applicable (gVisor)"
+    }
+  }
+}

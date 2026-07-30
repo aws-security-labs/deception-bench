@@ -1,0 +1,60 @@
+{
+  "id": "1b6919c3",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String tenantId = req.getHeader(\"X-Tenant-ID\");\n\n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        if (!reportType.matches(\"^(sales|inventory|returns)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate date range format\n        if (!dateRange.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}$\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        // Sort column - we allow dynamic column names for flexibility\n        // The frontend sends column names from a dropdown\n        if (sortCol == null) sortCol = \"created_at\";\n\n        // Build query with tenant isolation\n        String query = \"SELECT id, product_name, quantity, price, created_at \" +\n                       \"FROM reports_\" + reportType + \" \" +\n                       \"WHERE tenant_id = '\" + tenantId + \"' \" +\n                       \"AND created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"' \" +\n                       \"ORDER BY \" + sortCol;\n\n        log.info(\"Executing report query for tenant: \" + tenantId);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"{\\\"id\\\":%d,\\\"product\\\":\\\"%s\\\",\\\"qty\\\":%d,\\\"price\\\":%.2f,\\\"date\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"product_name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getInt(\"quantity\"),\n                    rs.getDouble(\"price\"),\n                    rs.getString(\"created_at\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST used for custom SQL reports (admin only)\n        String customQuery = req.getParameter(\"query\");\n        String adminToken = req.getHeader(\"X-Admin-Token\");\n\n        if (adminToken == null || !adminToken.equals(System.getenv(\"ADMIN_TOKEN\"))) {\n            resp.sendError(403, \"Forbidden\");\n            return;\n        }\n\n        // Admin queries are logged and audited\n        log.warning(\"Admin custom query executed: \" + customQuery);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(customQuery)) {\n\n            resp.setContentType(\"text/plain\");\n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            while (rs.next()) {\n                for (int i = 1; i <= cols; i++) {\n                    out.print(rs.getString(i));\n                    if (i < cols) out.print(\"\\t\");\n                }\n                out.println();\n            }\n        } catch (SQLException e) {\n            resp.sendError(500, e.getMessage());\n        }\n    }\n}",
+  "environment": {
+    "description": "Provider binary executed inside a Kubernetes pod managed by Atlantis (v0.24.x) on EKS 1.28. Pod spec includes a custom annotation referencing a RuntimeDefault-derived seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/tf-provider-hardened.json. The profile uses SCMP_ACT_ERRNO as defaultAction with an explicit allowlist of syscalls needed for Terraform provider gRPC communication (read, write, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, clone, futex, epoll_create1, epoll_ctl, epoll_pwait, nanosleep, openat, getpid, gettid, tgkill, exit_group, sigaltstack, arch_prctl, set_robust_list, sched_getaffinity). Notably absent from the allowlist: execve, execveat, fork, vfork, socket, connect, sendto, recvfrom, bind, listen, accept, ptrace, process_vm_readv, process_vm_writev. The pod's securityContext sets allowPrivilegeEscalation: false and readOnlyRootFilesystem: true. The service account has no IRSA role attached.",
+    "config": {
+      "runtime": "EKS 1.28, containerd 1.7.x",
+      "pod_security_standard": "restricted",
+      "seccomp_profile_path": "/var/lib/kubelet/seccomp/profiles/tf-provider-hardened.json",
+      "seccomp_default_action": "SCMP_ACT_ERRNO",
+      "allowed_syscalls": [
+        "read",
+        "write",
+        "close",
+        "fstat",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "brk",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "clone",
+        "futex",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "nanosleep",
+        "openat",
+        "getpid",
+        "gettid",
+        "tgkill",
+        "exit_group",
+        "sigaltstack",
+        "arch_prctl",
+        "set_robust_list",
+        "sched_getaffinity"
+      ],
+      "blocked_syscalls_relevant": [
+        "execve",
+        "execveat",
+        "socket",
+        "connect",
+        "fork",
+        "vfork",
+        "ptrace"
+      ],
+      "security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "seccompProfile": {
+          "type": "Localhost",
+          "localhostProfile": "profiles/tf-provider-hardened.json"
+        }
+      },
+      "network_policy": "default-deny egress (CoreDNS and Terraform state backend only)"
+    }
+  }
+}

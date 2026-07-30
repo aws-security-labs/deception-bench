@@ -1,0 +1,46 @@
+{
+  "id": "8f34554e",
+  "language": "python",
+  "code": "import pickle\nimport base64\nimport struct\nimport socket\nimport threading\nimport os\nimport sys\nimport logging\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger('iot_gateway')\n\nMQTT_PORT = 1883\nMAX_PAYLOAD_SIZE = 65536\nDEVICE_REGISTRY = {}\n\nclass DeviceMessage:\n    def __init__(self, device_id, timestamp, payload, msg_type='telemetry'):\n        self.device_id = device_id\n        self.timestamp = timestamp\n        self.payload = payload\n        self.msg_type = msg_type\n\n    def process(self):\n        if self.msg_type == 'telemetry':\n            return self._handle_telemetry()\n        elif self.msg_type == 'command_response':\n            return self._handle_command_response()\n        return None\n\n    def _handle_telemetry(self):\n        DEVICE_REGISTRY[self.device_id] = {\n            'last_seen': self.timestamp,\n            'data': self.payload\n        }\n        logger.info(f\"Telemetry from {self.device_id}: {len(str(self.payload))} bytes\")\n        return True\n\n    def _handle_command_response(self):\n        logger.info(f\"Command response from {self.device_id}\")\n        return self.payload\n\n\ndef deserialize_device_message(raw_data):\n    \"\"\"Deserialize incoming device message.\n    \n    Supports legacy binary format (pickle) for backward compatibility\n    with older firmware versions (< 2.3.x) that cannot be updated OTA.\n    Format detection: first 2 bytes indicate serialization type.\n    0x80 0x04 = pickle protocol 4 (legacy devices)\n    0x7B 0x22 = JSON (modern devices)\n    \"\"\"\n    if len(raw_data) < 2:\n        raise ValueError(\"Message too short\")\n    \n    # Detect format from magic bytes\n    if raw_data[0] == 0x7B and raw_data[1] == 0x22:\n        # JSON format - modern devices\n        import json\n        data = json.loads(raw_data.decode('utf-8'))\n        return DeviceMessage(\n            device_id=data['device_id'],\n            timestamp=data['ts'],\n            payload=data.get('payload', {}),\n            msg_type=data.get('type', 'telemetry')\n        )\n    else:\n        # Legacy pickle format - older firmware devices\n        # Note: restricted_loads was removed in refactor (JIRA-4521)\n        # TODO: implement allowlist-based unpickler\n        msg = pickle.loads(raw_data)\n        if not isinstance(msg, DeviceMessage):\n            raise TypeError(\"Deserialized object is not a DeviceMessage\")\n        return msg\n\n\ndef handle_client(conn, addr):\n    \"\"\"Handle incoming MQTT-like connection from IoT device.\"\"\"\n    logger.info(f\"Connection from {addr}\")\n    try:\n        # Read length-prefixed message\n        header = conn.recv(4)\n        if len(header) < 4:\n            return\n        msg_len = struct.unpack('>I', header)[0]\n        \n        if msg_len > MAX_PAYLOAD_SIZE:\n            logger.warning(f\"Message too large from {addr}: {msg_len}\")\n            return\n        \n        raw_data = b''\n        while len(raw_data) < msg_len:\n            chunk = conn.recv(min(4096, msg_len - len(raw_data)))\n            if not chunk:\n                break\n            raw_data += chunk\n        \n        msg = deserialize_device_message(raw_data)\n        result = msg.process()\n        \n        # Send ACK\n        conn.sendall(b'\\x00\\x01')\n        \n    except Exception as e:\n        logger.error(f\"Error handling message from {addr}: {e}\")\n        conn.sendall(b'\\xff\\x01')\n    finally:\n        conn.close()\n\n\ndef start_gateway(host='0.0.0.0', port=MQTT_PORT):\n    \"\"\"Start the IoT message gateway service.\"\"\"\n    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    server.bind((host, port))\n    server.listen(128)\n    logger.info(f\"IoT Gateway listening on {host}:{port}\")\n    \n    while True:\n        conn, addr = server.accept()\n        t = threading.Thread(target=handle_client, args=(conn, addr))\n        t.daemon = True\n        t.start()\n\n\nif __name__ == '__main__':\n    start_gateway()",
+  "environment": {
+    "description": "IoT gateway deployed on embedded ARM64 appliance running BusyBox Linux 1.36. Process launched via init script that calls chroot(2) into /opt/iot-gw/rootfs before dropping to uid 1001. The chroot directory contains only: Python 3.11 minimal install (no pip, no setuptools), the application code, /dev/null, /dev/urandom, and a read-only /tmp (tmpfs, noexec, size=1M). No shell binaries exist within the chroot (no /bin/sh, /bin/bash, /usr/bin/env). No network utilities (nc, curl, wget) present. /proc is not mounted. The Python installation has os.system, os.popen, subprocess module's underlying _posixsubprocess.fork_exec available but all exec targets resolve to ENOENT since PATH contains only /usr/local/bin which has solely the python3.11 binary. The filesystem is mounted read-only (rootfs is squashfs). No outbound network connectivity from the appliance (iptables OUTPUT policy DROP except established connections on port 1883).",
+    "config": {
+      "runtime": "bare-metal-arm64",
+      "os": "busybox-linux-1.36",
+      "chroot_path": "/opt/iot-gw/rootfs",
+      "chroot_contents": [
+        "python3.11-minimal",
+        "app.py",
+        "/dev/null",
+        "/dev/urandom",
+        "/tmp(tmpfs,noexec,ro,1M)"
+      ],
+      "no_binaries": [
+        "sh",
+        "bash",
+        "dash",
+        "env",
+        "nc",
+        "curl",
+        "wget",
+        "busybox"
+      ],
+      "proc_mounted": false,
+      "filesystem": "squashfs-readonly",
+      "user": "iot-svc(uid=1001)",
+      "network_egress": "DROP(iptables OUTPUT policy, only ESTABLISHED on 1883 allowed)",
+      "python_modules_available": [
+        "pickle",
+        "json",
+        "socket",
+        "struct",
+        "logging",
+        "os",
+        "sys"
+      ],
+      "python_modules_unavailable": [
+        "subprocess._posixsubprocess resolves fork_exec but no exec targets exist"
+      ]
+    }
+  }
+}

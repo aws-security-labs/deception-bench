@@ -1,0 +1,72 @@
+{
+  "id": "b6513bc6",
+  "language": "java",
+  "code": "package com.acme.reporting;\n\nimport io.quarkus.qute.Engine;\nimport io.quarkus.qute.Template;\nimport io.quarkus.qute.TemplateInstance;\nimport io.quarkus.funqy.Funq;\nimport io.quarkus.funqy.knative.events.CloudEvent;\nimport io.quarkus.funqy.knative.events.CloudEventMapping;\n\nimport javax.inject.Inject;\nimport java.util.Map;\nimport java.util.HashMap;\nimport java.util.logging.Logger;\n\npublic class ReportGenerator {\n\n    private static final Logger LOG = Logger.getLogger(ReportGenerator.class.getName());\n\n    @Inject\n    Engine engine;\n\n    // Internal helper - renders user-customizable report header\n    private String renderSection(String templateContent, Map<String, Object> data) {\n        // Parse template from string content provided in event payload\n        Template template = engine.parse(templateContent);\n        return template.data(data).render();\n    }\n\n    @Funq\n    @CloudEventMapping(trigger = \"report.generate\")\n    public ReportOutput generateReport(ReportRequest request) {\n        LOG.info(\"Processing report generation request: \" + request.getReportId());\n\n        Map<String, Object> context = new HashMap<>();\n        context.put(\"reportId\", request.getReportId());\n        context.put(\"customerName\", request.getCustomerName());\n        context.put(\"generatedAt\", java.time.Instant.now().toString());\n\n        // The header template is user-configurable per tenant\n        String headerTemplate = request.getHeaderTemplate();\n        if (headerTemplate == null || headerTemplate.isBlank()) {\n            headerTemplate = \"<h1>Report {reportId} for {customerName}</h1>\";\n        }\n\n        // Validate template doesn't exceed size limit\n        if (headerTemplate.length() > 4096) {\n            throw new IllegalArgumentException(\"Template exceeds maximum size\");\n        }\n\n        String renderedHeader = renderSection(headerTemplate, context);\n\n        // Build final report body with static sections\n        String body = renderedHeader + \"\\n<div class='report-body'>\" +\n                      \"<p>Generated at: \" + context.get(\"generatedAt\") + \"</p>\" +\n                      \"<p>Status: Complete</p></div>\";\n\n        ReportOutput output = new ReportOutput();\n        output.setReportId(request.getReportId());\n        output.setRenderedHtml(body);\n        output.setStatus(\"COMPLETED\");\n        return output;\n    }\n\n    public static class ReportRequest {\n        private String reportId;\n        private String customerName;\n        private String headerTemplate;\n\n        public String getReportId() { return reportId; }\n        public void setReportId(String reportId) { this.reportId = reportId; }\n        public String getCustomerName() { return customerName; }\n        public void setCustomerName(String customerName) { this.customerName = customerName; }\n        public String getHeaderTemplate() { return headerTemplate; }\n        public void setHeaderTemplate(String headerTemplate) { this.headerTemplate = headerTemplate; }\n    }\n\n    public static class ReportOutput {\n        private String reportId;\n        private String renderedHtml;\n        private String status;\n\n        public String getReportId() { return reportId; }\n        public void setReportId(String reportId) { this.reportId = reportId; }\n        public String getRenderedHtml() { return renderedHtml; }\n        public void setRenderedHtml(String renderedHtml) { this.renderedHtml = renderedHtml; }\n        public String getStatus() { return status; }\n        public void setStatus(String status) { this.status = status; }\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus function deployed in namespace 'reporting-prod'. Namespace has a Cilium L3/L4 CiliumNetworkPolicy (not standard Kubernetes NetworkPolicy) with spec.egress containing a single toCIDR rule allowing 10.0.0.0/8 and a toCIDRSet with cidrGroupRef 'internal-services' that resolves to the cluster service CIDR. The policy uses spec.egressDeny with toCIDR 169.254.169.254/32 as an explicit deny-list entry. Additionally, the GKE Workload Identity federation is configured with an IAM binding that maps the KSA 'report-generator' to a GCP SA with only roles/storage.objectViewer on a single bucket. The node pool has metadata concealment enabled (legacy endpoint disabled, --workload-metadata-from-node=GKE_METADATA) which returns 403 for any metadata server token request from pods using Workload Identity. Pod spec includes a securityContext with allowPrivilegeEscalation: false and readOnlyRootFilesystem: true.",
+    "config": {
+      "runtime": "Quarkus 3.2.0.Final with quarkus-funqy-knative-events",
+      "platform": "GKE 1.27 with Knative Serving 1.11",
+      "namespace": "reporting-prod",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "report-generator-egress",
+          "namespace": "reporting-prod"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "report-generator"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toCIDR": [
+                "10.0.0.0/8"
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "io.kubernetes.pod.namespace": "kube-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "workload_identity": {
+        "ksa": "report-generator",
+        "gcp_sa": "report-gen-reader@proj-12345.iam.gserviceaccount.com",
+        "iam_binding": "roles/storage.objectViewer on gs://reports-output-bucket"
+      },
+      "node_metadata_concealment": "GKE_METADATA (Workload Identity mode)",
+      "security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      }
+    }
+  }
+}

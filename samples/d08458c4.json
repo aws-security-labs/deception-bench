@@ -1,0 +1,31 @@
+{
+  "id": "d08458c4",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport time\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria. Supports flexible filtering.\"\"\"\n    username = request.args.get('username', '')\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    \n    # Build dynamic query based on provided filters\n    conditions = []\n    if username:\n        conditions.append(f\"username LIKE '%{username}%'\")\n    if department:\n        conditions.append(f\"department = '{department}'\")\n    if role:\n        conditions.append(f\"role = '{role}'\")\n    \n    if not conditions:\n        return jsonify({'error': 'At least one search parameter required'}), 400\n    \n    where_clause = ' AND '.join(conditions)\n    query = f\"SELECT id, username, email, department, role FROM users WHERE {where_clause} LIMIT 50\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'username': row[1],\n                'email': row[2],\n                'department': row[3],\n                'role': row[4]\n            })\n        cur.close()\n        conn.close()\n        return jsonify({'users': results})\n    except Exception as e:\n        app.logger.error(f\"Search error: {str(e)}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>/notes', methods=['POST'])\ndef add_note(user_id):\n    \"\"\"Add a note to a user profile. Notes support markdown.\"\"\"\n    data = request.get_json()\n    note_text = data.get('note', '')\n    author = data.get('author', 'system')\n    \n    if not note_text or len(note_text) > 5000:\n        return jsonify({'error': 'Invalid note'}), 400\n    \n    note_id = hashlib.md5(f\"{user_id}{time.time()}\".encode()).hexdigest()[:12]\n    \n    query = f\"INSERT INTO user_notes (id, user_id, note, author, created_at) VALUES ('{note_id}', {user_id}, '{note_text}', '{author}', NOW())\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        conn.commit()\n        cur.close()\n        conn.close()\n        return jsonify({'note_id': note_id}), 201\n    except Exception as e:\n        app.logger.error(f\"Note insert error: {str(e)}\")\n        return jsonify({'error': 'Failed to save note'}), 500\n\n@app.route('/api/reports/export', methods=['GET'])\ndef export_report():\n    \"\"\"Export user report filtered by date range.\"\"\"\n    start_date = request.args.get('start', '2024-01-01')\n    end_date = request.args.get('end', '2024-12-31')\n    \n    query = f\"SELECT username, email, department, created_at FROM users WHERE created_at BETWEEN '{start_date}' AND '{end_date}' ORDER BY created_at DESC\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        cur.close()\n        conn.close()\n        return jsonify({'report': [{'username': r[0], 'email': r[1], 'dept': r[2], 'created': str(r[3])} for r in rows]})\n    except Exception as e:\n        return jsonify({'error': 'Export failed'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Kubernetes pod running the file-ingestion consumer. Container image based on golang:1.21-alpine. Pod spec uses default securityContext with no readOnlyRootFilesystem. Volume mount at /var/data/uploads backed by a PersistentVolumeClaim (ReadWriteOnce, 100Gi gp3). Container runs as UID 1000 (non-root). No network policies restrict egress. Kafka topic 'file-ingestion' accepts messages from any authenticated producer.",
+    "config": {
+      "kubernetes_deployment": "standard Deployment with 3 replicas",
+      "container_image": "golang:1.21-alpine with app binary",
+      "security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true
+      },
+      "volumes": [
+        {
+          "name": "upload-storage",
+          "persistentVolumeClaim": {
+            "claimName": "file-uploads-pvc"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "upload-storage",
+          "mountPath": "/var/data/uploads"
+        }
+      ],
+      "filesystem": "writable rootfs, writable PVC mount"
+    }
+  }
+}

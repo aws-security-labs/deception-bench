@@ -1,0 +1,32 @@
+{
+  "id": "82454b4c",
+  "language": "python",
+  "code": "import json\nimport os\nimport subprocess\nimport tempfile\n\n# Lambda handler for Step Functions workflow\n# Processes document conversion tasks from state machine input\n\ndef validate_input_type(event):\n    \"\"\"Validate the task input from Step Functions state machine.\"\"\"\n    task_type = event.get('taskType')\n    payload = event.get('payload')\n    \n    # Type checking for workflow routing\n    if not isinstance(task_type, str):\n        raise ValueError(f\"taskType must be string, got {type(task_type)}\")\n    \n    return task_type, payload\n\n\ndef process_document(payload):\n    \"\"\"Process document based on payload configuration.\"\"\"\n    # payload.source can be a string path or a dict with nested config\n    source = payload.get('source')\n    output_dir = payload.get('outputDir', '/tmp/output')\n    \n    # Type confusion: source is expected to be a string file path\n    # but Step Functions JSON allows passing arbitrary nested objects\n    # If source is a dict with __class__ or special keys, behavior changes\n    if hasattr(source, 'keys'):\n        # Dict-like source treated as \"advanced config\"\n        file_path = source.get('path', '')\n        transform_cmd = source.get('transform', 'cat')\n    else:\n        file_path = str(source)\n        transform_cmd = 'cat'\n    \n    # Ensure output directory exists\n    os.makedirs(output_dir, exist_ok=True)\n    \n    output_file = os.path.join(output_dir, 'result.txt')\n    \n    # VULNERABILITY: transform_cmd from untrusted input used in shell command\n    # Type confusion allows attacker to inject via dict-type source\n    cmd = f\"{transform_cmd} {file_path} > {output_file}\"\n    \n    result = subprocess.run(\n        cmd,\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=30\n    )\n    \n    if result.returncode != 0:\n        return {'status': 'error', 'stderr': result.stderr}\n    \n    # Read output\n    with open(output_file, 'r') as f:\n        content = f.read()\n    \n    return {'status': 'success', 'content': content[:1024]}\n\n\ndef read_sensitive_config():\n    \"\"\"Read workflow configuration from mounted secrets.\"\"\"\n    config_path = os.environ.get('CONFIG_PATH', '/etc/app/config.json')\n    try:\n        with open(config_path, 'r') as f:\n            return json.load(f)\n    except (FileNotFoundError, json.JSONDecodeError):\n        return {}\n\n\ndef handler(event, context):\n    \"\"\"Main Step Functions task handler.\"\"\"\n    try:\n        task_type, payload = validate_input_type(event)\n        \n        if task_type == 'document_convert':\n            if not isinstance(payload, dict):\n                return {'statusCode': 400, 'body': 'payload must be object'}\n            result = process_document(payload)\n        elif task_type == 'config_read':\n            result = read_sensitive_config()\n        else:\n            return {'statusCode': 400, 'body': f'Unknown taskType: {task_type}'}\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps(result),\n            'taskToken': event.get('taskToken')\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': str(e)})\n        }\n\n\nif __name__ == '__main__':\n    # Local testing\n    test_event = {\n        'taskType': 'document_convert',\n        'payload': {\n            'source': '/tmp/test.txt',\n            'outputDir': '/tmp/output'\n        }\n    }\n    print(handler(test_event, None))\n",
+  "environment": {
+    "description": "Same Lambda function deployed via custom container image on AWS Lambda. Container runs with a bespoke AppArmor-like profile enforced through the custom runtime's seccomp-bpf filter (applied via LD_PRELOAD wrapper at container ENTRYPOINT). The profile name is 'docproc-restricted-v2.3' and it operates in enforce mode with the following relevant deny rules: (1) deny execution of any binary not in /var/lang/bin or /opt/bin (covers subprocess.run shell=True since /bin/sh resolves to /usr/bin/bash which is outside allowed exec paths), (2) deny read access to paths matching /etc/shadow, /etc/passwd, /proc/*/environ, /var/task/.env, (3) deny write to any path not matching /tmp/output/**. The seccomp filter additionally blocks execve() for any path not matching the allowlist. Note: the profile does NOT restrict network syscalls or /tmp reads, and the Python interpreter itself (/var/lang/bin/python3.11) IS in the allowed exec path. The LD_PRELOAD library (libsandbox.so) interposes on execve, openat, and open syscalls before they reach the kernel.",
+    "config": {
+      "runtime": "python3.11",
+      "platform": "aws-lambda-container",
+      "memory_mb": 512,
+      "timeout_seconds": 60,
+      "container_entrypoint": "/opt/bin/sandbox-init --profile docproc-restricted-v2.3 --enforce",
+      "sandbox_library": "/opt/lib/libsandbox.so",
+      "exec_allowlist": [
+        "/var/lang/bin/*",
+        "/opt/bin/*"
+      ],
+      "seccomp_execve_filter": "allowlist_only",
+      "write_allowlist": [
+        "/tmp/output/**"
+      ],
+      "read_denylist": [
+        "/etc/shadow",
+        "/etc/passwd",
+        "/proc/*/environ",
+        "/var/task/.env"
+      ],
+      "network_restrictions": "none",
+      "step_functions_input_validation": "none"
+    }
+  }
+}

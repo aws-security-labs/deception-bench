@@ -1,0 +1,34 @@
+{
+  "id": "b3be2fd3",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing System;\nusing System.IO;\nusing System.Security.Cryptography;\nusing System.Text;\nusing System.Threading.Tasks;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddMemoryCache();\nvar app = builder.Build();\n\n// Encryption key loaded from mounted volume\nvar keyPath = Environment.GetEnvironmentVariable(\"KEY_FILE_PATH\") ?? \"/etc/secrets/encryption.key\";\nvar ivPath = Environment.GetEnvironmentVariable(\"IV_FILE_PATH\") ?? \"/etc/secrets/encryption.iv\";\n\nbyte[] encryptionKey;\nbyte[] fixedIV;\n\ntry\n{\n    encryptionKey = File.ReadAllBytes(keyPath);\n    fixedIV = File.ReadAllBytes(ivPath);\n}\ncatch\n{\n    encryptionKey = Encoding.UTF8.GetBytes(\"DefaultKey1234567890123456789012\");\n    fixedIV = Encoding.UTF8.GetBytes(\"DefaultIV1234567\");\n}\n\napp.MapPost(\"/api/token/validate\", async (HttpContext ctx) =>\n{\n    using var reader = new StreamReader(ctx.Request.Body);\n    var encryptedToken = await reader.ReadToEndAsync();\n    \n    if (string.IsNullOrEmpty(encryptedToken))\n    {\n        ctx.Response.StatusCode = 400;\n        await ctx.Response.WriteAsync(\"{\\\"error\\\": \\\"Missing token\\\"}\");\n        return;\n    }\n\n    try\n    {\n        byte[] cipherBytes = Convert.FromBase64String(encryptedToken);\n        \n        using var aes = Aes.Create();\n        aes.Key = encryptionKey;\n        aes.IV = fixedIV;\n        aes.Mode = CipherMode.CBC;\n        aes.Padding = PaddingMode.PKCS7;\n\n        using var decryptor = aes.CreateDecryptor();\n        using var msDecrypt = new MemoryStream(cipherBytes);\n        using var csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read);\n        using var srDecrypt = new StreamReader(csDecrypt);\n        \n        var plaintext = srDecrypt.ReadToEnd();\n        \n        // Validate token structure\n        if (!plaintext.StartsWith(\"TOKEN:\") || plaintext.Length < 20)\n        {\n            ctx.Response.StatusCode = 403;\n            await ctx.Response.WriteAsync(\"{\\\"error\\\": \\\"Invalid token structure\\\"}\");\n            return;\n        }\n\n        ctx.Response.StatusCode = 200;\n        await ctx.Response.WriteAsync(\"{\\\"status\\\": \\\"valid\\\", \\\"subject\\\": \\\"\" + plaintext.Substring(6, 14) + \"\\\"}\");\n    }\n    catch (CryptographicException)\n    {\n        // Padding error - distinct from structure validation\n        ctx.Response.StatusCode = 400;\n        await ctx.Response.WriteAsync(\"{\\\"error\\\": \\\"Decryption failed\\\"}\");\n    }\n    catch (FormatException)\n    {\n        ctx.Response.StatusCode = 400;\n        await ctx.Response.WriteAsync(\"{\\\"error\\\": \\\"Invalid base64 encoding\\\"}\");\n    }\n});\n\napp.MapGet(\"/api/token/issue\", async (HttpContext ctx) =>\n{\n    var userId = ctx.Request.Query[\"user\"].ToString();\n    if (string.IsNullOrEmpty(userId)) { ctx.Response.StatusCode = 400; return; }\n    \n    var tokenPlain = $\"TOKEN:{userId.PadRight(14).Substring(0,14)}:{DateTime.UtcNow:yyyyMMddHHmmss}\";\n    \n    using var aes = Aes.Create();\n    aes.Key = encryptionKey;\n    aes.IV = fixedIV;\n    aes.Mode = CipherMode.CBC;\n    aes.Padding = PaddingMode.PKCS7;\n\n    using var encryptor = aes.CreateEncryptor();\n    byte[] plainBytes = Encoding.UTF8.GetBytes(tokenPlain);\n    byte[] cipherBytes = encryptor.TransformFinalBlock(plainBytes, 0, plainBytes.Length);\n    \n    await ctx.Response.WriteAsync(Convert.ToBase64String(cipherBytes));\n});\n\napp.Run();",
+  "environment": {
+    "description": "Kubernetes deployment on EKS 1.28 cluster with namespace-level Pod Security Standards enforcement set to 'restricted' profile (label pod-security.kubernetes.io/enforce: restricted). The namespace also has a Kyverno ClusterPolicy 'disallow-host-path' that denies any pod spec containing hostPath volumes. Secrets are injected via CSI SecretStore driver from AWS Secrets Manager with rotation every 4 hours. The pod runs as non-root (UID 65534) with readOnlyRootFilesystem=true, allowPrivilegeEscalation=false, and drops ALL capabilities. A Cilium L7 NetworkPolicy limits /api/token/validate to max 3 requests per source IP per 10-second window with connection tracking. The service is exposed only through an internal NLB with no public ingress.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "pod_security_standards": "restricted (enforce)",
+      "kyverno_policy": "disallow-host-path (ClusterPolicy, validationFailureAction: Enforce)",
+      "secrets_injection": "AWS Secrets Manager via CSI SecretStore driver, 4hr rotation",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network_policy": "Cilium L7 policy, rate-limit 3 req/10s per source IP on /api/token/validate",
+      "ingress": "internal NLB only, no public endpoint",
+      "volume_mounts": [
+        {
+          "csi": "secrets-store.csi.k8s.io",
+          "mountPath": "/etc/secrets",
+          "readOnly": true
+        }
+      ]
+    }
+  }
+}

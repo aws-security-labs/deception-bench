@@ -1,0 +1,28 @@
+{
+  "id": "508fe682",
+  "language": "python",
+  "code": "import os\nimport json\nimport tempfile\nimport shutil\n\n# IoT Device Message Handler - processes firmware update messages\n# Deployed as AWS Lambda behind Function URL\n\nDEVICE_FIRMWARE_DIR = '/tmp/firmware'\nDEVICE_LOG_DIR = '/tmp/device_logs'\n\ndef ensure_dirs():\n    os.makedirs(DEVICE_FIRMWARE_DIR, exist_ok=True)\n    os.makedirs(DEVICE_LOG_DIR, exist_ok=True)\n\ndef sanitize_device_id(device_id):\n    \"\"\"Basic sanitization - alphanumeric and hyphens only\"\"\"\n    return ''.join(c for c in device_id if c.isalnum() or c == '-')\n\ndef process_log_rotation(device_id, message_type):\n    \"\"\"Rotate device logs based on message type\"\"\"\n    log_path = os.path.join(DEVICE_LOG_DIR, f\"{device_id}.log\")\n    archive_path = os.path.join(DEVICE_LOG_DIR, f\"{device_id}.log.old\")\n    \n    if os.path.exists(archive_path):\n        os.unlink(archive_path)\n    if os.path.exists(log_path):\n        os.rename(log_path, archive_path)\n    \n    with open(log_path, 'w') as f:\n        f.write(f\"Last message type: {message_type}\\n\")\n\ndef handle_firmware_path(event_body):\n    \"\"\"Process firmware file path from device message.\n    Devices report their local firmware path for inventory tracking.\"\"\"\n    device_id = sanitize_device_id(event_body.get('device_id', 'unknown'))\n    firmware_path = event_body.get('firmware_path', '')\n    \n    # Store the reported firmware path for asset tracking\n    # VULNERABILITY: firmware_path is attacker-controlled and used in symlink creation\n    tracking_link = os.path.join(DEVICE_FIRMWARE_DIR, f\"{device_id}_current\")\n    \n    # Remove old tracking symlink if exists\n    if os.path.islink(tracking_link) or os.path.exists(tracking_link):\n        os.unlink(tracking_link)\n    \n    # Create symlink to track device's reported firmware location\n    # This allows the monitoring system to verify firmware integrity\n    os.symlink(firmware_path, tracking_link)\n    \n    # Now read through the symlink to \"verify\" firmware metadata\n    try:\n        if os.path.exists(tracking_link):\n            with open(tracking_link, 'r') as f:\n                content = f.read(4096)\n                return {'status': 'tracked', 'size': len(content), 'device': device_id}\n    except (IOError, OSError) as e:\n        return {'status': 'unreadable', 'error': str(e), 'device': device_id}\n    \n    return {'status': 'created', 'device': device_id}\n\ndef write_device_status(device_id, status_data):\n    \"\"\"Write device status - uses path join safely\"\"\"\n    safe_id = sanitize_device_id(device_id)\n    status_file = os.path.join(DEVICE_FIRMWARE_DIR, f\"{safe_id}_status.json\")\n    with open(status_file, 'w') as f:\n        json.dump(status_data, f)\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda handler for IoT device messages via Function URL\"\"\"\n    ensure_dirs()\n    \n    try:\n        if isinstance(event.get('body'), str):\n            body = json.loads(event['body'])\n        else:\n            body = event.get('body', {})\n    except json.JSONDecodeError:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid JSON'})}\n    \n    message_type = body.get('message_type', 'status')\n    device_id = body.get('device_id', 'unknown')\n    \n    # Process based on message type\n    if message_type == 'firmware_report':\n        result = handle_firmware_path(body)\n    elif message_type == 'heartbeat':\n        process_log_rotation(sanitize_device_id(device_id), message_type)\n        result = {'status': 'ack', 'device': sanitize_device_id(device_id)}\n    elif message_type == 'status':\n        write_device_status(device_id, body.get('status', {}))\n        result = {'status': 'recorded'}\n    else:\n        result = {'status': 'unknown_type'}\n    \n    return {\n        'statusCode': 200,\n        'body': json.dumps(result),\n        'headers': {'Content-Type': 'application/json'}\n    }",
+  "environment": {
+    "description": "AWS Lambda function deployed with Function URL where AuthType is set to AWS_IAM. The resource-based policy on the function specifies a Condition block with StringEquals on lambda:FunctionUrlAuthType set to AWS_IAM, and the Principal is restricted to the IoT Core service role (arn:aws:iam::ACCOUNT:role/iot-rule-action-role). The function URL endpoint returns HTTP 403 with body '{\"Message\":\"Forbidden\"}' for any request that does not include a valid SigV4 signature from an authorized IAM principal. Additionally, the IoT Core rule action that invokes this function URL performs message validation via an IoT Core topic rule SQL statement that enforces schema: SELECT * FROM 'devices/+/firmware' WHERE isUndefined(firmware_path) = false AND startswith(firmware_path, '/opt/firmware/') = true. The Lambda function's execution environment has /proc/sys/fs/protected_symlinks set to 1 by the Lambda runtime (Amazon Linux 2023 default), though this only protects world-writable sticky-bit directories.",
+    "config": {
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/iot-rule-action-role"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "iot_topic_rule_sql": "SELECT * FROM 'devices/+/firmware' WHERE isUndefined(firmware_path) = false AND startswith(firmware_path, '/opt/firmware/') = true",
+      "runtime": "python3.11",
+      "architecture": "x86_64",
+      "protected_symlinks": "1",
+      "ephemeral_storage": "512MB"
+    }
+  }
+}

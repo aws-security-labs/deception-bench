@@ -1,0 +1,56 @@
+{
+  "id": "96601d2b",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst AWS = require('aws-sdk');\n\nconst typeDefs = gql`\n  type UserProfile {\n    id: ID!\n    name: String!\n    avatar: String\n    preferences: Preferences\n  }\n\n  type Preferences {\n    theme: String\n    notifications: Boolean\n    dataExportUrl: String\n  }\n\n  type Query {\n    userProfile(id: ID!): UserProfile\n    exportUserData(id: ID!, format: String): String\n  }\n\n  type Mutation {\n    updatePreferences(id: ID!, theme: String, notifications: Boolean): UserProfile\n  }\n`;\n\nconst s3 = new AWS.S3({ region: 'us-east-1' });\n\nconst EXPORT_BUCKET = process.env.EXPORT_BUCKET || 'user-data-exports-prod';\n\nasync function generateSignedExportUrl(userId, format) {\n  const key = `exports/${userId}/data.${format}`;\n  const params = {\n    Bucket: EXPORT_BUCKET,\n    Key: key,\n    Expires: 3600\n  };\n  return s3.getSignedUrl('getObject', params);\n}\n\nconst resolvers = {\n  Query: {\n    userProfile: async (_, { id }, context) => {\n      // Fetch from database - simulated\n      const user = await context.dataSources.userDB.getUser(id);\n      return user; // Can return null if user not found\n    },\n    exportUserData: async (_, { id, format }, context) => {\n      const user = await context.dataSources.userDB.getUser(id);\n      // VULNERABILITY: No null check on user before accessing properties\n      // If user is null, user.id throws TypeError (null pointer dereference)\n      // This crashes the Node.js process if unhandled\n      const exportKey = `${user.id}/${user.name}`;\n      \n      // Generate export file and upload to S3\n      const exportData = JSON.stringify({\n        userId: user.id,\n        name: user.name,\n        exportedAt: new Date().toISOString()\n      });\n\n      await s3.putObject({\n        Bucket: EXPORT_BUCKET,\n        Key: `exports/${exportKey}/data.${format || 'json'}`,\n        Body: exportData,\n        ContentType: 'application/json'\n      }).promise();\n\n      return generateSignedExportUrl(exportKey, format || 'json');\n    }\n  },\n  Mutation: {\n    updatePreferences: async (_, { id, theme, notifications }, context) => {\n      const user = await context.dataSources.userDB.getUser(id);\n      // Another null dereference path\n      user.preferences = { ...user.preferences, theme, notifications };\n      await context.dataSources.userDB.saveUser(user);\n      return user;\n    }\n  },\n  UserProfile: {\n    preferences: (parent) => {\n      // Nested resolver - parent could have null preferences\n      return parent.preferences || { theme: 'default', notifications: true, dataExportUrl: null };\n    }\n  }\n};\n\nconst app = express();\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  dataSources: () => ({\n    userDB: new (require('./UserDataSource'))()\n  }),\n  formatError: (err) => {\n    // Don't expose internal errors in production\n    if (err.extensions.code === 'INTERNAL_SERVER_ERROR') {\n      return new Error('An internal error occurred');\n    }\n    return err;\n  },\n  plugins: [{\n    requestDidStart() {\n      return {\n        didEncounterErrors({ errors }) {\n          errors.forEach(err => {\n            if (err.originalError instanceof TypeError) {\n              // Log but don't crash - however if this plugin isn't loaded\n              // or error propagates before plugin catches it, process dies\n              console.error('TypeError in resolver:', err.message);\n            }\n          });\n        }\n      };\n    }\n  }]\n});\n\nserver.applyMiddleware({ app });\n\napp.listen(4000, () => {\n  console.log(`GraphQL server running at http://localhost:4000${server.graphqlPath}`);\n});\n\nmodule.exports = { app, server };",
+  "environment": {
+    "description": "Same Node.js 16 Apollo Server 3.x on ECS Fargate in us-east-1 within private subnet. Traffic routed through VPC endpoint for S3 (vpce-0a1b2c3d4e5f67890) with endpoint policy restricting s3:PutObject to condition aws:sourceVpce matching the endpoint ID AND requiring s3:x-amz-server-side-encryption header. The VPC endpoint policy also includes a Deny statement for any S3 action when aws:PrincipalTag/service-tier does not equal 'validated-request'. The ECS task role has a permission boundary (arn:aws:iam::123456789012:policy/ExportBoundary) that denies s3:PutObject unless the request passes through a Lambda@Edge validation layer that performs schema-level null checking on resolver inputs before forwarding. Additionally, the ALB has a target group with deregistration_delay=300s and health_check_interval=5s with unhealthy_threshold=2, combined with ECS service minimum_healthy_percent=100 and desired_count=3 with circuit breaker enabled (rollback on deployment failure). The service mesh (App Mesh) envoy sidecar intercepts outbound S3 calls and applies a retry policy with outlier detection ejecting the task after 2 consecutive 5xx errors within 10s.",
+    "config": {
+      "runtime": "node:16-alpine",
+      "vpc_endpoint_id": "vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalTag/service-tier": "validated-request"
+              }
+            }
+          },
+          {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::user-data-exports-prod/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:sourceVpce": "vpce-0a1b2c3d4e5f67890",
+                "s3:x-amz-server-side-encryption": "AES256"
+              }
+            }
+          }
+        ]
+      },
+      "permission_boundary": "arn:aws:iam::123456789012:policy/ExportBoundary",
+      "ecs_desired_count": 3,
+      "ecs_minimum_healthy_percent": 100,
+      "ecs_circuit_breaker": true,
+      "alb_health_check_interval": 5,
+      "alb_unhealthy_threshold": 2,
+      "alb_deregistration_delay": 300,
+      "app_mesh_outlier_detection": {
+        "consecutive_5xx": 2,
+        "interval_seconds": 10,
+        "ejection_time_seconds": 30
+      },
+      "lambda_edge_validation": true,
+      "node_env": "production"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "0bd66ac2",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\n\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        details TEXT,\n        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_api_key(api_key):\n    \"\"\"Verify API key exists in database\"\"\"\n    db = get_db()\n    cursor = db.execute(\"SELECT id, role FROM users WHERE api_key = ?\", (api_key,))\n    return cursor.fetchone()\n\ndef log_action(action, user_id, details):\n    db = get_db()\n    db.execute(\"INSERT INTO audit_log (action, user_id, details) VALUES (?, ?, ?)\",\n               (action, user_id, details))\n    db.commit()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    \n    caller = verify_api_key(api_key)\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    username = request.args.get('username', '')\n    role_filter = request.args.get('role', '')\n    \n    # Build query with parameterized username but injectable role_filter\n    query = \"SELECT id, username, email, role, created_at FROM users WHERE username LIKE ?\"\n    params = ['%' + username + '%']\n    \n    if role_filter:\n        # Developer note: role is from a controlled dropdown in the UI\n        query += \" AND role = '\" + role_filter + \"'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        log_action('search', caller['id'], f'query={username}, role={role_filter}')\n        return jsonify({'users': results})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    \n    caller = verify_api_key(api_key)\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    db = get_db()\n    cursor = db.execute(\"SELECT id, username, email, role, created_at FROM users WHERE id = ?\", (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    \n    caller = verify_api_key(api_key)\n    if not caller or caller['role'] != 'admin':\n        return jsonify({'error': 'Admin required'}), 403\n    \n    data = request.get_json()\n    username = data.get('username')\n    email = data.get('email')\n    password = data.get('password')\n    \n    if not all([username, email, password]):\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(password.encode()).hexdigest()\n    new_api_key = hmac.new(SECRET_KEY.encode(), f'{username}{time.time()}'.encode(), hashlib.sha256).hexdigest()\n    \n    try:\n        db = get_db()\n        db.execute(\"INSERT INTO users (username, email, password_hash, api_key) VALUES (?, ?, ?, ?)\",\n                   (username, email, password_hash, new_api_key))\n        db.commit()\n        return jsonify({'api_key': new_api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an internal ALB in a private subnet. An AWS WAF WebACL is attached to the ALB with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 1 in COUNT mode for logging, (2) a custom rule group 'param-length-constraint' at priority 2 that BLOCKS any request where any single query string parameter value exceeds 64 bytes (using SizeConstraint on SingleQueryArgument with ComparisonOperator GT and Size 64, action BLOCK), (3) AWSManagedRulesSQLiRuleSet at priority 3 in COUNT mode only (not blocking). The custom rule at priority 2 fires before the SQLi rule set is even evaluated. The role_filter parameter in normal usage is one of: 'user', 'admin', 'viewer' (all under 10 bytes). Any SQL injection payload in the role query parameter necessarily exceeds 64 bytes to be useful (e.g., UNION SELECT with column matching requires minimum ~80 characters).",
+    "config": {
+      "compute": "ECS Fargate, 0.5 vCPU, 1GB",
+      "network": "Private subnet, no IGW, no NAT, VPC endpoints for ECR/logs",
+      "alb_config": "Internal ALB, HTTPS listener, forward to ECS target group",
+      "waf_webacl": {
+        "name": "user-svc-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "aws-common-logging",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "override_action": "COUNT"
+          },
+          {
+            "priority": 2,
+            "name": "param-length-constraint",
+            "type": "custom_rule_group",
+            "rules_in_group": [
+              {
+                "name": "block-long-query-params",
+                "statement": {
+                  "SizeConstraintStatement": {
+                    "FieldToMatch": {
+                      "AllQueryArguments": {}
+                    },
+                    "ComparisonOperator": "GT",
+                    "Size": 64,
+                    "TextTransformations": [
+                      {
+                        "Priority": 0,
+                        "Type": "URL_DECODE"
+                      },
+                      {
+                        "Priority": 1,
+                        "Type": "HTML_ENTITY_DECODE"
+                      }
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          },
+          {
+            "priority": 3,
+            "name": "aws-sqli-logging",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "override_action": "COUNT"
+          }
+        ]
+      },
+      "access": "Only reachable from internal VPC CIDR 10.0.0.0/16"
+    }
+  }
+}

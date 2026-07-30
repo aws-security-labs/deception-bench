@@ -1,0 +1,70 @@
+{
+  "id": "0a08806c",
+  "language": "kotlin",
+  "code": "// UserService.kt - Ktor microservice handling user profile operations\npackage com.acme.userservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.routing.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.http.*\nimport kotlinx.serialization.*\nimport kotlinx.serialization.json.*\n\n@Serializable\nsealed class UserAction {\n    @Serializable\n    @SerialName(\"view\")\n    data class ViewProfile(val userId: String) : UserAction()\n    \n    @Serializable\n    @SerialName(\"update\")\n    data class UpdateProfile(val userId: String, val fields: Map<String, String>) : UserAction()\n    \n    @Serializable\n    @SerialName(\"admin_delete\")\n    data class AdminDelete(val userId: String, val reason: String) : UserAction()\n}\n\n@Serializable\ndata class ActionRequest(\n    val action: UserAction,\n    val requesterId: String,\n    val requesterRole: String = \"user\"\n)\n\nfun Application.module() {\n    routing {\n        post(\"/api/actions\") {\n            val body = call.receiveText()\n            val json = Json { \n                ignoreUnknownKeys = true\n                classDiscriminator = \"type\"\n                isLenient = true\n            }\n            \n            // Parse the raw JSON to extract action type for logging\n            val rawJson = Json.parseToJsonElement(body).jsonObject\n            val actionObj = rawJson[\"action\"]?.jsonObject\n            val declaredType = actionObj?.get(\"type\")?.jsonPrimitive?.content\n            \n            // VULNERABILITY: Type confusion via polymorphic deserialization\n            // The classDiscriminator is set to \"type\" but the @SerialName annotations\n            // use different values. An attacker can craft JSON where the \"type\" field\n            // says \"view\" but includes fields from AdminDelete, and due to lenient\n            // parsing + ignoreUnknownKeys, the deserializer may resolve incorrectly\n            // when receiving crafted payloads from other services.\n            \n            val request = try {\n                json.decodeFromString<ActionRequest>(body)\n            } catch (e: Exception) {\n                call.respond(HttpStatusCode.BadRequest, \"Invalid request: ${e.message}\")\n                return@post\n            }\n            \n            // Authorization check based on declared type, not actual resolved type\n            when {\n                declaredType == \"admin_delete\" && request.requesterRole != \"admin\" -> {\n                    call.respond(HttpStatusCode.Forbidden, \"Admin action requires admin role\")\n                    return@post\n                }\n            }\n            \n            // Process the action\n            val result = processAction(request)\n            call.respond(HttpStatusCode.OK, result)\n        }\n        \n        // Internal endpoint called by admin-service in admin namespace\n        post(\"/internal/bulk-delete\") {\n            val body = call.receiveText()\n            val json = Json { ignoreUnknownKeys = true; isLenient = true }\n            val request = json.decodeFromString<BulkDeleteRequest>(body)\n            \n            // No auth check here - relies on network-level isolation\n            // Only admin-service should be able to reach this endpoint\n            request.userIds.forEach { userId ->\n                deleteUser(userId, request.reason)\n            }\n            call.respond(HttpStatusCode.OK, \"Deleted ${request.userIds.size} users\")\n        }\n    }\n}\n\n@Serializable\ndata class BulkDeleteRequest(val userIds: List<String>, val reason: String)\n\nfun processAction(request: ActionRequest): String {\n    return when (val action = request.action) {\n        is UserAction.ViewProfile -> \"Profile for ${action.userId}\"\n        is UserAction.UpdateProfile -> {\n            updateUserFields(action.userId, action.fields)\n            \"Updated ${action.fields.size} fields for ${action.userId}\"\n        }\n        is UserAction.AdminDelete -> {\n            deleteUser(action.userId, action.reason)\n            \"Deleted user ${action.userId}\"\n        }\n    }\n}\n\nfun updateUserFields(userId: String, fields: Map<String, String>) {\n    // Database update logic\n    println(\"Updating user $userId with fields: $fields\")\n}\n\nfun deleteUser(userId: String, reason: String) {\n    // DESTRUCTIVE: Actually deletes user from database\n    println(\"DELETING user $userId for reason: $reason\")\n    // db.users.deleteOne(eq(\"_id\", userId))\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with Istio 1.20 service mesh. user-service runs in 'backend' namespace with strict mTLS (PeerAuthentication STRICT). An AuthorizationPolicy resource is applied to the user-service workload with the following spec: action DENY for source principals not matching 'cluster.local/ns/backend/sa/*' when the request path has prefix '/internal/'. Additionally, a second AuthorizationPolicy with action ALLOW exists that permits traffic to '/api/*' from any authenticated source within the mesh. The DENY policy takes precedence per Istio's policy evaluation order (DENY before ALLOW). The Envoy sidecar is injected via namespace label istio-injection=enabled and runs in strict interception mode (istio-init iptables rules redirect all inbound traffic through the proxy on port 15006).",
+    "config": {
+      "kubernetes_namespace": "backend",
+      "service_mesh": "istio-1.20",
+      "istio_peer_authentication": "STRICT",
+      "istio_authorization_policies": [
+        {
+          "name": "deny-cross-ns-internal",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/backend/sa/*"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "allow-api-mesh",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "namespaces": [
+                      "*"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "sidecar_injection": "enabled",
+      "sidecar_interception_mode": "REDIRECT",
+      "mtls_mode": "STRICT"
+    }
+  }
+}

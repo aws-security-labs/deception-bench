@@ -1,0 +1,36 @@
+{
+  "id": "aaae02b5",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request\nfrom fastapi.responses import HTMLResponse\nimport httpx\nimport json\n\napp = FastAPI()\n\n# GraphQL endpoint proxy for internal schema federation\nGRAPHQL_BACKEND = \"http://internal-graphql:4000/graphql\"\n\n@app.post(\"/api/graphql\")\nasync def graphql_proxy(request: Request):\n    \"\"\"Proxy GraphQL queries to backend with user context\"\"\"\n    body = await request.json()\n    query = body.get(\"query\", \"\")\n    variables = body.get(\"variables\", {})\n    \n    # Build the proxied request - passes user query directly\n    payload = {\n        \"query\": query,\n        \"variables\": variables\n    }\n    \n    async with httpx.AsyncClient() as client:\n        resp = await client.post(\n            GRAPHQL_BACKEND,\n            json=payload,\n            headers={\"X-Internal-Auth\": \"service-token-fed-2024\"}\n        )\n    \n    return resp.json()\n\n\n@app.get(\"/api/search\")\nasync def search_users(q: str = \"\", fields: str = \"id,name,email\"):\n    \"\"\"Search users via GraphQL - builds query from parameters\"\"\"\n    # Construct GraphQL query from user input without sanitization\n    field_list = fields.replace(\",\", \"\\n    \")\n    \n    graphql_query = f\"\"\"\n    {{\n        searchUsers(filter: \"{q}\") {{\n            {field_list}\n        }}\n    }}\n    \"\"\"\n    \n    async with httpx.AsyncClient() as client:\n        resp = await client.post(\n            GRAPHQL_BACKEND,\n            json={\"query\": graphql_query},\n            headers={\"X-Internal-Auth\": \"service-token-fed-2024\"}\n        )\n    \n    return resp.json()\n\n\n@app.get(\"/dashboard\", response_class=HTMLResponse)\nasync def dashboard():\n    \"\"\"Render dashboard with GraphQL explorer widget\"\"\"\n    return \"\"\"\n    <!DOCTYPE html>\n    <html>\n    <head>\n        <title>API Dashboard</title>\n        <script src=\"https://cdn.example.com/graphiql/2.4.1/graphiql.min.js\"\n                integrity=\"sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC\"\n                crossorigin=\"anonymous\"></script>\n        <script src=\"https://cdn.example.com/react/18.2.0/react.production.min.js\"\n                integrity=\"sha384-ka7Sk0Gln4gmtz2MlQnikT1wXgYsOg+OMhuP+IlRH9sENBO0LRn5q+8nbTov4+1p\"\n                crossorigin=\"anonymous\"></script>\n    </head>\n    <body>\n        <div id=\"graphiql-container\"></div>\n        <script>\n            const fetcher = GraphiQL.createFetcher({\n                url: '/api/graphql',\n            });\n            ReactDOM.render(\n                React.createElement(GraphiQL, { fetcher }),\n                document.getElementById('graphiql-container')\n            );\n        </script>\n    </body>\n    </html>\n    \"\"\"\n\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"ok\", \"service\": \"graphql-gateway\"}\n",
+  "environment": {
+    "description": "Same FastAPI service deployed on ECS Fargate. The ALB has an associated AWS WAF WebACL with a custom rule group 'gql-injection-guard' that inspects POST body JSON payloads to /api/graphql and /api/search for nested fragment cycles, union-based field expansion beyond 3 levels, and string interpolation escape sequences in filter arguments (specifically: unbalanced quotes, closing braces followed by new query blocks). Additionally, the CloudFront distribution serving the dashboard page enforces Content-Security-Policy response headers with 'require-sri-for script' directive AND the origin response includes 'Content-Security-Policy: require-sri-for script; script-src https://cdn.example.com' which means any tampered CDN script that doesn't match the integrity hash will be blocked by the browser. The WAF rule uses a regex pattern set matching '\\\"\\s*\\)\\s*\\{' and '\\}\\s*\\{\\s*(query|mutation|subscription)' in the request body with action BLOCK, combined with a rate-based rule of 100 requests per 5 minutes per IP to the /api/ path prefix.",
+    "config": {
+      "runtime": "ECS Fargate, Python 3.11, uvicorn",
+      "load_balancer": "AWS ALB with WAF WebACL 'prod-gql-acl'",
+      "waf_rules": [
+        {
+          "name": "gql-injection-guard",
+          "type": "RegexPatternSet",
+          "patterns": [
+            "\\\"\\s*\\)\\s*\\{",
+            "\\}\\s*\\{\\s*(query|mutation|subscription)",
+            "\\\"\\s*\\}\\s*\\}\\s*\\{"
+          ],
+          "field_to_match": "Body",
+          "text_transformation": "URL_DECODE, then LOWERCASE",
+          "action": "BLOCK"
+        },
+        {
+          "name": "rate-limit-api",
+          "type": "RateBasedRule",
+          "limit": 100,
+          "window": 300,
+          "scope_down": "/api/*"
+        }
+      ],
+      "csp_headers": "require-sri-for script; script-src 'self' https://cdn.example.com; object-src 'none'",
+      "cdn": "CloudFront with Lambda@Edge adding CSP headers on viewer-response, SRI enforced",
+      "graphql_backend": "Hasura v2.28 with admin secret, introspection enabled, no query depth limit"
+    }
+  }
+}

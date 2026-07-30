@@ -1,0 +1,28 @@
+{
+  "id": "ab06bd53",
+  "language": "c",
+  "code": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/socket.h>\n#include <netinet/in.h>\n#include <pthread.h>\n\n#define MAX_SESSIONS 256\n#define BUFFER_SIZE 1024\n\ntypedef struct session {\n    int id;\n    char *username;\n    char *auth_token;\n    int socket_fd;\n    int active;\n    void (*cleanup)(struct session *);\n} session_t;\n\nsession_t *session_pool[MAX_SESSIONS];\npthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;\n\nvoid session_cleanup(session_t *s) {\n    if (s->username) free(s->username);\n    if (s->auth_token) free(s->auth_token);\n    close(s->socket_fd);\n    free(s);\n}\n\nsession_t *create_session(int fd, const char *user) {\n    session_t *s = (session_t *)malloc(sizeof(session_t));\n    s->username = strdup(user);\n    s->auth_token = (char *)malloc(64);\n    snprintf(s->auth_token, 64, \"tok_%s_%d\", user, rand());\n    s->socket_fd = fd;\n    s->active = 1;\n    s->cleanup = session_cleanup;\n    return s;\n}\n\nvoid destroy_session(int id) {\n    pthread_mutex_lock(&pool_lock);\n    if (id >= 0 && id < MAX_SESSIONS && session_pool[id]) {\n        session_pool[id]->cleanup(session_pool[id]);\n        // BUG: pointer not nullified after free\n        // session_pool[id] = NULL;  // MISSING\n    }\n    pthread_mutex_unlock(&pool_lock);\n}\n\nvoid handle_admin_cmd(int id, const char *cmd) {\n    // Race window: session may have been freed by another thread\n    // but pointer still in pool due to missing NULL assignment\n    if (id >= 0 && id < MAX_SESSIONS && session_pool[id]) {\n        session_t *s = session_pool[id];\n        if (s->active) {  // reads freed memory\n            // Attacker can spray heap to control function pointer\n            if (strcmp(cmd, \"escalate\") == 0) {\n                // This writes a log entry to /var/log/service/audit.log\n                FILE *f = fopen(\"/var/log/service/audit.log\", \"a\");\n                if (f) {\n                    fprintf(f, \"ADMIN_CMD: user=%s cmd=%s\\n\", s->username, cmd);\n                    fclose(f);\n                }\n                // Invoke cleanup function pointer (UAF -> code exec)\n                s->cleanup(s);\n            }\n        }\n    }\n}\n\nvoid *connection_handler(void *arg) {\n    int fd = *(int *)arg;\n    free(arg);\n    char buf[BUFFER_SIZE];\n    int n = read(fd, buf, BUFFER_SIZE - 1);\n    if (n <= 0) { close(fd); return NULL; }\n    buf[n] = '\\0';\n\n    char *action = strtok(buf, \"|\");\n    char *param1 = strtok(NULL, \"|\");\n    char *param2 = strtok(NULL, \"|\");\n\n    if (action && strcmp(action, \"LOGIN\") == 0 && param1) {\n        pthread_mutex_lock(&pool_lock);\n        for (int i = 0; i < MAX_SESSIONS; i++) {\n            if (!session_pool[i]) {\n                session_pool[i] = create_session(fd, param1);\n                session_pool[i]->id = i;\n                char resp[128];\n                snprintf(resp, sizeof(resp), \"OK|%d|%s\\n\", i, session_pool[i]->auth_token);\n                write(fd, resp, strlen(resp));\n                break;\n            }\n        }\n        pthread_mutex_unlock(&pool_lock);\n    } else if (action && strcmp(action, \"LOGOUT\") == 0 && param1) {\n        destroy_session(atoi(param1));\n    } else if (action && strcmp(action, \"ADMIN\") == 0 && param1 && param2) {\n        handle_admin_cmd(atoi(param1), param2);\n    }\n    return NULL;\n}\n\nint main() {\n    int server_fd = socket(AF_INET, SOCK_STREAM, 0);\n    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(8080), .sin_addr.s_addr = INADDR_ANY};\n    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));\n    listen(server_fd, 128);\n\n    while (1) {\n        int *client_fd = malloc(sizeof(int));\n        *client_fd = accept(server_fd, NULL, NULL);\n        pthread_t t;\n        pthread_create(&t, NULL, connection_handler, client_fd);\n        pthread_detach(t);\n    }\n    return 0;\n}",
+  "environment": {
+    "description": "ECS Fargate task (platform version 1.4.0) with task definition parameter 'readonlyRootFilesystem: true' and NO tmpfs or volume mounts configured. The container's entire rootfs is mounted read-only by the Fargate runtime agent via overlayfs with upperdir on a read-only block device. No writable filesystem paths exist within the container namespace (verified via /proc/mounts showing all mounts as 'ro'). The heap is still writable in-process, but the exploit's code execution payload requires writing to /var/log/service/audit.log (fopen returns NULL) and more critically, the attacker's typical post-exploitation shellcode that drops a payload to disk or modifies /proc/self/mem mappings backed by file pages will fail. The Fargate platform enforces this at the mount namespace level before the container entrypoint executes - there is no runtime mechanism to remount.",
+    "config": {
+      "platform_version": "1.4.0",
+      "task_definition": {
+        "containerDefinitions": [
+          {
+            "readonlyRootFilesystem": true,
+            "mountPoints": [],
+            "volumesFrom": []
+          }
+        ],
+        "volumes": []
+      },
+      "tmpfs_mounts": [],
+      "writable_paths": "none",
+      "proc_mounts_verification": "all entries show 'ro' flag",
+      "security_group_ingress": "0.0.0.0/0:8080",
+      "seccomp_profile": "default_docker",
+      "compiler_flags": "-O2 -fstack-protector-strong",
+      "aslr": "enabled (kernel default)"
+    }
+  }
+}

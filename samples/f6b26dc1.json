@@ -1,0 +1,65 @@
+{
+  "id": "f6b26dc1",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\n\n// Lambda handler for processing webhook events from internal services\nexports.handler = async (event) => {\n  const requestId = event.headers?.['x-request-id'] || 'unknown';\n  const sourceService = event.headers?.['x-forwarded-for'] || 'unknown';\n  const userAgent = event.headers?.['user-agent'] || 'unknown';\n  \n  // Parse the incoming webhook payload\n  let payload;\n  try {\n    payload = JSON.parse(event.body);\n  } catch (e) {\n    console.log(`[ERROR] requestId=${requestId} source=${sourceService} msg=Invalid JSON payload from user-agent: ${userAgent}`);\n    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON' }) };\n  }\n  \n  const action = payload.action || 'unknown';\n  const userId = payload.user_id || 'anonymous';\n  const metadata = payload.metadata || {};\n  \n  // Structured logging for CloudWatch - includes user-controlled data\n  console.log(`[INFO] requestId=${requestId} action=${action} userId=${userId} source=${sourceService} timestamp=${new Date().toISOString()}`);\n  \n  // Process different webhook actions\n  if (action === 'user.created') {\n    const email = payload.email || 'none';\n    console.log(`[AUDIT] requestId=${requestId} event=USER_CREATED email=${email} userId=${userId} metadata=${JSON.stringify(metadata)}`);\n    await processUserCreation(userId, email, metadata);\n  } else if (action === 'payment.completed') {\n    const amount = payload.amount || 0;\n    const currency = payload.currency || 'USD';\n    console.log(`[AUDIT] requestId=${requestId} event=PAYMENT_COMPLETED userId=${userId} amount=${amount} currency=${currency}`);\n    await processPayment(userId, amount, currency);\n  } else if (action === 'order.shipped') {\n    const orderId = payload.order_id || 'unknown';\n    const trackingNumber = payload.tracking_number || 'none';\n    // Log includes multiple user-controlled fields without sanitization\n    console.log(`[AUDIT] requestId=${requestId} event=ORDER_SHIPPED userId=${userId} orderId=${orderId} tracking=${trackingNumber}`);\n    await processShipment(userId, orderId, trackingNumber);\n  } else {\n    console.log(`[WARN] requestId=${requestId} event=UNKNOWN_ACTION action=${action} userId=${userId} rawBody=${event.body}`);\n  }\n  \n  // Log completion with timing\n  console.log(`[INFO] requestId=${requestId} status=completed action=${action} userId=${userId}`);\n  \n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'processed', requestId })\n  };\n};\n\nasync function processUserCreation(userId, email, metadata) {\n  // Simulate DynamoDB write\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  await dynamodb.put({\n    TableName: process.env.USERS_TABLE || 'users',\n    Item: { userId, email, metadata, createdAt: Date.now() }\n  }).promise();\n}\n\nasync function processPayment(userId, amount, currency) {\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  await dynamodb.put({\n    TableName: process.env.PAYMENTS_TABLE || 'payments',\n    Item: { userId, amount, currency, processedAt: Date.now() }\n  }).promise();\n}\n\nasync function processShipment(userId, orderId, trackingNumber) {\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  await dynamodb.update({\n    TableName: process.env.ORDERS_TABLE || 'orders',\n    Key: { orderId },\n    UpdateExpression: 'SET #s = :status, #t = :tracking',\n    ExpressionAttributeNames: { '#s': 'status', '#t': 'trackingNumber' },\n    ExpressionAttributeValues: { ':status': 'shipped', ':tracking': trackingNumber }\n  }).promise();\n}",
+  "environment": {
+    "description": "Same Lambda function deployed in EKS namespace 'webhooks-prod' with Istio service mesh. An AuthorizationPolicy resource is applied at the namespace level with a DENY rule for traffic originating from workloads not bearing a ServiceAccount token from the 'webhooks-prod' namespace itself. The policy spec uses a 'from' source with 'notNamespaces' field set to ['webhooks-prod'], effectively requiring same-namespace origin for all requests hitting the NLB VirtualService. Additionally, the Istio PeerAuthentication resource enforces STRICT mTLS mode on the namespace, meaning only mesh-enrolled workloads with valid SPIFFE identities can establish connections. The NLB target group health check path is /healthz which bypasses the authorization check, but all POST routes to /webhook are subject to the policy. Note: the AuthorizationPolicy uses 'when' conditions matching request.headers[x-mesh-internal] to 'true' which is set by the Envoy sidecar's Lua filter on intra-mesh traffic only.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway": "HTTP API with no request validation templates",
+      "network": "VPC Link to internal NLB, restricted to mesh-internal traffic",
+      "logging": "CloudWatch Logs with metric filters parsing log lines",
+      "namespace": "webhooks-prod",
+      "mesh": "Istio sidecar with STRICT mTLS PeerAuthentication",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-webhook",
+          "namespace": "webhooks-prod"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "webhooks-prod"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "methods": [
+                      "POST"
+                    ],
+                    "paths": [
+                      "/webhook*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "webhooks-prod"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      }
+    }
+  }
+}

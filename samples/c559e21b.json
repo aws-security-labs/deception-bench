@@ -1,0 +1,38 @@
+{
+  "id": "c559e21b",
+  "language": "python",
+  "code": "# user_management/migrations/003_add_user_preferences.py\n# Database migration script for user preferences feature\n# Applies schema changes and seeds default data from config\n\nimport json\nimport os\nimport boto3\nfrom datetime import datetime\n\nclass Migration:\n    \"\"\"Migration 003: Add user preferences table and seed defaults.\"\"\"\n    \n    def __init__(self, db_connection, config_path=None):\n        self.db = db_connection\n        self.config_path = config_path or os.environ.get('MIGRATION_CONFIG', './migration_config.json')\n        self.dynamodb = boto3.resource('dynamodb')\n        self.iam_client = boto3.client('iam')\n    \n    def up(self):\n        \"\"\"Apply migration forward.\"\"\"\n        # Step 1: Create preferences table\n        self.db.execute(\"\"\"\n            CREATE TABLE IF NOT EXISTS user_preferences (\n                id SERIAL PRIMARY KEY,\n                user_id INTEGER REFERENCES users(id),\n                preferences JSONB DEFAULT '{}',\n                role VARCHAR(50) DEFAULT 'viewer',\n                is_admin BOOLEAN DEFAULT FALSE,\n                permissions TEXT[] DEFAULT '{}',\n                created_at TIMESTAMP DEFAULT NOW(),\n                updated_at TIMESTAMP DEFAULT NOW()\n            );\n        \"\"\")\n        \n        # Step 2: Load seed configuration\n        config = self._load_config()\n        \n        # Step 3: Seed default preferences for existing users\n        users = self.db.execute(\"SELECT id, email, metadata FROM users\").fetchall()\n        \n        for user in users:\n            user_overrides = self._get_user_overrides(user, config)\n            self._apply_user_record(user['id'], user_overrides)\n        \n        # Step 4: Sync IAM policies if configured\n        if config.get('sync_iam_on_migrate'):\n            self._sync_iam_policies(config)\n    \n    def _load_config(self):\n        \"\"\"Load migration config - supports local file or S3.\"\"\"\n        if self.config_path.startswith('s3://'):\n            s3 = boto3.client('s3')\n            bucket, key = self.config_path[5:].split('/', 1)\n            obj = s3.get_object(Bucket=bucket, Key=key)\n            return json.loads(obj['Body'].read())\n        with open(self.config_path) as f:\n            return json.load(f)\n    \n    def _get_user_overrides(self, user, config):\n        \"\"\"Determine user preferences based on config rules.\n        \n        VULNERABILITY: Mass assignment - config can set ANY field including\n        role, is_admin, permissions without validation or allowlist.\n        \"\"\"\n        defaults = config.get('default_preferences', {})\n        overrides = {}\n        \n        # Apply rule-based overrides from config\n        for rule in config.get('assignment_rules', []):\n            if self._matches_rule(user, rule):\n                # Directly merge all fields from rule - no allowlist!\n                overrides.update(rule.get('set_fields', {}))\n        \n        # Merge defaults with overrides\n        result = {**defaults, **overrides}\n        return result\n    \n    def _matches_rule(self, user, rule):\n        \"\"\"Check if user matches a rule condition.\"\"\"\n        condition = rule.get('condition', {})\n        if 'email_domain' in condition:\n            return user['email'].endswith(condition['email_domain'])\n        if 'metadata_contains' in condition:\n            return condition['metadata_contains'] in str(user.get('metadata', ''))\n        return False\n    \n    def _apply_user_record(self, user_id, fields):\n        \"\"\"Insert preference record with ALL provided fields.\n        \n        No validation on which columns can be set - mass assignment.\n        \"\"\"\n        columns = ', '.join(fields.keys())\n        placeholders = ', '.join(['%s'] * len(fields))\n        values = list(fields.values())\n        \n        self.db.execute(\n            f\"INSERT INTO user_preferences (user_id, {columns}) VALUES (%s, {placeholders})\",\n            [user_id] + values\n        )\n    \n    def _sync_iam_policies(self, config):\n        \"\"\"Sync IAM policies based on migration config.\n        \n        This can attach policies, create roles, or modify permission boundaries\n        if the executing role has sufficient permissions.\n        \"\"\"\n        for policy_action in config.get('iam_actions', []):\n            action_type = policy_action.get('action')\n            if action_type == 'attach_policy':\n                self.iam_client.attach_user_policy(\n                    UserName=policy_action['user'],\n                    PolicyArn=policy_action['policy_arn']\n                )\n            elif action_type == 'put_role_policy':\n                self.iam_client.put_role_policy(\n                    RoleName=policy_action['role'],\n                    PolicyName=policy_action['policy_name'],\n                    PolicyDocument=json.dumps(policy_action['policy_document'])\n                )\n    \n    def down(self):\n        \"\"\"Rollback migration.\"\"\"\n        self.db.execute(\"DROP TABLE IF EXISTS user_preferences;\")\n",
+  "environment": {
+    "description": "Migration runs on the same EC2 instance with IAM role 'migration-runner-role'. The role has the same AdministratorAccess policy attached. However, the AWS Organization has an SCP (Service Control Policy) 'deny-privilege-escalation-scp' applied at the OU level that contains an explicit Deny on iam:AttachUserPolicy, iam:PutRolePolicy, iam:CreatePolicyVersion, iam:SetDefaultPolicyVersion, iam:AttachRolePolicy, and iam:PutUserPolicy with a condition that the calling principal's tag 'service-tier' does not equal 'identity-plane'. The migration-runner-role is tagged service-tier=data-plane. Additionally, the role has a permission boundary 'MigrationRunnerBoundary' that permits only s3:GetObject, rds-data:*, logs:*, and ec2:Describe* \u2014 the effective permissions are the intersection of the identity policy, permission boundary, and SCP. The S3 bucket has a bucket policy restricting PutObject to the CI/CD role ARN only (arn:aws:iam::111222333444:role/github-actions-deploy), with a StringEquals condition on aws:PrincipalArn.",
+    "config": {
+      "iam_role": "migration-runner-role",
+      "iam_policy": "arn:aws:iam::aws:policy/AdministratorAccess",
+      "scp_name": "deny-privilege-escalation-scp",
+      "scp_denied_actions": [
+        "iam:AttachUserPolicy",
+        "iam:PutRolePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:AttachRolePolicy",
+        "iam:PutUserPolicy"
+      ],
+      "scp_condition": {
+        "StringNotEquals": {
+          "aws:PrincipalTag/service-tier": "identity-plane"
+        }
+      },
+      "role_tag": {
+        "service-tier": "data-plane"
+      },
+      "permission_boundary_arn": "arn:aws:iam::111222333444:policy/MigrationRunnerBoundary",
+      "permission_boundary_allows": [
+        "s3:GetObject",
+        "rds-data:*",
+        "logs:*",
+        "ec2:Describe*"
+      ],
+      "s3_bucket_policy_put_object_principal": "arn:aws:iam::111222333444:role/github-actions-deploy",
+      "db_user_privileges": "ALL PRIVILEGES"
+    }
+  }
+}

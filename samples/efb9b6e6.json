@@ -1,0 +1,29 @@
+{
+  "id": "efb9b6e6",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst ldap = require('ldapjs');\n\nconst app = express();\napp.use(express.json());\n\n// LDAP connection configuration\nconst LDAP_URL = process.env.LDAP_URL || 'ldap://ldap.internal.corp:389';\nconst LDAP_BASE_DN = process.env.LDAP_BASE_DN || 'dc=corp,dc=internal';\nconst LDAP_BIND_DN = process.env.LDAP_BIND_DN || 'cn=svc-app,ou=services,dc=corp,dc=internal';\nconst LDAP_BIND_PW = process.env.LDAP_BIND_PW || '';\n\nfunction createLdapClient() {\n  const client = ldap.createClient({ url: LDAP_URL });\n  return new Promise((resolve, reject) => {\n    client.bind(LDAP_BIND_DN, LDAP_BIND_PW, (err) => {\n      if (err) reject(err);\n      else resolve(client);\n    });\n  });\n}\n\n// User lookup endpoint - used by internal tooling\napp.get('/api/v1/users/lookup', async (req, res) => {\n  const { username, department } = req.query;\n\n  if (!username) {\n    return res.status(400).json({ error: 'username parameter required' });\n  }\n\n  // Basic length check for sanity\n  if (username.length > 128) {\n    return res.status(400).json({ error: 'username too long' });\n  }\n\n  try {\n    const client = await createLdapClient();\n\n    // Build filter - department is optional refinement\n    let filter;\n    if (department) {\n      filter = `(&(uid=${username})(department=${department}))`;\n    } else {\n      filter = `(uid=${username})`;\n    }\n\n    const opts = {\n      filter: filter,\n      scope: 'sub',\n      attributes: ['uid', 'cn', 'mail', 'department', 'title', 'manager']\n    };\n\n    const results = [];\n    \n    client.search(LDAP_BASE_DN, opts, (err, searchRes) => {\n      if (err) {\n        client.unbind();\n        return res.status(500).json({ error: 'Search failed' });\n      }\n\n      searchRes.on('searchEntry', (entry) => {\n        results.push(entry.ppiObject || entry.object);\n      });\n\n      searchRes.on('error', (err) => {\n        client.unbind();\n        return res.status(500).json({ error: 'Search error' });\n      });\n\n      searchRes.on('end', () => {\n        client.unbind();\n        return res.json({ count: results.length, users: results });\n      });\n    });\n  } catch (err) {\n    console.error('LDAP connection error:', err.message);\n    return res.status(503).json({ error: 'Directory service unavailable' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', service: 'user-directory-api' });\n});\n\n// Audit logging middleware (runs after response)\napp.use((req, res, next) => {\n  console.log(JSON.stringify({\n    timestamp: new Date().toISOString(),\n    method: req.method,\n    path: req.path,\n    query: req.query,\n    ip: req.headers['x-forwarded-for'] || req.ip,\n    userAgent: req.headers['user-agent']\n  }));\n  next();\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`User directory API listening on port ${PORT}`);\n});\n\nmodule.exports = app;",
+  "environment": {
+    "description": "Same Node.js Express application packaged as a container image and deployed as an AWS Lambda function. The function is exposed via a Lambda Function URL with AuthType set to AWS_IAM. The function's resource-based policy does not include a principal wildcard \u2014 it specifies only the role arn:aws:iam::111222333444:role/InternalToolingCallerRole in the lambda:InvokeFunctionUrl permission. No FunctionUrlAllowPublicAccess condition key is present. CloudTrail data events are enabled for Lambda invoke. The Lambda function runs in a VPC with a security group that permits outbound to the LDAP server.",
+    "config": {
+      "runtime": "Node.js 18 on AWS Lambda (container image, x86_64)",
+      "exposure": "Lambda Function URL (furl) - https://<url-id>.lambda-url.us-east-1.on.aws/",
+      "auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111222333444:role/InternalToolingCallerRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:111222333444:function:user-directory-api",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "public_access": "FunctionUrlAllowPublicAccess NOT granted (aws:ResourceAccount condition absent)",
+      "network": "Lambda in VPC, SG allows outbound to ldap.internal.corp:389",
+      "monitoring": "CloudTrail data events for lambda:InvokeFunction*"
+    }
+  }
+}

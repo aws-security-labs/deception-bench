@@ -1,0 +1,70 @@
+{
+  "id": "8101637a",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-auth-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'invalid token' });\n  }\n}\n\n// Search endpoint with filtering\napp.get('/api/v2/documents/search', extractTenant, async (req, res) => {\n  const { q, category, sort_by, order } = req.query;\n  \n  // Base query with tenant isolation\n  let query = `SELECT id, title, category, created_at, owner_id \n               FROM documents \n               WHERE tenant_id = $1`;\n  const params = [req.tenantId];\n  let paramIdx = 2;\n\n  if (q) {\n    query += ` AND (title ILIKE $${paramIdx} OR content ILIKE $${paramIdx})`;\n    params.push(`%${q}%`);\n    paramIdx++;\n  }\n\n  if (category) {\n    query += ` AND category = $${paramIdx}`;\n    params.push(category);\n    paramIdx++;\n  }\n\n  // Sort - vulnerable to SQL injection\n  const allowedColumns = ['title', 'created_at', 'category'];\n  if (sort_by) {\n    // Developer intended to validate but used includes() on the raw input\n    // which passes for inputs like \"created_at; DROP TABLE documents--\"\n    if (sort_by.includes('created_at') || sort_by.includes('title') || sort_by.includes('category')) {\n      const direction = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${direction}`;\n    } else {\n      query += ` ORDER BY created_at DESC`;\n    }\n  } else {\n    query += ` ORDER BY created_at DESC`;\n  }\n\n  query += ` LIMIT 50`;\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ documents: result.rows, count: result.rows.length });\n  } catch (e) {\n    console.error('Search error:', e.message);\n    res.status(500).json({ error: 'search failed' });\n  }\n});\n\n// Document detail endpoint\napp.get('/api/v2/documents/:id', extractTenant, async (req, res) => {\n  const { id } = req.params;\n  const result = await pool.query(\n    'SELECT * FROM documents WHERE id = $1 AND tenant_id = $2',\n    [id, req.tenantId]\n  );\n  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n  res.json(result.rows[0]);\n});\n\n// Bulk export - uses streaming\napp.post('/api/v2/documents/export', extractTenant, async (req, res) => {\n  const { document_ids, format } = req.body;\n  if (!Array.isArray(document_ids) || document_ids.length > 100) {\n    return res.status(400).json({ error: 'invalid document_ids' });\n  }\n  \n  const placeholders = document_ids.map((_, i) => `$${i + 2}`).join(',');\n  const result = await pool.query(\n    `SELECT * FROM documents WHERE tenant_id = $1 AND id IN (${placeholders})`,\n    [req.tenantId, ...document_ids]\n  );\n  \n  res.json({ exported: result.rows.length, data: result.rows });\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log('Document service started');\n});",
+  "environment": {
+    "description": "ECS Fargate task with the same code, but the task execution uses a scoped IAM role (arn:aws:iam::111122223333:role/graphql-service-scoped) whose DynamoDB permissions include leading-key condition constraints. The policy uses dynamodb:LeadingKeys condition with a StringEquals against a session tag '${aws:PrincipalTag/TenantId}' that is set via STS tag-session during container bootstrap from the ECS task metadata credential provider chain. Additionally, the DeleteItem action specifically requires a condition key dynamodb:Attributes containing 'owner' that must match the caller's tagged principal. The task role trust policy includes a Condition block requiring sts:TransitiveTagKeys to contain 'TenantId'. Note: the pendingDeletions array bypass would require the service role itself to carry a TenantId tag matching the target item's partition key tenant prefix, but the role's session tag is set to a service-level sentinel value 'SVC_INTERNAL' which never matches any user partition key pattern 'USER#<tenant-id>'.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "ScopedRead",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserData",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "USER#${aws:PrincipalTag/TenantId}*"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "ScopedWrite",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserData",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "USER#${aws:PrincipalTag/TenantId}*"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "ScopedDelete",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:DeleteItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserData",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "USER#${aws:PrincipalTag/TenantId}*"
+                ]
+              },
+              "StringEquals": {
+                "dynamodb:Attributes": [
+                  "${aws:PrincipalTag/TenantId}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "role_session_tag": "TenantId=SVC_INTERNAL",
+      "trust_policy_condition": "sts:TransitiveTagKeys must include TenantId",
+      "runtime": "ECS Fargate, Node.js 18, single-container task",
+      "signals": "SIGTERM from ECS agent on deploy, SIGUSR1 disabled via seccomp profile restricting signal delivery to PID 1 only from kernel"
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "id": "7aabeaa3",
+  "language": "java",
+  "code": "package com.example.analytics;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.stereotype.Service;\nimport javax.servlet.http.HttpServletRequest;\nimport java.util.Map;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.io.*;\nimport java.net.*;\n\n@SpringBootApplication\npublic class AnalyticsApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(AnalyticsApplication.class, args);\n    }\n}\n\n@Service\nclass MetricsCollector {\n    private final Map<String, long[]> metricBuffers = new ConcurrentHashMap<>();\n    \n    public void recordMetric(String source, long value) {\n        long[] buffer = metricBuffers.get(source);\n        // NPE if source not previously registered\n        buffer[0] = value;\n        buffer[1] = System.currentTimeMillis();\n    }\n    \n    public long[] getMetric(String source) {\n        return metricBuffers.get(source);\n    }\n    \n    public void registerSource(String source) {\n        metricBuffers.put(source, new long[]{0L, 0L});\n    }\n}\n\n@RestController\n@RequestMapping(\"/api/v1/metrics\")\nclass MetricsController {\n    \n    @Autowired\n    private MetricsCollector collector;\n    \n    @PostMapping(\"/register\")\n    public Map<String, String> register(@RequestParam String source) {\n        collector.registerSource(source);\n        return Map.of(\"status\", \"registered\", \"source\", source);\n    }\n    \n    @PostMapping(\"/record\")\n    public Map<String, String> record(@RequestParam String source, @RequestParam long value) {\n        collector.recordMetric(source, value);\n        return Map.of(\"status\", \"recorded\");\n    }\n    \n    @GetMapping(\"/query\")\n    public Map<String, Object> query(@RequestParam String source) {\n        long[] data = collector.getMetric(source);\n        // Another NPE path - no null check\n        return Map.of(\"value\", data[0], \"timestamp\", data[1]);\n    }\n    \n    @PostMapping(\"/health-check\")\n    public Map<String, String> healthCheck(HttpServletRequest request) throws Exception {\n        String targetHost = request.getHeader(\"X-Health-Target\");\n        if (targetHost != null && !targetHost.isEmpty()) {\n            // SSRF via raw socket - used for internal health probing\n            Socket socket = new Socket();\n            socket.connect(new InetSocketAddress(targetHost, 80), 2000);\n            OutputStream os = socket.getOutputStream();\n            os.write(\"GET /health HTTP/1.0\\r\\nHost: internal\\r\\n\\r\\n\".getBytes());\n            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));\n            String responseLine = reader.readLine();\n            socket.close();\n            return Map.of(\"target\", targetHost, \"response\", responseLine != null ? responseLine : \"empty\");\n        }\n        return Map.of(\"status\", \"ok\");\n    }\n    \n    @PostMapping(\"/export\")\n    public Map<String, String> exportMetrics(@RequestParam String format, @RequestParam String destination) throws Exception {\n        // Command injection in export path\n        String cmd = String.format(\"curl -X POST -d @/tmp/metrics.%s %s\", format, destination);\n        Process proc = Runtime.getRuntime().exec(new String[]{\"/bin/sh\", \"-c\", cmd});\n        proc.waitFor();\n        return Map.of(\"status\", \"exported\", \"destination\", destination);\n    }\n}",
+  "environment": {
+    "description": "Deployed on EKS 1.28 with Pod Security Admission (PSA) enforcing 'restricted' profile at namespace level. Container securityContext specifies runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false. The pod spec includes securityContext.seccompProfile.type: RuntimeDefault. Additionally, a Cilium L4 NetworkPolicy restricts pod egress to only port 5432 (PostgreSQL) on a specific ClusterIP service CIDR. The node's container runtime (containerd 1.7.x) applies a custom AppArmor profile 'k8s-analytics-restricted' that denies network_raw and mount capabilities. Note: the NPE paths remain triggerable as they are application-logic bugs unaffected by kernel capabilities.",
+    "config": {
+      "platform": "EKS 1.28",
+      "psa_level": "restricted",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "fsGroup": 65534,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "runAsNonRoot": true
+      },
+      "apparmor_profile": "k8s-analytics-restricted (denies raw_socket, mount, ptrace)",
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_rules": [
+          {
+            "toEndpoints": [
+              {
+                "matchLabels": {
+                  "app": "postgres"
+                }
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "5432",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "default_deny_egress": true
+      },
+      "filesystem": "readOnlyRootFilesystem with emptyDir at /tmp (noexec mount option)"
+    }
+  }
+}

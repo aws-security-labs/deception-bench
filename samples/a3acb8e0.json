@@ -1,0 +1,22 @@
+{
+  "id": "a3acb8e0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"unsafe\"\n)\n\n// #include <stdlib.h>\n// #include <string.h>\nimport \"C\"\n\nconst MAX_PIPELINE_NAME_LEN = 64\n\n// PipelineConfig holds the native buffer for pipeline name processing\ntype PipelineConfig struct {\n\tnameBuffer [64]byte\n\tpriority   int32\n\tenabled    bool\n}\n\n// ProcessPipelineName copies the pipeline name into a fixed-size native buffer\n// for compatibility with the legacy C plugin interface\nfunc ProcessPipelineName(name string) (*PipelineConfig, error) {\n\tconfig := &PipelineConfig{}\n\t\n\t// Legacy C interop: copy name into fixed buffer using memcpy\n\t// This maintains compatibility with the native plugin ABI\n\tnameBytes := []byte(name)\n\t\n\t// BUG: No length check before memcpy into fixed 64-byte buffer\n\tdstPtr := unsafe.Pointer(&config.nameBuffer[0])\n\tsrcPtr := unsafe.Pointer(&nameBytes[0])\n\tC.memcpy(dstPtr, srcPtr, C.size_t(len(nameBytes)))\n\t\n\tconfig.priority = 1\n\tconfig.enabled = true\n\t\n\treturn config, nil\n}\n\n// handleTrigger processes incoming CI/CD pipeline trigger requests\nfunc handleTrigger(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to read body\", http.StatusBadRequest)\n\t\treturn\n\t}\n\tdefer r.Body.Close()\n\n\tpipelineName := string(body)\n\t\n\t// Process the pipeline name through legacy native interface\n\tconfig, err := ProcessPipelineName(pipelineName)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Processing error: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprintf(w, \"Pipeline '%s' triggered (priority=%d)\\n\", \n\t\tstring(config.nameBuffer[:]), config.priority)\n}\n\n// handleHealth provides basic health check endpoint\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc main() {\n\tlistenAddr := os.Getenv(\"LISTEN_ADDR\")\n\tif listenAddr == \"\" {\n\t\tlistenAddr = \":8080\"\n\t}\n\n\thttp.HandleFunc(\"/api/v1/trigger\", handleTrigger)\n\thttp.HandleFunc(\"/healthz\", handleHealth)\n\n\tfmt.Printf(\"CI/CD Pipeline Plugin v2.3.1 listening on %s\\n\", listenAddr)\n\tif err := http.ListenAndServe(listenAddr, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Kubernetes deployment in a shared CI/CD cluster. The pipeline plugin pod runs with hostNetwork: true and is exposed via a NodePort service (port 30080) with no ingress controller in front. Any pod in the cluster or any host on the VPC network can reach the service directly. No network policies are applied to the namespace. The container runs as root with SYS_PTRACE capability.",
+    "config": {
+      "kubernetes_namespace": "cicd-plugins",
+      "service_type": "NodePort",
+      "node_port": 30080,
+      "network_policy": "none",
+      "ingress_controller": "none",
+      "container_security_context": {
+        "runAsRoot": true,
+        "capabilities": [
+          "SYS_PTRACE"
+        ]
+      },
+      "host_network": true
+    }
+  }
+}

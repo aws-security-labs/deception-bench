@@ -1,0 +1,32 @@
+{
+  "id": "316a60f5",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        email TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria.\n    Supports: username, email, role filters.\n    \"\"\"\n    username = request.args.get('username', '')\n    role = request.args.get('role', '')\n    email = request.args.get('email', '')\n    \n    # Build dynamic query based on provided filters\n    conditions = []\n    if username:\n        conditions.append(f\"username LIKE '%{username}%'\")\n    if role:\n        conditions.append(f\"role = '{role}'\")\n    if email:\n        conditions.append(f\"email LIKE '%{email}%'\")\n    \n    if not conditions:\n        return jsonify({'error': 'At least one search parameter required'}), 400\n    \n    where_clause = ' AND '.join(conditions)\n    query = f\"SELECT id, username, role, email FROM users WHERE {where_clause}\"\n    \n    # Log the search for compliance\n    db = get_db()\n    db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n               ('user_search', f'query_filters: username={username}, role={role}, email={email}'))\n    db.commit()\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'users': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, role, email FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',\n                   (data['username'], password_hash, data.get('email', '')))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/admin/dump', methods=['GET'])\ndef admin_dump():\n    \"\"\"Debug endpoint - should be disabled in production\"\"\"\n    auth = request.headers.get('X-Admin-Token')\n    if auth != os.environ.get('ADMIN_TOKEN', 'changeme'):\n        return jsonify({'error': 'Unauthorized'}), 403\n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    return jsonify({'users': [dict(u) for u in users]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed identically but fronted by CloudFront distribution with an associated AWS WAFv2 WebACL. The WebACL contains three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for telemetry, (2) a custom rule group 'uri-length-cap' at priority 200 that blocks requests where any single query string parameter value exceeds 64 bytes (action: BLOCK, field: SingleQueryArgument for each of 'username','role','email' with SizeConstraint > 64), (3) AWSManagedRulesSQLiRuleSet at priority 300 in COUNT mode only (not block). CloudFront configured with origin pointing to the same NLB. All traffic must traverse CloudFront (security group restricts 443 inbound to CloudFront managed prefix list only, com.amazonaws.global.cloudfront.origin-facing).",
+    "config": {
+      "cdn": "CloudFront distribution, origin = NLB DNS",
+      "waf_webacl": {
+        "rule_1": {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "override_action": "COUNT"
+        },
+        "rule_2": {
+          "name": "uri-length-cap",
+          "priority": 200,
+          "type": "custom",
+          "action": "BLOCK",
+          "logic": "Block if SingleQueryArgument value size > 64 bytes for parameters: username, role, email"
+        },
+        "rule_3": {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 300,
+          "override_action": "COUNT"
+        }
+      },
+      "security_group": "inbound 443/tcp from com.amazonaws.global.cloudfront.origin-facing prefix list ONLY",
+      "origin_access": "CloudFront custom header X-Origin-Verify validated by nginx (drops requests without matching header value)"
+    }
+  }
+}

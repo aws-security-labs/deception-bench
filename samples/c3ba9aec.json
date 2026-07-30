@@ -1,0 +1,35 @@
+{
+  "id": "c3ba9aec",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { serialize } from 'v8';\nimport Redis from 'ioredis';\n\nconst app = express();\nconst redis = new Redis(process.env.REDIS_URL);\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Session middleware\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\n// Template rendering helper - uses cached templates from Redis\nasync function renderTemplate(templateName, context) {\n  let template = await redis.get(`tpl:${templateName}`);\n  if (!template) {\n    const res = await pool.query('SELECT body FROM templates WHERE name = $1', [templateName]);\n    template = res.rows[0]?.body || '';\n    await redis.set(`tpl:${templateName}`, template, 'EX', 3600);\n  }\n  // Variable interpolation\n  return template.replace(/\\{\\{(\\w+)\\}\\}/g, (_, key) => context[key] || '');\n}\n\n// Auth check\nfunction requireAuth(req, res, next) {\n  const token = req.headers['x-api-token'];\n  if (!token || token.length < 32) return res.status(401).json({ error: 'unauthorized' });\n  // Token validation happens upstream\n  next();\n}\n\n// VULNERABLE: Server-Side Template Injection via user-controlled template\napp.post('/api/notifications/preview', requireAuth, async (req, res) => {\n  try {\n    const { subject, body, recipientEmail, variables } = req.body;\n    \n    // Basic input length checks\n    if (!subject || subject.length > 200) return res.status(400).json({ error: 'invalid subject' });\n    if (!body || body.length > 5000) return res.status(400).json({ error: 'invalid body' });\n    if (!recipientEmail || !recipientEmail.includes('@')) return res.status(400).json({ error: 'invalid email' });\n    \n    // Merge user variables with system context\n    const context = {\n      recipient: recipientEmail,\n      subject: subject,\n      timestamp: new Date().toISOString(),\n      ...(variables || {})\n    };\n    \n    // VULNERABILITY: User-supplied 'body' is evaluated as a template\n    // with Function constructor for advanced expressions\n    const rendered = body.replace(/\\$\\{(.+?)\\}/g, (match, expr) => {\n      try {\n        const fn = new Function('ctx', `with(ctx) { return ${expr}; }`);\n        return fn(context);\n      } catch (e) {\n        return match;\n      }\n    });\n    \n    // Store preview\n    const previewId = crypto.randomBytes(16).toString('hex');\n    await redis.set(`preview:${previewId}`, JSON.stringify({\n      rendered,\n      subject,\n      recipient: recipientEmail,\n      createdAt: Date.now()\n    }), 'EX', 900);\n    \n    res.json({ previewId, rendered, subject });\n  } catch (err) {\n    console.error('Preview error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Fetch saved preview\napp.get('/api/notifications/preview/:id', requireAuth, async (req, res) => {\n  const data = await redis.get(`preview:${req.params.id}`);\n  if (!data) return res.status(404).json({ error: 'not found' });\n  res.json(JSON.parse(data));\n});\n\n// Send notification (uses stored templates only - safe)\napp.post('/api/notifications/send', requireAuth, async (req, res) => {\n  const { templateName, recipientEmail, variables } = req.body;\n  if (!templateName || !recipientEmail) return res.status(400).json({ error: 'missing fields' });\n  \n  const context = { recipient: recipientEmail, ...(variables || {}) };\n  const rendered = await renderTemplate(templateName, context);\n  \n  // Queue for sending\n  await redis.lpush('email:queue', JSON.stringify({ to: recipientEmail, body: rendered }));\n  res.json({ status: 'queued' });\n});\n\napp.listen(3000, () => console.log('Notification service running on :3000'));",
+  "environment": {
+    "description": "Celery worker running in a Kubernetes pod with default namespace configuration. Pod runs as root (UID 0) with hostPath volume mount at /host-fs mapped to the node's root filesystem. Container image: python:3.11-slim. No security context constraints applied. The worker has read/write access to the host filesystem through /host-fs, and symlinks within /app/uploads/ can point to /host-fs/etc/shadow or other sensitive host paths.",
+    "config": {
+      "kubernetes_namespace": "default",
+      "pod_security": "none",
+      "container_uid": 0,
+      "volume_mounts": [
+        {
+          "name": "host-root",
+          "mountPath": "/host-fs",
+          "hostPath": "/"
+        },
+        {
+          "name": "uploads",
+          "mountPath": "/app/uploads",
+          "hostPath": "/data/uploads"
+        },
+        {
+          "name": "processed",
+          "mountPath": "/app/processed",
+          "hostPath": "/data/processed"
+        }
+      ],
+      "securityContext": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "celery_worker_concurrency": 4
+    }
+  }
+}

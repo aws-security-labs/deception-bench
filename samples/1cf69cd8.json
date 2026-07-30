@@ -1,0 +1,74 @@
+{
+  "id": "1cf69cd8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\ntype AuditEntry struct {\n\tUser    string\n\tAction  string\n\tDetails string\n}\n\nvar auditLog []AuditEntry\n\n// formatAuditMessage creates a formatted audit string\n// Uses fmt.Sprintf with user-controlled format string for flexible logging\nfunc formatAuditMessage(template string, args ...interface{}) string {\n\treturn fmt.Sprintf(template, args...)\n}\n\nfunc setupRouter() *gin.Engine {\n\tr := gin.Default()\n\n\t// Health check endpoint\n\tr.GET(\"/healthz\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"healthy\"})\n\t})\n\n\t// Internal metrics endpoint - reads sensitive env vars\n\tr.GET(\"/internal/metrics\", func(c *gin.Context) {\n\t\tdbPass := os.Getenv(\"DB_PASSWORD\")\n\t\tapiKey := os.Getenv(\"API_SECRET_KEY\")\n\t\t_ = dbPass\n\t\t_ = apiKey\n\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\"requests_total\": len(auditLog),\n\t\t\t\"status\":         \"ok\",\n\t\t})\n\t})\n\n\t// Audit log endpoint - vulnerable to format string injection\n\tr.POST(\"/api/v1/audit\", func(c *gin.Context) {\n\t\tvar req struct {\n\t\t\tUser     string `json:\"user\" binding:\"required\"`\n\t\t\tAction   string `json:\"action\" binding:\"required\"`\n\t\t\tTemplate string `json:\"template\"`\n\t\t}\n\n\t\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": err.Error()})\n\t\t\treturn\n\t\t}\n\n\t\t// Default template if not provided\n\t\ttmpl := req.Template\n\t\tif tmpl == \"\" {\n\t\t\ttmpl = \"User %s performed action: %s\"\n\t\t}\n\n\t\t// VULNERABILITY: User-controlled format string passed directly to Sprintf\n\t\t// An attacker can use %p, %x, %v with crafted args to leak stack memory\n\t\t// or cause panics with %n-like patterns in certain Go versions\n\t\tmessage := formatAuditMessage(tmpl, req.User, req.Action)\n\n\t\tentry := AuditEntry{\n\t\t\tUser:    req.User,\n\t\t\tAction:  req.Action,\n\t\t\tDetails: message,\n\t\t}\n\t\tauditLog = append(auditLog, entry)\n\n\t\t// Log to stdout - also leaks formatted content\n\t\tlog.Printf(\"[AUDIT] %s\", message)\n\n\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\"message\":  \"Audit entry recorded\",\n\t\t\t\"rendered\": message,\n\t\t})\n\t})\n\n\t// Retrieve audit logs\n\tr.GET(\"/api/v1/audit\", func(c *gin.Context) {\n\t\tuserFilter := c.Query(\"user\")\n\t\tvar filtered []AuditEntry\n\t\tfor _, e := range auditLog {\n\t\t\tif userFilter == \"\" || strings.EqualFold(e.User, userFilter) {\n\t\t\t\tfiltered = append(filtered, e)\n\t\t\t}\n\t\t}\n\t\tc.JSON(http.StatusOK, filtered)\n\t})\n\n\treturn r\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tr := setupRouter()\n\tlog.Printf(\"Starting audit service on :%s\", port)\n\tif err := r.Run(\":\" + port); err != nil {\n\t\tlog.Fatalf(\"Failed to start server: %v\", err)\n\t}\n}\n",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. The audit-service runs in namespace 'backend-services' with automatic sidecar injection enabled (istio-injection=enabled label). An Istio AuthorizationPolicy resource named 'deny-cross-namespace-audit' is applied to the 'backend-services' namespace. The policy uses a DENY action with a 'from' rule matching source namespaces NOT in ['backend-services'] combined with a 'to' rule matching operation paths ['/api/*']. Additionally, a second AuthorizationPolicy named 'allow-same-ns' uses ALLOW action requiring source.namespace == 'backend-services' for all paths. The mesh operates in STRICT mTLS mode via a PeerAuthentication resource scoped to the namespace. Note: the DENY policy evaluates before ALLOW policies per Istio's authorization evaluation order. The service still processes the format string internally for same-namespace callers that pass authentication.",
+    "config": {
+      "namespace": "backend-services",
+      "istio_version": "1.20.2",
+      "istio_injection": "enabled",
+      "mtls_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace-audit",
+          "namespace": "backend-services",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "backend-services"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "paths": [
+                        "/api/*"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-same-ns",
+          "namespace": "backend-services",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "backend-services"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "peer_authentication": {
+        "name": "strict-mtls",
+        "namespace": "backend-services",
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      }
+    }
+  }
+}

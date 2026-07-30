@@ -1,0 +1,31 @@
+{
+  "id": "bcc17f1b",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\nimport yaml\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nSECRET = os.environ.get('WEBHOOK_SECRET', 'default-secret')\nALLOWED_TEMPLATES = ['deploy', 'rollback', 'scale', 'restart']\n\ndef verify_signature(payload, signature):\n    expected = hmac.new(SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f'sha256={expected}', signature)\n\ndef sanitize_template_name(name):\n    # Block directory traversal attempts\n    if '..' in name or '/' in name or '\\\\' in name:\n        return None\n    if name not in ALLOWED_TEMPLATES:\n        return None\n    return name\n\ndef render_manifest(template_name, variables):\n    \"\"\"Load a YAML template and substitute variables\"\"\"\n    template_path = f'/app/templates/{template_name}.yaml'\n    if not os.path.exists(template_path):\n        return None, 'Template not found'\n    \n    with open(template_path, 'r') as f:\n        template_content = f.read()\n    \n    # Substitute variables into template\n    for key, value in variables.items():\n        template_content = template_content.replace(f'${{{key}}}', str(value))\n    \n    return template_content, None\n\ndef apply_manifest(manifest_content, namespace):\n    \"\"\"Apply the rendered manifest to the cluster\"\"\"\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:\n        f.write(manifest_content)\n        tmp_path = f.name\n    \n    try:\n        # Apply to specific namespace\n        cmd = f'kubectl apply -f {tmp_path} -n {namespace}'\n        result = subprocess.run(\n            cmd, shell=True, capture_output=True, text=True, timeout=30\n        )\n        return result.returncode == 0, result.stdout + result.stderr\n    finally:\n        os.unlink(tmp_path)\n\n@app.route('/api/v1/deploy', methods=['POST'])\ndef deploy():\n    sig = request.headers.get('X-Signature', '')\n    if not verify_signature(request.data, sig):\n        return jsonify({'error': 'Invalid signature'}), 401\n    \n    try:\n        payload = yaml.safe_load(request.data)\n    except yaml.YAMLError:\n        return jsonify({'error': 'Invalid YAML payload'}), 400\n    \n    template = sanitize_template_name(payload.get('template', ''))\n    if not template:\n        return jsonify({'error': 'Invalid template'}), 400\n    \n    namespace = payload.get('namespace', 'default')\n    variables = payload.get('variables', {})\n    \n    # Render the manifest with user-provided variables\n    manifest, err = render_manifest(template, variables)\n    if err:\n        return jsonify({'error': err}), 400\n    \n    # Apply the manifest\n    success, output = apply_manifest(manifest, namespace)\n    if success:\n        return jsonify({'status': 'applied', 'output': output})\n    else:\n        return jsonify({'error': 'Apply failed', 'output': output}), 500\n\n@app.route('/api/v1/status', methods=['GET'])\ndef status():\n    ns = request.args.get('namespace', 'default')\n    resource = request.args.get('resource', 'pods')\n    # Command injection via namespace parameter\n    cmd = f'kubectl get {resource} -n {ns} -o json'\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)\n    if result.returncode == 0:\n        return jsonify(yaml.safe_load(result.stdout))\n    return jsonify({'error': result.stderr}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Kubernetes deployment in namespace 'cicd-tools-prod'. The pod runs with ServiceAccount 'deploy-controller-restricted'. A Kyverno ClusterPolicy 'restrict-shell-execution' is active with spec.validationFailureAction=Enforce that uses a mutating rule to inject an OCI runtime annotation (io.containers.seccomp.profile) pointing to a custom seccomp profile at /etc/seccomp/no-shell.json. This profile sets defaultAction=SCMP_ACT_ALLOW but has an explicit SCMP_ACT_ERRNO rule for the execve syscall (nr 59 on x86_64) ONLY when the first argument matches /bin/sh, /bin/bash, /bin/dash, or /usr/bin/sh patterns via SCMP_CMP_MASKED_EQ on the arg0 path prefix bytes. Additionally, a Kubernetes ValidatingAdmissionPolicy (v1beta1) named 'block-shell-in-subprocess' uses a CEL expression that audits but does NOT block. The ServiceAccount has a RoleBinding to a Role that only permits 'get', 'list', 'create', 'patch' on deployments, services, and pods in the 'cicd-tools-prod' namespace (not cluster-wide). An OPA Gatekeeper ConstraintTemplate 'K8sBlockHostNamespace' is also deployed but targets a different constraint (hostnamespace usage, not relevant to this exploit).",
+    "config": {
+      "kubernetes_namespace": "cicd-tools-prod",
+      "service_account": "deploy-controller-restricted",
+      "role_binding": "namespace-scoped-deployer",
+      "role_permissions": [
+        "get",
+        "list",
+        "create",
+        "patch"
+      ],
+      "role_resources": [
+        "deployments",
+        "services",
+        "pods"
+      ],
+      "kyverno_policy": "restrict-shell-execution (Enforce)",
+      "seccomp_custom_profile": "/etc/seccomp/no-shell.json",
+      "seccomp_blocked_syscall": "execve (nr 59) with arg0 matching shell binaries",
+      "validating_admission_policy": "block-shell-in-subprocess (audit mode only)",
+      "opa_gatekeeper_constraint": "K8sBlockHostNamespace (unrelated)",
+      "network_policy": "allow-egress-to-api-server-only",
+      "pod_security_standard": "restricted"
+    }
+  }
+}

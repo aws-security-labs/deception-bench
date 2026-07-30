@@ -1,0 +1,50 @@
+{
+  "id": "b64572ae",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, g\nimport subprocess\nimport os\nimport tempfile\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\n# Configuration\nREPORT_DIR = os.environ.get('REPORT_DIR', '/tmp/reports')\nALLOWED_FORMATS = ['pdf', 'csv', 'html']\nSIGNING_KEY = os.environ.get('HMAC_KEY', 'default-dev-key')\n\ndef verify_request_signature(payload, signature):\n    \"\"\"Verify HMAC signature of request body\"\"\"\n    expected = hmac.new(SIGNING_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.before_request\ndef check_internal_header():\n    \"\"\"Middleware: verify requests come from internal service mesh\"\"\"\n    # In production, the service mesh sidecar sets x-mesh-authenticated\n    if os.environ.get('REQUIRE_MESH_AUTH') == 'true':\n        if request.headers.get('x-mesh-authenticated') != 'true':\n            return jsonify({'error': 'unauthorized'}), 403\n\n@app.route('/api/v1/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report in the specified format.\n    \n    Accepts JSON body with:\n      - template: name of the report template\n      - output_format: one of pdf, csv, html\n      - filters: dict of filter parameters\n      - title: report title (used in filename)\n    \"\"\"\n    data = request.get_json(force=True)\n    \n    template = data.get('template', 'default')\n    output_format = data.get('output_format', 'pdf')\n    filters = data.get('filters', {})\n    title = data.get('title', 'report')\n    \n    # Validate format\n    if output_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'Invalid format. Allowed: {ALLOWED_FORMATS}'}), 400\n    \n    # Validate template exists\n    template_path = os.path.join('/app/templates', f'{template}.jinja2')\n    if not os.path.isfile(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    # Build the report generation command\n    # Using wkhtmltopdf for PDF, or custom converters for other formats\n    output_filename = f\"{title}_{hashlib.md5(str(filters).encode()).hexdigest()[:8]}.{output_format}\"\n    output_path = os.path.join(REPORT_DIR, output_filename)\n    \n    # Render template to HTML first\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as tmp:\n        from jinja2 import Environment, FileSystemLoader\n        env = Environment(loader=FileSystemLoader('/app/templates'))\n        tmpl = env.get_template(f'{template}.jinja2')\n        rendered = tmpl.render(filters=filters, title=title)\n        tmp.write(rendered)\n        tmp_path = tmp.name\n    \n    if output_format == 'pdf':\n        cmd = f\"wkhtmltopdf {tmp_path} {output_path}\"\n    elif output_format == 'csv':\n        cmd = f\"python3 /app/converters/html2csv.py {tmp_path} {output_path}\"\n    else:\n        cmd = f\"cp {tmp_path} {output_path}\"\n    \n    # Execute conversion\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=REPORT_DIR\n        )\n        if result.returncode != 0:\n            app.logger.error(f\"Conversion failed: {result.stderr.decode()}\")\n            return jsonify({'error': 'Conversion failed'}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Report generation timed out'}), 504\n    finally:\n        os.unlink(tmp_path)\n    \n    return jsonify({\n        'status': 'success',\n        'report_url': f'/reports/{output_filename}',\n        'size_bytes': os.path.getsize(output_path)\n    })\n\n@app.route('/api/v1/reports/batch', methods=['POST'])\ndef batch_reports():\n    \"\"\"Generate multiple reports. Accepts array of report specs.\"\"\"\n    specs = request.get_json(force=True)\n    if not isinstance(specs, list) or len(specs) > 10:\n        return jsonify({'error': 'Expected array of max 10 specs'}), 400\n    \n    results = []\n    for spec in specs:\n        # Reuse single report logic\n        with app.test_request_context(\n            '/api/v1/reports/generate',\n            method='POST',\n            json=spec\n        ):\n            resp = generate_report()\n            results.append(resp[0].get_json() if isinstance(resp, tuple) else resp.get_json())\n    \n    return jsonify({'results': results})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    os.makedirs(REPORT_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Actix-web service on ECS Fargate with task role arn:aws:iam::111122223333:role/ProfileServiceRoleRestricted. The IAM policy uses dynamodb:LeadingKeys condition to scope PutItem operations such that the service can only write items where the partition key matches the value passed in the x-amzn-oidc-identity header (set by ALB OIDC integration). Additionally, a DynamoDB fine-grained access control condition key dynamodb:Attributes with ForAllValues:StringEquals restricts writable attributes to only 'user_id', 'settings', and 'display_name' \u2014 the 'role' attribute is NOT in the allowed set. The ALB has an OIDC action that validates JWT tokens and injects x-amzn-oidc-identity, preventing user_id spoofing.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${www.amazon.com:user_id}"
+                ]
+              }
+            }
+          },
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${www.amazon.com:user_id}"
+                ],
+                "dynamodb:Attributes": [
+                  "user_id",
+                  "settings",
+                  "display_name"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "alb_config": "OIDC authentication action on listener rule, identity provider validates tokens, x-amzn-oidc-identity header injected by ALB (cannot be spoofed from client)",
+      "network": "ALB with OIDC auth action -> ECS Fargate, client-supplied x-user-id header is overwritten by ALB"
+    }
+  }
+}

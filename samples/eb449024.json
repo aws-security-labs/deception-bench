@@ -1,0 +1,36 @@
+{
+  "id": "eb449024",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.Pattern;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Allow alphanumeric, spaces, hyphens, and common punctuation\n    private static final Pattern DISPLAY_SANITIZER = Pattern.compile(\"[<>\\\"'&]\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate date format\n        if (!startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\") || \n            !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Validate sort column against whitelist\n        String[] allowedSorts = {\"created_at\", \"amount\", \"customer_name\", \"status\"};\n        String validatedSort = \"created_at\";\n        if (sortCol != null) {\n            for (String allowed : allowedSorts) {\n                if (allowed.equals(sortCol)) {\n                    validatedSort = sortCol;\n                    break;\n                }\n            }\n        }\n        \n        String query = buildQuery(reportType, startDate, endDate, validatedSort, customFilter);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"text/html; charset=UTF-8\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"<html><body><table>\");\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            out.println(\"<tr>\");\n            for (int i = 1; i <= cols; i++) {\n                out.println(\"<th>\" + sanitizeDisplay(meta.getColumnName(i)) + \"</th>\");\n            }\n            out.println(\"</tr>\");\n            \n            while (rs.next()) {\n                out.println(\"<tr>\");\n                for (int i = 1; i <= cols; i++) {\n                    out.println(\"<td>\" + sanitizeDisplay(rs.getString(i)) + \"</td>\");\n                }\n                out.println(\"</tr>\");\n            }\n            out.println(\"</table></body></html>\");\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private String buildQuery(String reportType, String start, String end, \n                              String sort, String customFilter) {\n        StringBuilder sb = new StringBuilder();\n        \n        switch (reportType) {\n            case \"sales\":\n                sb.append(\"SELECT id, customer_name, amount, status, created_at FROM orders\");\n                break;\n            case \"inventory\":\n                sb.append(\"SELECT sku, product_name, quantity, warehouse FROM inventory\");\n                break;\n            default:\n                sb.append(\"SELECT id, description, created_at FROM audit_log\");\n        }\n        \n        sb.append(\" WHERE created_at BETWEEN '\" + start + \"' AND '\" + end + \"'\");\n        \n        // Custom filter - appended directly for flexible reporting\n        if (customFilter != null && !customFilter.isEmpty()) {\n            sb.append(\" AND \" + customFilter);\n        }\n        \n        sb.append(\" ORDER BY \" + sort + \" DESC LIMIT 1000\");\n        \n        return sb.toString();\n    }\n    \n    private String sanitizeDisplay(String input) {\n        if (input == null) return \"\";\n        return DISPLAY_SANITIZER.matcher(input).replaceAll(\"\");\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.27 cluster running migration jobs as privileged containers with hostPath volume mounts. The migration pod spec uses `securityContext.privileged: true` and mounts the host filesystem at /host. Container runs as root (UID 0). No PodSecurityPolicy or Pod Security Standards enforcement. The MIGRATION_DIR environment variable is set to '/host/etc' allowing zip slip traversal to write arbitrary files to the host node filesystem (e.g., overwriting /etc/crontab, /etc/shadow, or injecting into /etc/kubernetes/manifests for static pod execution).",
+    "config": {
+      "kubernetes_version": "1.27",
+      "pod_security_admission": "disabled",
+      "pod_security_policy": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0,
+        "allowPrivilegeEscalation": true
+      },
+      "volumes": [
+        {
+          "name": "host-fs",
+          "hostPath": {
+            "path": "/",
+            "type": "Directory"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-fs",
+          "mountPath": "/host"
+        }
+      ],
+      "env": {
+        "MIGRATION_DIR": "/host/etc"
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "id": "4682d894",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nAPI_SECRET = os.environ.get('API_SECRET', 'changeme')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\ndef verify_request_signature(payload, signature):\n    \"\"\"Verify HMAC signature for webhook requests\"\"\"\n    expected = hmac.new(API_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria. Supports filtering.\"\"\"\n    username = request.args.get('username', '')\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    page = request.args.get('page', '1')\n    \n    # Build dynamic query based on provided filters\n    base_query = \"SELECT id, username, email, department, role FROM users WHERE 1=1\"\n    conditions = []\n    \n    if username:\n        conditions.append(f\" AND username LIKE '%{username}%'\")\n    if department:\n        conditions.append(f\" AND department = '{department}'\")\n    if role:\n        conditions.append(f\" AND role = '{role}'\")\n    \n    # Pagination\n    try:\n        page_num = int(page)\n        offset = (page_num - 1) * 25\n    except ValueError:\n        offset = 0\n    \n    final_query = base_query + ''.join(conditions) + f\" ORDER BY username LIMIT 25 OFFSET {offset}\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(final_query)\n        rows = cur.fetchall()\n        results = [\n            {'id': r[0], 'username': r[1], 'email': r[2], 'department': r[3], 'role': r[4]}\n            for r in rows\n        ]\n        cur.close()\n        conn.close()\n        return jsonify({'results': results, 'page': page_num})\n    except Exception as e:\n        app.logger.error(f\"Query failed: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/v1/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID\"\"\"\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, username, email, department, role FROM users WHERE id = %s\", (user_id,))\n    row = cur.fetchone()\n    cur.close()\n    conn.close()\n    if row:\n        return jsonify({'id': row[0], 'username': row[1], 'email': row[2], 'department': row[3], 'role': row[4]})\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/v1/reports/export', methods=['POST'])\ndef export_report():\n    \"\"\"Export filtered user report - admin only\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    data = request.get_json()\n    filter_field = data.get('filter_field', 'department')\n    filter_value = data.get('filter_value', '')\n    \n    # Only allow filtering on specific fields\n    allowed_fields = ['department', 'role', 'username']\n    if filter_field not in allowed_fields:\n        return jsonify({'error': 'Invalid filter field'}), 400\n    \n    query = f\"SELECT id, username, email, department, role FROM users WHERE {filter_field} = '{filter_value}'\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        cur.close()\n        conn.close()\n        return jsonify({'count': len(rows), 'data': rows})\n    except Exception as e:\n        app.logger.error(f\"Export failed: {e}\")\n        return jsonify({'error': 'Export failed'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "ECS Fargate task running with default configuration. Container image based on python:3.11-slim. Task role has read access to S3 buckets. Container filesystem includes /etc/shadow, /proc/self/environ with AWS credentials, and mounted EFS volume at /mnt/shared containing application secrets. No additional filesystem isolation beyond standard container namespacing.",
+    "config": {
+      "ecs_task_definition": {
+        "networkMode": "awsvpc",
+        "containerDefinitions": [
+          {
+            "image": "python:3.11-slim",
+            "user": "root",
+            "mountPoints": [
+              {
+                "sourceVolume": "shared-efs",
+                "containerPath": "/mnt/shared"
+              }
+            ],
+            "environment": [
+              {
+                "name": "AWS_DEFAULT_REGION",
+                "value": "us-east-1"
+              },
+              {
+                "name": "EXTRACT_DIR",
+                "value": "/app/workspace"
+              },
+              {
+                "name": "OUTPUT_DIR",
+                "value": "/app/output"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "shared-efs",
+            "efsVolumeConfiguration": {
+              "fileSystemId": "fs-0abc123"
+            }
+          }
+        ]
+      },
+      "runtime": "standard Fargate 1.4.0"
+    }
+  }
+}

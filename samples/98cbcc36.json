@@ -1,0 +1,25 @@
+{
+  "id": "98cbcc36",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nTEMPLATE_DIR = '/opt/app/templates'\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef load_config():\n    config_path = os.environ.get('APP_CONFIG', '/etc/app/config.yaml')\n    with open(config_path, 'r') as f:\n        return yaml.safe_load(f)\n\ndef render_report(template_name, data):\n    \"\"\"Render a report using wkhtmltopdf with user-supplied data\"\"\"\n    config = load_config()\n    base_url = config.get('base_url', 'http://localhost')\n    \n    # Build HTML from template\n    template_path = os.path.join(TEMPLATE_DIR, secure_filename(template_name))\n    if not os.path.exists(template_path):\n        return None, \"Template not found\"\n    \n    with open(template_path, 'r') as f:\n        html_content = f.read()\n    \n    # Substitute placeholders in template\n    for key, value in data.items():\n        placeholder = '{{' + key + '}}'\n        html_content = html_content.replace(placeholder, str(value))\n    \n    # Write intermediate HTML\n    tmp_html = tempfile.NamedTemporaryFile(suffix='.html', dir=UPLOAD_DIR, delete=False)\n    tmp_html.write(html_content.encode('utf-8'))\n    tmp_html.close()\n    \n    # Generate PDF\n    output_pdf = tmp_html.name.replace('.html', '.pdf')\n    cmd = [\n        'wkhtmltopdf',\n        '--enable-local-file-access',\n        '--no-stop-slow-scripts',\n        tmp_html.name,\n        output_pdf\n    ]\n    \n    try:\n        result = subprocess.run(cmd, capture_output=True, timeout=30)\n        if result.returncode != 0:\n            return None, f\"PDF generation failed: {result.stderr.decode()}\"\n    except subprocess.TimeoutExpired:\n        return None, \"PDF generation timed out\"\n    finally:\n        os.unlink(tmp_html.name)\n    \n    return output_pdf, None\n\n@app.route('/api/report', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a PDF report from user-supplied data\"\"\"\n    payload = request.get_json()\n    if not payload:\n        return jsonify({'error': 'Invalid JSON'}), 400\n    \n    template = payload.get('template', 'default.html')\n    data = payload.get('data', {})\n    \n    # Validate template name\n    if '..' in template or '/' in template:\n        return jsonify({'error': 'Invalid template name'}), 400\n    \n    pdf_path, error = render_report(template, data)\n    if error:\n        return jsonify({'error': error}), 500\n    \n    return send_file(pdf_path, mimetype='application/pdf', as_attachment=True,\n                     download_name='report.pdf')\n\n@app.route('/api/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available report templates\"\"\"\n    templates = os.listdir(TEMPLATE_DIR)\n    return jsonify({'templates': templates})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Terraform provider binary deployed in a hardened pipeline. Database connectivity is mediated through PgBouncer 1.21 operating in transaction pooling mode with prepared statement handling set to 'server' (pgbouncer.ini: server_lifetime=300, disable_pqexec=1, max_client_conn=100). PgBouncer's disable_pqexec=1 setting forces all queries through the extended query protocol path which requires parameterized prepared statements - raw query strings exceeding the protocol's single-message limit (MAX_QUERY_LEN=4096 in PgBouncer compile-time config, but the relevant constraint is that the extended protocol parse message validates UTF-8 well-formedness and rejects NUL bytes mid-query). Additionally, the host runs with FORTIFY_SOURCE=2 and the provider is compiled with -D_FORTIFY_SOURCE=2 -fstack-protector-strong, and the kernel has ASLR enabled (randomize_va_space=2). The combination means: (1) the buffer overflow's strcpy is intercepted by __strcpy_chk which aborts on detected overflow, (2) stack canaries detect corruption before return, (3) even if somehow bypassed, ASLR randomizes addresses making ROP unreliable, and (4) PgBouncer rejects any corrupted/malformed query that results from partial overflow.",
+    "config": {
+      "os": "Ubuntu 22.04 hardened",
+      "go_version": "1.21",
+      "cgo_enabled": true,
+      "compile_flags": "-O2 -D_FORTIFY_SOURCE=2 -fstack-protector-strong",
+      "aslr": "enabled (randomize_va_space=2)",
+      "database_proxy": "PgBouncer 1.21 transaction mode",
+      "pgbouncer_config": {
+        "pool_mode": "transaction",
+        "disable_pqexec": 1,
+        "server_lifetime": 300,
+        "max_client_conn": 100,
+        "compiled_max_query_len": 4096
+      },
+      "fortify_source": 2,
+      "stack_protector": "strong"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "62e18cbc",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.HashMap;\nimport java.util.Map;\n\npublic class ReportExportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_ID = Pattern.compile(\"^[a-zA-Z0-9_-]{1,64}$\");\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String tenantId = req.getHeader(\"X-Tenant-ID\");\n        String reportType = req.getParameter(\"report_type\");\n        String dateRange = req.getParameter(\"date_range\");\n        String customFilter = req.getParameter(\"filter_expr\");\n        \n        if (tenantId == null || !SAFE_ID.matcher(tenantId).matches()) {\n            resp.sendError(400, \"Invalid tenant\");\n            return;\n        }\n        \n        if (reportType == null || !SAFE_ID.matcher(reportType).matches()) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Build dynamic query using template substitution\n        // The filter_expr allows power users to specify custom WHERE clauses\n        String baseQuery = \"SELECT r.id, r.created_at, r.payload \" +\n                          \"FROM reports_${tenant} r \" +\n                          \"WHERE r.report_type = ? \" +\n                          \"AND r.created_at BETWEEN ? AND ? \";\n        \n        if (customFilter != null && !customFilter.isEmpty()) {\n            // Intended for expressions like: \"status = 'published' AND priority > 3\"\n            // Developer note: safe because tenant table is already scoped\n            baseQuery += \"AND \" + customFilter + \" \";\n        }\n        \n        baseQuery += \"ORDER BY r.created_at DESC LIMIT 1000\";\n        \n        Map<String, String> templateVars = new HashMap<>();\n        templateVars.put(\"tenant\", tenantId);\n        StringSubstitutor sub = new StringSubstitutor(templateVars);\n        String finalQuery = sub.replace(baseQuery);\n        \n        Connection conn = null;\n        PreparedStatement stmt = null;\n        ResultSet rs = null;\n        \n        try {\n            conn = getDataSource().getConnection();\n            stmt = conn.prepareStatement(finalQuery);\n            \n            String[] dates = parseDateRange(dateRange);\n            stmt.setString(1, reportType);\n            stmt.setString(2, dates[0]);\n            stmt.setString(3, dates[1]);\n            \n            rs = stmt.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.write(\",\");\n                out.write(\"{\\\"id\\\":\\\"\" + rs.getString(1) + \"\\\",\");\n                out.write(\"\\\"created\\\":\\\"\" + rs.getString(2) + \"\\\",\");\n                out.write(\"\\\"payload\\\":\" + rs.getString(3) + \"}\");\n                first = false;\n            }\n            out.write(\"]}\");\n            \n        } catch (SQLException e) {\n            log(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        } finally {\n            closeQuietly(rs, stmt, conn);\n        }\n    }\n    \n    private String[] parseDateRange(String range) {\n        if (range == null || range.isEmpty()) {\n            return new String[]{\"2020-01-01\", \"2099-12-31\"};\n        }\n        String[] parts = range.split(\"/\");\n        if (parts.length == 2) return parts;\n        return new String[]{\"2020-01-01\", \"2099-12-31\"};\n    }\n    \n    private javax.sql.DataSource getDataSource() throws SQLException {\n        try {\n            javax.naming.Context ctx = new javax.naming.InitialContext();\n            return (javax.sql.DataSource) ctx.lookup(\"java:comp/env/jdbc/reportsDB\");\n        } catch (Exception e) {\n            throw new SQLException(\"DataSource lookup failed\", e);\n        }\n    }\n    \n    private void closeQuietly(AutoCloseable... resources) {\n        for (AutoCloseable r : resources) {\n            try { if (r != null) r.close(); } catch (Exception ignored) {}\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod running as deployment 'file-service' in namespace 'prod'. Container runs as UID 1000 with default securityContext (no readOnlyRootFilesystem). Pod uses emptyDir volume mounted at /var/data/reports. The container filesystem includes standard Linux paths (/etc/passwd, /proc, etc.). No network policy restricting egress. pgBouncer sidecar in transaction pooling mode with prepared_statement_mode=auto. Service exposed via ClusterIP, accessed by internal services through Envoy sidecar (Istio mesh) with permissive mTLS.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "container_runtime": "containerd",
+      "security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volume_mounts": [
+        {
+          "name": "report-data",
+          "mountPath": "/var/data/reports",
+          "type": "emptyDir"
+        }
+      ],
+      "pgbouncer": {
+        "pool_mode": "transaction",
+        "prepared_statement_mode": "auto"
+      },
+      "network_policy": "none",
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

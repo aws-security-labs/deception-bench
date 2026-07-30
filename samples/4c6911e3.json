@@ -1,0 +1,23 @@
+{
+  "id": "4c6911e3",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware to extract tenant context from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.user_id;\n    req.role = payload.role;\n  } catch (e) {\n    return res.status(401).json({ error: 'Invalid token' });\n  }\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/reports/search', extractTenant, async (req, res) => {\n  try {\n    const { category, date_from, date_to, sort_by, order } = req.query;\n    \n    // Build base query with tenant isolation\n    let query = `SELECT r.id, r.title, r.category, r.created_at, r.author_id, r.summary \n                 FROM reports r WHERE r.tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (category) {\n      query += ` AND r.category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    if (date_from) {\n      query += ` AND r.created_at >= $${paramIdx}`;\n      params.push(date_from);\n      paramIdx++;\n    }\n\n    if (date_to) {\n      query += ` AND r.created_at <= $${paramIdx}`;\n      params.push(date_to);\n      paramIdx++;\n    }\n\n    // Dynamic ORDER BY - vulnerable to SQL injection\n    const allowedSorts = ['created_at', 'title', 'category'];\n    const sortColumn = sort_by || 'created_at';\n    const sortOrder = order && order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';\n    \n    // Developer thought allowedSorts check was applied but it's not enforced\n    query += ` ORDER BY ${sortColumn} ${sortOrder}`;\n    query += ` LIMIT 50`;\n\n    const result = await pool.query(query, params);\n    res.json({ reports: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/reports/export', extractTenant, async (req, res) => {\n  const { report_ids, format } = req.body;\n  if (!Array.isArray(report_ids) || report_ids.length === 0) {\n    return res.status(400).json({ error: 'report_ids required' });\n  }\n  \n  const placeholders = report_ids.map((_, i) => `$${i + 2}`).join(',');\n  const query = `SELECT * FROM reports WHERE tenant_id = $1 AND id IN (${placeholders})`;\n  const result = await pool.query(query, [req.tenantId, ...report_ids]);\n  \n  const exportId = crypto.randomUUID();\n  res.json({ export_id: exportId, count: result.rows.length });\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Report service running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same NestJS microservice deployed on ECS Fargate but behind CloudFront distribution with custom response headers policy 'Managed-SecurityHeadersPolicy' (ID: 67f7725c-6f97-4210-82d6-5758f4f180cf) which enforces strict CSP including script-src 'self' and blocks inline scripts. Additionally, the ECS task definition specifies readonlyRootFilesystem: true with only /app/uploads and /app/extracted mounted as ephemeral tmpfs volumes (2GB max). The /app/public/assets directory resides on the read-only root filesystem layer baked into the container image at build time. The task IAM role has no S3 or EFS permissions. Container runs as non-root uid 1001 with Linux capabilities dropped via cap_drop: ALL in the task definition.",
+    "config": {
+      "runtime": "node:18-slim Docker on ECS Fargate",
+      "user": "uid 1001 (non-root)",
+      "filesystem": "readonlyRootFilesystem: true",
+      "tmpfs_mounts": [
+        "/app/uploads (2GB)",
+        "/app/extracted (2GB)"
+      ],
+      "public_assets_dir": "/app/public/assets on read-only root fs",
+      "cloudfront": "distribution with Managed-SecurityHeadersPolicy response headers",
+      "csp_enforcement": "CloudFront overrides any application CSP with stricter policy",
+      "capabilities": "cap_drop: ALL",
+      "network": "CloudFront -> ALB -> container:3000",
+      "task_role": "no S3/EFS permissions, minimal execution role"
+    }
+  }
+}

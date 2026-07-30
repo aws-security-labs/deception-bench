@@ -1,0 +1,45 @@
+{
+  "id": "40a3cc63",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (1, 'admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (2, 'svc-readonly', 'svc@corp.internal', 'readonly', 'sk-svc-1a2b3c4d')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef authenticate():\n    key = request.headers.get('X-API-Key')\n    if not key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    g.current_user = dict(user)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Restrict searchable fields to prevent schema enumeration\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    db.execute('INSERT INTO audit_log (action, details) VALUES (?, ?)',\n               ('search', f'user={g.current_user[\"username\"]} field={field} q={value}'))\n    db.commit()\n    \n    # Build query - field is validated against allowlist above\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/me', methods=['GET'])\ndef get_me():\n    return jsonify({\n        'username': g.current_user['username'],\n        'email': g.current_user['email'],\n        'role': g.current_user['role']\n    })\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with two rule groups: (1) AWSManagedRulesCommonRuleSet with default action, and (2) a custom rule group 'corp-query-inspection' containing a RegexMatchStatement on query string values with pattern '(?i)(?:union\\s+select|;\\s*(?:drop|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d|\\x27|%27)' in BLOCK mode at priority 1. Additionally, the ECS task role has no network egress (VPC with no NAT gateway, no internet gateway on the subnet, security group egress limited to port 443 to the S3 VPC endpoint only), preventing any out-of-band data exfiltration. The task's ephemeral storage is encrypted and the container runs read-only root filesystem with /var/lib/app mounted as a tmpfs volume.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "wafv2_web_acl": {
+        "rule_groups": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 10,
+            "override_action": "none"
+          },
+          {
+            "name": "corp-query-inspection",
+            "priority": 1,
+            "rules": [
+              {
+                "name": "block-sqli-patterns",
+                "statement": {
+                  "type": "RegexMatchStatement",
+                  "field": "QUERY_STRING",
+                  "regex": "(?i)(?:union\\s+select|;\\s*(?:drop|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d|\\x27|%27)"
+                },
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "network": {
+        "vpc_subnet": "private, no NAT gateway, no IGW",
+        "security_group_egress": "443 to S3 VPC endpoint only",
+        "dns": "VPC internal resolver only"
+      },
+      "ecs_task": {
+        "readonly_root_fs": true,
+        "ephemeral_storage_encrypted": true,
+        "tmpfs_mount": "/var/lib/app"
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "28ca3e2a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\n\t_ \"github.com/lib/pq\"\n)\n\n// TerraformProviderBackend handles state storage and resource queries\n// for a custom Terraform provider that manages internal infrastructure.\ntype TerraformProviderBackend struct {\n\tdb       *sql.DB\n\tcacheDir string\n}\n\nfunc NewBackend(dsn string) (*TerraformProviderBackend, error) {\n\tdb, err := sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tcacheDir := os.Getenv(\"TF_PROVIDER_CACHE_DIR\")\n\tif cacheDir == \"\" {\n\t\tcacheDir = \"/var/lib/terraform-provider/cache\"\n\t}\n\treturn &TerraformProviderBackend{db: db, cacheDir: cacheDir}, nil\n}\n\n// ReadResource fetches resource state by name, caches result to local file\n// for offline plan operations. The resource_name parameter comes from\n// Terraform's planning phase and represents the resource address.\nfunc (b *TerraformProviderBackend) ReadResource(w http.ResponseWriter, r *http.Request) {\n\tresourceName := r.URL.Query().Get(\"resource_name\")\n\tworkspace := r.URL.Query().Get(\"workspace\")\n\n\tif resourceName == \"\" || workspace == \"\" {\n\t\thttp.Error(w, \"missing required parameters\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - resource_name is from terraform plan, considered internal\n\t// Note: workspace is validated but resource_name passes through for\n\t// flexibility with complex resource addressing (module paths, indexes)\n\tquery := fmt.Sprintf(\n\t\t\"SELECT state_json FROM tf_resources WHERE resource_name = '%s' AND workspace = $1\",\n\t\tresourceName,\n\t)\n\n\tvar stateJSON string\n\terr := b.db.QueryRow(query, workspace).Scan(&stateJSON)\n\tif err != nil {\n\t\tif err == sql.ErrNoRows {\n\t\t\thttp.Error(w, \"resource not found\", http.StatusNotFound)\n\t\t\treturn\n\t\t}\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Cache the result for offline plan operations\n\tcacheFile := filepath.Join(b.cacheDir, workspace, resourceName+\".json\")\n\tcacheSubdir := filepath.Dir(cacheFile)\n\tif err := os.MkdirAll(cacheSubdir, 0755); err != nil {\n\t\tlog.Printf(\"cache dir creation failed (non-fatal): %v\", err)\n\t} else {\n\t\tif err := ioutil.WriteFile(cacheFile, []byte(stateJSON), 0644); err != nil {\n\t\t\tlog.Printf(\"cache write failed (non-fatal): %v\", err)\n\t\t}\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(stateJSON))\n}\n\n// ImportResource handles terraform import operations\nfunc (b *TerraformProviderBackend) ImportResource(w http.ResponseWriter, r *http.Request) {\n\tresourceID := r.URL.Query().Get(\"id\")\n\tresourceType := r.URL.Query().Get(\"type\")\n\n\tif resourceID == \"\" || resourceType == \"\" {\n\t\thttp.Error(w, \"missing parameters\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Import query also uses string formatting for resource type\n\t// since types are from provider schema (trusted)\n\tquery := fmt.Sprintf(\n\t\t\"SELECT state_json FROM tf_imported WHERE resource_type = '%s' AND external_id = $1\",\n\t\tresourceType,\n\t)\n\n\tvar stateJSON string\n\terr := b.db.QueryRow(query, resourceID).Scan(&stateJSON)\n\tif err != nil {\n\t\thttp.Error(w, \"import failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(stateJSON))\n}\n\nfunc main() {\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tif dsn == \"\" {\n\t\tlog.Fatal(\"DATABASE_URL required\")\n\t}\n\n\tbackend, err := NewBackend(dsn)\n\tif err != nil {\n\t\tlog.Fatalf(\"failed to initialize backend: %v\", err)\n\t}\n\n\thttp.HandleFunc(\"/v1/resource/read\", backend.ReadResource)\n\thttp.HandleFunc(\"/v1/resource/import\", backend.ImportResource)\n\n\tlog.Println(\"terraform provider backend listening on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}",
+  "environment": {
+    "description": "Container deployed via internal platform team's hardened base image (gcr.io/infra-secured/distroless-go:nonroot). Pod spec includes securityContext with readOnlyRootFilesystem: true. No emptyDir, tmpfs, or PVC volumes are mounted. The container's ephemeral storage is entirely immutable. The PostgreSQL connection uses a connection pooler (PgBouncer) configured in transaction mode with a prepared statement cache that rejects queries containing single-quote characters outside of dollar-quoted strings (custom pgbouncer patch from internal fork at commit 3a8f1e2, applied via the pool_mode=transaction and custom_sanitize_mode=strict settings). The database user granted to the application has SECURITY LABEL 'restricted_interpolation' which triggers a custom PostgreSQL event trigger that aborts any query where the planner detects a constant string comparison that wasn't present in the original prepared statement template.",
+    "config": {
+      "runtime": "GKE Autopilot",
+      "container_image": "gcr.io/infra-secured/distroless-go:nonroot",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": "none (no emptyDir, no tmpfs, no PVC)",
+      "pgbouncer": {
+        "pool_mode": "transaction",
+        "custom_sanitize_mode": "strict",
+        "fork_commit": "3a8f1e2",
+        "behavior": "rejects queries containing unescaped single-quote literals outside dollar-quoting"
+      },
+      "postgresql_event_trigger": {
+        "trigger_name": "restrict_dynamic_interpolation",
+        "security_label": "restricted_interpolation",
+        "behavior": "aborts execution when query planner detects injected constant comparisons not matching prepared statement template"
+      },
+      "filesystem_note": "readOnlyRootFilesystem prevents cache writes but application handles this gracefully via non-fatal error logging"
+    }
+  }
+}

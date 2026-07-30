@@ -1,0 +1,39 @@
+{
+  "id": "58cd58ba",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strconv\"\n\n\t_ \"github.com/lib/pq\"\n)\n\ntype TerraformState struct {\n\tID        int    `json:\"id\"`\n\tWorkspace string `json:\"workspace\"`\n\tOwnerOrg  string `json:\"owner_org\"`\n\tStateData string `json:\"state_data\"`\n\tLockID    string `json:\"lock_id\"`\n\tVersion   int    `json:\"version\"`\n}\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=localhost dbname=tfstate sslmode=disable\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// getStateHandler retrieves Terraform state by workspace ID\n// Authentication is handled by the API gateway layer\nfunc getStateHandler(w http.ResponseWriter, r *http.Request) {\n\t// Extract authenticated org from header (set by upstream auth proxy)\n\tauthOrg := r.Header.Get(\"X-Authenticated-Org\")\n\tif authOrg == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Get workspace_id from query parameter\n\tworkspaceID := r.URL.Query().Get(\"workspace_id\")\n\tif workspaceID == \"\" {\n\t\thttp.Error(w, \"workspace_id required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// VULNERABILITY: No authorization check - any authenticated org can access\n\t// any workspace state by manipulating the workspace_id parameter.\n\t// The query uses parameterized statements (no SQLi) but lacks ownership validation.\n\tstateID, err := strconv.Atoi(workspaceID)\n\tif err != nil {\n\t\thttp.Error(w, \"invalid workspace_id\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tvar state TerraformState\n\terr = db.QueryRow(\n\t\t\"SELECT id, workspace, owner_org, state_data, lock_id, version FROM tf_states WHERE id = $1\",\n\t\tstateID,\n\t).Scan(&state.ID, &state.Workspace, &state.OwnerOrg, &state.StateData, &state.LockID, &state.Version)\n\n\tif err == sql.ErrNoRows {\n\t\thttp.Error(w, \"not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Note: We intentionally do NOT check state.OwnerOrg == authOrg\n\t// This was flagged in security review SR-2024-0891 but deprioritized\n\t// because \"the WAF handles enumeration protection\"\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(state)\n}\n\n// updateStateHandler allows updating state with lock verification\nfunc updateStateHandler(w http.ResponseWriter, r *http.Request) {\n\tauthOrg := r.Header.Get(\"X-Authenticated-Org\")\n\tif authOrg == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tvar req struct {\n\t\tWorkspaceID int    `json:\"workspace_id\"`\n\t\tLockID      string `json:\"lock_id\"`\n\t\tStateData   string `json:\"state_data\"`\n\t}\n\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"invalid body\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Lock verification exists but no ownership check\n\tresult, err := db.Exec(\n\t\t\"UPDATE tf_states SET state_data = $1, version = version + 1 WHERE id = $2 AND lock_id = $3\",\n\t\treq.StateData, req.WorkspaceID, req.LockID,\n\t)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\trows, _ := result.RowsAffected()\n\tif rows == 0 {\n\t\thttp.Error(w, \"lock mismatch or not found\", http.StatusConflict)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprintf(w, `{\"updated\": true}`)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/v1/state\", getStateHandler)\n\thttp.HandleFunc(\"/v1/state/update\", updateStateHandler)\n\tlog.Println(\"Terraform state backend listening on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}",
+  "environment": {
+    "description": "Same Terraform state backend on ECS Fargate behind ALB. AWS WAFv2 WebACL attached to the ALB with a custom rate-based rule (threshold: 5 requests per 5-minute window per IP for /v1/state path with distinct query string values) combined with a custom regex pattern set rule that inspects the workspace_id query parameter and blocks requests where the numeric value falls outside the pre-registered workspace ID allocation range for the source IP's mapped organization (maintained via a DynamoDB lookup in a WAF custom response integration using AWS WAFv2 Intelligent Threat Mitigation with ATP credential stuffing signal correlation). The WebACL also includes AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING in COUNT mode and a label-based cross-rule evaluation that promotes to BLOCK when combined with the rate signal.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate",
+      "load_balancer": "ALB with HTTPS listener",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:111222333444:regional/webacl/tfstate-protection/a1b2c3d4",
+      "waf_rules": [
+        {
+          "name": "OrgWorkspaceIDEnforcement",
+          "priority": 1,
+          "type": "custom_rule_group",
+          "description": "Cross-references workspace_id parameter against per-org allocation table via IP-to-org mapping. Blocks access to workspace IDs not allocated to the requesting organization.",
+          "action": "BLOCK",
+          "backing_store": "DynamoDB table org-workspace-allocations with IP-range to org-id mapping and org-id to workspace-id-range mapping"
+        },
+        {
+          "name": "StateEnumerationRateLimit",
+          "priority": 2,
+          "type": "rate_based_rule",
+          "threshold": 5,
+          "window": 300,
+          "scope_down": "URI path /v1/state with varying query strings"
+        },
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 3,
+          "type": "managed_rule_group",
+          "override_action": "none"
+        }
+      ],
+      "auth": "OAuth2 proxy sidecar sets X-Authenticated-Org header",
+      "network": "Private subnet, ALB in public subnet"
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "id": "a8b2ff54",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst _ = require('lodash');\n\n// Step Functions activity worker that processes state machine tasks\n// Reads configuration from S3, merges with task input, writes results back\n\nconst s3 = new AWS.S3({ region: process.env.AWS_REGION || 'us-east-1' });\nconst stepfunctions = new AWS.StepFunctions();\n\nconst CONFIG_BUCKET = process.env.CONFIG_BUCKET || 'workflow-configs-prod';\nconst RESULTS_BUCKET = process.env.RESULTS_BUCKET || 'workflow-results-prod';\n\nasync function loadBaseConfig(workflowId) {\n  const params = {\n    Bucket: CONFIG_BUCKET,\n    Key: `workflows/${workflowId}/base-config.json`\n  };\n  const data = await s3.getObject(params).promise();\n  return JSON.parse(data.Body.toString());\n}\n\nasync function mergeTaskInput(baseConfig, taskInput) {\n  // Deep merge task input overrides into base configuration\n  // This allows step function tasks to customize behavior per-execution\n  const merged = {};\n  _.merge(merged, baseConfig, taskInput.configOverrides || {});\n  return merged;\n}\n\nasync function writeResults(workflowId, executionId, results) {\n  const params = {\n    Bucket: RESULTS_BUCKET,\n    Key: `results/${workflowId}/${executionId}/output.json`,\n    Body: JSON.stringify(results),\n    ContentType: 'application/json'\n  };\n  await s3.putObject(params).promise();\n}\n\nasync function processTask(taskToken, input) {\n  try {\n    const { workflowId, executionId, configOverrides } = input;\n    \n    if (!workflowId || !executionId) {\n      throw new Error('Missing required fields: workflowId, executionId');\n    }\n\n    // Load base configuration from S3\n    const baseConfig = await loadBaseConfig(workflowId);\n    \n    // Merge overrides from step function input (VULNERABILITY: prototype pollution)\n    const effectiveConfig = await mergeTaskInput(baseConfig, input);\n    \n    // Process based on merged configuration\n    const results = {\n      workflowId,\n      executionId,\n      processedAt: new Date().toISOString(),\n      config: effectiveConfig,\n      status: 'completed'\n    };\n\n    // Check if admin mode was enabled (can be polluted via __proto__)\n    if (effectiveConfig.adminMode) {\n      results.sensitiveData = process.env;\n      results.status = 'admin-completed';\n    }\n\n    // Write results to S3\n    await writeResults(workflowId, executionId, results);\n\n    // Report success back to Step Functions\n    await stepfunctions.sendTaskSuccess({\n      taskToken,\n      output: JSON.stringify(results)\n    }).promise();\n\n  } catch (err) {\n    await stepfunctions.sendTaskFailure({\n      taskToken,\n      error: err.name,\n      cause: err.message\n    }).promise();\n  }\n}\n\nasync function pollForTasks() {\n  const activityArn = process.env.ACTIVITY_ARN;\n  \n  while (true) {\n    try {\n      const task = await stepfunctions.getActivityTask({\n        activityArn,\n        workerName: `worker-${process.pid}`\n      }).promise();\n\n      if (task.taskToken) {\n        const input = JSON.parse(task.input);\n        await processTask(task.taskToken, input);\n      }\n    } catch (err) {\n      console.error('Poll error:', err.message);\n      await new Promise(r => setTimeout(r, 5000));\n    }\n  }\n}\n\n// Start polling\npollForTasks().catch(console.error);\n\nmodule.exports = { processTask, mergeTaskInput, loadBaseConfig };",
+  "environment": {
+    "description": "Same worker deployed in VPC vpc-0def456 with S3 Gateway Endpoint vpce-0x9f8e7d configured with a custom endpoint policy. The endpoint policy document specifies a Condition block with StringEquals on 's3:prefix' restricting PutObject to keys matching 'results/${aws:PrincipalTag/workflowId}/*' and a secondary Condition using 'aws:ResourceTag/classification' != 'sensitive' on the results bucket. Additionally, the VPC has no NAT gateway and no internet gateway \u2014 all S3 traffic MUST traverse the VPC endpoint. The endpoint policy also includes a blanket Deny for any PutObject where the Content-Length header exceeds 4096 bytes, enforced via NumericGreaterThan on s3:content-length-range. The worker's IAM role has a permissions boundary (arn:aws:iam::111222333444:policy/WorkflowBoundary) that denies s3:PutObject when StringLike on s3:prefix matches '*output.json' AND the request context includes objects larger than 4KB.",
+    "config": {
+      "runtime": "nodejs14.x",
+      "vpc": "vpc-0def456",
+      "subnets": [
+        "subnet-0e4f5a6b"
+      ],
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "s3_access": "vpce-0x9f8e7d (Gateway Endpoint)",
+      "vpce_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetConfig",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::workflow-configs-prod/workflows/*/base-config.json"
+          },
+          {
+            "Sid": "AllowPutResultsConstrained",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::workflow-results-prod/results/*",
+            "Condition": {
+              "NumericLessThanEquals": {
+                "s3:content-length-range": "4096"
+              }
+            }
+          },
+          {
+            "Sid": "DenyAll",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalArn": "arn:aws:iam::111222333444:role/WorkflowWorkerRole"
+              }
+            }
+          }
+        ]
+      },
+      "permissions_boundary": "arn:aws:iam::111222333444:policy/WorkflowBoundary",
+      "permissions_boundary_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "DenyLargePuts",
+            "Effect": "Deny",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::workflow-results-prod/*",
+            "Condition": {
+              "NumericGreaterThan": {
+                "s3:content-length-range": "4096"
+              }
+            }
+          }
+        ]
+      },
+      "lodash_version": "4.17.15",
+      "input_validation": "none"
+    }
+  }
+}

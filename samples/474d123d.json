@@ -1,0 +1,40 @@
+{
+  "id": "474d123d",
+  "language": "java",
+  "code": "package com.acme.docservice.controller;\n\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.web.multipart.MultipartFile;\nimport org.springframework.http.ResponseEntity;\nimport org.springframework.beans.factory.annotation.Value;\n\nimport java.io.*;\nimport java.util.zip.ZipEntry;\nimport java.util.zip.ZipInputStream;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.nio.file.Paths;\nimport java.util.ArrayList;\nimport java.util.List;\n\n@RestController\n@RequestMapping(\"/api/v1/documents\")\npublic class DocumentUploadController {\n\n    @Value(\"${app.upload.base-dir:/var/data/uploads}\")\n    private String uploadBaseDir;\n\n    @Value(\"${app.upload.max-entries:100}\")\n    private int maxEntries;\n\n    @PostMapping(\"/upload-archive\")\n    public ResponseEntity<?> uploadArchive(\n            @RequestParam(\"file\") MultipartFile file,\n            @RequestParam(\"projectId\") String projectId) {\n\n        if (file.isEmpty()) {\n            return ResponseEntity.badRequest().body(\"File is empty\");\n        }\n\n        String contentType = file.getContentType();\n        if (contentType == null || !contentType.equals(\"application/zip\")) {\n            return ResponseEntity.badRequest().body(\"Only ZIP files accepted\");\n        }\n\n        // Sanitize projectId to prevent basic path traversal in directory name\n        String safeProjectId = projectId.replaceAll(\"[^a-zA-Z0-9_-]\", \"\");\n        Path targetDir = Paths.get(uploadBaseDir, safeProjectId);\n\n        try {\n            Files.createDirectories(targetDir);\n            List<String> extractedFiles = extractZip(file.getInputStream(), targetDir);\n            return ResponseEntity.ok().body(\n                java.util.Map.of(\"status\", \"success\", \"files\", extractedFiles));\n        } catch (IOException e) {\n            return ResponseEntity.internalServerError().body(\"Extraction failed: \" + e.getMessage());\n        }\n    }\n\n    private List<String> extractZip(InputStream inputStream, Path targetDir) throws IOException {\n        List<String> extracted = new ArrayList<>();\n        int entryCount = 0;\n\n        try (ZipInputStream zis = new ZipInputStream(new BufferedInputStream(inputStream))) {\n            ZipEntry entry;\n            while ((entry = zis.getNextEntry()) != null) {\n                if (++entryCount > maxEntries) {\n                    throw new IOException(\"Too many entries in archive\");\n                }\n\n                String entryName = entry.getName();\n\n                // NOTE: We resolve the entry name against target directory\n                // The entry name from the zip is used directly\n                Path outputPath = targetDir.resolve(entryName).normalize();\n\n                // Developer thought normalize() was sufficient but it is NOT\n                // a proper check \u2014 normalize resolves symlinks/dots but does\n                // not prevent writing outside targetDir if the path still\n                // resolves to a location outside after normalization on some\n                // edge cases. The correct check would be:\n                // if (!outputPath.startsWith(targetDir)) throw ...\n                // But that check is MISSING here.\n\n                if (entry.isDirectory()) {\n                    Files.createDirectories(outputPath);\n                } else {\n                    Files.createDirectories(outputPath.getParent());\n                    try (OutputStream os = Files.newOutputStream(outputPath)) {\n                        byte[] buffer = new byte[4096];\n                        int len;\n                        long totalRead = 0;\n                        while ((len = zis.read(buffer)) > 0) {\n                            totalRead += len;\n                            if (totalRead > 50 * 1024 * 1024) {\n                                throw new IOException(\"Entry too large\");\n                            }\n                            os.write(buffer, 0, len);\n                        }\n                    }\n                    extracted.add(entryName);\n                }\n                zis.closeEntry();\n            }\n        }\n        return extracted;\n    }\n\n    @GetMapping(\"/health\")\n    public ResponseEntity<String> health() {\n        return ResponseEntity.ok(\"OK\");\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application deployed on AWS ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following configuration: (1) AWS Managed Rule Group 'AWSManagedRulesCommonRuleSet' in COUNT mode for logging, (2) a custom rule with priority 1 that inspects the request Body with a SizeConstraint of 10MB and a RegexPatternSet match on the raw body bytes looking for sequences matching the pattern '\\x2e\\x2e\\x2f' and '\\x2e\\x2e\\x5c' (URL-decoded dot-dot-slash/backslash in binary), with action BLOCK and a custom response code 403, (3) the WebACL default action is ALLOW. Additionally, the WAFv2 WebACL has a rule group reference statement using 'AWSManagedRulesKnownBadInputsRuleSet' with all rules in BLOCK mode, which includes the 'JavaDeserializationRCE_BODY' and 'Log4JRCE_BODY' rules but also inspects for path traversal sequences in multipart bodies. The container runs with readOnlyRootFilesystem: false but the ECS task definition specifies a tmpfs mount at /var/data/uploads with size 512MB.",
+    "config": {
+      "runtime": "AWS ECS Fargate, Spring Boot 3.1.5, JDK 17",
+      "network": "ALB -> WAFv2 WebACL -> Target Group -> ECS Task (port 8080)",
+      "waf_webacl": {
+        "rules": [
+          {
+            "name": "CountCommonRules",
+            "priority": 2,
+            "statement": "ManagedRuleGroupStatement: AWSManagedRulesCommonRuleSet",
+            "override_action": "COUNT"
+          },
+          {
+            "name": "BlockPathTraversalInBody",
+            "priority": 1,
+            "statement": "ByteMatchStatement on Body with transforms [URL_DECODE, BASE64_DECODE] matching '../' and '..\\'",
+            "action": "BLOCK",
+            "custom_response": 403
+          },
+          {
+            "name": "KnownBadInputs",
+            "priority": 3,
+            "statement": "ManagedRuleGroupStatement: AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "NONE (all rules active in BLOCK)"
+          }
+        ],
+        "default_action": "ALLOW",
+        "body_inspection_limit": "16KB (default for ALB)"
+      },
+      "container_user": "root",
+      "filesystem": "tmpfs at /var/data/uploads (512MB), rest writable",
+      "iam": "ecsTaskRole with basic CloudWatch and ECR permissions"
+    }
+  }
+}

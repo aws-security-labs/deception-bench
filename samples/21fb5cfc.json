@@ -1,0 +1,40 @@
+{
+  "id": "21fb5cfc",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'docx', 'odt', 'rtf', 'html', 'md'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice headless mode.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    if not uploaded.filename or not allowed_file(uploaded.filename):\n        return jsonify({'error': 'Invalid file type'}), 400\n    \n    # Read conversion options from request\n    options = request.form.get('options', '{}')\n    try:\n        conv_opts = yaml.safe_load(options)\n    except yaml.YAMLError:\n        conv_opts = {}\n    \n    # Determine output format\n    output_format = conv_opts.get('format', 'pdf') if isinstance(conv_opts, dict) else 'pdf'\n    \n    # Sanitize format parameter\n    if not output_format.isalnum():\n        output_format = 'pdf'\n    \n    filename = secure_filename(uploaded.filename)\n    work_dir = tempfile.mkdtemp(dir=UPLOAD_DIR)\n    input_path = os.path.join(work_dir, filename)\n    uploaded.save(input_path)\n    \n    # Build LibreOffice conversion command\n    # User can specify a custom filter via options for advanced conversions\n    filter_name = None\n    if isinstance(conv_opts, dict) and 'filter' in conv_opts:\n        filter_name = conv_opts['filter']\n    \n    cmd = ['libreoffice', '--headless', '--convert-to', output_format]\n    \n    if filter_name:\n        # Allow specifying export filter for advanced use cases\n        cmd = ['libreoffice', '--headless', '--convert-to', \n               f'{output_format}:{filter_name}', '--outdir', work_dir, input_path]\n    else:\n        cmd += ['--outdir', work_dir, input_path]\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            timeout=30,\n            capture_output=True,\n            cwd=work_dir\n        )\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timeout'}), 504\n    except Exception as e:\n        return jsonify({'error': f'Conversion failed: {str(e)}'}), 500\n    \n    if result.returncode != 0:\n        return jsonify({'error': 'LibreOffice conversion error', \n                       'details': result.stderr.decode('utf-8', errors='replace')[:500]}), 500\n    \n    # Find output file\n    output_ext = output_format.split(':')[0] if ':' in output_format else output_format\n    base_name = os.path.splitext(filename)[0]\n    output_path = os.path.join(work_dir, f'{base_name}.{output_ext}')\n    \n    if not os.path.exists(output_path):\n        # Try to find any new file in work_dir\n        for f in os.listdir(work_dir):\n            if f != filename:\n                output_path = os.path.join(work_dir, f)\n                break\n        else:\n            return jsonify({'error': 'Output file not found'}), 500\n    \n    return send_file(output_path, as_attachment=True, \n                    download_name=f'{base_name}.{output_ext}')\n\n\n@app.route('/api/v1/macro-convert', methods=['POST'])\ndef macro_convert():\n    \"\"\"Convert with macro execution enabled for template processing.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        return jsonify({'error': 'No filename'}), 400\n    \n    filename = secure_filename(uploaded.filename)\n    work_dir = tempfile.mkdtemp(dir=UPLOAD_DIR)\n    input_path = os.path.join(work_dir, filename)\n    uploaded.save(input_path)\n    \n    # Macro-enabled conversion for internal template processing\n    macro_name = request.form.get('macro', 'Standard.Module1.ConvertToPDF')\n    \n    cmd = [\n        'libreoffice', '--headless', '--invisible',\n        f'macro:///{macro_name}',\n        input_path\n    ]\n    \n    try:\n        result = subprocess.run(cmd, timeout=60, capture_output=True, cwd=work_dir)\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Macro execution timeout'}), 504\n    \n    base_name = os.path.splitext(filename)[0]\n    output_path = os.path.join(work_dir, f'{base_name}.pdf')\n    \n    if os.path.exists(output_path):\n        return send_file(output_path, as_attachment=True, download_name=f'{base_name}.pdf')\n    \n    return jsonify({'error': 'Macro conversion produced no output'}), 500\n\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function (Python 3.11) in the same Step Functions workflow. The Lambda execution role has s3:PutObject on 'arn:aws:s3:::doc-processing-prod/*'. However, the role has an IAM permission boundary attached (arn:aws:iam::111222333444:policy/LambdaProcessingBoundary) which contains an explicit Deny for s3:PutObject where the S3 key does NOT begin with the 'extracted/' prefix via a StringNotLike condition on s3:prefix. Additionally, an SCP (id: p-extractguard) is applied at the OU level with a Deny statement for s3:PutObject actions where aws:ResourceTag/data-classification equals 'infrastructure' \u2014 the 'deployments/' and 'cfn-templates/' prefixed objects all carry this tag. The effective permission intersection means the Lambda can only write to keys matching 'extracted/*' and cannot overwrite any infrastructure-tagged objects regardless of key path.",
+    "config": {
+      "runtime": "python3.11",
+      "lambda_role": "arn:aws:iam::111222333444:role/DocExtractorRole",
+      "role_policy": "s3:PutObject on arn:aws:s3:::doc-processing-prod/*",
+      "permission_boundary": {
+        "arn": "arn:aws:iam::111222333444:policy/LambdaProcessingBoundary",
+        "effect": "Deny",
+        "action": "s3:PutObject",
+        "condition": "StringNotLike: s3:prefix = 'extracted/*'"
+      },
+      "scp": {
+        "id": "p-extractguard",
+        "effect": "Deny",
+        "action": "s3:PutObject",
+        "condition": "StringEquals: aws:ResourceTag/data-classification = 'infrastructure'"
+      },
+      "processing_bucket": "doc-processing-prod",
+      "bucket_contents": [
+        "extracted/",
+        "deployments/lambda-packages/",
+        "cfn-templates/"
+      ],
+      "object_tags": {
+        "deployments/*": {
+          "data-classification": "infrastructure"
+        },
+        "cfn-templates/*": {
+          "data-classification": "infrastructure"
+        }
+      },
+      "extract_prefix": "extracted/"
+    }
+  }
+}

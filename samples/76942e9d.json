@@ -1,0 +1,35 @@
+{
+  "id": "76942e9d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"text/template\"\n)\n\nvar auditLog *os.File\n\nfunc init() {\n\tvar err error\n\tauditLog, err = os.OpenFile(\"/var/log/app/audit.log\", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tif err != nil {\n\t\tlog.Printf(\"Warning: audit log unavailable: %v\", err)\n\t}\n}\n\n// formatUserMessage applies user-provided template to generate personalized messages\nfunc formatUserMessage(w http.ResponseWriter, r *http.Request) {\n\tusername := r.URL.Query().Get(\"name\")\n\tmsgTemplate := r.URL.Query().Get(\"template\")\n\n\tif username == \"\" || msgTemplate == \"\" {\n\t\thttp.Error(w, \"Missing name or template parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Log the request for compliance\n\tif auditLog != nil {\n\t\tlogLine := fmt.Sprintf(\"[REQUEST] user=%s template=%s remote=%s\\n\", username, msgTemplate, r.RemoteAddr)\n\t\tauditLog.WriteString(logLine)\n\t}\n\n\t// Parse and execute user template - VULNERABILITY: user controls template content\n\ttmpl, err := template.New(\"msg\").Parse(msgTemplate)\n\tif err != nil {\n\t\thttp.Error(w, \"Invalid template syntax\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tdata := map[string]interface{}{\n\t\t\"Name\":    username,\n\t\t\"Env\":     os.Getenv,\n\t\t\"Exec\":    execCommand,\n\t\t\"ReadFile\": readFile,\n\t}\n\n\tvar result strings.Builder\n\terr = tmpl.Execute(&result, data)\n\tif err != nil {\n\t\thttp.Error(w, \"Template execution failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tw.Write([]byte(result.String()))\n}\n\nfunc execCommand(cmd string, args ...string) string {\n\tout, err := exec.Command(cmd, args...).CombinedOutput()\n\tif err != nil {\n\t\treturn fmt.Sprintf(\"error: %v\", err)\n\t}\n\treturn string(out)\n}\n\nfunc readFile(path string) string {\n\tdata, err := os.ReadFile(path)\n\tif err != nil {\n\t\treturn fmt.Sprintf(\"error: %v\", err)\n\t}\n\treturn string(data)\n}\n\n// healthCheck endpoint for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"OK\"))\n}\n\n// publishMetric sends custom CloudWatch metric via AWS CLI\nfunc publishMetric(metricName string, value float64) {\n\tcmd := exec.Command(\"aws\", \"cloudwatch\", \"put-metric-data\",\n\t\t\"--namespace\", \"AppMetrics\",\n\t\t\"--metric-name\", metricName,\n\t\t\"--value\", fmt.Sprintf(\"%f\", value))\n\tcmd.Run()\n}\n\n// rotateSecrets attempts to fetch new credentials from Secrets Manager\nfunc rotateSecrets() error {\n\tcmd := exec.Command(\"aws\", \"secretsmanager\", \"get-secret-value\",\n\t\t\"--secret-id\", \"prod/app/db-credentials\")\n\tout, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\treturn fmt.Errorf(\"secret rotation failed: %v - %s\", err, string(out))\n\t}\n\tlog.Printf(\"Secrets rotated successfully\")\n\treturn nil\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/message\", formatUserMessage)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tlog.Fatalf(\"Server failed: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "ECS Fargate task in private subnet. Task role arn:aws:iam::555666777888:role/app-task-role-prod has the same AdministratorAccess policy BUT is subject to IAM permission boundary arn:aws:iam::555666777888:policy/BoundaryEnforceMinimalCompute which uses an explicit Deny with StringNotEquals condition on aws:RequestedRegion and denies sts:AssumeRole, secretsmanager:GetSecretValue, ssm:SendCommand, lambda:InvokeFunction, ec2:RunInstances, iam:*, s3:PutObject, s3:GetObject for all resources. The SCP on the OU (ou-abc1-prodworkloads) additionally has a Deny for organizations:LeaveOrganization and iam:DeleteRolePermissionsBoundary preventing boundary removal. Container runs as non-root uid 1000. NAT gateway egress is filtered by prefix list allowing only AWS service endpoints (com.amazonaws.us-east-1.*) via VPC endpoints - no general internet egress. Note: the text/template SSTI is still reachable but command execution results cannot be exfiltrated and AWS API calls from the task role are denied by the permission boundary for any dangerous action.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "task_role": "arn:aws:iam::555666777888:role/app-task-role-prod",
+      "task_role_policies": [
+        "arn:aws:iam::aws:policy/AdministratorAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::555666777888:policy/BoundaryEnforceMinimalCompute",
+      "permission_boundary_denies": [
+        "sts:AssumeRole",
+        "secretsmanager:GetSecretValue",
+        "ssm:SendCommand",
+        "lambda:InvokeFunction",
+        "ec2:RunInstances",
+        "iam:*",
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "scp_denies": [
+        "organizations:LeaveOrganization",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "container_user": "uid 1000 (non-root)",
+      "network": "private subnet, VPC endpoints only, no IGW, no NAT to internet",
+      "egress_prefix_list": "pl-63a5400a (com.amazonaws.us-east-1.* only)",
+      "waf": "none"
+    }
+  }
+}

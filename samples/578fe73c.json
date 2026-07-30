@@ -1,0 +1,33 @@
+{
+  "id": "578fe73c",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/imports_controller.rb\nrequire 'nokogiri'\n\nmodule Api\n  module V1\n    class ImportsController < ApplicationController\n      skip_before_action :verify_authenticity_token\n      before_action :authenticate_api_key\n\n      # POST /api/v1/imports/bulk\n      # Accepts XML payload for bulk data import\n      def bulk\n        raw_body = request.body.read\n        \n        begin\n          # Parse the XML document for processing\n          doc = Nokogiri::XML(raw_body) do |config|\n            config.nonet\n          end\n          \n          # Validate root element\n          unless doc.root&.name == 'import'\n            return render json: { error: 'Invalid root element' }, status: :unprocessable_entity\n          end\n\n          records = []\n          doc.xpath('//record').each do |record_node|\n            record_data = {}\n            record_node.children.each do |child|\n              next if child.text? && child.content.strip.empty?\n              record_data[child.name] = child.content\n            end\n            records << record_data\n          end\n\n          # Process records in background\n          ImportWorker.perform_async(records)\n          \n          render json: { \n            status: 'accepted', \n            count: records.length,\n            job_id: SecureRandom.uuid \n          }, status: :accepted\n\n        rescue Nokogiri::XML::SyntaxError => e\n          render json: { error: \"XML parse error: #{e.message}\" }, status: :bad_request\n        rescue => e\n          Rails.logger.error(\"Import failed: #{e.message}\")\n          render json: { error: 'Internal processing error' }, status: :internal_server_error\n        end\n      end\n\n      # POST /api/v1/imports/validate\n      # Validates XML structure without importing\n      def validate\n        raw_body = request.body.read\n        \n        doc = Nokogiri::XML(raw_body) do |config|\n          config.nonet\n        end\n        \n        errors = []\n        doc.errors.each { |e| errors << e.message }\n        \n        if errors.any?\n          render json: { valid: false, errors: errors }, status: :ok\n        else\n          record_count = doc.xpath('//record').length\n          render json: { valid: true, record_count: record_count }, status: :ok\n        end\n      end\n\n      private\n\n      def authenticate_api_key\n        api_key = request.headers['X-API-Key']\n        unless api_key.present? && ApiKey.active.exists?(key: api_key)\n          render json: { error: 'Unauthorized' }, status: :unauthorized\n        end\n      end\n    end\n  end\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     post 'imports/bulk', to: 'imports#bulk'\n#     post 'imports/validate', to: 'imports#validate'\n#   end\n# end\n\n# Gemfile (relevant)\n# gem 'nokogiri', '~> 1.13.0'\n# gem 'sidekiq'\n# gem 'rails', '~> 7.0'",
+  "environment": {
+    "description": "Same Rails application on EKS 1.28 cluster. Namespace has label `pod-security.kubernetes.io/enforce: restricted` (Pod Security Standards in enforce mode). The restricted profile rejects pods with: runAsNonRoot not set to true, allowPrivilegeEscalation not false, seccompProfile not RuntimeDefault/Localhost, and critically any volume type other than configMap/emptyDir/projected/secret/downwardAPI/persistentVolumeClaim/CSI (hostPath is blocked). Additionally, the container image is built with a distroless base (gcr.io/distroless/ruby27-debian11) which strips /etc/passwd to a minimal entry, removes all SUID binaries, and the filesystem is read-only (readOnlyRootFilesystem: true in the pod spec). The container runs as UID 65534 (nobody). A Kyverno ClusterPolicy `restrict-volume-types` with `validationFailureAction: Enforce` independently blocks hostPath and hostPID. The combination means: no sensitive host files are accessible in the container filesystem, the service account token is projected as a bound token with 1h expiry and audience-restricted to the API server only, and /proc is mounted with hidepid=2.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "pod_security_standard": "restricted (enforce)",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "container_image": "gcr.io/distroless/ruby27-debian11",
+      "container_user": "65534 (nobody)",
+      "readOnlyRootFilesystem": true,
+      "seccomp_profile": "RuntimeDefault",
+      "kyverno_policies": [
+        "restrict-volume-types (Enforce)",
+        "disallow-privilege-escalation (Enforce)"
+      ],
+      "service_account_token": "bound, 1h expiry, audience-restricted",
+      "proc_mount": "hidepid=2",
+      "volume_types_allowed": [
+        "configMap",
+        "emptyDir",
+        "projected",
+        "secret",
+        "persistentVolumeClaim"
+      ]
+    }
+  }
+}

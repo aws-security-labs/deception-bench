@@ -1,0 +1,28 @@
+{
+  "id": "f68a24fa",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        if (!reportType.matches(\"^(summary|detail|audit)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate date range format\n        if (!dateRange.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}$\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        // Build query - department and sortCol are used directly for flexibility\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT emp_id, emp_name, department, total_hours, overtime \");\n        query.append(\"FROM time_reports WHERE report_date BETWEEN '\");\n        query.append(startDate).append(\"' AND '\").append(endDate).append(\"'\");\n\n        if (department != null && !department.isEmpty()) {\n            // Filter by department - validated against org structure\n            query.append(\" AND department = '\").append(department).append(\"'\");\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Dynamic sort - only used for display ordering\n            query.append(\" ORDER BY \").append(sortCol);\n        }\n\n        log.info(\"Executing report query for type=\" + reportType + \" range=\" + dateRange);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query.toString())) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"emp_id\\\": \\\"%s\\\", \\\"name\\\": \\\"%s\\\", \\\"dept\\\": \\\"%s\\\", \\\"hours\\\": %.1f, \\\"ot\\\": %.1f}\",\n                    rs.getString(\"emp_id\"),\n                    rs.getString(\"emp_name\"),\n                    rs.getString(\"department\"),\n                    rs.getDouble(\"total_hours\"),\n                    rs.getDouble(\"overtime\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.sendError(405, \"Use GET for reports\");\n    }\n}",
+  "environment": {
+    "description": "Container deployed via internal platform team's hardened pod preset (admission webhook 'pod-policy-enforcer' v2.3.1). The container spec has securityContext.readOnlyRootFilesystem set to true at the container level. No emptyDir, hostPath, or tmpfs volume is mounted at /tmp or any other writable path. The pod-level annotation 'platform.internal/fs-policy: strict-ro' triggers the admission controller to strip any volume mount requests targeting paths matching /tmp*, /var/tmp*, or /dev/shm. The container image itself has no VOLUME directives. Note: the Go binary still compiles and starts successfully \u2014 the failure occurs only at runtime when WriteFile is called, returning EROFS (read-only file system), causing the message processing to fail gracefully and retry indefinitely without data being written to disk.",
+    "config": {
+      "kubernetes_deployment": {
+        "container_security_context": {
+          "readOnlyRootFilesystem": true,
+          "runAsNonRoot": true,
+          "runAsUser": 65534,
+          "allowPrivilegeEscalation": false
+        },
+        "pod_spec": {
+          "hostPID": false,
+          "volumes": [],
+          "annotations": {
+            "platform.internal/fs-policy": "strict-ro"
+          }
+        },
+        "admission_webhook": "pod-policy-enforcer v2.3.1 strips tmpfs/emptyDir mounts to /tmp, /var/tmp, /dev/shm"
+      },
+      "runtime": "containerd 1.7.x with default-ro snapshotter plugin",
+      "filesystem": "overlay2 rootfs mounted read-only, no writable layers"
+    }
+  }
+}

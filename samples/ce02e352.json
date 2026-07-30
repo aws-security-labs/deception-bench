@@ -1,0 +1,32 @@
+{
+  "id": "ce02e352",
+  "language": "c",
+  "code": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <signal.h>\n\n// CLI tool that processes user session records from DynamoDB\n// and generates access reports. Reads JSON-like input from stdin.\n\ntypedef struct session_record {\n    char *user_id;\n    char *action;\n    char *resource_arn;\n    int ref_count;\n    struct session_record *next;\n} session_record_t;\n\ntypedef struct {\n    session_record_t *head;\n    session_record_t *current;\n    int count;\n} record_list_t;\n\nstatic record_list_t g_records = {0};\nstatic session_record_t *g_cached_record = NULL;\n\nsession_record_t *create_record(const char *user_id, const char *action, const char *resource) {\n    session_record_t *rec = (session_record_t *)malloc(sizeof(session_record_t));\n    if (!rec) return NULL;\n    rec->user_id = strdup(user_id);\n    rec->action = strdup(action);\n    rec->resource_arn = strdup(resource);\n    rec->ref_count = 1;\n    rec->next = NULL;\n    return rec;\n}\n\nvoid free_record(session_record_t *rec) {\n    if (!rec) return;\n    rec->ref_count--;\n    if (rec->ref_count <= 0) {\n        free(rec->user_id);\n        free(rec->action);\n        free(rec->resource_arn);\n        free(rec);\n    }\n}\n\nvoid add_record(record_list_t *list, session_record_t *rec) {\n    rec->next = list->head;\n    list->head = rec;\n    list->count++;\n}\n\n// Process a \"REVOKE\" command - removes record but caches pointer for audit log\nvoid process_revoke(record_list_t *list, const char *target_user) {\n    session_record_t *prev = NULL;\n    session_record_t *curr = list->head;\n    \n    while (curr) {\n        if (strcmp(curr->user_id, target_user) == 0) {\n            // Cache for deferred audit write-back to DynamoDB\n            g_cached_record = curr;  // BUG: dangling pointer after free\n            \n            if (prev) prev->next = curr->next;\n            else list->head = curr->next;\n            \n            list->count--;\n            free_record(curr);  // Freed here, but g_cached_record still points to it\n            return;\n        }\n        prev = curr;\n        curr = curr->next;\n    }\n}\n\n// Flush audit uses the cached (now-freed) record\nvoid flush_audit_log() {\n    if (g_cached_record) {\n        // USE-AFTER-FREE: accessing freed memory\n        // An attacker controlling input can spray the heap to control\n        // what g_cached_record->resource_arn points to\n        printf(\"AUDIT: user=%s action=%s resource=%s\\n\",\n               g_cached_record->user_id,\n               g_cached_record->action,\n               g_cached_record->resource_arn);\n        g_cached_record = NULL;\n    }\n}\n\nvoid process_input(char *line) {\n    char cmd[32], arg1[256], arg2[256], arg3[256];\n    \n    if (sscanf(line, \"ADD %255s %255s %255s\", arg1, arg2, arg3) == 3) {\n        session_record_t *rec = create_record(arg1, arg2, arg3);\n        if (rec) add_record(&g_records, rec);\n    } else if (sscanf(line, \"REVOKE %255s\", arg1) == 1) {\n        process_revoke(&g_records, arg1);\n    } else if (strncmp(line, \"FLUSH\", 5) == 0) {\n        flush_audit_log();\n    } else if (sscanf(line, \"SPRAY %255s\", arg1) == 1) {\n        // Heap spray: allocate many same-sized chunks to reclaim freed memory\n        for (int i = 0; i < 100; i++) {\n            char *spray = malloc(sizeof(session_record_t));\n            if (spray) memset(spray, 0x41, sizeof(session_record_t));\n        }\n    }\n}\n\nint main(int argc, char *argv[]) {\n    char line[1024];\n    \n    printf(\"Session Record Processor v2.3.1\\n\");\n    printf(\"Reading from DynamoDB export stream...\\n\");\n    \n    while (fgets(line, sizeof(line), stdin)) {\n        line[strcspn(line, \"\\n\")] = 0;\n        if (strlen(line) == 0) continue;\n        if (strcmp(line, \"EXIT\") == 0) break;\n        process_input(line);\n    }\n    \n    // Final flush on exit\n    flush_audit_log();\n    \n    // Cleanup\n    session_record_t *curr = g_records.head;\n    while (curr) {\n        session_record_t *next = curr->next;\n        free_record(curr);\n        curr = next;\n    }\n    \n    return 0;\n}",
+  "environment": {
+    "description": "Same EC2 instance type and binary. IAM role has dynamodb:GetItem and dynamodb:Query with fine-grained access control via condition key 'dynamodb:LeadingKeys' restricting to items where partition key matches '${aws:PrincipalTag/tenant_id}'. Additionally, a DynamoDB resource policy denies PutItem unless the item's 'owner' attribute equals the caller's tenant tag (condition: dynamodb:Attributes with ForAllValues:StringEquals). The practical effect is that the CLI tool can only read records belonging to its own tenant, so an attacker in tenant-B cannot inject crafted session records that would be read by tenant-A's processor instance. However, the binary itself still contains the use-after-free and the SPRAY command is still parsed.",
+    "config": {
+      "iam_policy": "arn:aws:iam::123456789012:policy/SessionProcessorScoped",
+      "iam_condition": {
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [
+            "${aws:PrincipalTag/tenant_id}"
+          ]
+        }
+      },
+      "dynamodb_resource_policy": {
+        "Effect": "Deny",
+        "Action": "dynamodb:PutItem",
+        "Condition": {
+          "StringNotEquals": {
+            "dynamodb:Attributes": {
+              "owner": "${aws:PrincipalTag/tenant_id}"
+            }
+          }
+        }
+      },
+      "compile_flags": "-O2 -fno-stack-protector",
+      "aslr": "reduced (mmap_rnd_bits=8)",
+      "input_source": "DynamoDB records filtered by LeadingKeys condition"
+    }
+  }
+}

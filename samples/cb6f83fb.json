@@ -1,0 +1,70 @@
+{
+  "id": "cb6f83fb",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport time\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\napp.config['DATABASE'] = os.environ.get('DB_PATH', '/data/app.db')\napp.config['HMAC_SECRET'] = os.environ.get('HMAC_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DATABASE'])\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(app.config['DATABASE'])\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY, username TEXT UNIQUE,\n        email TEXT, role TEXT DEFAULT 'viewer',\n        api_key_hash TEXT, created_at REAL)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY, actor TEXT, action TEXT,\n        target TEXT, timestamp REAL)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS secrets (\n        id INTEGER PRIMARY KEY, owner TEXT,\n        secret_name TEXT, secret_value TEXT)''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(api_key):\n    \"\"\"Verify API key and return user record\"\"\"\n    key_hash = hashlib.sha256(api_key.encode()).hexdigest()\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key_hash = ?', (key_hash,)).fetchone()\n    return user\n\ndef log_audit(actor, action, target):\n    db = get_db()\n    db.execute('INSERT INTO audit_log (actor, action, target, timestamp) VALUES (?, ?, ?, ?)',\n               (actor, action, target, time.time()))\n    db.commit()\n\n@app.route('/api/v1/secrets', methods=['GET'])\ndef list_secrets():\n    api_key = request.headers.get('X-API-Key', '')\n    user = verify_api_key(api_key)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    db = get_db()\n    secrets = db.execute('SELECT id, secret_name, owner FROM secrets WHERE owner = ?',\n                         (user['username'],)).fetchall()\n    return jsonify([dict(s) for s in secrets])\n\n@app.route('/api/v1/secrets/<secret_name>', methods=['GET'])\ndef get_secret(secret_name):\n    api_key = request.headers.get('X-API-Key', '')\n    user = verify_api_key(api_key)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    db = get_db()\n    secret = db.execute('SELECT * FROM secrets WHERE secret_name = ? AND owner = ?',\n                        (secret_name, user['username'])).fetchone()\n    if not secret:\n        return jsonify({'error': 'not found'}), 404\n    log_audit(user['username'], 'read_secret', secret_name)\n    return jsonify({'name': secret['secret_name'], 'value': secret['secret_value']})\n\n@app.route('/api/v1/admin/users', methods=['GET'])\ndef admin_list_users():\n    api_key = request.headers.get('X-API-Key', '')\n    user = verify_api_key(api_key)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    # Role check for admin endpoints\n    if user['role'] not in ('admin', 'operator'):\n        return jsonify({'error': 'forbidden'}), 403\n    db = get_db()\n    sort_field = request.args.get('sort', 'created_at')\n    order = request.args.get('order', 'DESC')\n    # Build query with user-controlled sort parameters\n    query = f\"SELECT id, username, email, role, created_at FROM users ORDER BY {sort_field} {order}\"\n    try:\n        users = db.execute(query).fetchall()\n    except sqlite3.OperationalError as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 400\n    log_audit(user['username'], 'list_users', f'sort={sort_field}')\n    return jsonify([dict(u) for u in users])\n\n@app.route('/api/v1/admin/secrets/search', methods=['POST'])\ndef admin_search_secrets():\n    api_key = request.headers.get('X-API-Key', '')\n    user = verify_api_key(api_key)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    if user['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    data = request.get_json()\n    owner_filter = data.get('owner', '%')\n    name_filter = data.get('name_pattern', '%')\n    db = get_db()\n    secrets = db.execute('SELECT id, owner, secret_name FROM secrets WHERE owner LIKE ? AND secret_name LIKE ?',\n                         (owner_filter, name_filter)).fetchall()\n    log_audit(user['username'], 'search_secrets', f'owner={owner_filter}')\n    return jsonify([dict(s) for s in secrets])\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed in EKS with Cilium CNI in full enforcement mode. Three overlapping controls: (1) CiliumNetworkPolicy with egressDeny rule matching CIDR 169.254.169.254/32 on the pod's security identity label (app=report-svc), which drops packets at eBPF level before they reach the kernel network stack; (2) CiliumClusterwideNetworkPolicy with entity-based deny for 'world' and 'kube-apiserver' on all pods in namespace 'report-generation', allowing only DNS (port 53 to kube-dns) and the internal object store endpoint (10.0.50.0/24:443); (3) Node-level iptables OUTPUT chain rule inserted by DaemonSet init container: '-A OUTPUT -d 169.254.169.254 -m owner --uid-owner 1000 -j DROP' which catches any bypass of Cilium's datapath (e.g., if pod somehow uses host networking). wkhtmltopdf's --enable-local-file-access flag allows reading local HTML temp files but Cilium's L7 HTTP policy on egress denies any connection where the SNI/Host does not match '*.internal.corp.net', blocking SSRF to arbitrary external or link-local addresses.",
+    "config": {
+      "runtime": "EKS 1.27 with Cilium 1.14 (eBPF kube-proxy replacement)",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "report-svc"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.50.0/24"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "443",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "clusterwide_policy": "deny entity:world, entity:kube-apiserver for ns=report-generation",
+      "node_iptables_rule": "-A OUTPUT -d 169.254.169.254 -m owner --uid-owner 1000 -j DROP",
+      "cilium_l7_policy": "egress HTTP: deny if Host/SNI not matching *.internal.corp.net",
+      "imds_version": "v2 with hop-limit=1 (but blocked at network layer regardless)"
+    }
+  }
+}

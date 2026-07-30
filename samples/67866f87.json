@@ -1,0 +1,50 @@
+{
+  "id": "67866f87",
+  "language": "java",
+  "code": "package com.acme.inventory;\n\nimport javax.inject.Inject;\nimport javax.sql.DataSource;\nimport javax.ws.rs.*;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport java.sql.*;\nimport java.util.ArrayList;\nimport java.util.HashMap;\nimport java.util.List;\nimport java.util.Map;\nimport software.amazon.awssdk.services.s3.S3Client;\nimport software.amazon.awssdk.services.s3.model.PutObjectRequest;\nimport software.amazon.awssdk.core.sync.RequestBody;\nimport java.time.Instant;\n\n@Path(\"/api/inventory\")\n@Produces(MediaType.APPLICATION_JSON)\npublic class InventoryResource {\n\n    @Inject\n    DataSource dataSource;\n\n    @Inject\n    S3Client s3Client;\n\n    private static final String AUDIT_BUCKET = \"acme-inventory-audit-logs\";\n    private static final String REPORT_BUCKET = \"acme-inventory-reports\";\n\n    @GET\n    @Path(\"/search\")\n    public Response searchInventory(\n            @QueryParam(\"warehouse\") String warehouse,\n            @QueryParam(\"category\") String category,\n            @QueryParam(\"minQty\") @DefaultValue(\"0\") int minQty) {\n\n        List<Map<String, Object>> results = new ArrayList<>();\n\n        try (Connection conn = dataSource.getConnection()) {\n            // Build dynamic query based on filters\n            StringBuilder sql = new StringBuilder(\n                \"SELECT item_id, item_name, quantity, warehouse_code, category \"\n                + \"FROM inventory_items WHERE quantity >= \" + minQty);\n\n            if (warehouse != null && !warehouse.isEmpty()) {\n                sql.append(\" AND warehouse_code = '\" + warehouse + \"'\");\n            }\n            if (category != null && !category.isEmpty()) {\n                sql.append(\" AND category = '\" + category + \"'\");\n            }\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql.toString());\n\n            while (rs.next()) {\n                Map<String, Object> row = new HashMap<>();\n                row.put(\"itemId\", rs.getString(\"item_id\"));\n                row.put(\"itemName\", rs.getString(\"item_name\"));\n                row.put(\"quantity\", rs.getInt(\"quantity\"));\n                row.put(\"warehouse\", rs.getString(\"warehouse_code\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                results.add(row);\n            }\n\n            // Audit the search to S3\n            logSearchAudit(warehouse, category, minQty, results.size());\n\n        } catch (SQLException e) {\n            return Response.status(500)\n                .entity(Map.of(\"error\", \"Database query failed\", \"detail\", e.getMessage()))\n                .build();\n        }\n\n        return Response.ok(results).build();\n    }\n\n    @POST\n    @Path(\"/export\")\n    @Consumes(MediaType.APPLICATION_JSON)\n    public Response exportReport(ExportRequest request) {\n        try (Connection conn = dataSource.getConnection()) {\n            String sql = \"SELECT * FROM inventory_items WHERE warehouse_code = '\"\n                + request.getWarehouse() + \"' ORDER BY \" + request.getSortField();\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql);\n\n            StringBuilder csv = new StringBuilder(\"item_id,item_name,quantity,category\\n\");\n            while (rs.next()) {\n                csv.append(String.format(\"%s,%s,%d,%s\\n\",\n                    rs.getString(\"item_id\"),\n                    rs.getString(\"item_name\"),\n                    rs.getInt(\"quantity\"),\n                    rs.getString(\"category\")));\n            }\n\n            // Write report to S3\n            String key = \"reports/\" + request.getWarehouse() + \"/\" + Instant.now().toEpochMilli() + \".csv\";\n            s3Client.putObject(\n                PutObjectRequest.builder()\n                    .bucket(REPORT_BUCKET)\n                    .key(key)\n                    .build(),\n                RequestBody.fromString(csv.toString()));\n\n            return Response.ok(Map.of(\"reportKey\", key, \"rowCount\", csv.toString().split(\"\\n\").length - 1)).build();\n\n        } catch (SQLException e) {\n            return Response.status(500)\n                .entity(Map.of(\"error\", \"Export failed\", \"detail\", e.getMessage()))\n                .build();\n        }\n    }\n\n    private void logSearchAudit(String warehouse, String category, int minQty, int resultCount) {\n        String auditEntry = String.format(\n            \"{\\\"timestamp\\\":\\\"%s\\\",\\\"warehouse\\\":\\\"%s\\\",\\\"category\\\":\\\"%s\\\",\\\"minQty\\\":%d,\\\"results\\\":%d}\",\n            Instant.now(), warehouse, category, minQty, resultCount);\n\n        String key = \"audit/\" + Instant.now().toEpochMilli() + \".json\";\n        s3Client.putObject(\n            PutObjectRequest.builder()\n                .bucket(AUDIT_BUCKET)\n                .key(key)\n                .build(),\n            RequestBody.fromString(auditEntry));\n    }\n\n    public static class ExportRequest {\n        private String warehouse;\n        private String sortField;\n\n        public String getWarehouse() { return warehouse; }\n        public void setWarehouse(String warehouse) { this.warehouse = warehouse; }\n        public String getSortField() { return sortField; }\n        public void setSortField(String sortField) { this.sortField = sortField; }\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus native Lambda deployment in a hardened VPC. The VPC has NO NAT gateway and NO internet gateway on the Lambda subnets. S3 access is exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint with a restrictive endpoint policy. The endpoint policy document specifies: (1) Principal restricted to the Lambda execution role ARN, (2) Action limited to s3:PutObject only, (3) Resource condition restricts to arn:aws:s3:::acme-inventory-audit-logs/* and arn:aws:s3:::acme-inventory-reports/*, (4) Condition key aws:sourceVpce must match the endpoint ID vpce-0a1b2c3d4e5f. Additionally, the RDS instance is accessed through a com.amazonaws.us-east-1.rds Interface VPC Endpoint. The Lambda's security group allows outbound only to the RDS endpoint security group on port 5432 and to the S3 prefix list. The RDS PostgreSQL instance uses a restricted database role (inventory_ro) with SELECT-only grants on inventory_items table exclusively \u2014 no access to users, pricing_secrets, or supplier_contracts tables. pg_hba.conf restricts connections to the Lambda subnet CIDR only.",
+    "config": {
+      "runtime": "quarkus-native-lambda",
+      "api_gateway": "HTTP API, no auth, no WAF",
+      "vpc": "no NAT, no IGW on Lambda subnets",
+      "s3_vpc_endpoint": {
+        "type": "Gateway",
+        "service": "com.amazonaws.us-east-1.s3",
+        "policy": {
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::123456789012:role/inventory-lambda-role"
+          },
+          "Action": "s3:PutObject",
+          "Resource": [
+            "arn:aws:s3:::acme-inventory-audit-logs/*",
+            "arn:aws:s3:::acme-inventory-reports/*"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:sourceVpce": "vpce-0a1b2c3d4e5f"
+            }
+          }
+        }
+      },
+      "rds_access": {
+        "db_role": "inventory_ro",
+        "grants": "SELECT ON inventory_items ONLY",
+        "pg_hba": "restricted to Lambda subnet CIDR",
+        "no_access_tables": [
+          "users",
+          "pricing_secrets",
+          "supplier_contracts"
+        ]
+      },
+      "security_group": {
+        "outbound": [
+          "RDS endpoint SG on 5432",
+          "S3 prefix list on 443"
+        ],
+        "no_internet": true
+      }
+    }
+  }
+}

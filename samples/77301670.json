@@ -1,0 +1,34 @@
+{
+  "id": "77301670",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { serialize } from 'cookie';\n\nconst app = express();\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Session middleware - stores session in signed cookie\nfunction getSession(req) {\n  const raw = req.headers.cookie?.split(';').find(c => c.trim().startsWith('sess='));\n  if (!raw) return null;\n  try {\n    const val = raw.split('=')[1];\n    return JSON.parse(Buffer.from(val, 'base64').toString());\n  } catch { return null; }\n}\n\n// Admin dashboard - renders report with custom date filtering\napp.get('/admin/reports', async (req, res) => {\n  const session = getSession(req);\n  if (!session || session.role !== 'admin') {\n    return res.status(401).json({ error: 'Unauthorized' });\n  }\n  \n  const { start_date, end_date, category } = req.query;\n  \n  // Build report query with date range\n  let query = `SELECT o.id, o.total, o.created_at, c.name as category_name \n               FROM orders o JOIN categories c ON o.category_id = c.id \n               WHERE o.created_at >= '${start_date || '2024-01-01'}' \n               AND o.created_at <= '${end_date || '2024-12-31'}'`;\n  \n  if (category) {\n    query += ` AND c.name = '${category}'`;\n  }\n  \n  query += ` ORDER BY o.created_at DESC LIMIT 500`;\n  \n  try {\n    const result = await pool.query(query);\n    res.json({ reports: result.rows, generated_at: new Date().toISOString() });\n  } catch (err) {\n    res.status(500).json({ error: 'Report generation failed', detail: err.message });\n  }\n});\n\n// Public product search - uses parameterized query\napp.get('/api/products', async (req, res) => {\n  const { q, limit } = req.query;\n  const result = await pool.query(\n    'SELECT id, name, price FROM products WHERE name ILIKE $1 LIMIT $2',\n    [`%${q || ''}%`, Math.min(parseInt(limit) || 20, 100)]\n  );\n  res.json(result.rows);\n});\n\n// Webhook receiver for payment processor callbacks\napp.post('/webhooks/payment', async (req, res) => {\n  const sig = req.headers['x-payment-signature'];\n  const expected = crypto.createHmac('sha256', process.env.WEBHOOK_SECRET || '')\n    .update(JSON.stringify(req.body)).digest('hex');\n  \n  // Timing-safe comparison\n  if (!sig || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n    return res.status(403).json({ error: 'Invalid signature' });\n  }\n  \n  await pool.query(\n    'UPDATE orders SET status = $1, paid_at = NOW() WHERE payment_ref = $2',\n    [req.body.status, req.body.reference]\n  );\n  res.json({ received: true });\n});\n\n// Health check exposing version info\napp.get('/health', (req, res) => {\n  res.json({ \n    status: 'ok', \n    version: process.env.APP_VERSION || '2.4.1',\n    node: process.version,\n    uptime: process.uptime()\n  });\n});\n\napp.listen(3000, () => console.log('Server running on :3000'));",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

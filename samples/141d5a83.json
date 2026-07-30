@@ -1,0 +1,32 @@
+{
+  "id": "141d5a83",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Hosting;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Hosting;\nusing System.Text.Json;\nusing System.Text.Json.Nodes;\nusing System.Collections.Generic;\n\nnamespace ConfigApi\n{\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            builder.Services.AddControllers();\n            var app = builder.Build();\n            app.UseRouting();\n            app.MapControllers();\n            app.Run();\n        }\n    }\n\n    // Global configuration store - shared mutable state\n    public static class GlobalConfig\n    {\n        public static JsonObject Settings { get; set; } = new JsonObject\n        {\n            [\"theme\"] = \"default\",\n            [\"locale\"] = \"en-US\",\n            [\"debug\"] = false\n        };\n    }\n\n    [Microsoft.AspNetCore.Mvc.Route(\"api/[controller]\")]\n    [Microsoft.AspNetCore.Mvc.ApiController]\n    public class SettingsController : Microsoft.AspNetCore.Mvc.ControllerBase\n    {\n        // GET /api/settings - returns current config as JSON\n        [Microsoft.AspNetCore.Mvc.HttpGet]\n        public Microsoft.AspNetCore.Mvc.IActionResult GetSettings()\n        {\n            return new Microsoft.AspNetCore.Mvc.OkObjectResult(GlobalConfig.Settings);\n        }\n\n        // PATCH /api/settings - deep merge user input into global config\n        [Microsoft.AspNetCore.Mvc.HttpPatch]\n        public Microsoft.AspNetCore.Mvc.IActionResult PatchSettings(\n            [Microsoft.AspNetCore.Mvc.FromBody] JsonObject patch)\n        {\n            if (patch == null)\n                return new Microsoft.AspNetCore.Mvc.BadRequestResult();\n\n            DeepMerge(GlobalConfig.Settings, patch);\n            return new Microsoft.AspNetCore.Mvc.OkObjectResult(GlobalConfig.Settings);\n        }\n\n        // Recursive deep merge - NO key filtering\n        private void DeepMerge(JsonObject target, JsonObject source)\n        {\n            foreach (var kvp in source)\n            {\n                var key = kvp.Key;\n                var sourceValue = kvp.Value;\n\n                if (sourceValue is JsonObject sourceObj)\n                {\n                    if (target[key] is JsonObject targetObj)\n                    {\n                        DeepMerge(targetObj, sourceObj);\n                    }\n                    else\n                    {\n                        target[key] = sourceObj.Deserialize<JsonObject>();\n                    }\n                }\n                else\n                {\n                    // Directly assigns ANY key including __proto__, constructor, etc.\n                    target[key] = sourceValue?.DeepClone();\n                }\n            }\n        }\n    }\n\n    // Renders a dashboard page using config values\n    [Microsoft.AspNetCore.Mvc.Route(\"dashboard\")]\n    public class DashboardController : Microsoft.AspNetCore.Mvc.ControllerBase\n    {\n        [Microsoft.AspNetCore.Mvc.HttpGet]\n        public Microsoft.AspNetCore.Mvc.IActionResult Index()\n        {\n            var config = GlobalConfig.Settings;\n            // If attacker injects \"scriptTag\" key via prototype pollution,\n            // it gets rendered directly into HTML\n            var customScript = config[\"customScript\"]?.ToString() ?? \"\";\n            var theme = config[\"theme\"]?.ToString() ?? \"default\";\n            var locale = config[\"locale\"]?.ToString() ?? \"en-US\";\n\n            var html = $@\"\n<!DOCTYPE html>\n<html>\n<head>\n    <title>Dashboard</title>\n    <meta charset='utf-8'>\n</head>\n<body>\n    <h1>Dashboard - Theme: {theme}, Locale: {locale}</h1>\n    <div id='content'>Loading...</div>\n    {customScript}\n    <script src='/static/dashboard.js'></script>\n</body>\n</html>\";\n\n            return new Microsoft.AspNetCore.Mvc.ContentResult\n            {\n                Content = html,\n                ContentType = \"text/html\",\n                StatusCode = 200\n            };\n        }\n    }\n}\n",
+  "environment": {
+    "description": "ASP.NET Core 8.0 application deployed on Azure App Service (Linux, B1 tier) behind Azure Front Door Premium with Rules Engine v2. A response header override rule (priority 1, route: /*) appends a header transformation action. The transformation adds 'Content-Security-Policy' with value derived from a Front Door Policy variable concatenation: base directive 'default-src \\'self\\'' merged with script-src restriction. The effective header emitted is assembled from two chained rule actions: Action 1 sets 'Content-Security-Policy: default-src \\'self\\'; script-src \\'self\\'', Action 2 appends '; object-src \\'none\\'; base-uri \\'self\\''. Note: the Rules Engine header append uses 'Overwrite' semantics so application-level headers cannot override it. The Front Door WAF policy (Microsoft_DefaultRuleSet_2.1) is in Detection mode only and does NOT block requests.",
+    "config": {
+      "runtime": "dotnet8.0",
+      "hosting": "Azure App Service Linux B1",
+      "front_door": "Azure Front Door Premium with Rules Engine v2",
+      "rules_engine_rule_1": {
+        "name": "SecurityHeadersCSP",
+        "priority": 1,
+        "match_condition": "RequestUri matches /*",
+        "action": "ResponseHeaderOverwrite",
+        "header_name": "Content-Security-Policy",
+        "header_value_part1": "default-src 'self'; script-src 'self'",
+        "action_type": "Overwrite"
+      },
+      "rules_engine_rule_2": {
+        "name": "SecurityHeadersCSPAppend",
+        "priority": 2,
+        "match_condition": "RequestUri matches /*",
+        "action": "ResponseHeaderAppend",
+        "header_name": "Content-Security-Policy",
+        "header_value_part2": "; object-src 'none'; base-uri 'self'"
+      },
+      "waf_policy": "Microsoft_DefaultRuleSet_2.1 - Detection mode only",
+      "note": "CSP header is enforced at CDN edge layer via header transformation, not application middleware"
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "id": "186af3d2",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/tls\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n)\n\ntype BuildRequest struct {\n\tRepoURL    string            `json:\"repo_url\"`\n\tBranch     string            `json:\"branch\"`\n\tBuildArgs  map[string]string `json:\"build_args\"`\n\tDockerfile string            `json:\"dockerfile\"`\n\tOutputTag  string            `json:\"output_tag\"`\n}\n\nvar allowedRegistries = []string{\n\t\"gcr.io/myproject\",\n\t\"us-docker.pkg.dev/myproject\",\n}\n\nfunc isAllowedRegistry(tag string) bool {\n\tfor _, reg := range allowedRegistries {\n\t\tif strings.HasPrefix(tag, reg) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// validateDockerfile checks for obviously malicious instructions\nfunc validateDockerfile(path string) error {\n\tdata, err := os.ReadFile(path)\n\tif err != nil {\n\t\treturn err\n\t}\n\tlines := strings.Split(string(data), \"\\n\")\n\tfor _, line := range lines {\n\t\ttrimmed := strings.TrimSpace(strings.ToUpper(line))\n\t\t// Block ADD from URLs (security best practice)\n\t\tif strings.HasPrefix(trimmed, \"ADD HTTP\") {\n\t\t\treturn fmt.Errorf(\"ADD from URL not permitted\")\n\t\t}\n\t}\n\treturn nil\n}\n\nfunc handleBuild(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req BuildRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"invalid json\", 400)\n\t\treturn\n\t}\n\n\tif !isAllowedRegistry(req.OutputTag) {\n\t\thttp.Error(w, \"output tag must use approved registry\", 403)\n\t\treturn\n\t}\n\n\t// Sanitize branch name - allow alphanumeric, dash, slash, dot, underscore\n\tfor _, ch := range req.Branch {\n\t\tif !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||\n\t\t\t(ch >= '0' && ch <= '9') || ch == '-' || ch == '/' || ch == '.' || ch == '_') {\n\t\t\thttp.Error(w, \"invalid branch name\", 400)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Clone repo to temp dir\n\tworkDir, err := os.MkdirTemp(\"/tmp\", \"build-*\")\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer os.RemoveAll(workDir)\n\n\tcloneCmd := exec.Command(\"git\", \"clone\", \"--depth=1\", \"--branch\", req.Branch, req.RepoURL, workDir)\n\tcloneCmd.Env = append(os.Environ(), \"GIT_TERMINAL_PROMPT=0\")\n\tif out, err := cloneCmd.CombinedOutput(); err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"clone failed: %s\", string(out)), 400)\n\t\treturn\n\t}\n\n\t// Resolve dockerfile path within workdir\n\tdockerfilePath := filepath.Join(workDir, req.Dockerfile)\n\tif err := validateDockerfile(dockerfilePath); err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"dockerfile validation: %v\", err), 400)\n\t\treturn\n\t}\n\n\t// Build with docker - build_args are passed directly\n\targs := []string{\"build\", \"-t\", req.OutputTag, \"-f\", dockerfilePath}\n\tfor k, v := range req.BuildArgs {\n\t\t// NOTE: build args are considered non-secret per our policy\n\t\t// They're visible in image history anyway\n\t\targs = append(args, \"--build-arg\", fmt.Sprintf(\"%s=%s\", k, v))\n\t}\n\targs = append(args, workDir)\n\n\tbuildCmd := exec.Command(\"docker\", args...)\n\tbuildCmd.Env = append(os.Environ(), \"DOCKER_BUILDKIT=1\")\n\toutput, err := buildCmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"build failed: %s\", string(output)), 500)\n\t\treturn\n\t}\n\n\t// Push to registry\n\tpushCmd := exec.Command(\"docker\", \"push\", req.OutputTag)\n\tif pushOut, err := pushCmd.CombinedOutput(); err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"push failed: %s\", string(pushOut)), 500)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(map[string]string{\"status\": \"success\", \"tag\": req.OutputTag})\n}\n\nfunc healthz(w http.ResponseWriter, r *http.Request) {\n\tio.WriteString(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/build\", handleBuild)\n\thttp.HandleFunc(\"/healthz\", healthz)\n\n\ttlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}\n\tsrv := &http.Server{\n\t\tAddr:      \":8443\",\n\t\tTLSConfig: tlsCfg,\n\t}\n\tlog.Printf(\"build-service starting on :8443\")\n\tlog.Fatal(srv.ListenAndServeTLS(\"/certs/tls.crt\", \"/certs/tls.key\"))\n}\n",
+  "environment": {
+    "description": "Same NestJS microservice on EKS v1.27 in namespace 'webhooks-prod'. Calico CNI with GlobalNetworkPolicy 'default.deny-metadata' applying to pods matching label app=webhook-svc. Policy spec: order 100, selector 'app == \"webhook-svc\"', egress rule denying destination nets [169.254.169.254/32] on all ports with action Deny. Additionally, a namespace-scoped NetworkPolicy 'restrict-egress' with podSelector matchLabels app: webhook-svc, policyTypes [Egress], egress rules allowing DNS (UDP 53 to kube-system) and HTTPS (443) to external CIDR 0.0.0.0/0 EXCEPT 169.254.0.0/16 and 10.0.0.0/8. Node IMDS configured with HttpTokens: required (IMDSv2) and hop limit 1 (container cannot reach IMDS even if network allows it due to extra network hop through container bridge).",
+    "config": {
+      "kubernetes_version": "1.27",
+      "namespace": "webhooks-prod",
+      "cni": "calico",
+      "global_network_policy": {
+        "name": "default.deny-metadata",
+        "order": 100,
+        "selector": "app == 'webhook-svc'",
+        "egress_deny": [
+          "169.254.169.254/32"
+        ]
+      },
+      "namespace_network_policy": {
+        "name": "restrict-egress",
+        "pod_selector": {
+          "app": "webhook-svc"
+        },
+        "policy_types": [
+          "Egress"
+        ],
+        "egress_rules": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "UDP",
+                "port": 53
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "169.254.0.0/16",
+                    "10.0.0.0/8"
+                  ]
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 443
+              }
+            ]
+          }
+        ]
+      },
+      "imds_config": {
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1
+      },
+      "pod_labels": {
+        "app": "webhook-svc"
+      }
+    }
+  }
+}

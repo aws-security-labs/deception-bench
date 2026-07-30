@@ -1,0 +1,38 @@
+{
+  "id": "1f0a7d14",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/xml\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\n// UserProfile represents a user profile submitted via XML\ntype UserProfile struct {\n\tXMLName   xml.Name `xml:\"profile\"`\n\tFirstName string   `xml:\"firstName\"`\n\tLastName  string   `xml:\"lastName\"`\n\tEmail     string   `xml:\"email\"`\n\tBio       string   `xml:\"bio\"`\n\tAvatarURL string   `xml:\"avatarUrl\"`\n}\n\n// ProfileResponse is the API response\ntype ProfileResponse struct {\n\tStatus  string      `json:\"status\"`\n\tProfile UserProfile `json:\"profile,omitempty\"`\n\tError   string      `json:\"error,omitempty\"`\n}\n\nfunc main() {\n\trouter := gin.Default()\n\trouter.POST(\"/api/v1/profile/import\", handleProfileImport)\n\trouter.GET(\"/api/v1/health\", handleHealth)\n\n\tport := os.Getenv(\"APP_PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\trouter.Run(\":\" + port)\n}\n\nfunc handleHealth(c *gin.Context) {\n\tc.JSON(http.StatusOK, gin.H{\"status\": \"healthy\"})\n}\n\nfunc handleProfileImport(c *gin.Context) {\n\tcontentType := c.GetHeader(\"Content-Type\")\n\tif !strings.Contains(contentType, \"application/xml\") && !strings.Contains(contentType, \"text/xml\") {\n\t\tc.JSON(http.StatusBadRequest, ProfileResponse{\n\t\t\tStatus: \"error\",\n\t\t\tError:  \"Content-Type must be application/xml or text/xml\",\n\t\t})\n\t\treturn\n\t}\n\n\tbody, err := ioutil.ReadAll(c.Request.Body)\n\tif err != nil {\n\t\tc.JSON(http.StatusBadRequest, ProfileResponse{\n\t\t\tStatus: \"error\",\n\t\t\tError:  \"Failed to read request body\",\n\t\t})\n\t\treturn\n\t}\n\tdefer c.Request.Body.Close()\n\n\tif len(body) > 1048576 {\n\t\tc.JSON(http.StatusRequestEntityTooLarge, ProfileResponse{\n\t\t\tStatus: \"error\",\n\t\t\tError:  \"Request body too large (max 1MB)\",\n\t\t})\n\t\treturn\n\t}\n\n\t// Parse the XML profile using the system XML library\n\t// Note: Go's encoding/xml does NOT process external entities by default,\n\t// but we use a custom decoder for legacy compatibility with partner systems\n\tprofile, err := parseXMLProfile(body)\n\tif err != nil {\n\t\tc.JSON(http.StatusUnprocessableEntity, ProfileResponse{\n\t\t\tStatus: \"error\",\n\t\t\tError:  fmt.Sprintf(\"Invalid XML: %v\", err),\n\t\t})\n\t\treturn\n\t}\n\n\t// Validate required fields\n\tif profile.Email == \"\" {\n\t\tc.JSON(http.StatusBadRequest, ProfileResponse{\n\t\t\tStatus: \"error\",\n\t\t\tError:  \"Email is required\",\n\t\t})\n\t\treturn\n\t}\n\n\tc.JSON(http.StatusOK, ProfileResponse{\n\t\tStatus:  \"success\",\n\t\tProfile: *profile,\n\t})\n}\n\n// parseXMLProfile uses libxml2 via cgo for full DTD/entity support\n// required by legacy partner XML feeds (SOAP-era integrations)\nfunc parseXMLProfile(data []byte) (*UserProfile, error) {\n\t// This calls into a cgo wrapper around libxml2 with entity loading enabled\n\t// The wrapper resolves external entities for backward compatibility\n\tresult, err := libxml2Parse(data)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn result, nil\n}\n\n// libxml2Parse wraps the C libxml2 parser with DTDLOAD and NOENT options\n// This enables external entity resolution for partner feed compatibility\nfunc libxml2Parse(data []byte) (*UserProfile, error) {\n\t// #cgo LDFLAGS: -lxml2\n\t// In production this calls xmlReadMemory with XML_PARSE_DTDLOAD | XML_PARSE_NOENT\n\t// For this example, we simulate the vulnerable behavior:\n\tprocessed := resolveEntities(string(data))\n\n\tvar profile UserProfile\n\terr := xml.Unmarshal([]byte(processed), &profile)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn &profile, nil\n}\n\n// resolveEntities simulates libxml2's entity resolution behavior\nfunc resolveEntities(xmlData string) string {\n\t// Check for SYSTEM entity declarations and resolve them\n\tif strings.Contains(xmlData, \"SYSTEM\") {\n\t\t// Extract file path from SYSTEM entity\n\t\tstart := strings.Index(xmlData, \"SYSTEM \\\"\")\n\t\tif start != -1 {\n\t\t\tstart += 8\n\t\t\tend := strings.Index(xmlData[start:], \"\\\"\")\n\t\t\tif end != -1 {\n\t\t\t\tpath := xmlData[start : start+end]\n\t\t\t\tif strings.HasPrefix(path, \"file://\") {\n\t\t\t\t\tpath = path[7:]\n\t\t\t\t}\n\t\t\t\tcontent, err := ioutil.ReadFile(path)\n\t\t\t\tif err == nil {\n\t\t\t\t\t// Replace entity reference with file content\n\t\t\t\t\txmlData = strings.Replace(xmlData, \"&xxe;\", string(content), -1)\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\treturn xmlData\n}\n",
+  "environment": {
+    "description": "Kubernetes deployment with Pod Security Admission enforcing 'restricted' profile. Container securityContext drops ALL capabilities then adds only CAP_NET_BIND_SERVICE. Additionally, the pod spec includes a seccomp profile of type RuntimeDefault and an AppArmor annotation (container.apparmor.security.beta.kubernetes.io/app=runtime/default). The container runs with readOnlyRootFilesystem: true, runAsNonRoot: true (uid 65534), and an emptyDir volume mounted at /tmp. The node uses a gVisor (runsc) runtime class which intercepts all syscalls through its application kernel, preventing direct host filesystem access even if the application attempts file:// URI resolution. The gVisor sentry does not implement the openat2 syscall variant used by the Go runtime's os.ReadFile on newer kernels, causing ENOSYS for any file read operations targeting paths outside the OCI bundle's rootfs layer.",
+    "config": {
+      "runtime_class": "gvisor",
+      "pod_security_admission": "restricted",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "apparmor_profile": "runtime/default",
+      "volumes": [
+        {
+          "name": "tmp",
+          "emptyDir": {},
+          "mountPath": "/tmp"
+        }
+      ],
+      "runtime_details": "gVisor runsc with restricted platform (ptrace), host filesystem isolated via overlay with no bind mounts to sensitive paths"
+    }
+  }
+}

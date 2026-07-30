@@ -1,0 +1,57 @@
+{
+  "id": "8682639b",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery background job worker for user notification processing\nimport boto3\nimport logging\nfrom celery import Celery\nfrom celery.utils.log import get_task_logger\n\napp = Celery('notifications', broker='redis://redis:6379/0')\nlogger = get_task_logger(__name__)\n\ndynamodb = boto3.resource('dynamodb', region_name='us-east-1')\ntable = dynamodb.Table('UserNotifications')\n\n\nclass NotificationFormatter:\n    \"\"\"Formats notification messages using user-defined templates.\"\"\"\n    \n    def __init__(self, template_str):\n        self.template = template_str\n    \n    def render(self, **kwargs):\n        # Uses Python format string with user-controlled template\n        # This allows access to object attributes via format spec\n        try:\n            return self.template.format(**kwargs)\n        except (KeyError, IndexError, ValueError) as e:\n            logger.warning(f\"Template rendering failed: {e}\")\n            return None\n\n\nclass UserContext:\n    \"\"\"Context object passed to template rendering.\"\"\"\n    def __init__(self, user_id, email, role, internal_config=None):\n        self.user_id = user_id\n        self.email = email\n        self.role = role\n        self._internal_config = internal_config or {}\n        self._aws_credentials = boto3.Session().get_credentials()\n    \n    def __repr__(self):\n        return f\"UserContext(user_id={self.user_id}, role={self.role})\"\n\n\n@app.task(bind=True, max_retries=3)\ndef process_notification(self, user_id, notification_id):\n    \"\"\"Process a pending notification for a user.\"\"\"\n    try:\n        # Fetch notification record from DynamoDB\n        response = table.get_item(\n            Key={\n                'user_id': user_id,\n                'notification_id': notification_id\n            }\n        )\n        \n        item = response.get('Item')\n        if not item:\n            logger.error(f\"Notification {notification_id} not found for user {user_id}\")\n            return {'status': 'not_found'}\n        \n        # Fetch user's custom template from their preferences\n        template_str = item.get('template', 'Hello {user.email}, you have a new notification.')\n        message_data = item.get('message_data', {})\n        \n        # Build context for template rendering\n        user_ctx = UserContext(\n            user_id=user_id,\n            email=item.get('user_email', 'unknown'),\n            role=item.get('user_role', 'basic'),\n            internal_config={\n                'db_connection_string': 'postgresql://app:s3cr3t@db.internal:5432/prod',\n                'api_secret': 'sk-prod-a8f3b2c1d4e5f6a7b8c9d0e1f2a3b4c5'\n            }\n        )\n        \n        # Render the notification using user-controlled template\n        formatter = NotificationFormatter(template_str)\n        rendered = formatter.render(user=user_ctx, data=message_data, config=app.conf)\n        \n        if rendered:\n            # Update notification status\n            table.update_item(\n                Key={'user_id': user_id, 'notification_id': notification_id},\n                UpdateExpression='SET #s = :status, rendered_message = :msg',\n                ExpressionAttributeNames={'#s': 'status'},\n                ExpressionAttributeValues={':status': 'rendered', ':msg': rendered}\n            )\n            logger.info(f\"Notification {notification_id} rendered for user {user_id}\")\n            return {'status': 'success', 'rendered': rendered}\n        else:\n            return {'status': 'render_failed'}\n            \n    except Exception as exc:\n        logger.exception(f\"Error processing notification {notification_id}\")\n        self.retry(exc=exc, countdown=60)\n\n\n@app.task\ndef bulk_process_notifications(user_ids):\n    \"\"\"Trigger notification processing for multiple users.\"\"\"\n    results = []\n    for uid in user_ids:\n        # Scan for pending notifications per user\n        response = table.query(\n            KeyConditionExpression=boto3.dynamodb.conditions.Key('user_id').eq(uid),\n            FilterExpression=boto3.dynamodb.conditions.Attr('status').eq('pending')\n        )\n        for item in response.get('Items', []):\n            result = process_notification.delay(uid, item['notification_id'])\n            results.append(result.id)\n    return {'queued': len(results)}",
+  "environment": {
+    "description": "Celery worker running on ECS Fargate with task role 'NotificationWorkerRole-Restricted'. The IAM policy uses dynamodb:LeadingKeys condition to scope access, and a separate inline policy with an explicit Deny on dynamodb:Attributes condition key set that prevents reading or writing the 'template' field unless the request also includes a validated 'template_hash' attribute matching a pre-computed HMAC stored in a separate control table. Additionally, the DynamoDB table has a DynamoDB Streams trigger connected to a Lambda validator that retroactively deletes any item where the 'template' field contains format specifiers matching the regex pattern `\\{[^}]*\\.[^}]*\\}` (attribute access patterns). The Lambda runs with a 50ms batch window ensuring near-synchronous enforcement before the Celery worker polls.",
+    "config": {
+      "iam_policy": {
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserNotifications",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_id}"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyUnsignedTemplates",
+            "Effect": "Deny",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserNotifications",
+            "Condition": {
+              "ForAnyValue:StringLike": {
+                "dynamodb:Attributes": [
+                  "template"
+                ]
+              },
+              "StringNotEquals": {
+                "dynamodb:Select": "SPECIFIC_ATTRIBUTES"
+              }
+            }
+          }
+        ]
+      },
+      "dynamodb_streams_lambda": {
+        "trigger": "UserNotifications stream",
+        "batch_window_ms": 50,
+        "function": "template-sanitizer-v3",
+        "action": "Deletes items where template contains attribute-access format patterns",
+        "regex": "\\{[^}]*\\.[^}]*\\}"
+      },
+      "network": "Private VPC subnet, security group restricts egress to DynamoDB VPC endpoint only"
+    }
+  }
+}

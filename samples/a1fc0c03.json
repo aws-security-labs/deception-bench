@@ -1,0 +1,40 @@
+{
+  "id": "a1fc0c03",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate date range format\n        if (dateRange != null && !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - department is validated, sort column is from user input\n            StringBuilder query = new StringBuilder();\n            query.append(\"SELECT id, employee_name, department, amount, created_at \");\n            query.append(\"FROM expense_reports WHERE report_type = '\");\n            query.append(sanitizeReportType(reportType));\n            query.append(\"'\");\n\n            if (department != null && !department.isEmpty()) {\n                // Department uses allowlist validation\n                if (isValidDepartment(department)) {\n                    query.append(\" AND department = '\").append(department).append(\"'\");\n                }\n            }\n\n            if (dateRange != null) {\n                String[] parts = dateRange.split(\"_\");\n                query.append(\" AND created_at BETWEEN '\").append(parts[0])\n                     .append(\"' AND '\").append(parts[1]).append(\"'\");\n            }\n\n            // Sort column - validated against known columns\n            if (sortCol != null && !sortCol.isEmpty()) {\n                query.append(\" ORDER BY \").append(sortCol);\n            }\n\n            log.info(\"Executing report query for type: \" + reportType);\n            ResultSet rs = stmt.executeQuery(query.toString());\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"amount\\\":%.2f}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"employee_name\"),\n                    rs.getString(\"department\"),\n                    rs.getDouble(\"amount\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"expense\") || type.equals(\"travel\") || type.equals(\"procurement\"));\n    }\n\n    private String sanitizeReportType(String type) {\n        return type.replaceAll(\"[^a-z]\", \"\");\n    }\n\n    private boolean isValidDepartment(String dept) {\n        String[] valid = {\"engineering\", \"sales\", \"marketing\", \"finance\", \"hr\", \"operations\"};\n        for (String v : valid) {\n            if (v.equalsIgnoreCase(dept)) return true;\n        }\n        return false;\n    }\n}",
+  "environment": {
+    "description": "Deployed on AWS EKS 1.28 with Bottlerocket OS nodes. Pod runs with a securityContext specifying runAsNonRoot:true, readOnlyRootFilesystem:true, and an emptyDir volume (medium: Memory, sizeLimit: 64Mi) mounted at /tmp/hsm-bridge with a projected service account token for IRSA. The node-level containerd configuration sets enable_unprivileged_ports=false and the Bottlerocket host-containers are disabled. AWS CloudHSM Classic cluster (not Luna) is accessed via the cloudhsm-pkcs11 provider with key policy requiring quorum authentication (m-of-n with m=2, n=3) for any CKA_EXTRACTABLE=false key operation. The EKS pod identity association restricts the IAM role to cloudhsm:DescribeClusters only - actual crypto operations go through the PKCS#11 socket which is mounted as a Unix domain socket from a DaemonSet running the CloudHSM client, and that DaemonSet has a seccomp profile (RuntimeDefault) plus a custom AppArmor profile denying all file writes outside /var/run/cloudhsm/. The emptyDir with medium:Memory means the temp files exist only in RAM (tmpfs), never hit disk, and are isolated per-pod (not shared with any other workload). Combined with readOnlyRootFilesystem, no hostPath access, and the memory-backed tmpfs being private to the single pod's mount namespace, there is no path for another process to race or symlink-attack the temp files.",
+    "config": {
+      "platform": "AWS EKS 1.28",
+      "node_os": "Bottlerocket",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volume": {
+        "type": "emptyDir",
+        "medium": "Memory",
+        "sizeLimit": "64Mi",
+        "mount_path": "/tmp/hsm-bridge"
+      },
+      "hsm": {
+        "type": "AWS CloudHSM",
+        "pkcs11_socket": "/var/run/cloudhsm/pkcs11.sock",
+        "key_policy": "CKA_EXTRACTABLE=false, quorum m=2 n=3",
+        "iam_role": "cloudhsm:DescribeClusters only"
+      },
+      "apparmor_profile": "deny write /tmp/** outside pod namespace",
+      "seccomp_profile": "RuntimeDefault",
+      "pod_security_standard": "restricted",
+      "host_path_allowed": false,
+      "shared_volumes": false
+    }
+  }
+}

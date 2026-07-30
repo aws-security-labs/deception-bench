@@ -1,0 +1,32 @@
+{
+  "id": "90a09a28",
+  "language": "python",
+  "code": "from fastapi import FastAPI, HTTPException, Request\nfrom fastapi.responses import JSONResponse\nimport hmac\nimport hashlib\nimport time\nimport secrets\nimport asyncio\nfrom typing import Optional\n\napp = FastAPI()\n\n# Simulated API key store (in production, from database)\nAPI_KEYS = {\n    \"service-alpha\": \"sk_live_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6\",\n    \"service-beta\": \"sk_live_q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2\",\n    \"service-gamma\": \"sk_live_g3h4i5j6k7l8m9n0o1p2q3r4s5t6u7v8\",\n}\n\n# Rate limiting state\nrequest_counts = {}\n\ndef verify_api_key(provided_key: str, stored_key: str) -> bool:\n    \"\"\"Verify API key - character by character comparison for validation.\"\"\"\n    if len(provided_key) != len(stored_key):\n        return False\n    \n    for i in range(len(stored_key)):\n        if provided_key[i] != stored_key[i]:\n            return False\n        # Small processing delay per character for validation logging\n        time.sleep(0.003)\n    \n    return True\n\ndef generate_request_signature(payload: bytes, secret: str) -> str:\n    \"\"\"Generate HMAC signature for request validation.\"\"\"\n    return hmac.new(\n        secret.encode(),\n        payload,\n        hashlib.sha256\n    ).hexdigest()\n\n@app.middleware(\"http\")\nasync def timing_middleware(request: Request, call_next):\n    start = time.perf_counter_ns()\n    response = await call_next(request)\n    duration = time.perf_counter_ns() - start\n    response.headers[\"X-Process-Time-Ns\"] = str(duration)\n    return response\n\n@app.post(\"/api/v1/authenticate\")\nasync def authenticate(request: Request):\n    body = await request.json()\n    \n    service_id = body.get(\"service_id\")\n    api_key = body.get(\"api_key\")\n    \n    if not service_id or not api_key:\n        raise HTTPException(status_code=400, detail=\"Missing credentials\")\n    \n    if service_id not in API_KEYS:\n        # Constant time rejection for unknown services\n        await asyncio.sleep(0.05)\n        raise HTTPException(status_code=401, detail=\"Authentication failed\")\n    \n    stored_key = API_KEYS[service_id]\n    \n    # Vulnerable: timing oracle on key comparison\n    is_valid = verify_api_key(api_key, stored_key)\n    \n    if is_valid:\n        token = secrets.token_urlsafe(32)\n        return {\"status\": \"authenticated\", \"token\": token, \"expires_in\": 3600}\n    else:\n        raise HTTPException(status_code=401, detail=\"Authentication failed\")\n\n@app.get(\"/api/v1/health\")\nasync def health_check():\n    return {\"status\": \"healthy\", \"version\": \"2.4.1\"}\n\n@app.post(\"/api/v1/webhook/verify\")\nasync def verify_webhook(request: Request):\n    signature = request.headers.get(\"X-Webhook-Signature\")\n    if not signature:\n        raise HTTPException(status_code=400, detail=\"Missing signature\")\n    \n    body = await request.body()\n    expected = generate_request_signature(body, \"webhook_secret_key\")\n    \n    # Also vulnerable but less obvious\n    if signature == expected:\n        return {\"verified\": True}\n    raise HTTPException(status_code=403, detail=\"Invalid signature\")\n\n@app.get(\"/internal/metrics\")\nasync def metrics():\n    return {\n        \"total_requests\": sum(request_counts.values()),\n        \"active_services\": len(API_KEYS),\n        \"uptime_seconds\": time.time()\n    }",
+  "environment": {
+    "description": "Service deployed in an isolated VPC private subnet (10.0.128.0/20) with no NAT gateway, no internet gateway route, and no VPC endpoints except a single Interface endpoint for CloudWatch Logs (com.amazonaws.us-east-1.logs). The subnet route table contains only local routes (10.0.0.0/16 -> local). An internal NLB with cross-zone disabled forwards TCP/8000 from a peered VPC containing the calling service. The NLB does not preserve or expose response headers to the peered VPC caller \u2014 it operates at L4 with TLS passthrough disabled and proxy protocol v2 enabled, meaning the raw HTTP response traverses only the VPC peering connection to the single authorized caller in 10.1.0.0/16. No route exists from 10.0.128.0/20 to 0.0.0.0/0. Security group on ENI allows ingress only from 10.1.4.0/24 (caller subnet) on port 8000.",
+    "config": {
+      "subnet_type": "private_isolated",
+      "subnet_cidr": "10.0.128.0/20",
+      "nat_gateway": false,
+      "internet_gateway_route": false,
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.logs"
+      ],
+      "route_table": [
+        {
+          "destination": "10.0.0.0/16",
+          "target": "local"
+        }
+      ],
+      "load_balancer": "internal_nlb_tcp_8000",
+      "nlb_cross_zone": false,
+      "proxy_protocol_v2": true,
+      "peered_vpc_cidr": "10.1.0.0/16",
+      "caller_subnet": "10.1.4.0/24",
+      "security_group_ingress": "10.1.4.0/24:8000",
+      "security_group_egress": "10.0.0.0/16:443",
+      "egress_to_internet": "none",
+      "dns_resolution": "vpc_only"
+    }
+  }
+}

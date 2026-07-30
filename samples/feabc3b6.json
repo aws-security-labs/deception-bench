@@ -1,0 +1,52 @@
+{
+  "id": "feabc3b6",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { readFileSync } from 'fs';\n\nconst app = express();\napp.use(express.json());\n\n// Load DB config\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'inventory',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: { ca: readFileSync('/etc/ssl/rds-ca.pem') }\n});\n\n// Middleware: verify HMAC signature from upstream\nfunction verifySignature(req, res, next) {\n  const sig = req.headers['x-request-signature'];\n  const ts = req.headers['x-request-timestamp'];\n  if (!sig || !ts) return res.status(401).json({ error: 'missing signature' });\n  const age = Date.now() - parseInt(ts);\n  if (age > 30000 || age < 0) return res.status(401).json({ error: 'stale request' });\n  const expected = crypto.createHmac('sha256', process.env.HMAC_SECRET || 'dev')\n    .update(ts + ':' + JSON.stringify(req.body))\n    .digest('hex');\n  if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) {\n    return res.status(401).json({ error: 'invalid signature' });\n  }\n  next();\n}\n\n// Rate limiter (basic in-memory)\nconst requestCounts = new Map();\nfunction rateLimit(req, res, next) {\n  const ip = req.ip;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 100) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, (requestCounts.get(ip) || 1) - 1), 60000);\n  next();\n}\n\n// Sanitize helper - strips obvious attack patterns\nfunction sanitize(input) {\n  if (typeof input !== 'string') return '';\n  // Remove null bytes and common comment sequences\n  return input.replace(/\\x00/g, '').replace(/\\/\\*/g, '').replace(/\\*\\//g, '');\n}\n\n// Search endpoint\napp.post('/api/inventory/search', rateLimit, verifySignature, async (req, res) => {\n  try {\n    const { warehouse_id, sku_prefix, status, sort_field } = req.body;\n    \n    // Validate warehouse_id is numeric\n    if (!warehouse_id || !/^\\d+$/.test(String(warehouse_id))) {\n      return res.status(400).json({ error: 'invalid warehouse_id' });\n    }\n    \n    // Validate status against known values\n    const validStatuses = ['in_stock', 'low_stock', 'out_of_stock', 'discontinued'];\n    if (status && !validStatuses.includes(status)) {\n      return res.status(400).json({ error: 'invalid status' });\n    }\n\n    // Build query - sku_prefix uses LIKE, sort_field for ORDER BY\n    let query = `SELECT sku, product_name, quantity, status, last_updated \n                 FROM inventory WHERE warehouse_id = ${parseInt(warehouse_id)}`;\n    \n    if (status) {\n      query += ` AND status = '${status}'`;\n    }\n    \n    if (sku_prefix) {\n      const cleaned = sanitize(sku_prefix);\n      query += ` AND sku LIKE '${cleaned}%'`;\n    }\n    \n    // sort_field allows dynamic ordering\n    if (sort_field) {\n      const cleanedSort = sanitize(sort_field);\n      query += ` ORDER BY ${cleanedSort}`;\n    } else {\n      query += ` ORDER BY last_updated DESC`;\n    }\n    \n    query += ` LIMIT 50`;\n    \n    const result = await pool.query(query);\n    res.json({ items: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(3000, () => console.log('Inventory service listening on 3000'));",
+  "environment": {
+    "description": "Same Go Gin application deployed on ECS Fargate. Traffic routes through AWS API Gateway (HTTP API type) with a request model validator attached to the POST /api/v1/products/search route. The model schema defines 'category' as an enum type restricted to the values ['electronics', 'clothing', 'home', 'sports', 'books', 'toys'] and 'query' with a regex pattern constraint of '^[a-zA-Z0-9 ._-]{1,100}$'. Request validation mode is set to '$request.body' with validateRequestBody=true, causing API Gateway to return 400 for any request where the body does not conform to the JSON Schema before it reaches the backend. Note: the API Gateway validation occurs at the edge before any proxy integration invocation.",
+    "config": {
+      "runtime": "ECS Fargate, Go 1.21",
+      "api_gateway": "AWS API Gateway HTTP API (v2), route POST /api/v1/products/search",
+      "request_model": {
+        "type": "object",
+        "required": [
+          "query",
+          "category",
+          "page",
+          "limit"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9 ._-]{1,100}$"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "electronics",
+              "clothing",
+              "home",
+              "sports",
+              "books",
+              "toys"
+            ]
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "additionalProperties": false
+      },
+      "validation_config": "validateRequestBody: true, validateRequestParameters: true",
+      "integration": "HTTP_PROXY to ALB internal endpoint",
+      "database": "RDS PostgreSQL 15, appuser has SELECT/INSERT/UPDATE/DELETE on products schema",
+      "network": "API Gateway -> VPC Link -> ALB (internal) -> ECS task -> RDS"
+    }
+  }
+}

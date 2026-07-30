@@ -1,0 +1,70 @@
+{
+  "id": "931154b2",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\nimport logging\n\napp = Flask(__name__)\nlogger = logging.getLogger(__name__)\n\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/var/app/uploads')\nMAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 10485760))\nALLOWED_EXTENSIONS = {'yaml', 'yml', 'json', 'txt'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef validate_config(config_data):\n    \"\"\"Validate configuration structure before processing\"\"\"\n    required_keys = ['version', 'pipeline']\n    if not isinstance(config_data, dict):\n        return False, \"Config must be a mapping\"\n    for key in required_keys:\n        if key not in config_data:\n            return False, f\"Missing required key: {key}\"\n    if not isinstance(config_data.get('pipeline'), list):\n        return False, \"pipeline must be a sequence\"\n    return True, None\n\ndef execute_pipeline_step(step):\n    \"\"\"Execute a single pipeline step from config\"\"\"\n    step_type = step.get('type', 'echo')\n    if step_type == 'transform':\n        input_file = step.get('input', '')\n        output_file = step.get('output', '')\n        transform_cmd = step.get('command', 'cat')\n        # Build transformation command\n        cmd = f\"{transform_cmd} {input_file} > {output_file}\"\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30, text=True)\n        return {'status': 'completed', 'stdout': result.stdout[:500], 'returncode': result.returncode}\n    elif step_type == 'validate':\n        schema = step.get('schema', '')\n        target = step.get('target', '')\n        result = subprocess.run(['python3', '-c', f\"import json; json.load(open('{target}'))\"],\n                              capture_output=True, timeout=10, text=True)\n        return {'status': 'completed', 'valid': result.returncode == 0}\n    elif step_type == 'notify':\n        return {'status': 'completed', 'message': step.get('message', 'done')}\n    else:\n        return {'status': 'skipped', 'reason': f'unknown type: {step_type}'}\n\n@app.route('/api/v2/pipeline/upload', methods=['POST'])\ndef upload_config():\n    \"\"\"Upload a pipeline configuration file\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 400\n    \n    content = file.read()\n    if len(content) > MAX_FILE_SIZE:\n        return jsonify({'error': 'File too large'}), 413\n    \n    filename = secure_filename(file.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    \n    with open(filepath, 'wb') as f:\n        f.write(content)\n    \n    return jsonify({'status': 'uploaded', 'filename': filename, 'path': filepath}), 201\n\n@app.route('/api/v2/pipeline/execute', methods=['POST'])\ndef execute_pipeline():\n    \"\"\"Execute a previously uploaded pipeline configuration\"\"\"\n    data = request.get_json()\n    if not data or 'filename' not in data:\n        return jsonify({'error': 'filename required'}), 400\n    \n    filename = secure_filename(data['filename'])\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    \n    if not os.path.exists(filepath):\n        return jsonify({'error': 'File not found'}), 404\n    \n    with open(filepath, 'r') as f:\n        # Parse YAML configuration\n        config = yaml.safe_load(f)\n    \n    valid, err = validate_config(config)\n    if not valid:\n        return jsonify({'error': f'Invalid config: {err}'}), 400\n    \n    results = []\n    for i, step in enumerate(config['pipeline']):\n        try:\n            result = execute_pipeline_step(step)\n            results.append({'step': i, **result})\n        except subprocess.TimeoutExpired:\n            results.append({'step': i, 'status': 'timeout'})\n        except Exception as e:\n            results.append({'step': i, 'status': 'error', 'detail': str(e)})\n    \n    return jsonify({'pipeline': data['filename'], 'results': results})\n\n@app.route('/api/v2/pipeline/status', methods=['GET'])\ndef pipeline_status():\n    \"\"\"List uploaded pipeline configs\"\"\"\n    files = os.listdir(UPLOAD_DIR)\n    return jsonify({'configs': files, 'upload_dir': UPLOAD_DIR})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has two listener rules: (1) a fixed-response rule at priority 5 matching path /api/users/search with query string parameter 'q' containing any value with a single-quote character (returns 403), and (2) an AWS WAF WebACL association with a custom rule group 'app-input-validation' containing a RegexPatternSet match on query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d)` with BLOCK action at priority 100, plus the AWSManagedRulesCommonRuleSet at priority 200 with SizeRestriction_QUERYSTRING rule overridden to COUNT. The WAF WebACL default action is ALLOW. Additionally, the ECS task role has no S3 or Secrets Manager permissions, and the task definition sets readonlyRootFilesystem: true with a tmpfs mount only at /tmp.",
+    "config": {
+      "waf_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "priority": 100,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "scope": "QUERY_STRING",
+                "patterns": [
+                  "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d)"
+                ]
+              }
+            }
+          },
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 200,
+            "override_action": "NONE",
+            "rule_overrides": [
+              {
+                "name": "SizeRestriction_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "condition": {
+            "path_pattern": "/api/users/search",
+            "query_string": [
+              {
+                "key": "q",
+                "value": "*'*"
+              }
+            ]
+          },
+          "action": "fixed-response",
+          "status_code": 403
+        },
+        {
+          "priority": 99,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "ecs_task_definition": {
+        "readonly_root_filesystem": true,
+        "tmpfs_mounts": [
+          "/tmp"
+        ],
+        "task_role_permissions": [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+      }
+    }
+  }
+}

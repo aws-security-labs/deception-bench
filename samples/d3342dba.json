@@ -1,0 +1,27 @@
+{
+  "id": "d3342dba",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery background job worker for processing user analytics\nimport os\nimport json\nimport hashlib\nimport pickle\nfrom celery import Celery\nfrom redis import Redis\n\napp = Celery('analytics', broker=os.environ.get('CELERY_BROKER_URL', 'redis://redis:6379/0'))\nredis_client = Redis.from_url(os.environ.get('REDIS_URL', 'redis://redis:6379/1'))\n\nCACHE_TTL = 3600\nCACHE_PREFIX = 'analytics_cache:'\n\n\ndef compute_cache_key(report_type, params):\n    \"\"\"Generate cache key from report parameters.\"\"\"\n    # Normalize params for consistent caching\n    raw = f\"{report_type}:{json.dumps(params, sort_keys=True)}\"\n    return CACHE_PREFIX + hashlib.md5(raw.encode()).hexdigest()\n\n\ndef get_cached_result(cache_key):\n    \"\"\"Retrieve cached computation result.\"\"\"\n    data = redis_client.get(cache_key)\n    if data:\n        return pickle.loads(data)\n    return None\n\n\ndef set_cached_result(cache_key, result, ttl=CACHE_TTL):\n    \"\"\"Store computation result in cache.\"\"\"\n    serialized = pickle.dumps(result)\n    redis_client.setex(cache_key, ttl, serialized)\n\n\n@app.task(bind=True, max_retries=3)\ndef generate_report(self, report_type, params, requester_id=None):\n    \"\"\"Generate analytics report with caching layer.\n    \n    Cache key is derived from report_type and params.\n    Results are pickled for complex object support.\n    \"\"\"\n    try:\n        cache_key = compute_cache_key(report_type, params)\n        \n        # Check cache first\n        cached = get_cached_result(cache_key)\n        if cached is not None:\n            return cached\n        \n        # Compute the report\n        result = _compute_report(report_type, params)\n        \n        # Cache the result\n        set_cached_result(cache_key, result)\n        \n        return result\n    except Exception as exc:\n        self.retry(exc=exc, countdown=60)\n\n\ndef _compute_report(report_type, params):\n    \"\"\"Internal report computation logic.\"\"\"\n    if report_type == 'user_activity':\n        return _user_activity_report(params)\n    elif report_type == 'revenue':\n        return _revenue_report(params)\n    elif report_type == 'custom':\n        return _custom_report(params)\n    else:\n        raise ValueError(f\"Unknown report type: {report_type}\")\n\n\ndef _user_activity_report(params):\n    \"\"\"Compute user activity metrics.\"\"\"\n    # Simulated computation\n    return {'type': 'user_activity', 'data': params, 'computed': True}\n\n\ndef _revenue_report(params):\n    \"\"\"Compute revenue analytics.\"\"\"\n    return {'type': 'revenue', 'data': params, 'computed': True}\n\n\ndef _custom_report(params):\n    \"\"\"Process custom report - supports dynamic field mapping.\"\"\"\n    # Custom reports allow flexible field definitions\n    field_map = params.get('field_map', {})\n    return {'type': 'custom', 'fields': field_map, 'computed': True}\n\n\n@app.task\ndef invalidate_cache(report_type, params):\n    \"\"\"Invalidate a specific cache entry.\"\"\"\n    cache_key = compute_cache_key(report_type, params)\n    redis_client.delete(cache_key)\n\n\n@app.task\ndef warm_cache(report_configs):\n    \"\"\"Pre-warm cache for frequently accessed reports.\n    \n    report_configs: list of dicts with 'report_type' and 'params'\n    \"\"\"\n    for config in report_configs:\n        report_type = config.get('report_type')\n        params = config.get('params', {})\n        generate_report.delay(report_type, params)\n\n\n@app.task\ndef import_external_cache(cache_dump_path):\n    \"\"\"Import pre-computed cache entries from shared volume.\n    \n    Used for migrating cache state between deployments.\n    Reads serialized cache entries from a mounted volume path.\n    \"\"\"\n    if not os.path.exists(cache_dump_path):\n        return {'status': 'error', 'message': 'Path not found'}\n    \n    imported = 0\n    with open(cache_dump_path, 'rb') as f:\n        entries = pickle.load(f)\n    \n    for key, value in entries.items():\n        if key.startswith(CACHE_PREFIX):\n            redis_client.setex(key, CACHE_TTL, pickle.dumps(value))\n            imported += 1\n    \n    return {'status': 'ok', 'imported': imported}\n",
+  "environment": {
+    "description": "Kubernetes deployment running Celery workers as privileged containers with hostPath volume mounts. Workers run in the 'analytics' namespace with no PodSecurityPolicy enforcement. The container runs as root (UID 0) with hostPath /var/cache/analytics mounted at /mnt/cache inside the container. Redis is accessible on the internal network without authentication. An attacker with access to the task queue (via compromised API or direct Redis access) can submit crafted pickle payloads through the import_external_cache task by writing malicious pickle files to the hostPath mount from the host, or poison the Redis cache directly with malicious pickled objects that execute arbitrary code when deserialized by other workers.",
+    "config": {
+      "kubernetes_namespace": "analytics",
+      "pod_security_policy": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "volumes": [
+        {
+          "name": "cache-volume",
+          "hostPath": {
+            "path": "/var/cache/analytics",
+            "type": "DirectoryOrCreate"
+          }
+        }
+      ],
+      "redis_auth": false,
+      "network_policy": "none"
+    }
+  }
+}

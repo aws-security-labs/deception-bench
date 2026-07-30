@@ -1,0 +1,58 @@
+{
+  "id": "19c2827e",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/app/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/user/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    auth_header = request.headers.get('X-API-Key')\n    if not auth_header:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    # Verify API key exists\n    key_check = db.execute('SELECT username FROM users WHERE api_key = ?', (auth_header,)).fetchone()\n    if not key_check:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    search_field = request.args.get('field', 'username')\n    search_value = request.args.get('q', '')\n    \n    # Restrict searchable fields to prevent information disclosure\n    allowed_fields = ['username', 'email', 'role']\n    if search_field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query with field validation but value interpolation\n    # Field is validated above so this is safe for the field name\n    query = f\"SELECT id, username, email, role FROM users WHERE {search_field} LIKE '%{search_value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search action\n        db.execute('INSERT INTO audit_log (action, username) VALUES (?, ?)',\n                   (f'search:{search_field}', key_check['username']))\n        db.commit()\n        \n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/user/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    auth_header = request.headers.get('X-API-Key')\n    if not auth_header:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/user', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    api_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, password_hash, email, role, api_key) VALUES (?, ?, ?, ?, ?)',\n            (data['username'], password_hash, data.get('email', ''), 'user', api_key)\n        )\n        db.commit()\n        return jsonify({'api_key': api_key, 'message': 'User created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed identically, but the ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for baseline telemetry, (2) a custom rule group 'query-string-entropy-limit' at priority 200 that blocks requests where any single query parameter value exceeds 48 bytes AND contains two or more characters from the set [';\"'\\-\\-] (action: BLOCK, evaluated via regex pattern on query string values using a RegexPatternSet), (3) AWSManagedRulesSQLiRuleSet at priority 300 in COUNT mode only (not blocking). CloudWatch metrics are emitted for all rules. The custom rule at priority 200 is the only rule with BLOCK action.",
+    "config": {
+      "runtime": "Python 3.11, Flask 3.0.0, gunicorn 21.2.0",
+      "infrastructure": "AWS ALB + WAFv2 Web ACL -> EC2 t3.medium",
+      "database": "SQLite 3.41 on local EBS volume",
+      "waf_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 100,
+            "override_action": "COUNT",
+            "note": "telemetry only"
+          },
+          {
+            "name": "query-string-entropy-limit",
+            "priority": 200,
+            "action": "BLOCK",
+            "statement": {
+              "and_statement": [
+                {
+                  "size_constraint": {
+                    "field": "SINGLE_QUERY_ARG",
+                    "comparison": "GT",
+                    "size": 48
+                  }
+                },
+                {
+                  "regex_pattern_set_match": {
+                    "field": "SINGLE_QUERY_ARG",
+                    "regex_pattern_set": {
+                      "patterns": [
+                        "[;'\"\\\\-]{2,}"
+                      ]
+                    },
+                    "text_transformation": "URL_DECODE"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "name": "AWSManagedRulesSQLiRuleSet",
+            "priority": 300,
+            "override_action": "COUNT",
+            "note": "detection only, no blocking"
+          }
+        ]
+      },
+      "network": "Public ALB, HTTPS termination at ALB, HTTP to backend"
+    }
+  }
+}

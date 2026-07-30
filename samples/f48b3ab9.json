@@ -1,0 +1,42 @@
+{
+  "id": "f48b3ab9",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Template cache for report generation\n    private Map<String, String> templateCache = new HashMap<>();\n    \n    @Override\n    public void init() throws ServletException {\n        templateCache.put(\"sales\", \"SELECT product_name, quantity, unit_price, (quantity * unit_price) as total FROM orders WHERE region = '${region}' AND quarter = '${quarter}' ORDER BY ${sort_col}\");\n        templateCache.put(\"inventory\", \"SELECT sku, warehouse, stock_level, reorder_point FROM inventory WHERE warehouse_id = '${warehouse}' AND stock_level ${operator} ${threshold}\");\n        templateCache.put(\"audit\", \"SELECT event_type, username, ip_address, timestamp FROM audit_log WHERE timestamp > '${start_date}' AND event_type IN (${event_types}) LIMIT ${limit}\");\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"report_type\");\n        String outputFormat = req.getParameter(\"format\");\n        \n        if (reportType == null || !templateCache.containsKey(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Collect all parameters for template substitution\n        Map<String, String> params = new HashMap<>();\n        Enumeration<String> paramNames = req.getParameterNames();\n        while (paramNames.hasMoreElements()) {\n            String name = paramNames.nextElement();\n            String value = req.getParameter(name);\n            // Basic sanitization - remove comments and semicolons\n            value = value.replaceAll(\"--\", \"\").replaceAll(\";\", \"\");\n            params.put(name, value);\n        }\n        \n        String template = templateCache.get(reportType);\n        StringSubstitutor sub = new StringSubstitutor(params);\n        String query = sub.replace(template);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout for long-running reports\n            stmt.setQueryTimeout(30);\n            ResultSet rs = stmt.executeQuery(query);\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            int colCount = meta.getColumnCount();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\\\"columns\\\":[\");\n            for (int i = 1; i <= colCount; i++) {\n                if (i > 1) out.print(\",\");\n                out.print(\"\\\"\" + meta.getColumnLabel(i) + \"\\\"\");\n            }\n            out.print(\"],\\\"rows\\\":[\");\n            boolean first = true;\n            int rowCount = 0;\n            while (rs.next() && rowCount < 10000) {\n                if (!first) out.print(\",\");\n                out.print(\"[\");\n                for (int i = 1; i <= colCount; i++) {\n                    if (i > 1) out.print(\",\");\n                    String val = rs.getString(i);\n                    out.print(val == null ? \"null\" : \"\\\"\" + val.replace(\"\\\"\", \"\\\\\\\"\") + \"\\\"\");\n                }\n                out.print(\"]\");\n                first = false;\n                rowCount++;\n            }\n            out.print(\"]}\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setContentType(\"text/html\");\n        PrintWriter out = resp.getWriter();\n        out.println(\"<html><body><h2>Report Generator</h2>\");\n        out.println(\"<p>Available reports: sales, inventory, audit</p>\");\n        out.println(\"<p>POST parameters vary by report type.</p>\");\n        out.println(\"</body></html>\");\n    }\n}",
+  "environment": {
+    "description": "Same Node.js 18 Express application on EC2 behind ALB in us-east-1. The ALB has an associated AWS WAFv2 WebACL (regional scope) with the following rule groups in priority order: (1) AWS-AWSManagedRulesCommonRuleSet at priority 1 in COUNT mode for baseline telemetry, (2) a custom rule group 'ssrf-dns-rebind-protection' at priority 2 with a rate-based rule limiting to 5 requests per 5 minutes to /api/webhooks/verify per source IP, (3) AWS-AWSManagedRulesAmazonIpReputationList at priority 3 in BLOCK mode. Additionally, the EC2 instance has IMDSv2 enforced (HttpPutResponseHopLimit: 1, HttpTokens: required). VPC has a Network Firewall with a stateful rule group containing domain-based egress filtering that only permits outbound DNS resolution to Route 53 Resolver endpoints and blocks TCP connections to RFC 1918 and link-local (169.254.0.0/16) destination ranges from the application subnet. The combination of hop-limit=1 on IMDS plus Network Firewall egress blocking to internal ranges prevents the SSRF payload from reaching metadata or internal services even if DNS rebinding succeeds at the application layer.",
+    "config": {
+      "runtime": "Node.js 18.x on EC2",
+      "imds_version": "v2 enforced (HttpTokens: required, HttpPutResponseHopLimit: 1)",
+      "waf": {
+        "web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/webhook-protection/abc123",
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 1,
+            "action": "COUNT"
+          },
+          {
+            "name": "ssrf-dns-rebind-protection",
+            "priority": 2,
+            "type": "rate-based",
+            "limit": 5,
+            "window": 300,
+            "scope": "/api/webhooks/verify"
+          },
+          {
+            "name": "AWS-AWSManagedRulesAmazonIpReputationList",
+            "priority": 3,
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "network_firewall": {
+        "stateful_rule_group": "block-internal-egress",
+        "rules": [
+          "drop tcp any any -> [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16] any (msg:\"Block internal egress\"; sid:1000001;)"
+        ]
+      },
+      "security_group_egress": "0.0.0.0/0 (filtered by Network Firewall inline)"
+    }
+  }
+}

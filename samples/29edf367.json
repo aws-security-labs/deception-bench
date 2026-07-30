@@ -1,0 +1,87 @@
+{
+  "id": "29edf367",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.*;\n\npublic class ReportGeneratorServlet extends HttpServlet {\n    \n    private static final String TEMPLATE_DIR = \"/opt/reports/templates/\";\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String templateName = req.getParameter(\"template\");\n        String outputFormat = req.getParameter(\"format\");\n        String dataSourceId = req.getParameter(\"dsid\");\n        \n        // Validate template name - only alphanumeric and hyphens\n        if (templateName == null || !templateName.matches(\"[a-zA-Z0-9\\\\-]+\")) {\n            resp.sendError(400, \"Invalid template name\");\n            return;\n        }\n        \n        // Load template\n        String templatePath = TEMPLATE_DIR + templateName + \".rpt\";\n        String templateContent = new String(\n            java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(templatePath)));\n        \n        // Build substitution map from request parameters\n        Map<String, String> valuesMap = new HashMap<>();\n        Enumeration<String> paramNames = req.getParameterNames();\n        while (paramNames.hasMoreElements()) {\n            String param = paramNames.nextElement();\n            if (param.startsWith(\"field_\")) {\n                String fieldName = param.substring(6);\n                valuesMap.put(fieldName, req.getParameter(param));\n            }\n        }\n        \n        // Perform template substitution using Apache Commons Text\n        StringSubstitutor sub = new StringSubstitutor(valuesMap);\n        String rendered = sub.replace(templateContent);\n        \n        // Execute rendered content as SQL report query\n        try (Connection conn = getDataSource(dataSourceId).getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(rendered)) {\n            \n            StringBuilder result = new StringBuilder();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            \n            // CSV output\n            for (int i = 1; i <= cols; i++) {\n                result.append(meta.getColumnName(i));\n                if (i < cols) result.append(\",\");\n            }\n            result.append(\"\\n\");\n            \n            while (rs.next()) {\n                for (int i = 1; i <= cols; i++) {\n                    String val = rs.getString(i);\n                    // Escape CSV values\n                    if (val != null && (val.contains(\",\") || val.contains(\"\\\"\"))) {\n                        val = \"\\\"\" + val.replace(\"\\\"\", \"\\\"\\\"\") + \"\\\"\";\n                    }\n                    result.append(val != null ? val : \"\");\n                    if (i < cols) result.append(\",\");\n                }\n                result.append(\"\\n\");\n            }\n            \n            resp.setContentType(\"text/csv\");\n            resp.setHeader(\"Content-Disposition\", \n                \"attachment; filename=report_\" + templateName + \".csv\");\n            resp.getWriter().write(result.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private javax.sql.DataSource getDataSource(String dsid) {\n        try {\n            javax.naming.Context ctx = new javax.naming.InitialContext();\n            return (javax.sql.DataSource) ctx.lookup(\n                \"java:comp/env/jdbc/\" + (dsid != null ? dsid : \"reporting\"));\n        } catch (javax.naming.NamingException e) {\n            throw new RuntimeException(\"DataSource not found\", e);\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application on EKS 1.28 with php:8.2-fpm. A Cilium-based NetworkPolicy is applied to the application namespace with the following spec: egress rules allow TCP port 443 to endpoints matching label 'role=database' and TCP port 53 to kube-dns only. A separate CiliumNetworkPolicy with entitySelector denies all egress to CIDR 169.254.169.254/32 on the app pods (label app=document-service). The node uses IMDSv2 with hop-limit=1 (container requests would fail anyway). Additionally, the pod runs with a seccomp profile (RuntimeDefault) and the container's /proc/net is mounted read-only. The federation_hosts config is empty. Note: the Cilium policy uses toFQDNs for allowed external endpoints and has a default-deny egress posture at the namespace level via a baseline NetworkPolicy of type Egress with no egress rules specified.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "cni": "cilium-1.14",
+      "namespace_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny-egress",
+          "namespace": "document-app"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Egress"
+          ]
+        }
+      },
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "app-egress-rules",
+          "namespace": "document-app"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "document-service"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "role": "database"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "5432",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "imds_version": "v2",
+      "imds_hop_limit": 1,
+      "seccomp_profile": "RuntimeDefault",
+      "documents_federation_hosts": [],
+      "php_allow_url_fopen": "On"
+    }
+  }
+}

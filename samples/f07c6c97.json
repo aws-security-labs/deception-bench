@@ -1,0 +1,43 @@
+{
+  "id": "f07c6c97",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse serde::{Deserialize, Serialize};\nuse rusoto_s3::{S3Client, S3, PutObjectRequest};\nuse rusoto_core::Region;\n\n#[derive(Deserialize, Serialize, Clone, Debug)]\npub struct UserProfile {\n    pub username: String,\n    pub email: String,\n    pub display_name: String,\n    // Internal fields that should not be user-settable\n    pub role: Option<String>,           // \"admin\", \"user\", \"moderator\"\n    pub account_tier: Option<String>,   // \"free\", \"premium\", \"enterprise\"\n    pub s3_export_prefix: Option<String>, // controls where profile exports land in S3\n    pub internal_flags: Option<u64>,\n}\n\n#[derive(Deserialize, Serialize, Clone, Debug)]\npub struct StoredProfile {\n    pub username: String,\n    pub email: String,\n    pub display_name: String,\n    pub role: String,\n    pub account_tier: String,\n    pub s3_export_prefix: String,\n    pub internal_flags: u64,\n}\n\nimpl From<UserProfile> for StoredProfile {\n    fn from(p: UserProfile) -> Self {\n        StoredProfile {\n            username: p.username,\n            email: p.email,\n            display_name: p.display_name,\n            // Mass assignment: user-supplied values override defaults\n            role: p.role.unwrap_or_else(|| \"user\".to_string()),\n            account_tier: p.account_tier.unwrap_or_else(|| \"free\".to_string()),\n            s3_export_prefix: p.s3_export_prefix.unwrap_or_else(|| \"exports/default/\".to_string()),\n            internal_flags: p.internal_flags.unwrap_or(0),\n        }\n    }\n}\n\nasync fn update_profile(\n    profile: web::Json<UserProfile>,\n    s3_client: web::Data<S3Client>,\n) -> HttpResponse {\n    let stored: StoredProfile = profile.into_inner().into();\n    \n    // Export profile to S3 using user-controlled prefix\n    let key = format!(\"{}{}.json\", stored.s3_export_prefix, stored.username);\n    let body = serde_json::to_vec(&stored).unwrap_or_default();\n    \n    let put_req = PutObjectRequest {\n        bucket: std::env::var(\"PROFILE_BUCKET\").unwrap_or_else(|_| \"app-profiles-prod\".into()),\n        key: key.clone(),\n        body: Some(body.into()),\n        content_type: Some(\"application/json\".to_string()),\n        ..Default::default()\n    };\n    \n    match s3_client.put_object(put_req).await {\n        Ok(_) => HttpResponse::Ok().json(serde_json::json!({\n            \"status\": \"updated\",\n            \"profile\": stored,\n            \"export_path\": key\n        })),\n        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({\n            \"error\": format!(\"Failed to export profile: {}\", e)\n        })),\n    }\n}\n\nasync fn get_profile(path: web::Path<String>) -> HttpResponse {\n    // Stub: would read from database\n    HttpResponse::Ok().json(serde_json::json!({\"username\": path.into_inner()}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let region = Region::Custom {\n        name: \"us-east-1\".to_string(),\n        endpoint: std::env::var(\"AWS_ENDPOINT\").unwrap_or_else(|_| \"https://s3.us-east-1.amazonaws.com\".into()),\n    };\n    let s3_client = S3Client::new(region);\n    \n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(s3_client.clone()))\n            .route(\"/api/profile\", web::post().to(update_profile))\n            .route(\"/api/profile/{username}\", web::get().to(get_profile))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same ECS Fargate service in us-east-1 VPC but all S3 traffic is forced through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f) with a custom endpoint policy. The VPC route tables have no NAT gateway route for S3 prefix lists (pl-63a5400a), so S3 is ONLY reachable via the VPCE. The endpoint policy document restricts PutObject to keys matching the condition s3:prefix with StringLike 'exports/default/*' and additionally requires s3:RequestObjectTag/origin to equal 'system-generated'. The task IAM role is unchanged. Subnet NACLs block outbound 443 to 0.0.0.0/0 except through the VPCE prefix list.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "vpc": "10.0.0.0/16, no NAT for S3 prefix list pl-63a5400a",
+      "vpce_id": "vpce-0a1b2c3d4e5f",
+      "vpce_type": "Gateway",
+      "vpce_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "RestrictPutObjectPrefix",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::app-profiles-prod/*",
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": "exports/default/*"
+              },
+              "StringEquals": {
+                "s3:RequestObjectTag/origin": "system-generated"
+              }
+            }
+          },
+          {
+            "Sid": "AllowGetObject",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::app-profiles-prod/exports/default/*"
+          }
+        ]
+      },
+      "nacl": "outbound 443 blocked to 0.0.0.0/0; only VPCE prefix list allowed",
+      "iam_role": "arn:aws:iam::123456789012:role/profile-svc-role with s3:PutObject on arn:aws:s3:::app-profiles-prod/*"
+    }
+  }
+}

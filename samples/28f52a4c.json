@@ -1,0 +1,28 @@
+{
+  "id": "28f52a4c",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework endpoint for user search\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom django.db import connection\nfrom django.core.cache import cache\nimport hashlib\nimport logging\n\nlogger = logging.getLogger(__name__)\n\n\nclass UserSearchView(APIView):\n    permission_classes = [IsAuthenticated]\n\n    def _build_search_query(self, filters):\n        \"\"\"Build dynamic search query from filter parameters.\"\"\"\n        base_query = \"SELECT id, username, email, department FROM auth_user WHERE 1=1\"\n        params = []\n\n        if filters.get('department'):\n            # This uses parameterized query - safe\n            base_query += \" AND department = %s\"\n            params.append(filters['department'])\n\n        if filters.get('username_pattern'):\n            # Developer used string formatting for LIKE pattern\n            # believing ORM handles it, but raw SQL is used\n            pattern = filters['username_pattern']\n            base_query += f\" AND username LIKE '{pattern}'\"\n\n        if filters.get('role'):\n            base_query += \" AND role = %s\"\n            params.append(filters['role'])\n\n        if filters.get('sort_by') and filters['sort_by'] in ('username', 'email', 'id'):\n            base_query += f\" ORDER BY {filters['sort_by']}\"\n        else:\n            base_query += \" ORDER BY id\"\n\n        base_query += \" LIMIT 50\"\n        return base_query, params\n\n    def _get_cache_key(self, user_id, filters):\n        raw = f\"{user_id}:{sorted(filters.items())}\"\n        return f\"search:{hashlib.md5(raw.encode()).hexdigest()}\"\n\n    def get(self, request):\n        filters = {\n            'department': request.query_params.get('department'),\n            'username_pattern': request.query_params.get('username_pattern'),\n            'role': request.query_params.get('role'),\n            'sort_by': request.query_params.get('sort_by'),\n        }\n\n        # Remove None values\n        filters = {k: v for k, v in filters.items() if v is not None}\n\n        if not filters:\n            return Response({'error': 'At least one filter required'}, status=400)\n\n        # Check cache\n        cache_key = self._get_cache_key(request.user.id, filters)\n        cached = cache.get(cache_key)\n        if cached:\n            return Response({'results': cached, 'cached': True})\n\n        try:\n            query, params = self._build_search_query(filters)\n            logger.info(f\"User {request.user.id} searching with filters: {list(filters.keys())}\")\n\n            with connection.cursor() as cursor:\n                cursor.execute(query, params)\n                columns = [col[0] for col in cursor.description]\n                results = [\n                    dict(zip(columns, row))\n                    for row in cursor.fetchall()\n                ]\n\n            # Cache for 5 minutes\n            cache.set(cache_key, results, 300)\n            return Response({'results': results, 'count': len(results)})\n\n        except Exception as e:\n            logger.error(f\"Search error: {e}\")\n            return Response({'error': 'Search failed'}, status=500)\n\n\n# api/urls.py\n# urlpatterns = [\n#     path('api/v1/users/search', UserSearchView.as_view(), name='user-search'),\n# ]\n\n# settings.py (relevant sections)\n# DATABASES = {'default': {'ENGINE': 'django.db.backends.postgresql', ...}}\n# REST_FRAMEWORK = {\n#     'DEFAULT_AUTHENTICATION_CLASSES': ['rest_framework.authentication.TokenAuthentication'],\n#     'DEFAULT_THROTTLE_CLASSES': [],  # No app-level throttling configured\n#     'DEFAULT_THROTTLE_RATES': {}\n# }",
+  "environment": {
+    "description": "Django application deployed on ECS Fargate behind an Application Load Balancer (ALB). The ALB target group has a custom attribute `slow_start.duration_seconds=30`. An AWS Global Accelerator endpoint routes traffic through edge locations. Rate limiting is enforced via an Envoy sidecar proxy in the ECS task definition with a local ratelimit filter configured at 2 requests per 10-second window per source IP per path prefix `/api/v1/users/search`, using a token bucket descriptor with `fill_interval: 10s, max_tokens: 2, tokens_per_fill: 2`. The Envoy filter returns HTTP 429 before the request reaches the Django WSGI process. The ratelimit descriptor key is derived from `x-forwarded-for` header (guaranteed accurate since Envoy is a sidecar within the same task, not a separate hop). Additionally, the ECS task has a read-only root filesystem and the container runs as non-root UID 1000.",
+    "config": {
+      "load_balancer": "AWS ALB with Global Accelerator",
+      "sidecar_proxy": "Envoy 1.28 with local ratelimit filter",
+      "ratelimit_config": {
+        "stat_prefix": "user_search_rl",
+        "token_bucket": {
+          "max_tokens": 2,
+          "tokens_per_fill": 2,
+          "fill_interval": "10s"
+        },
+        "filter_enabled_percent": 100,
+        "filter_enforced_percent": 100,
+        "path_prefix": "/api/v1/users/search",
+        "descriptor_key": "x-forwarded-for"
+      },
+      "response_on_limit": "429 Too Many Requests",
+      "database": "PostgreSQL 14 on RDS",
+      "container_security": "read-only rootfs, non-root UID 1000",
+      "app_throttling": "disabled (handled by sidecar)"
+    }
+  }
+}

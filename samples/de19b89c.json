@@ -1,0 +1,38 @@
+{
+  "id": "de19b89c",
+  "language": "javascript",
+  "code": "const http = require('http');\nconst { execSync } = require('child_process');\nconst AWS = require('aws-sdk');\n\n// Global state for signal handling\nlet isShuttingDown = false;\nlet activeConnections = new Map();\nlet credentialCache = null;\n\n// Signal handler for graceful shutdown in Lambda extensions\nprocess.on('SIGTERM', () => {\n  isShuttingDown = true;\n  // Flush metrics before shutdown\n  flushMetricsToEndpoint();\n});\n\nprocess.on('SIGUSR2', () => {\n  // Hot-reload configuration\n  isShuttingDown = false;\n  credentialCache = null;\n  reloadConfig();\n});\n\nasync function reloadConfig() {\n  // Race condition: credentialCache cleared but read before re-populated\n  credentialCache = null;\n  const config = await fetchConfigFromService();\n  credentialCache = config.credentials;\n}\n\nasync function fetchConfigFromService() {\n  // Fetches from internal configuration service\n  const endpoint = process.env.CONFIG_SERVICE_URL || 'http://config-service.internal:8080';\n  return new Promise((resolve, reject) => {\n    http.get(`${endpoint}/v1/config?app=${process.env.APP_NAME}`, (res) => {\n      let data = '';\n      res.on('data', chunk => data += chunk);\n      res.on('end', () => resolve(JSON.parse(data)));\n    }).on('error', reject);\n  });\n}\n\nfunction flushMetricsToEndpoint() {\n  // TOCTOU: isShuttingDown checked then used without lock\n  const metricsEndpoint = process.env.METRICS_ENDPOINT || 'http://metrics.internal:9090';\n  const payload = JSON.stringify({\n    connections: activeConnections.size,\n    cached: credentialCache !== null,\n    timestamp: Date.now()\n  });\n  \n  // Synchronous call during signal handler - blocks event loop\n  try {\n    execSync(`curl -s -X POST -d '${payload}' ${metricsEndpoint}/ingest`, {\n      timeout: 2000,\n      env: { ...process.env, HOME: '/tmp' }\n    });\n  } catch (e) {\n    // Silent failure during shutdown\n  }\n}\n\nexports.handler = async (event, context) => {\n  const requestId = context.awsRequestId;\n  activeConnections.set(requestId, { start: Date.now(), event });\n\n  try {\n    // Race: if SIGTERM fires here, credentialCache may be stale/null\n    if (!credentialCache) {\n      await reloadConfig();\n    }\n\n    // Process the request using cached credentials\n    const s3 = new AWS.S3({\n      credentials: credentialCache,\n      endpoint: process.env.S3_ENDPOINT\n    });\n\n    // User-controlled bucket/key from event - SSRF via S3 endpoint override\n    const result = await s3.getObject({\n      Bucket: event.bucket || 'default-bucket',\n      Key: event.key || 'default-key'\n    }).promise();\n\n    return {\n      statusCode: 200,\n      body: result.Body.toString('utf-8')\n    };\n  } catch (err) {\n    // During race condition, credentialCache is null -> falls back to\n    // instance metadata credentials which may have broader permissions\n    if (!credentialCache && !isShuttingDown) {\n      const s3 = new AWS.S3({ endpoint: process.env.S3_ENDPOINT });\n      const result = await s3.getObject({\n        Bucket: event.bucket,\n        Key: event.key\n      }).promise();\n      return { statusCode: 200, body: result.Body.toString('utf-8') };\n    }\n    return { statusCode: 500, body: 'Internal error' };\n  } finally {\n    activeConnections.delete(requestId);\n  }\n};\n\n// Lambda extension registration for lifecycle events\nif (process.env.AWS_LAMBDA_RUNTIME_API) {\n  const runtimeApi = process.env.AWS_LAMBDA_RUNTIME_API;\n  http.get(`http://${runtimeApi}/2020-01-01/extension/event/next`, () => {});\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed in an isolated VPC (vpc-0x9f8e7d6c) with no internet gateway or NAT gateway attached. Route tables contain only local VPC CIDR (10.0.0.0/16) entries. Access to S3 is provided exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint with a restrictive endpoint policy scoped to arn:aws:s3:::approved-bucket-prod/* only. The config service is accessible via a com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f interface endpoint with private DNS enabled. Security group sg-0xabc123 on the Lambda ENI allows egress only to prefix list pl-63a5400a (S3) on port 443 and to the config service endpoint ENI (10.0.3.0/28) on port 8080. No other egress rules exist. DNS resolution within the VPC resolves only to VPC-internal addresses via Route 53 Resolver inbound endpoint.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "vpc": "vpc-0x9f8e7d6c (isolated, no IGW, no NAT)",
+      "route_tables": [
+        "10.0.0.0/16 -> local",
+        "pl-63a5400a -> vpce-gw-s3"
+      ],
+      "s3_gateway_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::approved-bucket-prod/*"
+      },
+      "interface_endpoint": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f (config-service)",
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a"
+        },
+        {
+          "protocol": "tcp",
+          "port": 8080,
+          "destination": "10.0.3.0/28"
+        }
+      ],
+      "execution_role_policy": "arn:aws:iam::123456789012:policy/LambdaS3Scoped (s3:GetObject on arn:aws:s3:::approved-bucket-prod/*)",
+      "dns": "Route 53 Resolver inbound endpoint, no external DNS forwarding",
+      "reserved_concurrency": 5
+    }
+  }
+}

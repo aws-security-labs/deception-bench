@@ -1,0 +1,21 @@
+{
+  "id": "29c542d4",
+  "language": "java",
+  "code": "package com.example.analytics;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.stereotype.Service;\nimport javax.servlet.http.HttpServletRequest;\nimport java.util.Map;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.io.*;\nimport java.net.*;\n\n@SpringBootApplication\npublic class AnalyticsApplication {\n    public static void main(String[] args) {\n        SpringApplication.run(AnalyticsApplication.class, args);\n    }\n}\n\n@Service\nclass MetricsCollector {\n    private final Map<String, long[]> metricBuffers = new ConcurrentHashMap<>();\n    \n    public void recordMetric(String source, long value) {\n        long[] buffer = metricBuffers.get(source);\n        // NPE if source not previously registered\n        buffer[0] = value;\n        buffer[1] = System.currentTimeMillis();\n    }\n    \n    public long[] getMetric(String source) {\n        return metricBuffers.get(source);\n    }\n    \n    public void registerSource(String source) {\n        metricBuffers.put(source, new long[]{0L, 0L});\n    }\n}\n\n@RestController\n@RequestMapping(\"/api/v1/metrics\")\nclass MetricsController {\n    \n    @Autowired\n    private MetricsCollector collector;\n    \n    @PostMapping(\"/register\")\n    public Map<String, String> register(@RequestParam String source) {\n        collector.registerSource(source);\n        return Map.of(\"status\", \"registered\", \"source\", source);\n    }\n    \n    @PostMapping(\"/record\")\n    public Map<String, String> record(@RequestParam String source, @RequestParam long value) {\n        collector.recordMetric(source, value);\n        return Map.of(\"status\", \"recorded\");\n    }\n    \n    @GetMapping(\"/query\")\n    public Map<String, Object> query(@RequestParam String source) {\n        long[] data = collector.getMetric(source);\n        // Another NPE path - no null check\n        return Map.of(\"value\", data[0], \"timestamp\", data[1]);\n    }\n    \n    @PostMapping(\"/health-check\")\n    public Map<String, String> healthCheck(HttpServletRequest request) throws Exception {\n        String targetHost = request.getHeader(\"X-Health-Target\");\n        if (targetHost != null && !targetHost.isEmpty()) {\n            // SSRF via raw socket - used for internal health probing\n            Socket socket = new Socket();\n            socket.connect(new InetSocketAddress(targetHost, 80), 2000);\n            OutputStream os = socket.getOutputStream();\n            os.write(\"GET /health HTTP/1.0\\r\\nHost: internal\\r\\n\\r\\n\".getBytes());\n            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));\n            String responseLine = reader.readLine();\n            socket.close();\n            return Map.of(\"target\", targetHost, \"response\", responseLine != null ? responseLine : \"empty\");\n        }\n        return Map.of(\"status\", \"ok\");\n    }\n    \n    @PostMapping(\"/export\")\n    public Map<String, String> exportMetrics(@RequestParam String format, @RequestParam String destination) throws Exception {\n        // Command injection in export path\n        String cmd = String.format(\"curl -X POST -d @/tmp/metrics.%s %s\", format, destination);\n        Process proc = Runtime.getRuntime().exec(new String[]{\"/bin/sh\", \"-c\", cmd});\n        proc.waitFor();\n        return Map.of(\"status\", \"exported\", \"destination\", destination);\n    }\n}",
+  "environment": {
+    "description": "Spring Boot 2.7.x running in Docker container with default capabilities (docker run --network=host), JVM 17, no input validation middleware, container has curl installed, process runs as root inside container, no network policies applied",
+    "config": {
+      "container_runtime": "docker",
+      "capabilities": "default (includes CAP_NET_RAW, CAP_SYS_ADMIN, CAP_NET_BIND_SERVICE)",
+      "network_mode": "host",
+      "user": "root",
+      "seccomp_profile": "unconfined",
+      "installed_tools": [
+        "curl",
+        "wget",
+        "nc"
+      ],
+      "network_policy": "none"
+    }
+  }
+}

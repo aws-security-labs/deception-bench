@@ -1,0 +1,34 @@
+{
+  "id": "c62c9808",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/app/data/metrics.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS metrics (\n            id INTEGER PRIMARY KEY,\n            service_name TEXT,\n            metric_type TEXT,\n            value REAL,\n            timestamp TEXT,\n            region TEXT\n        );\n        CREATE TABLE IF NOT EXISTS api_keys (\n            id INTEGER PRIMARY KEY,\n            key_hash TEXT,\n            owner TEXT,\n            permissions TEXT,\n            created_at TEXT\n        );\n        INSERT OR IGNORE INTO api_keys VALUES (1, 'a1b2c3d4e5f6', 'admin', 'read,write,delete', '2024-01-01');\n        INSERT OR IGNORE INTO metrics VALUES (1, 'auth-svc', 'latency', 42.5, '2024-06-01T00:00:00Z', 'us-east-1');\n        INSERT OR IGNORE INTO metrics VALUES (2, 'payment-svc', 'error_rate', 0.02, '2024-06-01T00:01:00Z', 'eu-west-1');\n    ''')\n    db.commit()\n    db.close()\n\ndef verify_hmac_token(req):\n    token = req.headers.get('X-Service-Token', '')\n    timestamp = req.headers.get('X-Request-Timestamp', '')\n    # Timing window check - tokens expire after 300s\n    try:\n        if abs(time.time() - float(timestamp)) > 300:\n            return False\n    except (ValueError, TypeError):\n        return False\n    expected = hashlib.sha256(f\"{os.environ.get('SERVICE_SECRET', 'dev-secret')}:{timestamp}\".encode()).hexdigest()[:32]\n    return token == expected\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/internal/metrics/query', methods=['GET'])\ndef query_metrics():\n    if not verify_hmac_token(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    service = request.args.get('service', '')\n    metric = request.args.get('metric', '')\n    region = request.args.get('region', '')\n    start = request.args.get('start', '')\n    end = request.args.get('end', '')\n    \n    # Build query dynamically for flexible filtering\n    query = \"SELECT id, service_name, metric_type, value, timestamp, region FROM metrics WHERE 1=1\"\n    \n    if service:\n        query += f\" AND service_name = '{service}'\"\n    if metric:\n        query += f\" AND metric_type = '{metric}'\"\n    if region:\n        query += f\" AND region = '{region}'\"\n    if start:\n        query += f\" AND timestamp >= '{start}'\"\n    if end:\n        query += f\" AND timestamp <= '{end}'\"\n    \n    query += \" ORDER BY timestamp DESC LIMIT 1000\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'data': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/internal/metrics/aggregate', methods=['GET'])\ndef aggregate_metrics():\n    if not verify_hmac_token(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    group_by = request.args.get('group', 'service_name')\n    allowed_groups = ['service_name', 'metric_type', 'region']\n    if group_by not in allowed_groups:\n        group_by = 'service_name'\n    \n    fn = request.args.get('fn', 'avg')\n    allowed_fns = ['avg', 'sum', 'count', 'min', 'max']\n    if fn not in allowed_fns:\n        fn = 'avg'\n    \n    query = f\"SELECT {group_by}, {fn}(value) as result FROM metrics GROUP BY {group_by}\"\n    results = db.execute(query).fetchall()\n    return jsonify({'data': [dict(r) for r in results]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=9090, debug=False)",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

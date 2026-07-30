@@ -1,0 +1,16 @@
+{
+  "id": "132e4c26",
+  "language": "ruby",
+  "code": "# app/controllers/comments_controller.rb\nclass CommentsController < ApplicationController\n  skip_before_action :verify_authenticity_token, only: [:create]\n\n  def index\n    @comments = Comment.all.order(created_at: :desc)\n    render :index\n  end\n\n  def create\n    @comment = Comment.new(comment_params)\n    @comment.user_id = current_user&.id || 0\n    if @comment.save\n      render json: { status: 'ok', comment: @comment }, status: :created\n    else\n      render json: { status: 'error', errors: @comment.errors }, status: :unprocessable_entity\n    end\n  end\n\n  private\n\n  def comment_params\n    params.require(:comment).permit(:body, :post_id)\n  end\nend\n\n# app/views/comments/index.html.erb\n# <div class=\"comments-section\">\n#   <% @comments.each do |comment| %>\n#     <div class=\"comment-card\">\n#       <p class=\"comment-body\"><%= raw comment.body %></p>\n#       <span class=\"comment-meta\">Posted by User #<%= comment.user_id %></span>\n#     </div>\n#   <% end %>\n# </div>\n#\n# <script src=\"/assets/comments-handler.js\"></script>\n# <script src=\"https://cdn.example.com/widgets/reaction-bar.min.js\"></script>\n\n# app/models/comment.rb\nclass Comment < ApplicationRecord\n  belongs_to :post, optional: true\n  validates :body, presence: true, length: { maximum: 5000 }\n\n  # Note: body is stored as-is for rich text support\n  # Sanitization is handled at the view layer per team convention\nend\n\n# config/initializers/content_security_policy.rb\nRails.application.config.content_security_policy do |policy|\n  policy.default_src :self\n  policy.font_src    :self, 'https://fonts.gstatic.com'\n  policy.img_src     :self, :data, 'https:'\n  policy.object_src  :none\n  policy.style_src   :self, :unsafe_inline, 'https://fonts.googleapis.com'\n  # script-src configured per environment - see deployment notes\nend\n\n# Gemfile (relevant entries)\n# gem 'rails', '~> 7.1'\n# gem 'sprockets-rails'\n# gem 'secure_headers', '~> 6.5'",
+  "environment": {
+    "description": "Rails 7.1 application deployed on Heroku with standard Puma web server. CSP header is configured but script-src directive includes 'unsafe-inline' to support legacy inline analytics snippets. No additional response header middleware. Comments are rendered using `raw` helper without sanitization. Standard PostgreSQL database backend.",
+    "config": {
+      "hosting": "Heroku, Cedar-22 stack",
+      "web_server": "Puma 6.x",
+      "csp_script_src": "'self' 'unsafe-inline' https://cdn.example.com",
+      "sri_enabled": false,
+      "waf": "none",
+      "sanitization": "none - raw output in view"
+    }
+  }
+}

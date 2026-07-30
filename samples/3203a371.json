@@ -1,0 +1,28 @@
+{
+  "id": "3203a371",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework view for product search\nimport re\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nfrom django.db import connection\nfrom django.core.cache import cache\n\n\n# Pattern to validate and extract search terms with optional quoted phrases\n# Supports: word, \"exact phrase\", word* (wildcard), -excluded\nSEARCH_PATTERN = re.compile(\n    r'^([\\w\\s\"*-]*?(\"[^\"]*?\")?[\\w\\s*-]*?)*$'\n)\n\n# Pattern to validate sort field names (alphanumeric + underscore)\nSORT_FIELD_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')\n\n\ndef validate_search_query(query_string):\n    \"\"\"Validate search query syntax before processing.\n    Returns (is_valid, cleaned_query) tuple.\n    \"\"\"\n    if not query_string or len(query_string) > 500:\n        return False, \"\"\n    \n    # Validate overall structure\n    match = SEARCH_PATTERN.match(query_string)\n    if not match:\n        return False, \"\"\n    \n    # Strip dangerous characters for DB safety\n    cleaned = query_string.replace(\"'\", \"\").replace(\";\", \"\")\n    return True, cleaned\n\n\ndef parse_search_terms(query_string):\n    \"\"\"Parse search string into individual terms and phrases.\"\"\"\n    terms = []\n    # Extract quoted phrases first\n    phrase_pattern = re.compile(r'\"([^\"]+)\"')\n    phrases = phrase_pattern.findall(query_string)\n    terms.extend(phrases)\n    \n    # Remove quoted phrases and get remaining words\n    remaining = phrase_pattern.sub('', query_string).strip()\n    if remaining:\n        words = remaining.split()\n        terms.extend([w for w in words if w and w != '-'])\n    \n    return terms\n\n\nclass ProductSearchView(APIView):\n    \"\"\"Search products with full-text matching and filtering.\"\"\"\n    \n    def get(self, request):\n        query = request.query_params.get('q', '')\n        sort_by = request.query_params.get('sort', 'relevance')\n        page = request.query_params.get('page', '1')\n        \n        # Validate search query\n        is_valid, cleaned_query = validate_search_query(query)\n        if not is_valid:\n            return Response(\n                {'error': 'Invalid search query syntax'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        # Check cache\n        cache_key = f\"search:{cleaned_query}:{sort_by}:{page}\"\n        cached = cache.get(cache_key)\n        if cached:\n            return Response(cached)\n        \n        # Parse terms for DB query\n        terms = parse_search_terms(cleaned_query)\n        if not terms:\n            return Response({'results': [], 'total': 0})\n        \n        # Validate sort field\n        if sort_by != 'relevance' and not SORT_FIELD_PATTERN.match(sort_by):\n            sort_by = 'relevance'\n        \n        # Build parameterized query using pgBouncer-compatible approach\n        try:\n            page_num = max(1, int(page))\n        except (ValueError, TypeError):\n            page_num = 1\n        \n        offset = (page_num - 1) * 20\n        \n        # Use parameterized query through connection pooler\n        placeholders = ' | '.join(['plainto_tsquery(%s)'] * len(terms))\n        sql = f\"\"\"\n            SELECT id, name, description, price,\n                   ts_rank(search_vector, {placeholders}) as rank\n            FROM products\n            WHERE search_vector @@ ({placeholders})\n            ORDER BY rank DESC\n            LIMIT 20 OFFSET %s\n        \"\"\"\n        \n        params = terms + terms + [offset]\n        \n        with connection.cursor() as cursor:\n            cursor.execute(sql, params)\n            columns = [col[0] for col in cursor.description]\n            results = [dict(zip(columns, row)) for row in cursor.fetchall()]\n        \n        response_data = {\n            'results': results,\n            'total': len(results),\n            'page': page_num\n        }\n        \n        # Cache for 5 minutes\n        cache.set(cache_key, response_data, 300)\n        \n        return Response(response_data)\n",
+  "environment": {
+    "description": "Same Django 4.2 REST API on ECS Fargate behind ALB. pgBouncer 1.19 in transaction pooling mode with prepared statement support (server_lifetime=300, max_client_conn=100). Gunicorn configured with --timeout 3 flag (worker timeout 3 seconds). Additionally, the ECS task definition includes an ulimit on CPU time (cpu: {hard: 2, soft: 1}) applied via the task definition's ulimits array, and the container runs with a custom seccomp profile that restricts clock_nanosleep and nanosleep syscalls to max 50ms granularity via SCMP_ACT_ERRNO on durations exceeding threshold. The ALB target group has a deregistration delay of 5s and health check interval of 5s with 2 unhealthy threshold, causing workers stuck in regex backtracking to be recycled before completing catastrophic backtracking on inputs designed to exploit the nested quantifier pattern.",
+    "config": {
+      "runtime": "Python 3.11, Django 4.2, DRF 3.14",
+      "server": "Gunicorn 21.2.0 with --timeout 3 --graceful-timeout 2",
+      "infrastructure": "ECS Fargate 2vCPU/4GB, ALB idle timeout 5s",
+      "database": "pgBouncer 1.19 transaction mode, prepared statements enabled",
+      "ecs_task_ulimits": [
+        {
+          "name": "cpu",
+          "softLimit": 1,
+          "hardLimit": 2
+        }
+      ],
+      "seccomp_profile": "custom-restricted-sleep.json",
+      "alb_target_group": {
+        "deregistration_delay": 5,
+        "health_check_interval": 5,
+        "unhealthy_threshold": 2
+      },
+      "gunicorn_timeout": 3
+    }
+  }
+}

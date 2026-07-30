@@ -1,0 +1,30 @@
+{
+  "id": "6d783a2a",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration script for multi-tenant SaaS platform.\nRuns as a Kubernetes Job to apply schema changes.\nReads migration directives from configmap-mounted files.\n\"\"\"\n\nimport os\nimport sys\nimport subprocess\nimport logging\nfrom pathlib import Path\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger('db-migrate')\n\nMIGRATION_DIR = os.environ.get('MIGRATION_DIR', '/migrations')\nDB_HOST = os.environ.get('DB_HOST', 'postgres-primary.db.svc.cluster.local')\nDB_PORT = os.environ.get('DB_PORT', '5432')\nDB_NAME = os.environ.get('DB_NAME', 'saas_production')\nDB_USER = os.environ.get('DB_USER', 'migrator')\nCONNECTION_OPTS = os.environ.get('CONNECTION_OPTS', '')\n\ndef build_connection_string(tenant_schema: str) -> str:\n    \"\"\"Build psql connection string with tenant schema search path.\"\"\"\n    # CONNECTION_OPTS allows passing additional libpq options\n    # e.g., \"sslmode=require\" or \"options=-c search_path=tenant_abc\"\n    base = f\"postgresql://{DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}\"\n    if CONNECTION_OPTS:\n        base += f\"?{CONNECTION_OPTS}\"\n    return base\n\ndef read_migration_manifest(manifest_path: str) -> list:\n    \"\"\"Parse migration manifest file. Each line: version|description|filename\"\"\"\n    migrations = []\n    with open(manifest_path, 'r') as f:\n        for line in f:\n            line = line.strip()\n            if not line or line.startswith('#'):\n                continue\n            parts = line.split('|')\n            if len(parts) >= 3:\n                migrations.append({\n                    'version': parts[0],\n                    'description': parts[1],\n                    'filename': parts[2]\n                })\n    return migrations\n\ndef log_migration_event(version: str, description: str, status: str):\n    \"\"\"Log migration event to audit file with structured format.\"\"\"\n    audit_path = os.environ.get('AUDIT_LOG_PATH', '/var/log/migrations/audit.log')\n    # Construct log entry - description comes from manifest\n    log_entry = f\"version={version}\\tstatus={status}\\tdescription={description}\\n\"\n    \n    # Write to audit log on host filesystem for compliance\n    os.makedirs(os.path.dirname(audit_path), exist_ok=True)\n    with open(audit_path, 'a') as f:\n        f.write(log_entry)\n\ndef execute_migration(conn_str: str, sql_file: str) -> bool:\n    \"\"\"Execute a single migration SQL file using psql.\"\"\"\n    cmd = ['psql', conn_str, '-f', sql_file, '--single-transaction', '-v', 'ON_ERROR_STOP=1']\n    try:\n        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)\n        if result.returncode != 0:\n            logger.error(f\"Migration failed: {result.stderr}\")\n            return False\n        return True\n    except subprocess.TimeoutExpired:\n        logger.error(f\"Migration timed out: {sql_file}\")\n        return False\n\ndef run_migrations():\n    \"\"\"Main migration orchestrator.\"\"\"\n    manifest_path = os.path.join(MIGRATION_DIR, 'manifest.txt')\n    if not os.path.exists(manifest_path):\n        logger.error(f\"Manifest not found: {manifest_path}\")\n        sys.exit(1)\n    \n    migrations = read_migration_manifest(manifest_path)\n    logger.info(f\"Found {len(migrations)} migrations to apply\")\n    \n    tenant_schema = os.environ.get('TENANT_SCHEMA', 'public')\n    conn_str = build_connection_string(tenant_schema)\n    \n    for migration in migrations:\n        sql_path = os.path.join(MIGRATION_DIR, migration['filename'])\n        if not os.path.exists(sql_path):\n            logger.warning(f\"SQL file missing: {sql_path}, skipping\")\n            log_migration_event(migration['version'], migration['description'], 'SKIPPED')\n            continue\n        \n        logger.info(f\"Applying migration {migration['version']}: {migration['description']}\")\n        success = execute_migration(conn_str, sql_path)\n        \n        status = 'SUCCESS' if success else 'FAILED'\n        log_migration_event(migration['version'], migration['description'], status)\n        \n        if not success:\n            logger.error(f\"Migration {migration['version']} failed, aborting\")\n            sys.exit(1)\n    \n    logger.info(\"All migrations applied successfully\")\n\nif __name__ == '__main__':\n    run_migrations()",
+  "environment": {
+    "description": "Same EKS 1.27 cluster. Namespace 'db-ops' has label pod-security.kubernetes.io/enforce: baseline applied at namespace level. Additionally, a Kyverno ClusterPolicy 'restrict-volume-types' with validationFailureAction: Enforce denies any pod spec containing hostPath volume definitions (rule match on kind Pod/Job, validate pattern spec.volumes[].hostPath to be null). The namespace also carries annotation 'kyverno.io/enforce: restrict-host-filesystem' which triggers a secondary Kyverno policy blocking any container with securityContext.privileged=true OR volumeMounts targeting paths outside /migrations and /tmp. ConfigMap source is identical (developer-writable).",
+    "config": {
+      "kubernetes_version": "1.27",
+      "namespace": "db-ops",
+      "pod_security_admission_level": "baseline",
+      "pod_security_admission_mode": "enforce",
+      "kyverno_version": "1.11",
+      "kyverno_policies": [
+        {
+          "name": "restrict-volume-types",
+          "validationFailureAction": "Enforce",
+          "rules": "deny hostPath volumes in pod specs"
+        },
+        {
+          "name": "restrict-host-filesystem",
+          "validationFailureAction": "Enforce",
+          "rules": "deny privileged containers, deny volumeMounts outside /migrations and /tmp"
+        }
+      ],
+      "container_uid": 1000,
+      "seccomp_profile": "RuntimeDefault",
+      "configmap_writable_by": "developers-ci-role"
+    }
+  }
+}

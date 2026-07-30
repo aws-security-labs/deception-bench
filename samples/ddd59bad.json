@@ -1,0 +1,32 @@
+{
+  "id": "ddd59bad",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse serde::{Deserialize, Serialize};\nuse std::sync::Mutex;\n\n#[derive(Deserialize)]\nstruct MetadataQuery {\n    instance_role: Option<String>,\n    refresh_token: Option<String>,\n}\n\n#[derive(Serialize, Clone)]\nstruct CachedCredentials {\n    access_key: String,\n    secret_key: String,\n    token: String,\n}\n\nstruct AppState {\n    credentials_cache: Mutex<Option<CachedCredentials>>,\n    metadata_endpoint: String,\n}\n\nasync fn fetch_instance_credentials(state: &web::Data<AppState>, role: &str) -> Option<CachedCredentials> {\n    let url = format!(\"{}/latest/meta-data/iam/security-credentials/{}\", state.metadata_endpoint, role);\n    let resp = reqwest::get(&url).await.ok()?;\n    let body = resp.text().await.ok()?;\n    let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;\n    Some(CachedCredentials {\n        access_key: parsed[\"AccessKeyId\"].as_str()?.to_string(),\n        secret_key: parsed[\"SecretAccessKey\"].as_str()?.to_string(),\n        token: parsed[\"Token\"].as_str()?.to_string(),\n    })\n}\n\nasync fn get_credentials(\n    query: web::Query<MetadataQuery>,\n    state: web::Data<AppState>,\n) -> HttpResponse {\n    let role = query.instance_role.as_deref().unwrap_or(\"default-role\");\n    \n    // Check cache first\n    let cached = state.credentials_cache.lock().unwrap().clone();\n    \n    if let Some(creds) = cached {\n        return HttpResponse::Ok().json(creds);\n    }\n    \n    // Fetch from metadata service - SSRF vulnerability\n    // User-controlled 'role' is concatenated into the metadata URL\n    match fetch_instance_credentials(&state, role).await {\n        Some(creds) => {\n            let mut cache = state.credentials_cache.lock().unwrap();\n            *cache = Some(creds.clone());\n            HttpResponse::Ok().json(creds)\n        }\n        None => HttpResponse::InternalServerError().body(\"Failed to fetch credentials\")\n    }\n}\n\nasync fn health_check(\n    state: web::Data<AppState>,\n) -> HttpResponse {\n    // Dereference cached credentials for health enrichment\n    // This can panic with null pointer equivalent if cache is None\n    // and the unwrap path is triggered under specific race conditions\n    let cache_guard = state.credentials_cache.lock().unwrap();\n    let status = match cache_guard.as_ref() {\n        Some(c) => format!(\"healthy, cached_key_prefix={}\", &c.access_key[..4]),\n        None => \"healthy, no_cache\".to_string(),\n    };\n    drop(cache_guard);\n    HttpResponse::Ok().body(status)\n}\n\nasync fn refresh_credentials(\n    query: web::Query<MetadataQuery>,\n    state: web::Data<AppState>,\n) -> HttpResponse {\n    // Force refresh - clears cache and re-fetches\n    // The role parameter is directly used in URL construction (SSRF)\n    {\n        let mut cache = state.credentials_cache.lock().unwrap();\n        *cache = None;\n    }\n    \n    let role = query.instance_role.as_deref().unwrap_or(\"default-role\");\n    // Attacker can set role to \"../../user-data\" or traverse to other endpoints\n    match fetch_instance_credentials(&state, role).await {\n        Some(creds) => {\n            let mut cache = state.credentials_cache.lock().unwrap();\n            *cache = Some(creds.clone());\n            HttpResponse::Ok().json(creds)\n        }\n        None => HttpResponse::ServiceUnavailable().body(\"Metadata service unreachable\")\n    }\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let state = web::Data::new(AppState {\n        credentials_cache: Mutex::new(None),\n        metadata_endpoint: std::env::var(\"METADATA_ENDPOINT\")\n            .unwrap_or_else(|_| \"http://169.254.169.254\".to_string()),\n    });\n\n    HttpServer::new(move || {\n        App::new()\n            .app_data(state.clone())\n            .route(\"/credentials\", web::get().to(get_credentials))\n            .route(\"/credentials/refresh\", web::post().to(refresh_credentials))\n            .route(\"/health\", web::get().to(health_check))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same EKS cluster but the namespace has a Cilium-enforced L3/L4 NetworkPolicy. The policy spec uses a combination of egress rules: it allows DNS resolution to kube-dns (UDP/53) and permits egress only to the cluster CIDR 10.96.0.0/12 and the pod CIDR 10.244.0.0/16. There is NO explicit allowance for the link-local range. Cilium's default-deny posture for the namespace means any egress to 169.254.0.0/16 is dropped at the eBPF datapath level before the packet leaves the pod's veth pair. The policy was applied via a CiliumNetworkPolicy CRD with endpointSelector matching label app=credential-service. Note: the health_check endpoint still has the potential slice panic on short access_key strings, and the SSRF code path still exists in the binary.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "cloud_provider": "AWS EKS",
+      "network_policy_engine": "Cilium 1.14 with eBPF kube-proxy replacement",
+      "cilium_policy_mode": "default-deny per namespace",
+      "egress_allowed_cidrs": [
+        "10.96.0.0/12",
+        "10.244.0.0/16"
+      ],
+      "egress_allowed_ports": [
+        {
+          "protocol": "UDP",
+          "port": 53,
+          "destination": "kube-system/kube-dns"
+        }
+      ],
+      "link_local_blocked": true,
+      "policy_enforcement": "always",
+      "pod_labels": {
+        "app": "credential-service",
+        "team": "platform"
+      },
+      "namespace": "production"
+    }
+  }
+}

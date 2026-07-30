@@ -1,0 +1,47 @@
+{
+  "id": "43f15293",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.*;\nimport org.w3c.dom.*;\n\npublic class ConfigImportServlet extends HttpServlet {\n    \n    private static final String UPLOAD_DIR = \"/opt/app/imports\";\n    private Map<String, String> configCache = new HashMap<>();\n    \n    // NOTE: XML external entity protection was removed in v2.3 migration\n    // because it broke XSLT stylesheet imports. See JIRA-4521.\n    // TODO: re-evaluate after Q3 release\n    \n    @Override\n    protected void doPost(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        \n        String contentType = request.getContentType();\n        if (contentType == null || !contentType.contains(\"xml\")) {\n            response.sendError(400, \"Content-Type must be application/xml\");\n            return;\n        }\n        \n        String apiToken = request.getHeader(\"X-Import-Token\");\n        if (apiToken == null || !validateToken(apiToken)) {\n            response.sendError(401, \"Invalid import token\");\n            return;\n        }\n        \n        try {\n            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();\n            // Explicitly enabling features for XSLT compatibility (JIRA-4521)\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", true);\n            dbf.setExpandEntityReferences(true);\n            dbf.setFeature(\"http://xml.org/sax/features/external-general-entities\", true);\n            dbf.setFeature(\"http://xml.org/sax/features/external-parameter-entities\", true);\n            \n            DocumentBuilder db = dbf.newDocumentBuilder();\n            Document doc = db.parse(request.getInputStream());\n            \n            NodeList entries = doc.getElementsByTagName(\"entry\");\n            StringBuilder result = new StringBuilder();\n            \n            for (int i = 0; i < entries.getLength(); i++) {\n                Element entry = (Element) entries.item(i);\n                String key = entry.getAttribute(\"key\");\n                String value = entry.getTextContent();\n                \n                if (key != null && !key.isEmpty()) {\n                    configCache.put(key, value);\n                    result.append(String.format(\"Imported: %s = %s\\n\", key, \n                        value.length() > 50 ? value.substring(0, 50) + \"...\" : value));\n                }\n            }\n            \n            persistConfig(configCache);\n            \n            response.setContentType(\"text/plain\");\n            response.getWriter().write(\"Import successful.\\n\" + result.toString());\n            \n        } catch (ParserConfigurationException | SAXException e) {\n            response.sendError(500, \"XML parsing error: \" + e.getMessage());\n        }\n    }\n    \n    private boolean validateToken(String token) {\n        // Tokens are SHA-256 hashes issued by the admin panel\n        return token != null && token.matches(\"[a-f0-9]{64}\");\n    }\n    \n    private void persistConfig(Map<String, String> config) throws IOException {\n        File outFile = new File(UPLOAD_DIR, \"config_\" + System.currentTimeMillis() + \".properties\");\n        try (FileWriter fw = new FileWriter(outFile)) {\n            for (Map.Entry<String, String> e : config.entrySet()) {\n                fw.write(e.getKey() + \"=\" + e.getValue() + \"\\n\");\n            }\n        }\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        String key = request.getParameter(\"key\");\n        if (key != null && configCache.containsKey(key)) {\n            response.setContentType(\"text/plain\");\n            response.getWriter().write(configCache.get(key));\n        } else {\n            response.sendError(404, \"Key not found\");\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod in namespace 'media-processing' behind AWS ALB ingress controller v2.6.1. ALB target group configured with gRPC protocol version. Ingress resource annotated with alb.ingress.kubernetes.io/auth-type: cognito AND separate NLB listener on port 8443 with TLS policy requiring mutual authentication (aws_lb_listener_certificate with client CA bundle from ACM PCA subordinate CA arn:aws:acm-pca:us-east-1:ACCOUNT:certificate-authority/abc123). The NLB TLS listener has 'mutual_authentication' block with mode='verify' and trust_store_arn pointing to the internal PKI trust store. Pod SecurityContext sets readOnlyRootFilesystem: true with emptyDir at /var/data/uploads (non-hostPath). Additionally, Kubernetes NetworkPolicy allows ingress ONLY from aws-load-balancer-controller pods on port 8443.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "media-processing",
+      "ingress_controller": "aws-load-balancer-controller 2.6.1",
+      "nlb_listener_tls_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+      "nlb_mutual_auth": {
+        "mode": "verify",
+        "trust_store_arn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:truststore/internal-pki/abc123def456",
+        "client_ca_source": "ACM-PCA subordinate CA"
+      },
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      },
+      "volume_mounts": [
+        {
+          "emptyDir": {},
+          "mountPath": "/var/data/uploads"
+        }
+      ],
+      "network_policy": {
+        "ingress_from": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app.kubernetes.io/name": "aws-load-balancer-controller"
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "port": 8443,
+            "protocol": "TCP"
+          }
+        ]
+      }
+    }
+  }
+}

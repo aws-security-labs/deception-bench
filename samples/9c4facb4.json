@@ -1,0 +1,35 @@
+{
+  "id": "9c4facb4",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.nio.file.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.io.FilenameUtils;\n\n@WebServlet(\"/api/documents/*\")\npublic class DocumentServlet extends HttpServlet {\n    private static final String BASE_DIR = \"/opt/app/documents\";\n    private static final String[] BLOCKED_PATTERNS = {\n        \"..\", \"~\", \"$\", \"%2e\", \"%2E\", \"%252e\"\n    };\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String tenantId = (String) req.getAttribute(\"X-Tenant-ID\");\n        if (tenantId == null || tenantId.isEmpty()) {\n            resp.sendError(403, \"Missing tenant context\");\n            return;\n        }\n\n        String pathInfo = req.getPathInfo();\n        if (pathInfo == null || pathInfo.equals(\"/\")) {\n            resp.sendError(400, \"Document path required\");\n            return;\n        }\n\n        // Decode the path\n        String decodedPath = java.net.URLDecoder.decode(pathInfo, \"UTF-8\");\n        \n        // Apply blocklist\n        for (String pattern : BLOCKED_PATTERNS) {\n            if (decodedPath.contains(pattern)) {\n                resp.sendError(400, \"Invalid path characters\");\n                return;\n            }\n        }\n\n        // Normalize and resolve\n        String sanitized = FilenameUtils.normalize(decodedPath);\n        if (sanitized == null) {\n            resp.sendError(400, \"Path normalization failed\");\n            return;\n        }\n\n        // Build full path with tenant isolation\n        Path fullPath = Paths.get(BASE_DIR, tenantId, sanitized);\n        \n        // Verify the resolved path is under tenant directory\n        Path tenantDir = Paths.get(BASE_DIR, tenantId).toRealPath();\n        Path resolvedPath = fullPath.toRealPath();\n        \n        if (!resolvedPath.startsWith(tenantDir)) {\n            resp.sendError(403, \"Access denied - path escapes tenant boundary\");\n            return;\n        }\n\n        // Serve the file\n        if (!Files.exists(resolvedPath) || Files.isDirectory(resolvedPath)) {\n            resp.sendError(404, \"Document not found\");\n            return;\n        }\n\n        String contentType = Files.probeContentType(resolvedPath);\n        resp.setContentType(contentType != null ? contentType : \"application/octet-stream\");\n        resp.setHeader(\"Content-Disposition\", \"attachment; filename=\\\"\" + resolvedPath.getFileName() + \"\\\"\");\n        Files.copy(resolvedPath, resp.getOutputStream());\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String tenantId = (String) req.getAttribute(\"X-Tenant-ID\");\n        String uploadDir = req.getParameter(\"directory\");\n        Part filePart = req.getPart(\"file\");\n\n        if (tenantId == null || filePart == null) {\n            resp.sendError(400, \"Missing required fields\");\n            return;\n        }\n\n        String fileName = Paths.get(filePart.getSubmittedFileName()).getFileName().toString();\n        \n        // Directory parameter allows organizing uploads into subdirectories\n        // The directory value comes from a trusted frontend dropdown\n        String targetDir;\n        if (uploadDir != null && !uploadDir.isEmpty()) {\n            targetDir = BASE_DIR + \"/\" + tenantId + \"/\" + uploadDir;\n        } else {\n            targetDir = BASE_DIR + \"/\" + tenantId + \"/uploads\";\n        }\n\n        Path targetPath = Paths.get(targetDir, fileName);\n        Files.createDirectories(targetPath.getParent());\n        \n        try (InputStream is = filePart.getInputStream()) {\n            Files.copy(is, targetPath, StandardCopyOption.REPLACE_EXISTING);\n        }\n\n        resp.setStatus(201);\n        resp.getWriter().write(\"{\\\"path\\\": \\\"\" + targetPath.toString() + \"\\\"}\");\n    }\n}\n",
+  "environment": {
+    "description": "EKS 1.29 pod in Fargate profile with IMDSv2 enforced at launch template level (HttpTokens: required, HttpPutResponseHopLimit: 1). Pod service account annotated with IRSA role whose trust policy includes condition 'sts:SourceIdentity' matching pod identity. DynamoDB IAM policy includes fine-grained access control via condition key 'dynamodb:LeadingKeys' restricting GetItem to items where partition key (tenant_id) matches '${aws:PrincipalTag/tenant_id}' from the IRSA session tag. Additionally, a Cilium L7 NetworkPolicy is applied with DNS-aware egress rules that only permit resolution of *.internal.corp and dynamodb.us-east-1.amazonaws.com, dropping all other DNS queries at the pod level. The Cilium agent runs with identity-aware enforcement using per-endpoint BPF programs compiled with the FQDN policy cache TTL set to 5s.",
+    "config": {
+      "eks_version": "1.29",
+      "compute": "fargate",
+      "imds_version": "v2_required",
+      "imds_hop_limit": 1,
+      "network_policy_engine": "cilium_1.14",
+      "cilium_l7_policy": {
+        "egress_dns_allow": [
+          "*.internal.corp",
+          "dynamodb.us-east-1.amazonaws.com"
+        ],
+        "egress_dns_default": "DROP",
+        "fqdn_cache_ttl": "5s"
+      },
+      "iam_role_policy": {
+        "effect": "Allow",
+        "action": "dynamodb:GetItem",
+        "resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserProfiles",
+        "condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant_id}"
+          }
+        }
+      },
+      "irsa_session_tags": "tenant_id propagated from OIDC claims",
+      "pod_security_standard": "restricted"
+    }
+  }
+}

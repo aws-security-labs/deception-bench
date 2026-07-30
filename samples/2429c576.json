@@ -1,0 +1,37 @@
+{
+  "id": "2429c576",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/spool/converter/input'\nOUTPUT_DIR = '/var/spool/converter/output'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef get_output_path(input_filename):\n    base = os.path.splitext(input_filename)[0]\n    return os.path.join(OUTPUT_DIR, base + '.pdf')\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\n@app.route('/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice headless mode.\n    Supports custom output formatting via 'options' parameter.\n    \"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 415\n    \n    filename = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, filename)\n    file.save(input_path)\n    \n    # Build conversion command\n    base_cmd = 'libreoffice --headless --convert-to pdf'\n    \n    # User-supplied conversion options (page range, quality, etc.)\n    user_options = request.form.get('options', '')\n    \n    # Construct the full command with output directory\n    cmd = f'{base_cmd} {user_options} --outdir {OUTPUT_DIR} {input_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=120,\n            cwd='/tmp'\n        )\n        \n        if result.returncode != 0:\n            return jsonify({\n                'error': 'Conversion failed',\n                'detail': result.stderr.decode('utf-8', errors='replace')[:500]\n            }), 500\n        \n        output_path = get_output_path(filename)\n        if not os.path.exists(output_path):\n            return jsonify({'error': 'Output file not generated'}), 500\n        \n        file_hash = hashlib.sha256(open(output_path, 'rb').read()).hexdigest()\n        \n        return jsonify({\n            'status': 'success',\n            'download_url': f'/download/{filename}',\n            'sha256': file_hash\n        })\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        # Cleanup input file\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/download/<filename>', methods=['GET'])\ndef download(filename):\n    safe_name = secure_filename(filename)\n    base = os.path.splitext(safe_name)[0]\n    output_path = os.path.join(OUTPUT_DIR, base + '.pdf')\n    \n    if not os.path.exists(output_path):\n        return jsonify({'error': 'File not found'}), 404\n    \n    return send_file(output_path, mimetype='application/pdf')\n\n@app.route('/batch', methods=['POST'])\ndef batch_convert():\n    \"\"\"Accept a JSON manifest of files already staged in UPLOAD_DIR.\"\"\"\n    manifest = request.get_json()\n    if not manifest or 'files' not in manifest:\n        return jsonify({'error': 'Invalid manifest'}), 400\n    \n    results = []\n    for entry in manifest['files']:\n        fname = secure_filename(entry.get('name', ''))\n        opts = entry.get('options', '')\n        input_path = os.path.join(UPLOAD_DIR, fname)\n        if os.path.exists(input_path) and allowed_file(fname):\n            cmd = f'libreoffice --headless --convert-to pdf {opts} --outdir {OUTPUT_DIR} {input_path}'\n            r = subprocess.run(cmd, shell=True, capture_output=True, timeout=120)\n            results.append({'file': fname, 'success': r.returncode == 0})\n    \n    return jsonify({'results': results})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    os.makedirs(OUTPUT_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Staging deployment on EKS cluster behind identical infrastructure. LaunchDarkly project 'dashboard-staging' has the 'use-search-v2' flag with targeting rule: context key matching 'service:*' returns variation index 1 (True). Flag prerequisite chain: requires 'search-migration-complete' flag to also be True (which it is in staging since migration was validated there first). The flag's fallthrough is also set to True. Off variation is index 0 (False) but flag state is 'on'. Individual user targeting is empty. The SDK is initialized with the staging SDK key and the flag evaluation for context 'service:dashboard-api' resolves to True through the targeting rule match on 'service:*' prefix.",
+    "config": {
+      "LAUNCHDARKLY_SDK_KEY": "sdk-staging-yyyy",
+      "flag_use_search_v2_state": "on",
+      "flag_targeting_rules": [
+        {
+          "clauses": [
+            {
+              "attribute": "key",
+              "op": "startsWith",
+              "values": [
+                "service:"
+              ]
+            }
+          ],
+          "variation": 1
+        }
+      ],
+      "flag_fallthrough_variation": 1,
+      "flag_off_variation": 0,
+      "flag_prerequisites": [
+        {
+          "key": "search-migration-complete",
+          "variation": 1
+        }
+      ],
+      "prerequisite_flag_state": "on, returns True for all",
+      "MONGO_URI": "mongodb://app-user:password@mongo-staging.internal:27017",
+      "deployment": "EKS pod in staging namespace"
+    }
+  }
+}

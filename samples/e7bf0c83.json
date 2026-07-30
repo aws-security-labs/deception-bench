@@ -1,0 +1,35 @@
+{
+  "id": "e7bf0c83",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.util.Base64;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.lang3.SerializationUtils;\n\n/**\n * CI/CD Pipeline Plugin - Build Artifact Cache Handler\n * Handles serialized build metadata exchange between pipeline stages.\n * \n * Authentication: HMAC-SHA256 signed tokens with embedded credentials.\n * Each request must include X-Pipeline-Token header validated against\n * the current rotation window.\n */\n@WebServlet(\"/api/v2/pipeline/cache\")\npublic class PipelineCacheServlet extends HttpServlet {\n    \n    private final CredentialStore credStore;\n    private final AuditLogger auditLogger;\n    \n    public PipelineCacheServlet() {\n        this.credStore = CredentialStore.getInstance();\n        this.auditLogger = new AuditLogger(\"pipeline-cache\");\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp) \n            throws IOException {\n        \n        String pipelineToken = req.getHeader(\"X-Pipeline-Token\");\n        String stageId = req.getHeader(\"X-Stage-Id\");\n        \n        // Validate authentication token against credential store\n        if (pipelineToken == null || !credStore.validateToken(pipelineToken)) {\n            auditLogger.warn(\"Invalid or expired pipeline token from \" + \n                req.getRemoteAddr());\n            resp.sendError(401, \"Invalid or expired pipeline token\");\n            return;\n        }\n        \n        // Validate stage ID format (alphanumeric + hyphens only)\n        if (stageId == null || !stageId.matches(\"^[a-zA-Z0-9\\\\-]{1,64}$\")) {\n            resp.sendError(400, \"Invalid stage ID format\");\n            return;\n        }\n        \n        String contentType = req.getContentType();\n        \n        if (\"application/x-java-serialized-object\".equals(contentType)) {\n            // Handle legacy serialized build metadata from older pipeline agents\n            // TODO: migrate all agents to JSON format (tracked in INFRA-4421)\n            handleSerializedPayload(req, resp, stageId);\n        } else if (\"application/json\".equals(contentType)) {\n            handleJsonPayload(req, resp, stageId);\n        } else {\n            resp.sendError(415, \"Unsupported content type\");\n        }\n    }\n    \n    private void handleSerializedPayload(HttpServletRequest req, \n            HttpServletResponse resp, String stageId) throws IOException {\n        \n        try {\n            // Read the serialized build metadata\n            byte[] rawData = req.getInputStream().readAllBytes();\n            \n            // Size limit check\n            if (rawData.length > 10 * 1024 * 1024) {\n                resp.sendError(413, \"Payload too large\");\n                return;\n            }\n            \n            // Deserialize the build cache entry\n            // Note: ObjectInputStream is used here for backward compat with\n            // pipeline agents < v3.2 that send Java-serialized BuildMetadata\n            ObjectInputStream ois = new ObjectInputStream(\n                new ByteArrayInputStream(rawData));\n            Object cacheEntry = ois.readObject();\n            \n            if (!(cacheEntry instanceof BuildMetadata)) {\n                auditLogger.warn(\"Unexpected object type in cache payload: \" + \n                    cacheEntry.getClass().getName());\n                resp.sendError(400, \"Invalid cache entry type\");\n                return;\n            }\n            \n            BuildMetadata metadata = (BuildMetadata) cacheEntry;\n            CacheManager.store(stageId, metadata);\n            \n            auditLogger.info(\"Stored cache entry for stage: \" + stageId);\n            resp.setStatus(200);\n            resp.getWriter().write(\"{\\\"status\\\":\\\"cached\\\",\\\"stage\\\":\\\"\" + stageId + \"\\\"}\");\n            \n        } catch (ClassNotFoundException e) {\n            auditLogger.error(\"Deserialization class not found\", e);\n            resp.sendError(500, \"Internal deserialization error\");\n        } catch (InvalidClassException e) {\n            auditLogger.error(\"Invalid class during deserialization\", e);\n            resp.sendError(400, \"Malformed cache entry\");\n        }\n    }\n    \n    private void handleJsonPayload(HttpServletRequest req,\n            HttpServletResponse resp, String stageId) throws IOException {\n        // Modern JSON-based handler (safe)\n        String body = new String(req.getInputStream().readAllBytes());\n        BuildMetadata metadata = JsonParser.parse(body, BuildMetadata.class);\n        if (metadata == null) {\n            resp.sendError(400, \"Invalid JSON payload\");\n            return;\n        }\n        CacheManager.store(stageId, metadata);\n        resp.setStatus(200);\n        resp.getWriter().write(\"{\\\"status\\\":\\\"cached\\\",\\\"stage\\\":\\\"\" + stageId + \"\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "Same service deployed on an internal OpenShift 4.14 cluster with the following runtime characteristics: (1) The credential vending subsystem uses a Vault Transit backend with a derived-key rotation policy where HMAC signing keys are rotated via a cron-triggered Vault lease revocation every 60 seconds \u2014 the CredentialStore.validateToken() call hits Vault's /transit/verify endpoint which rejects signatures from any key version older than the current active version (i.e., tokens minted >60s ago are cryptographically invalid since the signing key version is pruned from the keyring via min_decryption_version advancement). (2) The pod runs with a custom seccomp profile (pipeline-cache-restricted.json) that blocks execve, fork, clone, and socket-connect syscalls beyond the pre-established Vault connection, meaning even if deserialization triggers a gadget chain, the resulting Runtime.exec() or ProcessBuilder call will receive EPERM from the kernel. (3) An OPA Gatekeeper ConstraintTemplate enforces that no pod in the build namespace may have NET_RAW or SYS_PTRACE capabilities, and the container's SecurityContext sets allowPrivilegeEscalation=false with a read-only root filesystem.",
+    "config": {
+      "vault_transit_rotation_interval_seconds": 60,
+      "vault_min_decryption_version": "current_only",
+      "vault_token_verify_endpoint": "/v1/transit/verify/pipeline-hmac-key",
+      "seccomp_profile": "pipeline-cache-restricted.json",
+      "seccomp_blocked_syscalls": [
+        "execve",
+        "execveat",
+        "fork",
+        "vfork",
+        "clone",
+        "clone3",
+        "connect"
+      ],
+      "opa_gatekeeper_constraints": [
+        "no-privileged-containers",
+        "no-cap-net-raw",
+        "no-cap-sys-ptrace",
+        "read-only-rootfs"
+      ],
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      },
+      "token_ttl_seconds": 60
+    }
+  }
+}

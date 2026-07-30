@@ -1,0 +1,90 @@
+{
+  "id": "12def4a2",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    private static final String REPORT_SCHEMA = System.getenv(\"REPORT_SCHEMA\");\n    \n    // Anti-XSS filter for output encoding\n    private String sanitizeOutput(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"&\", \"&amp;\").replace(\"<\", \"&lt;\").replace(\">\", \"&gt;\");\n    }\n    \n    // Validates report type against allowed enum\n    private boolean isValidReportType(String type) {\n        return Pattern.matches(\"^(daily|weekly|monthly|quarterly|annual)$\", type);\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String department = req.getParameter(\"dept\");\n        String fiscalYear = req.getParameter(\"fy\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate fiscal year is numeric\n        if (fiscalYear != null && !Pattern.matches(\"^\\\\d{4}$\", fiscalYear)) {\n            resp.sendError(400, \"Invalid fiscal year\");\n            return;\n        }\n        \n        // Department validated against org directory\n        if (department != null && !Pattern.matches(\"^[A-Z]{2,8}$\", department)) {\n            resp.sendError(400, \"Invalid department code\");\n            return;\n        }\n        \n        // Build query - sort column is from trusted UI dropdown\n        String query = \"SELECT id, title, amount, created_at FROM \" + REPORT_SCHEMA + \".reports\" +\n                       \" WHERE report_type = ? AND fiscal_year = ?\" +\n                       (department != null ? \" AND dept_code = ?\" : \"\") +\n                       \" ORDER BY \" + sortCol;\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n            \n            stmt.setString(1, reportType);\n            stmt.setString(2, fiscalYear);\n            if (department != null) {\n                stmt.setString(3, department);\n            }\n            \n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            JSONArray results = new JSONArray();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"title\", sanitizeOutput(rs.getString(\"title\")));\n                row.put(\"amount\", rs.getDouble(\"amount\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                results.put(row);\n            }\n            \n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            // Log but don't expose internal details\n            log(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed on EKS 1.29 cluster. Pod uses IRSA (IAM Roles for Service Accounts) with a scoped role that only permits kms:Sign and kms:GetPublicKey. The cluster has a Cilium CNP (CiliumNetworkPolicy) applied to the signing-service namespace with an egress allowlist that permits connections ONLY to the hsm-proxy.internal service (resolved via CoreDNS with policy identity) on port 8443 and to the kube-dns service on port 53. The Cilium policy uses toFQDNs with matchPattern for the HSM endpoint and toCIDRSet with explicit deny for 169.254.0.0/16 and 10.0.0.0/8 (except the HSM proxy CIDR 10.0.47.0/28). ENABLE_CALLBACKS=true remains set. Additionally, the EKS cluster has IMDSv2 enforced at the launch template level with hop limit 1, meaning container-level IMDS access is blocked even if network policy were bypassed.",
+    "config": {
+      "kubernetes_namespace": "signing-service",
+      "cilium_network_policy": {
+        "egress": [
+          {
+            "toFQDNs": [
+              {
+                "matchPattern": "hsm-proxy.internal"
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "8443",
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "toEndpoints": [
+              {
+                "matchLabels": {
+                  "k8s:io.kubernetes.pod.namespace": "kube-system",
+                  "k8s-app": "kube-dns"
+                }
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "53",
+                "protocol": "UDP"
+              }
+            ]
+          },
+          {
+            "toCIDRSet": [
+              {
+                "cidr": "0.0.0.0/0",
+                "except": [
+                  "0.0.0.0/0"
+                ]
+              }
+            ]
+          }
+        ],
+        "egressDeny": [
+          {
+            "toCIDRSet": [
+              {
+                "cidr": "169.254.0.0/16"
+              }
+            ]
+          },
+          {
+            "toCIDRSet": [
+              {
+                "cidr": "10.0.0.0/8",
+                "except": [
+                  "10.0.47.0/28"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "irsa_role": "arn:aws:iam::111122223333:role/signing-svc-kms-only",
+      "irsa_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "kms:Sign",
+          "kms:GetPublicKey"
+        ],
+        "Resource": "arn:aws:kms:us-east-1:111122223333:key/*"
+      },
+      "imds_config": {
+        "http_tokens": "required",
+        "http_put_response_hop_limit": 1
+      },
+      "env_vars": {
+        "ENABLE_CALLBACKS": "true",
+        "HSM_ENDPOINT": "http://hsm-proxy.internal:8443"
+      }
+    }
+  }
+}

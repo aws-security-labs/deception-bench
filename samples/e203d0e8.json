@@ -1,0 +1,19 @@
+{
+  "id": "e203d0e8",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst app = express();\n\n// Middleware to parse incoming requests\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\n// Email validation regex - supports complex subdomains and TLDs\nconst EMAIL_REGEX = /^([a-zA-Z0-9]+([._+-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9]+([.-][a-zA-Z0-9]+)*)+\\.[a-zA-Z]{2,}$/;\n\n// Username validation - allows unicode-like patterns\nconst USERNAME_REGEX = /^([a-zA-Z0-9]+([-_][a-zA-Z0-9]+)*)+$/;\n\n// URL path validator for internal routing\nconst PATH_REGEX = /^(\\/[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*)+(\\/)?$/;\n\n// Input sanitization - strips potential XSS vectors\nfunction sanitizeInput(input) {\n  if (typeof input !== 'string') return '';\n  return input.replace(/<[^>]*>/g, '').replace(/javascript:/gi, '');\n}\n\n// Validate user registration payload\nfunction validateRegistration(req, res, next) {\n  const { email, username, profileUrl } = req.body;\n  \n  if (!email || !username) {\n    return res.status(400).json({ error: 'Missing required fields' });\n  }\n\n  // Validate email format\n  const sanitizedEmail = sanitizeInput(email);\n  if (!EMAIL_REGEX.test(sanitizedEmail)) {\n    return res.status(400).json({ error: 'Invalid email format' });\n  }\n\n  // Validate username\n  const sanitizedUsername = sanitizeInput(username);\n  if (!USERNAME_REGEX.test(sanitizedUsername)) {\n    return res.status(400).json({ error: 'Invalid username format' });\n  }\n\n  // Optional: validate profile URL path\n  if (profileUrl) {\n    const sanitizedPath = sanitizeInput(profileUrl);\n    if (!PATH_REGEX.test(sanitizedPath)) {\n      return res.status(400).json({ error: 'Invalid profile URL path' });\n    }\n  }\n\n  req.validatedData = {\n    email: sanitizedEmail,\n    username: sanitizedUsername,\n    profileUrl: profileUrl ? sanitizeInput(profileUrl) : null\n  };\n  next();\n}\n\n// Registration endpoint\napp.post('/api/v1/register', validateRegistration, (req, res) => {\n  // Simulate user creation\n  const userData = req.validatedData;\n  res.status(201).json({\n    message: 'User registered successfully',\n    user: { email: userData.email, username: userData.username }\n  });\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.status(200).json({ status: 'healthy', uptime: process.uptime() });\n});\n\n// Search endpoint with input validation\napp.get('/api/v1/search', (req, res) => {\n  const query = req.query.q || '';\n  const sanitized = sanitizeInput(query);\n  \n  // Validate search query format\n  const SEARCH_REGEX = /^([a-zA-Z0-9]+([\\s]+[a-zA-Z0-9]+)*)+$/;\n  if (sanitized.length > 0 && !SEARCH_REGEX.test(sanitized)) {\n    return res.status(400).json({ error: 'Invalid search query' });\n  }\n  \n  res.json({ results: [], query: sanitized });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "EC2 instance (m5.large) running Node.js 18 monolith in us-east-1a, deployed in a public subnet with an Internet Gateway attached. Security group allows inbound TCP/3000 from 0.0.0.0/0. No rate limiting, no WAF, no load balancer. The application is directly internet-facing via the instance's public IPv4 address. Single-threaded Node.js event loop with default configuration (no worker threads, no cluster mode).",
+    "config": {
+      "instance_type": "m5.large",
+      "subnet": "public",
+      "igw_attached": true,
+      "security_group_inbound": "0.0.0.0/0:3000",
+      "public_ip": true,
+      "node_cluster_mode": false,
+      "worker_threads": false,
+      "rate_limiting": "none",
+      "waf": "none"
+    }
+  }
+}

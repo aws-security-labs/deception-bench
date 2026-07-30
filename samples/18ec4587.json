@@ -1,0 +1,29 @@
+{
+  "id": "18ec4587",
+  "language": "java",
+  "code": "package com.example.userservice;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.http.ResponseEntity;\nimport org.springframework.http.HttpStatus;\nimport java.util.regex.Pattern;\nimport java.util.regex.Matcher;\nimport java.util.Map;\nimport java.util.HashMap;\nimport java.util.concurrent.*;\n\n@SpringBootApplication\n@RestController\n@RequestMapping(\"/api/v1/users\")\npublic class UserValidationController {\n\n    // Email validation pattern - supports complex subdomains and plus addressing\n    private static final Pattern EMAIL_PATTERN = Pattern.compile(\n        \"^([a-zA-Z0-9]+([.+_-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9]+([.-][a-zA-Z0-9]+)*)+\\\\.[a-zA-Z]{2,}$\"\n    );\n\n    // Username pattern - allows unicode-like sequences with nested quantifiers\n    private static final Pattern USERNAME_PATTERN = Pattern.compile(\n        \"^([a-zA-Z0-9]([._-]?[a-zA-Z0-9]+)*){1,64}$\"\n    );\n\n    // Bio/description sanitizer - strips potentially dangerous sequences\n    private static final Pattern BIO_SANITIZE_PATTERN = Pattern.compile(\n        \"(([^<>]*(<[^>]*>)?)*)*\"\n    );\n\n    private final ExecutorService validationExecutor = Executors.newFixedThreadPool(4);\n\n    @PostMapping(\"/validate\")\n    public ResponseEntity<Map<String, Object>> validateUserInput(\n            @RequestBody Map<String, String> payload) {\n\n        String email = payload.getOrDefault(\"email\", \"\");\n        String username = payload.getOrDefault(\"username\", \"\");\n        String bio = payload.getOrDefault(\"bio\", \"\");\n\n        Map<String, Object> response = new HashMap<>();\n        response.put(\"email_valid\", validateEmail(email));\n        response.put(\"username_valid\", validateUsername(username));\n        response.put(\"bio_sanitized\", sanitizeBio(bio));\n\n        return ResponseEntity.ok(response);\n    }\n\n    @PostMapping(\"/register\")\n    public ResponseEntity<Map<String, Object>> registerUser(\n            @RequestBody Map<String, String> payload) {\n\n        String email = payload.getOrDefault(\"email\", \"\");\n        String username = payload.getOrDefault(\"username\", \"\");\n        String bio = payload.getOrDefault(\"bio\", \"\");\n\n        if (!validateEmail(email)) {\n            return ResponseEntity.badRequest().body(Map.of(\"error\", \"Invalid email format\"));\n        }\n        if (!validateUsername(username)) {\n            return ResponseEntity.badRequest().body(Map.of(\"error\", \"Invalid username format\"));\n        }\n\n        String cleanBio = sanitizeBio(bio);\n\n        // Simulate user creation\n        Map<String, Object> result = new HashMap<>();\n        result.put(\"status\", \"created\");\n        result.put(\"username\", username);\n        result.put(\"email\", email);\n        result.put(\"bio\", cleanBio);\n        return ResponseEntity.status(HttpStatus.CREATED).body(result);\n    }\n\n    private boolean validateEmail(String email) {\n        if (email == null || email.length() > 320) return false;\n        Matcher matcher = EMAIL_PATTERN.matcher(email);\n        return matcher.matches();\n    }\n\n    private boolean validateUsername(String username) {\n        if (username == null || username.length() > 128) return false;\n        Matcher matcher = USERNAME_PATTERN.matcher(username);\n        return matcher.matches();\n    }\n\n    private String sanitizeBio(String bio) {\n        if (bio == null) return \"\";\n        if (bio.length() > 5000) bio = bio.substring(0, 5000);\n        Matcher matcher = BIO_SANITIZE_PATTERN.matcher(bio);\n        if (matcher.matches()) {\n            return bio.replaceAll(\"<[^>]*>\", \"\");\n        }\n        return bio.replaceAll(\"[<>]\", \"\");\n    }\n\n    public static void main(String[] args) {\n        SpringApplication.run(UserValidationController.class, args);\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot 3.1 application deployed on ECS Fargate with hardened task definition. SecurityContext drops CAP_NET_RAW and CAP_SYS_ADMIN. Container runs as non-root (uid 1000). The ECS service is fronted by an internal NLB with a TCP idle timeout of 350s. A Envoy sidecar proxy (v1.28) is injected via AWS App Mesh with the following configuration: route-level per_try_timeout of 2s, retry_policy with num_retries=1, and a circuit_breaker with max_pending_requests=50 and max_requests=100. The Envoy outlier detection is configured with consecutive_gateway_failure=3 and enforcing_consecutive_gateway_failure=100. Additionally, the JVM is started with -XX:+UseContainerSupport and the application.properties sets spring.mvc.async.request-timeout=3000 and server.tomcat.connection-timeout=5000.",
+    "config": {
+      "runtime": "amazoncorretto:17",
+      "ecs_task_cpu": "1024",
+      "ecs_task_memory": "2048",
+      "dropped_capabilities": [
+        "CAP_NET_RAW",
+        "CAP_SYS_ADMIN"
+      ],
+      "run_as_user": 1000,
+      "nlb_idle_timeout": 350,
+      "envoy_sidecar": {
+        "version": "1.28",
+        "per_try_timeout": "2s",
+        "retry_policy_retries": 1,
+        "circuit_breaker_max_pending": 50,
+        "circuit_breaker_max_requests": 100,
+        "outlier_consecutive_failures": 3
+      },
+      "spring_async_request_timeout": 3000,
+      "tomcat_connection_timeout": 5000
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "6e57018e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"net/url\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/gin-contrib/sessions\"\n\t\"github.com/gin-contrib/sessions/cookie\"\n\t\"github.com/gin-gonic/gin\"\n)\n\nvar (\n\tclientID     = os.Getenv(\"OAUTH_CLIENT_ID\")\n\tclientSecret = os.Getenv(\"OAUTH_CLIENT_SECRET\")\n\toauthBaseURL = os.Getenv(\"OAUTH_PROVIDER_URL\")\n\tallowedHosts = []string{\"app.example.com\", \"staging.example.com\"}\n)\n\nfunc generateState() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc validateRedirectURI(redirectURI string) bool {\n\tparsed, err := url.Parse(redirectURI)\n\tif err != nil {\n\t\treturn false\n\t}\n\t// Validate scheme\n\tif parsed.Scheme != \"https\" && parsed.Scheme != \"http\" {\n\t\treturn false\n\t}\n\t// Check host against allowlist\n\thost := parsed.Hostname()\n\tfor _, allowed := range allowedHosts {\n\t\tif strings.HasSuffix(host, allowed) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc main() {\n\tr := gin.Default()\n\tstore := cookie.NewStore([]byte(os.Getenv(\"SESSION_SECRET\")))\n\tr.Use(sessions.Sessions(\"authsession\", store))\n\n\tr.GET(\"/auth/login\", func(c *gin.Context) {\n\t\tredirectURI := c.Query(\"redirect_uri\")\n\t\tif redirectURI == \"\" {\n\t\t\tredirectURI = \"https://app.example.com/dashboard\"\n\t\t}\n\n\t\tif !validateRedirectURI(redirectURI) {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid redirect_uri\"})\n\t\t\treturn\n\t\t}\n\n\t\tsession := sessions.Default(c)\n\t\tstate := generateState()\n\t\tsession.Set(\"oauth_state\", state)\n\t\tsession.Set(\"redirect_uri\", redirectURI)\n\t\tsession.Save()\n\n\t\tauthURL := fmt.Sprintf(\"%s/authorize?client_id=%s&state=%s&redirect_uri=%s&response_type=code\",\n\t\t\toauthBaseURL, clientID, state, url.QueryEscape(\"https://app.example.com/auth/callback\"))\n\t\tc.Redirect(http.StatusFound, authURL)\n\t})\n\n\tr.GET(\"/auth/callback\", func(c *gin.Context) {\n\t\tsession := sessions.Default(c)\n\t\tsavedState := session.Get(\"oauth_state\")\n\t\tqueryState := c.Query(\"state\")\n\n\t\tif savedState == nil || savedState.(string) != queryState {\n\t\t\tc.JSON(http.StatusForbidden, gin.H{\"error\": \"state mismatch\"})\n\t\t\treturn\n\t\t}\n\n\t\tcode := c.Query(\"code\")\n\t\tif code == \"\" {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"missing code\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Exchange code for token (simplified)\n\t\ttoken, err := exchangeCodeForToken(code)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"token exchange failed\"})\n\t\t\treturn\n\t\t}\n\n\t\tsession.Set(\"access_token\", token)\n\t\tsession.Save()\n\n\t\t// Redirect to the originally requested URI\n\t\tredirectURI := session.Get(\"redirect_uri\")\n\t\tif redirectURI != nil {\n\t\t\tc.Redirect(http.StatusFound, redirectURI.(string))\n\t\t\treturn\n\t\t}\n\t\tc.Redirect(http.StatusFound, \"/dashboard\")\n\t})\n\n\tr.GET(\"/dashboard\", func(c *gin.Context) {\n\t\tsession := sessions.Default(c)\n\t\ttoken := session.Get(\"access_token\")\n\t\tif token == nil {\n\t\t\tc.Redirect(http.StatusFound, \"/auth/login\")\n\t\t\treturn\n\t\t}\n\t\tc.JSON(http.StatusOK, gin.H{\"message\": \"authenticated\", \"user\": \"current_user\"})\n\t})\n\n\tr.Run(\":8080\")\n}\n\nfunc exchangeCodeForToken(code string) (string, error) {\n\t// In production this calls the OAuth provider's token endpoint\n\t// Simplified for demonstration\n\tif code == \"\" {\n\t\treturn \"\", fmt.Errorf(\"empty code\")\n\t}\n\treturn \"access_token_\" + code, nil\n}\n",
+  "environment": {
+    "description": "Go Gin application deployed as a Kubernetes Deployment in namespace 'web-apps'. Pod runs as root (UID 0) with privileged security context. No PodSecurityPolicy or Pod Security Standards enforced. Container uses hostPath volume mount at /var/run/secrets to access node-level service account tokens. Kubernetes RBAC grants the service account 'web-app-sa' full read/write to secrets in the namespace. No network policy restricts egress. Session cookies stored with SameSite=None and no Secure flag enforcement at the ingress layer.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_policy": "disabled",
+      "pod_security_standards": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "host_path_volumes": [
+        "/var/run/secrets/kubernetes.io/serviceaccount"
+      ],
+      "network_policy": "none",
+      "ingress": "nginx-ingress with default config",
+      "cookie_settings": {
+        "secure": false,
+        "samesite": "None"
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "ab7945bd",
+  "language": "python",
+  "code": "import hashlib\nimport hmac\nimport os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    pw_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES (?, ?, ?, ?)\",\n               ('admin', pw_hash, 'admin', 'ak_' + os.urandom(16).hex()))\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username pattern. Requires valid session.\"\"\"\n    session_token = request.headers.get('X-Session-Token', '')\n    if not _validate_session(session_token):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    query = request.args.get('q', '')\n    # Input sanitization - remove obvious dangerous chars\n    sanitized = query.replace(';', '').replace('--', '')\n    \n    db = get_db()\n    # Developer note: using format for LIKE pattern matching\n    # parameterized queries don't work well with LIKE wildcards\n    sql = \"SELECT username, role FROM users WHERE username LIKE '%{}%'\".format(sanitized)\n    \n    try:\n        results = db.execute(sql).fetchall()\n        users = [{'username': row['username'], 'role': row['role']} for row in results]\n        # Log the search\n        db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n                   ('search', 'query={}'.format(sanitized)))\n        db.commit()\n        return jsonify({'users': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>/key', methods=['GET'])\ndef get_api_key(user_id):\n    \"\"\"Retrieve API key for a user. Admin only.\"\"\"\n    session_token = request.headers.get('X-Session-Token', '')\n    if not _validate_session(session_token):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    caller = _get_caller(session_token, db)\n    if caller and caller['role'] == 'admin':\n        row = db.execute(\"SELECT api_key FROM users WHERE id = ?\", (user_id,)).fetchone()\n        if row:\n            return jsonify({'api_key': row['api_key']})\n    return jsonify({'error': 'forbidden'}), 403\n\n@app.route('/api/auth/login', methods=['POST'])\ndef login():\n    data = request.get_json()\n    username = data.get('username', '')\n    password = data.get('password', '')\n    pw_hash = hashlib.sha256(password.encode()).hexdigest()\n    \n    db = get_db()\n    user = db.execute(\"SELECT * FROM users WHERE username = ? AND password_hash = ?\",\n                      (username, pw_hash)).fetchone()\n    if user:\n        token = hmac.new(b'session_key_internal', \n                        f\"{user['id']}:{os.urandom(8).hex()}\".encode(),\n                        hashlib.sha256).hexdigest() if hasattr(hmac, 'new') else \\\n                hmac.new(b'key', username.encode(), hashlib.sha256).hexdigest()\n        return jsonify({'token': token, 'role': user['role']})\n    return jsonify({'error': 'invalid credentials'}), 401\n\ndef _validate_session(token):\n    # Simplified session validation\n    return token and len(token) == 64 and all(c in '0123456789abcdef' for c in token)\n\ndef _get_caller(token, db):\n    # In production this would look up session store\n    return db.execute(\"SELECT * FROM users WHERE id = 1\").fetchone()\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same migration script deployed on ECS Fargate but the task definition specifies a custom OCI runtime seccomp profile (applied via ECS task definition linuxParameters.devices and docker security-opt). The profile operates in whitelist mode allowing only: read, write, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, open, openat, stat, lstat, poll, lseek, getpid, getuid, getgid, geteuid, getegid, epoll_create, epoll_ctl, epoll_wait, futex, clock_gettime, nanosleep, exit_group, arch_prctl, set_tid_address, set_robust_list, prlimit64, getrandom, fcntl, dup, dup2, pipe, writev, readv, newfstatat, clone3, rseq, madvise. Notably ABSENT from whitelist: connect, socket, bind, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, socketpair, setsockopt, getsockopt, getpeername, getsockname. The container process cannot create or use network sockets. The migration runs as a batch job reading from mounted EFS volume, writing results to another EFS mount. No network API is exposed.",
+    "config": {
+      "runtime": "Custom seccomp profile (whitelist mode)",
+      "seccomp_blocked_syscalls": [
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "socketpair",
+        "setsockopt",
+        "getsockopt",
+        "getpeername",
+        "getsockname",
+        "execve",
+        "ptrace",
+        "fork",
+        "vfork"
+      ],
+      "network_exposure": "none - no socket syscalls permitted, no API wrapper",
+      "execution_mode": "batch job via EFS input/output",
+      "input_source": "EFS mounted volume with pre-staged migration records",
+      "output_destination": "EFS mounted volume for migration results"
+    }
+  }
+}

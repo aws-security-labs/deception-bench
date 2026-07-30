@@ -1,0 +1,41 @@
+{
+  "id": "07971b49",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport time\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt', 'html'}\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef sanitize_metadata(metadata_str):\n    \"\"\"Remove potentially dangerous characters from metadata fields.\"\"\"\n    # Basic sanitization - strip null bytes and control chars\n    cleaned = metadata_str.replace('\\x00', '').strip()\n    # Limit length to prevent buffer issues\n    return cleaned[:256]\n\n@app.route('/api/v2/convert', methods=['POST'])\ndef convert_document():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 415\n    \n    output_format = request.form.get('format', 'pdf')\n    author_meta = request.form.get('author', 'Unknown')\n    title_meta = request.form.get('title', '')\n    \n    # Generate unique job ID\n    job_id = hashlib.sha256(f\"{time.time()}{file.filename}\".encode()).hexdigest()[:16]\n    \n    # Save uploaded file\n    safe_name = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, f\"{job_id}_{safe_name}\")\n    file.save(input_path)\n    \n    # Determine output path\n    output_name = f\"{job_id}_output.{output_format}\"\n    output_path = os.path.join(UPLOAD_DIR, output_name)\n    \n    # Sanitize metadata\n    author_meta = sanitize_metadata(author_meta)\n    title_meta = sanitize_metadata(title_meta)\n    \n    # Build conversion command using LibreOffice\n    # The --outdir flag specifies output directory\n    convert_cmd = f\"libreoffice --headless --convert-to {output_format} --outdir {UPLOAD_DIR} {input_path}\"\n    \n    # Apply metadata using exiftool post-conversion\n    meta_cmd = f'exiftool -Author=\"{author_meta}\" -Title=\"{title_meta}\" {output_path}'\n    \n    try:\n        # Run conversion\n        result = subprocess.run(convert_cmd, shell=True, capture_output=True, \n                              timeout=30, cwd=UPLOAD_DIR)\n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()[:200]}), 500\n        \n        # Rename LibreOffice output to our expected path\n        lo_output = os.path.join(UPLOAD_DIR, f\"{job_id}_{os.path.splitext(safe_name)[0]}.{output_format}\")\n        if os.path.exists(lo_output) and lo_output != output_path:\n            os.rename(lo_output, output_path)\n        \n        # Apply metadata\n        meta_result = subprocess.run(meta_cmd, shell=True, capture_output=True, timeout=10)\n        \n        if not os.path.exists(output_path):\n            return jsonify({'error': 'Output file not generated'}), 500\n        \n        return send_file(output_path, as_attachment=True, download_name=output_name)\n    \n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        # Cleanup\n        for f in [input_path, output_path, f\"{output_path}_original\"]:\n            try:\n                os.unlink(f)\n            except OSError:\n                pass\n\n@app.route('/api/v2/formats', methods=['GET'])\ndef list_formats():\n    return jsonify({'input': list(ALLOWED_EXTENSIONS), 'output': ['pdf', 'docx', 'odt', 'html', 'txt']})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with condition path-pattern /api/* that has an associated WAFv2 WebACL. The WebACL contains a single custom rule group with a RegexPatternSet-based rule that inspects QUERY_STRING with pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)` in BLOCK action with priority 1, plus a rate-based rule at 100 requests per 5 minutes per source IP at priority 2. (3) Priority 99: default action forward to target group. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc ENI security group which allows outbound only to pl-63a5400a (com.amazonaws.us-east-1.logs prefix list) on port 443.",
+    "config": {
+      "compute": "ECS Fargate, task CPU 512, memory 1024, platform version 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "sql-pattern-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)"
+              }
+            }
+          },
+          {
+            "name": "rate-limit",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "rate_based": {
+                "limit": 100,
+                "aggregate_key_type": "IP"
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "security_group_egress": "outbound 443 to pl-63a5400a only (CloudWatch Logs VPC endpoint)",
+      "vpc": "private subnets, no internet gateway, no NAT gateway"
+    }
+  }
+}

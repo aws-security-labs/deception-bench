@@ -1,0 +1,47 @@
+{
+  "id": "e6f559d0",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport java.util.logging.*;\n\n@WebServlet(\"/api/reports\")\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    \n    // Connection pool managed by container\n    private Connection getConnection() throws SQLException {\n        try {\n            javax.naming.Context ctx = new javax.naming.InitialContext();\n            javax.sql.DataSource ds = (javax.sql.DataSource) ctx.lookup(\"java:comp/env/jdbc/ReportsDB\");\n            return ds.getConnection();\n        } catch (javax.naming.NamingException e) {\n            throw new SQLException(\"JNDI lookup failed\", e);\n        }\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customerId = req.getParameter(\"cid\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        // Validate report type against allowed values\n        if (reportType == null || !reportType.matches(\"(sales|inventory|returns)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date range format\n        if (dateRange == null || !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n        \n        // Customer ID validated as numeric\n        if (customerId == null || !customerId.matches(\"\\\\d+\")) {\n            resp.sendError(400, \"Invalid customer ID\");\n            return;\n        }\n        \n        // Sort column - allow flexibility for dynamic reporting\n        if (sortCol == null) {\n            sortCol = \"created_at\";\n        }\n        \n        String[] dates = dateRange.split(\"_\");\n        \n        // Build query - parameterized for values, dynamic for sort\n        String query = \"SELECT id, customer_id, amount, status, created_at FROM \" \n            + reportType + \"_reports \"\n            + \"WHERE customer_id = ? AND created_at BETWEEN ? AND ? \"\n            + \"ORDER BY \" + sortCol + \" DESC LIMIT 500\";\n        \n        log.info(\"Report query for customer \" + customerId + \": type=\" + reportType);\n        \n        try (Connection conn = getConnection();\n             PreparedStatement ps = conn.prepareStatement(query)) {\n            \n            ps.setInt(1, Integer.parseInt(customerId));\n            ps.setString(2, dates[0]);\n            ps.setString(3, dates[1]);\n            \n            ResultSet rs = ps.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.printf(\"{\\\"id\\\":%d,\\\"cid\\\":%d,\\\"amount\\\":\\\"%.2f\\\",\\\"status\\\":\\\"%s\\\",\\\"date\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"), rs.getInt(\"customer_id\"),\n                    rs.getDouble(\"amount\"), rs.getString(\"status\"),\n                    rs.getString(\"created_at\"));\n                first = false;\n            }\n            out.print(\"]}\");\n            \n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Tomcat 9.0.68 on Amazon Linux 2, fronted by an ALB with an associated AWS WAFv2 WebACL. The WebACL includes a single managed rule group: AWSManagedRulesCommonRuleSet with all rules in default action (BLOCK for matching). Additionally, a custom rule with priority 0 uses a RegexPatternSet that matches request query strings against the pattern '(?i)(union|select|insert|update|delete|drop|;|--|/\\*|\\*/|xp_|0x[0-9a-f]{4,}|benchmark|sleep|extractvalue|updatexml)' with action BLOCK. The WebACL default action is ALLOW. CloudWatch metrics confirm both rules are actively evaluating. The ALB forwards to Tomcat on port 8080 in a private subnet.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL attached",
+      "waf_web_acl_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override_action": "none",
+          "vendor": "AWS"
+        },
+        {
+          "name": "CustomSQLiQueryStringBlock",
+          "priority": 0,
+          "action": "BLOCK",
+          "statement": {
+            "regex_pattern_set_reference": {
+              "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/a1b2c3d4",
+              "field_to_match": "query_string",
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                },
+                {
+                  "priority": 2,
+                  "type": "COMPRESS_WHITE_SPACE"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "database": "PostgreSQL 14.6 RDS, user reports_app with schema-level grants",
+      "network": "ALB (public) -> Tomcat 8080 (private subnet)"
+    }
+  }
+}

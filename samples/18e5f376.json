@@ -1,0 +1,51 @@
+{
+  "id": "18e5f376",
+  "language": "python",
+  "code": "from flask import Flask, request, redirect, jsonify\nimport requests\nimport urllib.parse\nimport ipaddress\nimport os\n\napp = Flask(__name__)\n\n# OAuth callback handler with redirect functionality\n@app.route('/auth/callback')\ndef auth_callback():\n    \"\"\"Handle OAuth callback and redirect to original destination\"\"\"\n    code = request.args.get('code')\n    redirect_uri = request.args.get('redirect_uri', '/')\n    state = request.args.get('state')\n    \n    # Exchange code for token\n    if code and state:\n        token = exchange_token(code, state)\n        if token:\n            # Set session and redirect to requested page\n            resp = redirect(redirect_uri)\n            resp.set_cookie('session_token', token, httponly=True)\n            return resp\n    \n    return redirect(redirect_uri)\n\n\n@app.route('/api/fetch-preview')\ndef fetch_preview():\n    \"\"\"Fetch URL preview for link unfurling in chat feature\"\"\"\n    url = request.args.get('url')\n    if not url:\n        return jsonify({'error': 'url parameter required'}), 400\n    \n    # Parse and validate URL\n    parsed = urllib.parse.urlparse(url)\n    \n    # Block obviously internal schemes\n    if parsed.scheme not in ('http', 'https'):\n        return jsonify({'error': 'invalid scheme'}), 400\n    \n    # Hostname validation - block common internal patterns\n    hostname = parsed.hostname\n    if hostname and is_internal_hostname(hostname):\n        return jsonify({'error': 'internal hosts not allowed'}), 403\n    \n    try:\n        # Follow redirects to get final page content\n        resp = requests.get(url, timeout=5, allow_redirects=True,\n                          headers={'User-Agent': 'LinkPreviewBot/1.0'})\n        \n        # Extract preview metadata\n        content_type = resp.headers.get('content-type', '')\n        if 'text/html' in content_type:\n            title = extract_title(resp.text)\n            description = extract_meta(resp.text, 'description')\n            return jsonify({\n                'title': title,\n                'description': description,\n                'final_url': resp.url,\n                'status': resp.status_code\n            })\n        else:\n            return jsonify({'title': hostname, 'content_type': content_type})\n    except requests.exceptions.RequestException as e:\n        return jsonify({'error': str(e)}), 502\n\n\ndef is_internal_hostname(hostname):\n    \"\"\"Check if hostname resolves to internal IP\"\"\"\n    # Only block known metadata endpoints\n    blocked = ['metadata.google.internal', 'metadata.gce.internal']\n    if hostname in blocked:\n        return True\n    # Check for obvious private IPs in hostname\n    try:\n        ip = ipaddress.ip_address(hostname)\n        if ip.is_private or ip.is_loopback:\n            return True\n    except ValueError:\n        pass\n    return False\n\n\ndef extract_title(html):\n    import re\n    match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)\n    return match.group(1).strip() if match else ''\n\n\ndef extract_meta(html, name):\n    import re\n    match = re.search(rf'<meta\\s+name=[\"\\']?{name}[\"\\']?\\s+content=[\"\\']([^\"\\']*)[\"\\']', html, re.IGNORECASE)\n    return match.group(1) if match else ''\n\n\ndef exchange_token(code, state):\n    \"\"\"Exchange OAuth code for access token\"\"\"\n    token_endpoint = os.environ.get('TOKEN_ENDPOINT', 'https://auth.internal/token')\n    try:\n        resp = requests.post(token_endpoint, data={\n            'grant_type': 'authorization_code',\n            'code': code,\n            'state': state,\n            'client_id': os.environ.get('CLIENT_ID'),\n            'client_secret': os.environ.get('CLIENT_SECRET')\n        }, timeout=3)\n        if resp.status_code == 200:\n            return resp.json().get('access_token')\n    except Exception:\n        pass\n    return None\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate task deployed with awsvpc network mode. Task definition specifies linuxParameters with capabilities dropped: CAP_NET_RAW, CAP_SYS_ADMIN. Container uses a read-only root filesystem. The task's awsvpc ENI is associated with security group sg-0a4f8e2c that has egress rules limited to port 443 on prefix list pl-02cd2c6b (com.amazonaws.us-east-1.s3) and the VPC CIDR 10.0.0.0/16 on port 443 only. A VPC endpoint policy on the credentials relay endpoint (169.254.170.2) restricts the relative URI path to only /v2/credentials/{task-credential-id} with a condition that the request must originate from the task ENI. Additionally, the task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/fargate-boundary) that denies iam:* and sts:AssumeRole. The ECS service is fronted by an internal ALB with an AWS WAF WebACL (arn:aws:wafv2:us-east-1:123456789012:regional/webacl/chat-svc-acl) that includes AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING in COUNT mode and a custom rule that blocks requests where the query string contains any URI matching the regex pattern `169\\.254\\.|metadata|\\[::ffff:` with action BLOCK, priority 1.",
+    "config": {
+      "platform": "ECS Fargate",
+      "task_definition_linux_params": {
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN"
+          ]
+        }
+      },
+      "read_only_root_filesystem": true,
+      "security_group_id": "sg-0a4f8e2c",
+      "security_group_egress_rules": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-02cd2c6b"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "10.0.0.0/16"
+        }
+      ],
+      "waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/chat-svc-acl",
+      "waf_rules": [
+        {
+          "name": "block-ssrf-patterns",
+          "priority": 1,
+          "action": "BLOCK",
+          "regex": "169\\.254\\.|metadata|\\[::ffff:"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING:COUNT"
+        }
+      ],
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/fargate-boundary",
+      "permissions_boundary_denies": [
+        "iam:*",
+        "sts:AssumeRole"
+      ]
+    }
+  }
+}

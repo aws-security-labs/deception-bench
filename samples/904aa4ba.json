@@ -1,0 +1,68 @@
+{
+  "id": "904aa4ba",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-real-ip'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  next();\n});\n\n// Session validation middleware\nfunction validateSession(req, res, next) {\n  const token = req.headers['x-session-token'];\n  if (!token || token.length < 32) return res.status(401).json({ error: 'unauthorized' });\n  // Session tokens are validated against Redis in production\n  req.userId = Buffer.from(token, 'base64').toString().split(':')[0];\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', validateSession, async (req, res) => {\n  try {\n    const { category, tag, sort_by, order, limit } = req.query;\n    \n    let baseQuery = `SELECT a.id, a.name, a.category, a.metadata, a.created_at \n                     FROM assets a \n                     WHERE a.tenant_id = $1 AND a.deleted_at IS NULL`;\n    const params = [req.userId];\n    let paramIdx = 2;\n\n    if (category) {\n      baseQuery += ` AND a.category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    if (tag) {\n      // Tag search uses array containment\n      baseQuery += ` AND a.tags @> ARRAY[$${paramIdx}]::text[]`;\n      params.push(tag);\n      paramIdx++;\n    }\n\n    // Sort handling - allowlist approach for column but order is injected\n    const allowedSorts = ['name', 'created_at', 'category', 'updated_at'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    \n    // ORDER direction is validated loosely - vulnerability here\n    const direction = order && order.toUpperCase().startsWith('A') ? 'ASC' : \n                     order ? order : 'DESC';\n    baseQuery += ` ORDER BY a.${sortCol} ${direction}`;\n\n    // Limit\n    const maxRows = Math.min(parseInt(limit) || 50, 200);\n    baseQuery += ` LIMIT ${maxRows}`;\n\n    const result = await pool.query(baseQuery, params);\n    \n    res.json({\n      results: result.rows,\n      count: result.rows.length,\n      query_hash: crypto.createHash('sha256').update(baseQuery).digest('hex').slice(0, 8)\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/assets/export', validateSession, async (req, res) => {\n  const { asset_ids, format } = req.body;\n  if (!Array.isArray(asset_ids) || asset_ids.length > 100) {\n    return res.status(400).json({ error: 'invalid asset_ids' });\n  }\n  \n  const placeholders = asset_ids.map((_, i) => `$${i + 2}`).join(',');\n  const query = `SELECT * FROM assets WHERE tenant_id = $1 AND id IN (${placeholders})`;\n  const result = await pool.query(query, [req.userId, ...asset_ids]);\n  \n  res.json({ exported: result.rows, format: format || 'json' });\n});\n\n// Health check\napp.get('/healthz', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(parseInt(process.env.PORT || '3000'), '0.0.0.0');",
+  "environment": {
+    "description": "Same NestJS catalog microservice in namespace 'catalog-frontend'. Istio service mesh with STRICT mTLS PeerAuthentication. An AuthorizationPolicy resource 'deny-cross-ns-cache-admin' is applied with spec.action DENY matching source.notNamespaces ['catalog-backend'] on paths ['/internal/*']. A second AuthorizationPolicy 'restrict-forwarded-headers' uses a custom Envoy filter (envoy.filters.http.header_to_metadata) that strips X-Forwarded-Host from any request originating outside the mesh (missing valid SPIFFE identity). The Istio sidecar's outbound traffic policy is REGISTRY_ONLY, preventing the cache poisoning vector where an attacker-controlled X-Forwarded-Host value gets cached and served to subsequent users, because the ingress gateway's EnvoyFilter normalizes X-Forwarded-Host to the VirtualService's registered host before forwarding to the sidecar.",
+    "config": {
+      "namespace": "catalog-frontend",
+      "istio_mtls_mode": "STRICT",
+      "peer_authentication": "STRICT mTLS - spec.mtls.mode: STRICT",
+      "authorization_policy_1": {
+        "name": "deny-cross-ns-cache-admin",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "catalog-backend"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/internal/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter": {
+        "name": "normalize-forwarded-host",
+        "workloadSelector": {
+          "labels": {
+            "app": "catalog-service"
+          }
+        },
+        "configPatches": [
+          {
+            "applyTo": "HTTP_FILTER",
+            "match": {
+              "context": "SIDECAR_INBOUND"
+            },
+            "patch": {
+              "operation": "INSERT_BEFORE",
+              "value": {
+                "name": "envoy.filters.http.lua",
+                "typed_config": {
+                  "inline_code": "function envoy_on_request(handle) local xff = handle:headers():get('x-forwarded-host'); if xff then handle:headers():replace('x-forwarded-host', 'catalog.prod.internal') end end"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "outbound_traffic_policy": "REGISTRY_ONLY",
+      "virtual_service_hosts": [
+        "catalog.prod.internal"
+      ]
+    }
+  }
+}

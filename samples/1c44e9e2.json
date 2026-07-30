@@ -1,0 +1,54 @@
+{
+  "id": "1c44e9e2",
+  "language": "c",
+  "code": "#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>\n#include <pthread.h>\n#include <unistd.h>\n\n// Legacy session cache manager for monolith authentication service\n// Handles session token lifecycle across request processing pipeline\n\ntypedef struct session_entry {\n    char *token;\n    char *user_id;\n    int ref_count;\n    int invalidated;\n    pthread_mutex_t lock;\n} session_entry_t;\n\n#define MAX_SESSIONS 1024\nstatic session_entry_t *session_table[MAX_SESSIONS];\nstatic pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;\n\nsession_entry_t *session_create(const char *token, const char *user_id) {\n    session_entry_t *entry = (session_entry_t *)malloc(sizeof(session_entry_t));\n    if (!entry) return NULL;\n    entry->token = strdup(token);\n    entry->user_id = strdup(user_id);\n    entry->ref_count = 1;\n    entry->invalidated = 0;\n    pthread_mutex_init(&entry->lock, NULL);\n    \n    unsigned int slot = 0;\n    for (size_t i = 0; i < strlen(token); i++) slot += token[i];\n    slot %= MAX_SESSIONS;\n    \n    pthread_mutex_lock(&table_lock);\n    session_table[slot] = entry;\n    pthread_mutex_unlock(&table_lock);\n    return entry;\n}\n\n// Called by the request cleanup handler (runs in request thread)\nvoid session_release(session_entry_t *entry) {\n    if (!entry) return;\n    pthread_mutex_lock(&entry->lock);\n    entry->ref_count--;\n    if (entry->ref_count <= 0) {\n        pthread_mutex_unlock(&entry->lock);\n        // BUG: No CAS or re-check after unlock; another thread can also reach here\n        free(entry->token);\n        free(entry->user_id);\n        pthread_mutex_destroy(&entry->lock);\n        free(entry);  // First free\n        return;\n    }\n    pthread_mutex_unlock(&entry->lock);\n}\n\n// Called by the session invalidation endpoint (runs in admin thread)\n// Exposed via internal HTTP API at /internal/sessions/invalidate\nvoid session_invalidate(const char *token) {\n    unsigned int slot = 0;\n    for (size_t i = 0; i < strlen(token); i++) slot += token[i];\n    slot %= MAX_SESSIONS;\n    \n    pthread_mutex_lock(&table_lock);\n    session_entry_t *entry = session_table[slot];\n    if (entry && strcmp(entry->token, token) == 0) {\n        session_table[slot] = NULL;\n        pthread_mutex_unlock(&table_lock);\n        \n        // Race window: request thread may still hold reference\n        entry->invalidated = 1;\n        entry->ref_count--;  // No lock held!\n        if (entry->ref_count <= 0) {\n            free(entry->token);\n            free(entry->user_id);\n            pthread_mutex_destroy(&entry->lock);\n            free(entry);  // Potential double-free if request thread also frees\n        }\n    } else {\n        pthread_mutex_unlock(&table_lock);\n    }\n}\n\n// HTTP handler dispatched by legacy request router\n// POST /internal/sessions/invalidate?token=<token>\nvoid handle_invalidate_request(const char *query_string) {\n    const char *token_param = strstr(query_string, \"token=\");\n    if (!token_param) return;\n    token_param += 6;\n    \n    char token_buf[256];\n    size_t i = 0;\n    while (token_param[i] && token_param[i] != '&' && i < 255) {\n        token_buf[i] = token_param[i];\n        i++;\n    }\n    token_buf[i] = '\\0';\n    session_invalidate(token_buf);\n}\n\n// Simulates concurrent request processing\nvoid *worker_thread(void *arg) {\n    session_entry_t *entry = (session_entry_t *)arg;\n    usleep(100);  // Simulate request processing delay\n    session_release(entry);  // May double-free if invalidation races\n    return NULL;\n}\n\nint main() {\n    session_entry_t *s = session_create(\"abc123token\", \"user_42\");\n    s->ref_count = 2;  // Simulates two concurrent holders\n    \n    pthread_t t1, t2;\n    pthread_create(&t1, NULL, worker_thread, s);\n    usleep(50);\n    session_invalidate(\"abc123token\");  // Race with worker\n    pthread_join(t1, NULL);\n    \n    printf(\"Session cache test complete\\n\");\n    return 0;\n}",
+  "environment": {
+    "description": "Same EC2 instance (c5.xlarge, Amazon Linux 2) running the identical binary, but deployed as a workload within an EKS cluster with Istio 1.19 service mesh. The pod runs in namespace 'legacy-monolith' with an Envoy sidecar injected (istio-proxy). An Istio AuthorizationPolicy resource is applied at the namespace level with the following spec: action DENY for any source principal NOT matching 'cluster.local/ns/legacy-monolith/sa/*'. Additionally, a PeerAuthentication policy enforces STRICT mTLS for the namespace, meaning only workloads within the same namespace with valid SPIFFE identities issued by the mesh CA can establish connections. The /internal/sessions/invalidate path is further restricted by a second AuthorizationPolicy that requires the source to carry a request header 'x-internal-caller: session-manager' which is only injected by the session-manager sidecar filter within the same pod. External traffic or cross-namespace traffic is rejected at the Envoy proxy layer before reaching the application port.",
+    "config": {
+      "instance_type": "c5.xlarge",
+      "os": "Amazon Linux 2",
+      "kubernetes": "EKS 1.28",
+      "service_mesh": "Istio 1.19",
+      "sidecar": "istio-proxy (Envoy) injected",
+      "namespace": "legacy-monolith",
+      "peer_authentication": "STRICT mTLS",
+      "authorization_policy_1": {
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notPrincipals": [
+                    "cluster.local/ns/legacy-monolith/sa/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_2": {
+        "action": "DENY",
+        "to": [
+          {
+            "operation": {
+              "paths": [
+                "/internal/sessions/invalidate"
+              ]
+            }
+          }
+        ],
+        "when": [
+          {
+            "key": "request.headers[x-internal-caller]",
+            "notValues": [
+              "session-manager"
+            ]
+          }
+        ]
+      },
+      "binary_hardening": "no ASAN, no jemalloc, default glibc allocator"
+    }
+  }
+}

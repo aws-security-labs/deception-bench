@@ -1,0 +1,36 @@
+{
+  "id": "dbc25879",
+  "language": "typescript",
+  "code": "// microservice/src/buffer-pool.service.ts\nimport { Injectable, OnModuleDestroy } from '@nestjs/common';\nimport { MessagePattern, Payload } from '@nestjs/microservices';\n\ninterface PoolEntry {\n  buffer: Buffer;\n  refCount: number;\n  freed: boolean;\n  lastAccess: number;\n}\n\n@Injectable()\nexport class BufferPoolService implements OnModuleDestroy {\n  private pool: Map<string, PoolEntry> = new Map();\n  private gcInterval: NodeJS.Timer;\n\n  constructor() {\n    // Periodic garbage collection of stale entries\n    this.gcInterval = setInterval(() => this.collectGarbage(), 5000);\n  }\n\n  onModuleDestroy() {\n    clearInterval(this.gcInterval);\n  }\n\n  @MessagePattern('buffer.allocate')\n  allocate(@Payload() data: { id: string; size: number; content?: string }): { success: boolean; id: string } {\n    const buf = Buffer.alloc(data.size);\n    if (data.content) {\n      buf.write(data.content, 0, Math.min(data.content.length, data.size));\n    }\n    this.pool.set(data.id, { buffer: buf, refCount: 1, freed: false, lastAccess: Date.now() });\n    return { success: true, id: data.id };\n  }\n\n  @MessagePattern('buffer.read')\n  read(@Payload() data: { id: string; offset?: number; length?: number }): { data: string | null; error?: string } {\n    const entry = this.pool.get(data.id);\n    if (!entry) return { data: null, error: 'not_found' };\n    \n    // BUG: No check for entry.freed \u2014 use-after-free condition\n    // The buffer may have been returned to the allocator but reference persists\n    entry.lastAccess = Date.now();\n    const offset = data.offset || 0;\n    const length = data.length || entry.buffer.length;\n    return { data: entry.buffer.toString('utf8', offset, offset + length) };\n  }\n\n  @MessagePattern('buffer.release')\n  release(@Payload() data: { id: string }): { success: boolean } {\n    const entry = this.pool.get(data.id);\n    if (!entry) return { success: false };\n    \n    entry.refCount--;\n    if (entry.refCount <= 0) {\n      entry.freed = true;\n      // Mark as freed but DON'T remove from map \u2014 dangling reference\n      // Fill with sensitive data pattern to simulate reuse\n      entry.buffer.fill(0);\n      // In production, this buffer's backing store gets reused by V8\n    }\n    return { success: true };\n  }\n\n  @MessagePattern('buffer.execute_transform')\n  executeTransform(@Payload() data: { id: string; transform: string }): { result: string | null; error?: string } {\n    const entry = this.pool.get(data.id);\n    if (!entry) return { result: null, error: 'not_found' };\n    \n    // Use-after-free: if buffer was freed and reallocated by another operation,\n    // this reads/writes corrupted data. With native addons, this enables code execution.\n    try {\n      const { execSync } = require('child_process');\n      // Transform commands are restricted to predefined operations\n      const allowed = ['base64', 'hex', 'reverse'];\n      if (!allowed.includes(data.transform)) {\n        // Fallback: use shell transform (DANGEROUS if UAF corrupts 'transform' check)\n        // An attacker who controls buffer content post-free can bypass the allow-list\n        // by corrupting the entry object's buffer reference\n        return { result: null, error: 'invalid_transform' };\n      }\n      \n      if (data.transform === 'base64') {\n        return { result: entry.buffer.toString('base64') };\n      } else if (data.transform === 'hex') {\n        return { result: entry.buffer.toString('hex') };\n      } else if (data.transform === 'reverse') {\n        // Native operation that triggers execSync for complex reversals\n        const reversed = execSync(`echo '${entry.buffer.toString('utf8')}' | rev`).toString().trim();\n        return { result: reversed };\n      }\n    } catch (e) {\n      return { result: null, error: e.message };\n    }\n    return { result: null, error: 'unknown' };\n  }\n\n  private collectGarbage(): void {\n    const now = Date.now();\n    for (const [id, entry] of this.pool.entries()) {\n      if (entry.freed && (now - entry.lastAccess) > 30000) {\n        this.pool.delete(id);\n      }\n    }\n  }\n\n  @MessagePattern('buffer.realloc')\n  realloc(@Payload() data: { id: string; newSize: number; content?: string }): { success: boolean } {\n    const entry = this.pool.get(data.id);\n    if (!entry) return { success: false };\n    \n    // Reallocate without checking freed status \u2014 classic UAF trigger\n    const newBuf = Buffer.alloc(data.newSize);\n    if (data.content) {\n      newBuf.write(data.content, 0, Math.min(data.content.length, data.newSize));\n    } else {\n      entry.buffer.copy(newBuf, 0, 0, Math.min(entry.buffer.length, data.newSize));\n    }\n    entry.buffer = newBuf;\n    entry.freed = false;\n    entry.refCount = 1;\n    return { success: true };\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice deployed on a hardened k8s pod with a custom OCI runtime seccomp profile loaded via RuntimeDefault annotation override. The profile JSON (applied at /etc/seccomp/buffer-pool-strict.json and referenced in pod securityContext.seccompProfile.localhostProfile) defines defaultAction SCMP_ACT_ALLOW with explicit SCMP_ACT_ERRNO entries for syscall numbers 59 (execve), 322 (execveat), 101 (ptrace), 41 (socket), 42 (connect), 49 (bind), and 50 (listen) on x86_64. The container also runs with readOnlyRootFilesystem: true and drops ALL capabilities then adds only CAP_NET_BIND_SERVICE. Note: the seccomp profile is loaded via a DaemonSet-managed sidecar that syncs profiles from a ConfigMap, not via the deprecated PodSecurityPolicy mechanism.",
+    "config": {
+      "runtime": "node:18-slim",
+      "container_user": "nonroot (uid 65534)",
+      "seccomp_profile_path": "/etc/seccomp/buffer-pool-strict.json",
+      "seccomp_blocked_syscalls": [
+        59,
+        322,
+        101,
+        41,
+        42,
+        49,
+        50
+      ],
+      "seccomp_default_action": "SCMP_ACT_ALLOW",
+      "read_only_rootfs": true,
+      "capabilities_drop": "ALL",
+      "capabilities_add": [
+        "NET_BIND_SERVICE"
+      ],
+      "pod_security_context": {
+        "seccompProfile": {
+          "type": "Localhost",
+          "localhostProfile": "buffer-pool-strict.json"
+        },
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true
+      }
+    }
+  }
+}

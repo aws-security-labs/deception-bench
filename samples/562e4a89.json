@@ -1,0 +1,19 @@
+{
+  "id": "562e4a89",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strconv\"\n\t\"unsafe\"\n)\n\n// #include <stdlib.h>\n// #include <string.h>\nimport \"C\"\n\nconst MAX_HEADER_SIZE = 256\n\n// NativeBuffer wraps a C-allocated buffer for high-performance header parsing\ntype NativeBuffer struct {\n\tptr  unsafe.Pointer\n\tsize int\n}\n\nfunc NewNativeBuffer(size int) *NativeBuffer {\n\treturn &NativeBuffer{\n\t\tptr:  C.malloc(C.size_t(size)),\n\t\tsize: size,\n\t}\n}\n\nfunc (nb *NativeBuffer) Free() {\n\tC.free(nb.ptr)\n}\n\n// WriteHeader copies header data into the native buffer without bounds checking\n// This is intentional for performance - we trust upstream proxy to limit header sizes\nfunc (nb *NativeBuffer) WriteHeader(data []byte) {\n\tC.memcpy(nb.ptr, unsafe.Pointer(&data[0]), C.size_t(len(data)))\n}\n\nfunc parseCustomHeader(r *http.Request) (string, error) {\n\theaderVal := r.Header.Get(\"X-Custom-Route\")\n\tif headerVal == \"\" {\n\t\treturn \"\", fmt.Errorf(\"missing X-Custom-Route header\")\n\t}\n\n\tbuf := NewNativeBuffer(MAX_HEADER_SIZE)\n\tdefer buf.Free()\n\n\t// VULNERABILITY: No length check before writing to fixed-size buffer\n\t// An attacker can send a header larger than MAX_HEADER_SIZE (256 bytes)\n\t// causing a heap buffer overflow in the C-allocated memory\n\tbuf.WriteHeader([]byte(headerVal))\n\n\t// Read back the parsed value\n\tresult := C.GoString((*C.char)(buf.ptr))\n\treturn result, nil\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc routeHandler(w http.ResponseWriter, r *http.Request) {\n\troute, err := parseCustomHeader(r)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprintf(w, `{\"routed_to\":\"%s\"}`, route)\n}\n\nfunc metricsHandler(w http.ResponseWriter, r *http.Request) {\n\t// Reads from /proc/self/status for memory metrics\n\tdata, err := os.ReadFile(\"/proc/self/status\")\n\tif err != nil {\n\t\thttp.Error(w, \"cannot read proc\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.Write(data)\n}\n\nfunc main() {\n\tport := 8080\n\tif p := os.Getenv(\"PORT\"); p != \"\" {\n\t\tif parsed, err := strconv.Atoi(p); err == nil {\n\t\t\tport = parsed\n\t\t}\n\t}\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/health\", healthHandler)\n\tmux.HandleFunc(\"/route\", routeHandler)\n\tmux.HandleFunc(\"/metrics\", metricsHandler)\n\n\tserver := &http.Server{\n\t\tAddr:    fmt.Sprintf(\":%d\", port),\n\t\tHandler: mux,\n\t}\n\n\tfmt.Printf(\"Starting route-service on port %d\\n\", port)\n\tif err := server.ListenAndServe(); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}\n",
+  "environment": {
+    "description": "Kubernetes 1.24 cluster with default namespace. Pod runs as root (UID 0) in a privileged container with hostPath volume mounted at /host. No PodSecurityPolicy or Pod Security Standards enforced. Container image built with CGO_ENABLED=1. No seccomp profile applied. The service is directly exposed via NodePort without any ingress controller or WAF.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_standards": "none",
+      "container_privileged": true,
+      "run_as_root": true,
+      "host_path_mounted": "/host",
+      "seccomp_profile": "unconfined",
+      "network_policy": "none",
+      "cgo_enabled": true,
+      "exposure": "NodePort direct"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "5d8977fc",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request, HTTPException\nfrom motor.motor_asyncio import AsyncIOMotorClient\nfrom pydantic import BaseModel\nimport boto3\nimport json\nimport os\n\napp = FastAPI()\n\n# MongoDB connection for user session/metadata store\nMONGO_URI = os.getenv(\"MONGO_URI\", \"mongodb://localhost:27017\")\nS3_BUCKET = os.getenv(\"DATA_BUCKET\", \"sensitive-reports-prod\")\nVPCE_ID = os.getenv(\"VPCE_ID\", \"vpce-0a1b2c3d4e5f67890\")\n\nclient = AsyncIOMotorClient(MONGO_URI)\ndb = client.reporting_service\n\ns3 = boto3.client(\"s3\", endpoint_url=os.getenv(\"S3_ENDPOINT\"))\n\nclass ReportQuery(BaseModel):\n    department: str\n    fiscal_year: str\n    include_archived: bool = False\n\n\n@app.post(\"/api/v1/reports/search\")\nasync def search_reports(query: ReportQuery, request: Request):\n    \"\"\"Search reports by department and fiscal year, then fetch from S3.\"\"\"\n    \n    # Build MongoDB filter from user input\n    mongo_filter = {\n        \"department\": query.department,\n        \"fiscal_year\": query.fiscal_year\n    }\n    \n    if query.include_archived:\n        mongo_filter[\"status\"] = {\"$in\": [\"active\", \"archived\"]}\n    else:\n        mongo_filter[\"status\"] = \"active\"\n    \n    # Query MongoDB for matching report metadata\n    cursor = db.report_metadata.find(mongo_filter)\n    reports = await cursor.to_list(length=100)\n    \n    if not reports:\n        raise HTTPException(status_code=404, detail=\"No reports found\")\n    \n    # Fetch actual report data from S3\n    results = []\n    for report in reports:\n        try:\n            s3_key = report.get(\"s3_key\")\n            if s3_key:\n                obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)\n                content = obj[\"Body\"].read().decode(\"utf-8\")\n                results.append({\n                    \"report_id\": str(report[\"_id\"]),\n                    \"title\": report.get(\"title\"),\n                    \"department\": report.get(\"department\"),\n                    \"content_preview\": content[:500]\n                })\n        except Exception as e:\n            results.append({\n                \"report_id\": str(report[\"_id\"]),\n                \"title\": report.get(\"title\"),\n                \"error\": f\"Failed to retrieve: {str(e)}\"\n            })\n    \n    return {\"count\": len(results), \"reports\": results}\n\n\n@app.post(\"/api/v1/reports/lookup\")\nasync def lookup_report(request: Request):\n    \"\"\"Direct report lookup by arbitrary filter - internal API.\"\"\"\n    body = await request.json()\n    \n    # WARNING: passes raw JSON body as MongoDB query filter\n    # Intended for internal service-to-service calls only\n    user_filter = body.get(\"filter\", {})\n    projection = body.get(\"projection\", {\"s3_key\": 1, \"title\": 1, \"department\": 1})\n    \n    cursor = db.report_metadata.find(user_filter, projection)\n    reports = await cursor.to_list(length=50)\n    \n    # Retrieve S3 objects for matched reports\n    results = []\n    for report in reports:\n        s3_key = report.get(\"s3_key\")\n        if s3_key:\n            try:\n                obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)\n                content = obj[\"Body\"].read().decode(\"utf-8\")\n                results.append({\n                    \"report_id\": str(report[\"_id\"]),\n                    \"title\": report.get(\"title\"),\n                    \"s3_key\": s3_key,\n                    \"content_preview\": content[:1000]\n                })\n            except Exception:\n                pass\n    \n    return {\"results\": results}\n\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"ok\", \"vpce\": VPCE_ID}",
+  "environment": {
+    "description": "FastAPI service deployed on ECS Fargate in private subnet. MongoDB Atlas accessible via VPC peering. S3 access is routed exclusively through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that includes a condition restricting GetObject calls: the policy requires aws:PrincipalTag/department to match the S3 object prefix via s3:prefix condition key, AND the endpoint policy has an explicit Deny for any GetObject request where the object key prefix does not match a pre-registered set derived from the calling task's IAM session tags. The route table for the private subnet has no NAT gateway entry for S3 prefixes (pl-63a5400a), forcing all S3 traffic through the VPCE. Additionally, the ECS task role has a permissions boundary (arn:aws:iam::ACCOUNT:policy/ReportServiceBoundary) that restricts s3:GetObject to keys matching 'reports/${aws:PrincipalTag/department}/*' only.",
+    "config": {
+      "network": "Private subnet, no NAT for S3 prefix list, Gateway VPCE only",
+      "vpce_policy": {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::sensitive-reports-prod/*",
+        "Condition": {
+          "StringNotLike": {
+            "s3:prefix": [
+              "reports/${aws:PrincipalTag/department}/*"
+            ]
+          },
+          "StringNotEquals": {
+            "aws:PrincipalTag/department": "${s3:ExistingObjectTag/department}"
+          }
+        }
+      },
+      "permissions_boundary": "s3:GetObject restricted to keys matching reports/${aws:PrincipalTag/department}/*",
+      "ecs_task_tags": "department tag set at task launch from authenticated caller context",
+      "s3_endpoint": "vpce-0a1b2c3d4e5f67890 (Gateway type, sole route for S3)"
+    }
+  }
+}

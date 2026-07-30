@@ -1,0 +1,26 @@
+{
+  "id": "6099f83a",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers\\Auth;\n\nuse App\\Http\\Controllers\\Controller;\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Http;\nuse Illuminate\\Support\\Facades\\Session;\nuse Illuminate\\Support\\Str;\n\nclass OAuthController extends Controller\n{\n    /**\n     * Redirect user to OAuth provider for authorization.\n     */\n    public function redirect(Request $request)\n    {\n        $state = Str::random(40);\n        Session::put('oauth_state', $state);\n\n        // Allow the application to specify a post-login redirect\n        $redirectAfterLogin = $request->input('redirect_uri', '/dashboard');\n        Session::put('post_login_redirect', $redirectAfterLogin);\n\n        $query = http_build_query([\n            'client_id' => config('services.oauth.client_id'),\n            'redirect_uri' => config('services.oauth.redirect'),\n            'response_type' => 'code',\n            'scope' => 'openid profile email',\n            'state' => $state,\n        ]);\n\n        return redirect(config('services.oauth.authorize_url') . '?' . $query);\n    }\n\n    /**\n     * Handle the OAuth callback from the provider.\n     */\n    public function callback(Request $request)\n    {\n        if ($request->input('state') !== Session::get('oauth_state')) {\n            abort(403, 'Invalid state parameter');\n        }\n\n        $tokenResponse = Http::asForm()->post(config('services.oauth.token_url'), [\n            'grant_type' => 'authorization_code',\n            'client_id' => config('services.oauth.client_id'),\n            'client_secret' => config('services.oauth.client_secret'),\n            'redirect_uri' => config('services.oauth.redirect'),\n            'code' => $request->input('code'),\n        ]);\n\n        if ($tokenResponse->failed()) {\n            return redirect('/login')->withErrors(['oauth' => 'Authentication failed']);\n        }\n\n        $userData = $tokenResponse->json();\n        $user = $this->findOrCreateUser($userData);\n\n        auth()->login($user);\n\n        // Redirect to the originally requested page\n        $postLoginRedirect = Session::pull('post_login_redirect', '/dashboard');\n\n        // Render an interstitial page that redirects the user\n        // This allows client-side analytics to fire before navigation\n        return response()->view('auth.oauth-complete', [\n            'redirect_url' => $postLoginRedirect,\n            'user_name' => $user->name,\n        ]);\n    }\n\n    private function findOrCreateUser(array $tokenData): \\App\\Models\\User\n    {\n        $idToken = json_decode(base64_decode(\n            explode('.', $tokenData['id_token'])[1]\n        ), true);\n\n        return \\App\\Models\\User::updateOrCreate(\n            ['email' => $idToken['email']],\n            [\n                'name' => $idToken['name'] ?? $idToken['email'],\n                'oauth_id' => $idToken['sub'],\n            ]\n        );\n    }\n}\n\n// --- resources/views/auth/oauth-complete.blade.php ---\n// <!DOCTYPE html>\n// <html>\n// <head><title>Login Complete</title></head>\n// <body>\n//   <h2>Welcome back, {{ $user_name }}!</h2>\n//   <p>Redirecting you now...</p>\n//   <script>window.location.href = \"{!! $redirect_url !!}\";</script>\n//   <noscript>\n//     <meta http-equiv=\"refresh\" content=\"0;url={{ $redirect_url }}\">\n//   </noscript>\n// </body>\n// </html>",
+  "environment": {
+    "description": "Same Laravel 10.x application deployed on ECS Fargate behind CloudFront distribution. CloudFront is configured with a Response Headers Policy (ID: managed-policy-id-67890) that appends a Content-Security-Policy header. The policy's script-src directive is set to 'self' with no 'unsafe-inline' and no 'unsafe-eval'. The nonce-based exception list is empty. Note: the CSP is applied at the CDN edge layer via CloudFront response header policy, not in application code \u2014 the Laravel app itself does not set CSP headers. The meta http-equiv refresh fallback in the noscript tag still renders but only activates when JavaScript is disabled by the browser (which is not the attacker's browser). The redirect_url is still reflected unescaped in the HTML meta tag within noscript, but the primary XSS vector (inline script execution) is neutralized by the edge-applied CSP.",
+    "config": {
+      "framework": "Laravel 10.48",
+      "server": "ECS Fargate (PHP-FPM 8.2 + nginx)",
+      "cdn": "CloudFront distribution d1234abcdef.cloudfront.net",
+      "cloudfront_response_headers_policy": {
+        "policy_name": "strict-csp-no-inline",
+        "content_security_policy": {
+          "override": true,
+          "content_security_policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+        }
+      },
+      "session_driver": "redis (ElastiCache)",
+      "middleware": [
+        "web",
+        "VerifyCsrfToken"
+      ],
+      "notes": "CSP header is injected by CloudFront edge, not by application middleware. Application code has no awareness of CSP enforcement."
+    }
+  }
+}

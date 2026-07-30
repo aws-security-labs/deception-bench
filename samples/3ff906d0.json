@@ -1,0 +1,66 @@
+{
+  "id": "3ff906d0",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport session from 'express-session';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\napp.use(session({ secret: process.env.SESSION_SECRET || 'dev-secret', resave: false, saveUninitialized: false }));\n\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware: check if user is authenticated\nfunction requireAuth(req, res, next) {\n  if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });\n  next();\n}\n\n// User search endpoint - supports flexible filtering\napp.get('/api/users/search', requireAuth, async (req, res) => {\n  try {\n    const { field, value, sortBy } = req.query;\n    \n    // Whitelist of searchable fields\n    const allowedFields = ['username', 'email', 'department', 'role', 'status'];\n    if (!allowedFields.includes(field)) {\n      return res.status(400).json({ error: 'Invalid search field' });\n    }\n    \n    // Build query - field is validated above, value is parameterized\n    let query = `SELECT id, username, email, department, role, status FROM users WHERE ${field} = $1`;\n    \n    // Sort support - NOTE: sortBy is user-controlled\n    if (sortBy) {\n      // Attempt to validate sortBy\n      const sortPattern = /^[a-zA-Z_]+$/;\n      if (sortPattern.test(sortBy)) {\n        query += ` ORDER BY ${sortBy}`;\n      }\n    }\n    \n    const result = await pool.query(query, [value]);\n    res.json({ users: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Admin endpoint - export user data\napp.get('/api/admin/export', requireAuth, async (req, res) => {\n  try {\n    const { format, filter } = req.query;\n    \n    // Check admin role from session\n    if (req.session.role !== 'admin') {\n      return res.status(403).json({ error: 'Admin access required' });\n    }\n    \n    // Dynamic filter construction for admin exports\n    let query = 'SELECT id, username, email, department, role, created_at FROM users';\n    \n    if (filter) {\n      // Admin filter uses a raw interpolation for complex expressions\n      // Admins are trusted internal users\n      query += ` WHERE ${filter}`;\n    }\n    \n    const result = await pool.query(query);\n    \n    if (format === 'csv') {\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.setHeader('Content-Type', 'text/csv');\n      res.send(csv);\n    } else {\n      res.json({ users: result.rows });\n    }\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\n// Password reset - generates token\napp.post('/api/users/reset-password', async (req, res) => {\n  const { email } = req.body;\n  const token = crypto.randomBytes(32).toString('hex');\n  try {\n    await pool.query(\n      'UPDATE users SET reset_token = $1, reset_expires = NOW() + interval \\'1 hour\\' WHERE email = $2',\n      [token, email]\n    );\n    // In production, send email with token\n    res.json({ message: 'If the email exists, a reset link was sent.' });\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to process reset' });\n  }\n});\n\napp.listen(3000, () => console.log('User service running on :3000'));",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate with task role 'CommentServiceTaskRole'. The IAM policy uses DynamoDB fine-grained access control with leading key condition: dynamodb:LeadingKeys restricts PutItem to items where project_id matches a tag-based prefix derived from the ECS task's resource tag 'AllowedProjectPrefix' (set to 'internal-'). Additionally, a DynamoDB condition expression requires that the 'source' attribute equals 'web' for all PutItem operations via an IAM policy condition key dynamodb:Attributes with ForAllValues:StringEquals. The /cli/import endpoint writes items with source='cli', which will be DENIED by the IAM condition. A VPC endpoint policy for DynamoDB further restricts the dynamodb:PutItem action to requests where the item's partition key starts with 'internal-' prefix only. Comments from external sources that could contain XSS payloads cannot be persisted because the CLI import path sets source='cli' which violates the IAM attribute-level condition.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserComments",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "internal-*"
+                ],
+                "dynamodb:Attributes": [
+                  "project_id",
+                  "timestamp",
+                  "body",
+                  "author",
+                  "source"
+                ]
+              },
+              "StringEquals": {
+                "dynamodb:Attributes": {
+                  "source": "web"
+                }
+              }
+            }
+          },
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:Query",
+              "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserComments"
+          }
+        ]
+      },
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Action": "dynamodb:PutItem",
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserComments",
+        "Condition": {
+          "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": [
+              "internal-*"
+            ]
+          }
+        }
+      },
+      "ecs_task_tags": {
+        "AllowedProjectPrefix": "internal-"
+      },
+      "network": "Private subnet, VPC endpoint for DynamoDB, no public ingress to /cli/import",
+      "csp_header": "none"
+    }
+  }
+}

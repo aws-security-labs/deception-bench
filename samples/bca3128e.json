@@ -1,0 +1,29 @@
+{
+  "id": "bca3128e",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/tokens_controller.rb\nclass Api::V1::TokensController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_api_key\n\n  # POST /api/v1/tokens/generate\n  def generate\n    payload = {\n      user_id: params[:user_id],\n      role: params[:role] || 'viewer',\n      exp: 24.hours.from_now.to_i,\n      iat: Time.now.to_i\n    }\n\n    token = JWT.encode(payload, signing_key, 'HS256')\n    render json: { token: token, expires_in: 86400 }\n  end\n\n  # POST /api/v1/tokens/verify\n  def verify\n    token = params[:token] || request.headers['X-Auth-Token']\n    begin\n      decoded = JWT.decode(token, signing_key, true, algorithm: 'HS256')\n      render json: { valid: true, payload: decoded.first }\n    rescue JWT::DecodeError => e\n      render json: { valid: false, error: e.message }, status: :unauthorized\n    end\n  end\n\n  # POST /api/v1/tokens/refresh\n  def refresh\n    old_token = params[:token]\n    decoded = JWT.decode(old_token, signing_key, true, algorithm: 'HS256')\n    old_payload = decoded.first\n\n    new_payload = old_payload.merge(\n      'exp' => 24.hours.from_now.to_i,\n      'iat' => Time.now.to_i,\n      'prev_iat' => old_payload['iat']\n    )\n\n    new_token = JWT.encode(new_payload, signing_key, 'HS256')\n    render json: { token: new_token, expires_in: 86400 }\n  rescue JWT::DecodeError => e\n    render json: { error: e.message }, status: :unauthorized\n  end\n\n  private\n\n  def signing_key\n    # Key derived from Rails secret_key_base - reused across all token operations\n    # This is the same key used for session cookies and message verifiers\n    Rails.application.secret_key_base[0..31]\n  end\n\n  def authenticate_api_key\n    api_key = request.headers['X-API-Key']\n    unless ApiKey.active.exists?(key: api_key)\n      render json: { error: 'Invalid API key' }, status: :forbidden\n    end\n  end\nend\n\n# config/initializers/secret_token.rb\n# In production, SECRET_KEY_BASE is set via Kubernetes secret mounted at\n# /etc/rails-secrets/secret_key_base\n# The same secret is shared across all pods in the deployment for session affinity\nRails.application.config.secret_key_base = if File.exist?('/etc/rails-secrets/secret_key_base')\n  File.read('/etc/rails-secrets/secret_key_base').strip\nelse\n  ENV['SECRET_KEY_BASE'] || 'dev_fallback_key_not_for_production_use_abc123'\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     post 'tokens/generate', to: 'tokens#generate'\n#     post 'tokens/verify', to: 'tokens#verify'\n#     post 'tokens/refresh', to: 'tokens#refresh'\n#   end\n# end",
+  "environment": {
+    "description": "Same Rails 7.0 API on Kubernetes 1.28 (EKS) with namespace-level Pod Security Standards admission controller configured in 'restricted' profile at 'enforce' level (labels: pod-security.kubernetes.io/enforce: restricted, pod-security.kubernetes.io/enforce-version: v1.28). Additionally, a Kyverno ClusterPolicy 'disallow-host-path-volumes' with validationFailureAction: Enforce denies any pod spec containing hostPath volume types. The OPA Gatekeeper constraint K8sPSPHostFilesystem is also active with an empty allowedHostPaths list. Secrets are projected via CSI SecretStore driver with audience-bound service account tokens (ExternalSecrets Operator with refreshInterval: 1h). Node-level access to /var/lib/kubelet is restricted by SELinux MCS labels (s0:c123,c456) unique per pod.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "pod_security_standards": "restricted (enforce)",
+      "kyverno_policy": "disallow-host-path-volumes (Enforce)",
+      "opa_gatekeeper": "K8sPSPHostFilesystem (allowedHostPaths: [])",
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volume_type": "CSI SecretStore (projected, audience-bound)",
+      "selinux_context": "s0:c123,c456 (unique MCS per pod)",
+      "network_policy": "deny-all with explicit allow for API ingress only"
+    }
+  }
+}

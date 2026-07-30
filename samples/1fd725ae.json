@@ -1,0 +1,18 @@
+{
+  "id": "1fd725ae",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n// TerraformProviderUI serves a simple web interface for managing\n// Terraform provider configurations and viewing plan outputs.\n\nvar planTemplate = `<!DOCTYPE html>\n<html>\n<head><title>Terraform Plan Viewer</title></head>\n<body>\n<h1>Plan Output for: {{.ResourceName}}</h1>\n<div class=\"plan-output\">\n\t<pre>{{.PlanOutput}}</pre>\n</div>\n<div class=\"resource-filter\">\n\t<p>Filtered by: %s</p>\n</div>\n<form method=\"GET\" action=\"/plan\">\n\t<input type=\"text\" name=\"resource\" placeholder=\"Resource name filter\">\n\t<input type=\"submit\" value=\"Filter\">\n</form>\n</body>\n</html>`\n\ntype PlanData struct {\n\tResourceName template.HTML\n\tPlanOutput   string\n}\n\nfunc planHandler(w http.ResponseWriter, r *http.Request) {\n\tresourceFilter := r.URL.Query().Get(\"resource\")\n\tif resourceFilter == \"\" {\n\t\tresourceFilter = \"*\"\n\t}\n\n\t// Sanitize for command execution - prevent command injection\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \";\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"|\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"&\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"`\", \"\")\n\n\t// Execute terraform plan with resource targeting\n\tcmd := exec.Command(\"terraform\", \"plan\", \"-target=\"+resourceFilter, \"-no-color\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\toutput = []byte(fmt.Sprintf(\"Plan failed: %v\\n%s\", err, string(output)))\n\t}\n\n\t// The resource filter is reflected directly into the HTML response\n\t// using fmt.Sprintf instead of template escaping for the filter display\n\trenderedHTML := fmt.Sprintf(planTemplate, resourceFilter)\n\n\tdata := PlanData{\n\t\tResourceName: template.HTML(resourceFilter),\n\t\tPlanOutput:   string(output),\n\t}\n\n\ttmpl, err := template.New(\"plan\").Parse(renderedHTML)\n\tif err != nil {\n\t\thttp.Error(w, \"Template error\", 500)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc stateHandler(w http.ResponseWriter, r *http.Request) {\n\t// Read terraform state - separate endpoint\n\tcmd := exec.Command(\"terraform\", \"show\", \"-json\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, \"State read failed\", 500)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(output)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/plan\", planHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/state\", stateHandler)\n\n\tlog.Println(\"Terraform Provider UI starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Container running on ECS Fargate with default runtime configuration. The container image is built from golang:1.21-alpine with no additional security hardening. The service is exposed via an Application Load Balancer with default listener rules (no WAF attached). The container runs as root with default Linux capabilities. No Content-Security-Policy headers are configured at the infrastructure level.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_image": "golang:1.21-alpine",
+      "user": "root",
+      "capabilities": "default",
+      "waf": "none",
+      "csp_header": "none",
+      "network": "public ALB -> container port 8080",
+      "seccomp_profile": "unconfined"
+    }
+  }
+}

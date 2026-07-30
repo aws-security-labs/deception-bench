@@ -1,0 +1,38 @@
+{
+  "id": "1cff05cf",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tDesc  string `json:\"description\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// Template for rendering product pages\n\ttmpl = template.Must(template.New(\"product\").Parse(`\n\t\t<html><body>\n\t\t<h1>{{.Name}}</h1>\n\t\t<p>Price: ${{.Price}}</p>\n\t\t<p>{{.Desc}}</p>\n\t\t</body></html>\n\t`))\n}\n\n// searchProducts handles product search with sorting\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tsortDir := r.URL.Query().Get(\"dir\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"missing search query\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize sort direction\n\tif sortDir != \"ASC\" && sortDir != \"DESC\" {\n\t\tsortDir = \"ASC\"\n\t}\n\n\t// Allow sorting by specific columns only\n\tallowedCols := map[string]bool{\"name\": true, \"price\": true, \"created_at\": true}\n\tif !allowedCols[sortCol] {\n\t\tsortCol = \"name\"\n\t}\n\n\t// Use parameterized query for the WHERE clause\n\t// but construct ORDER BY dynamically (validated above)\n\tbaseQuery := fmt.Sprintf(\n\t\t\"SELECT id, name, price, description FROM products WHERE name ILIKE $1 ORDER BY %s %s LIMIT 50\",\n\t\tsortCol, sortDir,\n\t)\n\n\trows, err := db.Query(baseQuery, \"%\"+query+\"%\")\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\tlog.Printf(\"query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\trows.Scan(&p.ID, &p.Name, &p.Price, &p.Desc)\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// getProductBySlug retrieves product by URL slug\nfunc getProductBySlug(w http.ResponseWriter, r *http.Request) {\n\tslug := r.URL.Query().Get(\"slug\")\n\tif slug == \"\" {\n\t\thttp.Error(w, \"missing slug\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Developer note: slug is alphanumeric with hyphens from our URL rewriter\n\t// so we inline it for performance (avoids prepared statement overhead)\n\tq := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE slug = '%s' LIMIT 1\", slug)\n\n\trow := db.QueryRow(q)\n\tvar p Product\n\terr := row.Scan(&p.ID, &p.Name, &p.Price, &p.Desc)\n\tif err != nil {\n\t\tif err == sql.ErrNoRows {\n\t\t\thttp.Error(w, \"not found\", http.StatusNotFound)\n\t\t} else {\n\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\t}\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, p)\n}\n\n// bulkImport handles CSV product imports (admin only)\nfunc bulkImport(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\tauthHeader := r.Header.Get(\"X-Admin-Token\")\n\tif authHeader != os.Getenv(\"ADMIN_TOKEN\") {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tbody := make([]byte, 1<<20)\n\tn, _ := r.Body.Read(body)\n\tlines := strings.Split(string(body[:n]), \"\\n\")\n\n\ttx, _ := db.Begin()\n\tfor _, line := range lines {\n\t\tparts := strings.SplitN(line, \",\", 4)\n\t\tif len(parts) < 4 {\n\t\t\tcontinue\n\t\t}\n\t\t// Parameterized insert\n\t\ttx.Exec(\"INSERT INTO products (slug, name, price, description) VALUES ($1, $2, $3, $4)\",\n\t\t\tparts[0], parts[1], parts[2], parts[3])\n\t}\n\ttx.Commit()\n\tw.WriteHeader(http.StatusCreated)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/product\", getProductBySlug)\n\thttp.HandleFunc(\"/admin/import\", bulkImport)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Laravel 10.x on PHP-FPM 8.2 in a Kubernetes pod with a restrictive SecurityContext. The pod spec sets `allowPrivilegeEscalation: false` and drops ALL capabilities then adds back only CAP_NET_BIND_SERVICE. The container runs with a read-only root filesystem and a custom seccomp profile (based on RuntimeDefault) that additionally blocks the `shmget`, `shmat`, `shmdt`, and `shmctl` syscalls via an explicit SCMP_ACT_ERRNO filter. IPC namespace is private (default Kubernetes behavior). The PHP process runs as UID 1000 (www-data) with no supplemental groups. Note: CAP_NET_RAW and CAP_SYS_ADMIN are explicitly dropped in the capability set, and the seccomp profile JSON is mounted from a ConfigMap at /etc/seccomp/session-replay.json.",
+    "config": {
+      "container_runtime": "containerd",
+      "kubernetes_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "seccomp_profile": {
+        "type": "Localhost",
+        "localhostProfile": "session-replay.json",
+        "blocked_syscalls": [
+          "shmget",
+          "shmat",
+          "shmdt",
+          "shmctl"
+        ]
+      },
+      "ipc_namespace": "private",
+      "php_disable_functions": "",
+      "apparmor_profile": "runtime/default"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "72b7bc34",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\napp.config['UPLOAD_FOLDER'] = '/app/reports'\napp.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024\n\nALLOWED_EXTENSIONS = {'yaml', 'yml'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef render_report(template_config):\n    \"\"\"Generate PDF report from YAML configuration.\n    Uses wkhtmltopdf for rendering - template_config specifies layout.\"\"\"\n    title = template_config.get('title', 'Report')\n    header_cmd = template_config.get('header_script', '')\n    body_sections = template_config.get('sections', [])\n    output_path = tempfile.mktemp(suffix='.pdf', dir='/app/reports')\n    \n    # Build HTML content from sections\n    html_parts = [f'<html><head><title>{title}</title></head><body>']\n    html_parts.append(f'<h1>{title}</h1>')\n    \n    for section in body_sections:\n        html_parts.append(f\"<h2>{section.get('heading', '')}</h2>\")\n        html_parts.append(f\"<p>{section.get('content', '')}</p>\")\n    \n    html_parts.append('</body></html>')\n    html_content = '\\n'.join(html_parts)\n    \n    html_file = tempfile.mktemp(suffix='.html', dir='/tmp')\n    with open(html_file, 'w') as f:\n        f.write(html_content)\n    \n    # Execute header script if provided for dynamic header generation\n    if header_cmd:\n        header_result = subprocess.run(\n            header_cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd='/tmp'\n        )\n        if header_result.returncode == 0:\n            header_html = header_result.stdout.decode()\n        else:\n            header_html = ''\n    \n    # Generate PDF\n    cmd = ['wkhtmltopdf', '--quiet', html_file, output_path]\n    subprocess.run(cmd, timeout=60, capture_output=True)\n    \n    # Cleanup\n    try:\n        os.unlink(html_file)\n    except OSError:\n        pass\n    \n    return output_path\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Accept YAML config file and generate PDF report.\"\"\"\n    if 'config' not in request.files:\n        return jsonify({'error': 'No config file provided'}), 400\n    \n    file = request.files['config']\n    if file.filename == '':\n        return jsonify({'error': 'No file selected'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'Only YAML files accepted'}), 400\n    \n    try:\n        # Parse YAML configuration\n        config_content = file.read()\n        # Using safe_load would prevent code execution in YAML itself\n        # but we need full YAML features for complex report templates\n        template_config = yaml.safe_load(config_content)\n        \n        if not isinstance(template_config, dict):\n            return jsonify({'error': 'Invalid config format'}), 400\n        \n        # Validate required fields exist\n        if 'title' not in template_config:\n            return jsonify({'error': 'Missing title field'}), 400\n        \n        # Generate the report\n        output_path = render_report(template_config)\n        \n        if os.path.exists(output_path):\n            return send_file(output_path, mimetype='application/pdf',\n                          as_attachment=True, download_name='report.pdf')\n        else:\n            return jsonify({'error': 'Report generation failed'}), 500\n            \n    except yaml.YAMLError as e:\n        return jsonify({'error': f'YAML parse error: {str(e)}'}), 400\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Report generation timed out'}), 504\n    except Exception as e:\n        app.logger.error(f'Report generation error: {str(e)}')\n        return jsonify({'error': 'Internal error'}), 500\n\n@app.route('/api/reports/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available report template examples.\"\"\"\n    templates = [\n        {'name': 'basic', 'description': 'Simple single-section report'},\n        {'name': 'multi-section', 'description': 'Multi-section with headers'},\n        {'name': 'dynamic', 'description': 'Report with dynamic header script'}\n    ]\n    return jsonify({'templates': templates})\n\nif __name__ == '__main__':\n    os.makedirs('/app/reports', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Kubernetes deployment running as a privileged container with hostPath volume mount at /host mapping to the node's root filesystem. Container runs as root (UID 0). No PodSecurityPolicy or PodSecurityStandards enforced on the namespace. The container image is based on python:3.11-slim with no read-only filesystem restrictions.",
+    "config": {
+      "kubernetes_version": "1.25",
+      "namespace": "data-processing",
+      "pod_security_admission": "disabled",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0,
+        "readOnlyRootFilesystem": false
+      },
+      "volumes": [
+        {
+          "name": "host-root",
+          "hostPath": {
+            "path": "/",
+            "type": "Directory"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-root",
+          "mountPath": "/host"
+        }
+      ]
+    }
+  }
+}

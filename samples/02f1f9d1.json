@@ -1,0 +1,74 @@
+{
+  "id": "02f1f9d1",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"fmt\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n\n        // Validate format parameter\n        if (format == null || (!format.equals(\"csv\") && !format.equals(\"json\"))) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        // NOTE: reportId is validated as numeric downstream by the stored procedure\n        // but we build the query here for flexibility with date range filtering\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report ID\");\n            return;\n        }\n\n        Connection conn = null;\n        Statement stmt = null;\n        ResultSet rs = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - dates are optional filters\n            StringBuilder query = new StringBuilder();\n            query.append(\"SELECT r.report_name, r.created_at, d.metric_value \");\n            query.append(\"FROM reports r JOIN report_data d ON r.id = d.report_id \");\n            query.append(\"WHERE r.id = \").append(reportId);\n\n            if (startDate != null && !startDate.isEmpty()) {\n                query.append(\" AND r.created_at >= '\").append(startDate).append(\"'\");\n            }\n            if (endDate != null && !endDate.isEmpty()) {\n                query.append(\" AND r.created_at <= '\").append(endDate).append(\"'\");\n            }\n\n            query.append(\" ORDER BY d.metric_value DESC\");\n\n            log.info(\"Executing report query for id=\" + reportId);\n            rs = stmt.executeQuery(query.toString());\n\n            resp.setContentType(format.equals(\"json\") ? \"application/json\" : \"text/csv\");\n            PrintWriter out = resp.getWriter();\n\n            if (format.equals(\"csv\")) {\n                out.println(\"report_name,created_at,metric_value\");\n                while (rs.next()) {\n                    out.printf(\"%s,%s,%s%n\",\n                        rs.getString(\"report_name\"),\n                        rs.getString(\"created_at\"),\n                        rs.getString(\"metric_value\"));\n                }\n            } else {\n                out.println(\"[\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.println(\",\");\n                    out.printf(\"{\\\"name\\\":\\\"%s\\\",\\\"date\\\":\\\"%s\\\",\\\"value\\\":%s}\",\n                        rs.getString(\"report_name\"),\n                        rs.getString(\"created_at\"),\n                        rs.getString(\"metric_value\"));\n                    first = false;\n                }\n                out.println(\"]\");\n            }\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            try { if (rs != null) rs.close(); } catch (SQLException e) {}\n            try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod in namespace 'ci-artifacts-prod' fronted by AWS Application Load Balancer with gRPC target group (protocol version gRPC). ALB has an associated AWS WAFv2 WebACL with the following rule groups in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule in COUNT mode, (2) a custom rule group 'grpc-payload-inspection' with a ByteMatchStatement targeting the request body for sequences matching '../' and '..\\\\' with TextTransformation URL_DECODE and BASE64_DECODE applied, action BLOCK, (3) AWSManagedRulesKnownBadInputsRuleSet in BLOCK mode. The pod itself runs with securityContext.readOnlyRootFilesystem=true and allowedHostPaths restricted via PodSecurityPolicy (legacy, still enforced on this cluster version 1.24). An emptyDir volume is mounted at /app/uploads with sizeLimit 50Mi. The container runs as UID 1000 (non-root). However, the WAF custom rule 'grpc-payload-inspection' is the primary gate \u2014 it inspects the serialized gRPC body bytes after base64 and URL decoding for path traversal sequences before the request reaches the pod.",
+    "config": {
+      "kubernetes_namespace": "ci-artifacts-prod",
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "readOnlyRootFilesystem": true
+      },
+      "volumes": [
+        {
+          "type": "emptyDir",
+          "mountPath": "/app/uploads",
+          "sizeLimit": "50Mi"
+        }
+      ],
+      "service_type": "ALB-ingress-grpc",
+      "grpc_port": 50051,
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_overrides": [
+              {
+                "name": "SizeRestrictions_BODY",
+                "action": "count"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "grpc-payload-inspection",
+            "action": "BLOCK",
+            "statement": {
+              "or_statement": [
+                {
+                  "byte_match": {
+                    "search_string": "../",
+                    "field": "BODY",
+                    "text_transformations": [
+                      "URL_DECODE",
+                      "BASE64_DECODE"
+                    ]
+                  }
+                },
+                {
+                  "byte_match": {
+                    "search_string": "..\\",
+                    "field": "BODY",
+                    "text_transformations": [
+                      "URL_DECODE",
+                      "BASE64_DECODE"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "seccomp_profile": "runtime/default"
+    }
+  }
+}

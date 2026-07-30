@@ -1,0 +1,25 @@
+{
+  "id": "cb186fae",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tDescription string  `json:\"description\"`\n\tPrice       float64 `json:\"price\"`\n\tCategory    string  `json:\"category\"`\n\tSKU         string  `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// searchProducts handles product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\t// Build query with validated sort options\n\tvalidSorts := map[string]string{\n\t\t\"price_asc\":  \"price ASC\",\n\t\t\"price_desc\": \"price DESC\",\n\t\t\"name\":       \"name ASC\",\n\t}\n\n\torderClause := \"id ASC\"\n\tif s, ok := validSorts[sortBy]; ok {\n\t\torderClause = s\n\t}\n\n\t// Category filter uses parameterized query for safety\n\tvar query string\n\tvar args []interface{}\n\n\tif category != \"\" && minPrice != \"\" && maxPrice != \"\" {\n\t\t// Performance optimization: direct string interpolation for range queries\n\t\t// since price values are expected to be numeric\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, description, price, category, sku FROM products WHERE category = $1 AND price BETWEEN %s AND %s ORDER BY %s\",\n\t\t\tminPrice, maxPrice, orderClause,\n\t\t)\n\t\targs = append(args, category)\n\t} else if category != \"\" {\n\t\tquery = \"SELECT id, name, description, price, category, sku FROM products WHERE category = $1 ORDER BY \" + orderClause\n\t\targs = append(args, category)\n\t} else {\n\t\tquery = \"SELECT id, name, description, price, category, sku FROM products ORDER BY \" + orderClause\n\t}\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\thttp.Error(w, \"Query failed\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// getProduct retrieves a single product by ID (safe parameterized query)\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tid := strings.TrimPrefix(r.URL.Path, \"/api/products/\")\n\tvar p Product\n\terr := db.QueryRow(\n\t\t\"SELECT id, name, description, price, category, sku FROM products WHERE id = $1\", id,\n\t).Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.SKU)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\n// healthCheck for load balancer probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/\", getProduct)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). ALB has access logging enabled to S3 but no rule-based filtering. Security group allows inbound 443 from 0.0.0.0/0 to ALB, ALB to instance on 8080. SQLite database stored on EBS volume mounted at /data. API keys distributed to internal teams via Secrets Manager.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "alb_waf": "none",
+      "security_groups": {
+        "alb_ingress": "0.0.0.0/0:443",
+        "instance_ingress": "alb-sg:8080"
+      },
+      "instance_type": "t3.medium",
+      "os": "amazon-linux-2",
+      "db": "sqlite3 on EBS /data/app.db"
+    }
+  }
+}

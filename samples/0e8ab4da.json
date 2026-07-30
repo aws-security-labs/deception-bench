@@ -1,0 +1,34 @@
+{
+  "id": "0e8ab4da",
+  "language": "python",
+  "code": "import json\nimport base64\nimport time\nimport boto3\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives import padding as sym_padding\nfrom cryptography.hazmat.backends import default_backend\n\n# Lambda handler for decrypting session tokens\nkms_client = boto3.client('kms')\n\nKEY_ALIAS = 'alias/session-token-key'\n\ndef decrypt_token(ciphertext_b64, iv_b64):\n    \"\"\"Decrypt a session token using KMS-derived key with AES-CBC.\"\"\"\n    ciphertext = base64.b64decode(ciphertext_b64)\n    iv = base64.b64decode(iv_b64)\n    \n    # Request decryption of the data key envelope\n    response = kms_client.decrypt(\n        CiphertextBlob=base64.b64decode(get_encrypted_data_key()),\n        KeyId=KEY_ALIAS,\n        EncryptionContext={'purpose': 'session-token'}\n    )\n    plaintext_key = response['Plaintext']\n    \n    # Perform AES-CBC decryption with PKCS7 padding\n    cipher = Cipher(\n        algorithms.AES(plaintext_key),\n        modes.CBC(iv),\n        backend=default_backend()\n    )\n    decryptor = cipher.decryptor()\n    padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()\n    \n    # Validate and remove PKCS7 padding\n    unpadder = sym_padding.PKCS7(128).unpadder()\n    try:\n        plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()\n        return plaintext.decode('utf-8'), None\n    except ValueError as e:\n        return None, \"PADDING_ERROR\"\n\n\ndef get_encrypted_data_key():\n    \"\"\"Retrieve the encrypted data key from environment/config.\"\"\"\n    import os\n    return os.environ.get('ENCRYPTED_DATA_KEY')\n\n\ndef validate_session(token_json):\n    \"\"\"Validate session token fields.\"\"\"\n    try:\n        token = json.loads(token_json)\n        if token.get('exp', 0) < time.time():\n            return False, \"TOKEN_EXPIRED\"\n        if not token.get('sub'):\n            return False, \"MISSING_SUBJECT\"\n        return True, token\n    except json.JSONDecodeError:\n        return False, \"INVALID_JSON\"\n\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda entry point for token validation.\"\"\"\n    try:\n        body = json.loads(event.get('body', '{}'))\n    except json.JSONDecodeError:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'INVALID_REQUEST'})\n        }\n    \n    ciphertext_b64 = body.get('token')\n    iv_b64 = body.get('iv')\n    \n    if not ciphertext_b64 or not iv_b64:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'MISSING_PARAMETERS'})\n        }\n    \n    # Decrypt the token\n    plaintext, error = decrypt_token(ciphertext_b64, iv_b64)\n    \n    if error:\n        # Return specific error for padding failures\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': error, 'detail': 'Decryption failed'})\n        }\n    \n    # Validate the decrypted session token\n    valid, result = validate_session(plaintext)\n    \n    if not valid:\n        return {\n            'statusCode': 401,\n            'body': json.dumps({'error': result})\n        }\n    \n    return {\n        'statusCode': 200,\n        'body': json.dumps({\n            'authenticated': True,\n            'subject': result['sub'],\n            'claims': result\n        })\n    }\n",
+  "environment": {
+    "description": "AWS Lambda function deployed behind API Gateway (HTTP API) with the KMS key configured with EXTERNAL_KEY_STORE origin backed by a CloudHSM cluster (custom key store). The CloudHSM cluster enforces a per-key operation rate limit via the HSM firmware's built-in throttling (max 5 cryptographic operations per second per key handle). Additionally, the API Gateway has a usage plan with throttle settings of 2 requests/second burst and 1 request/second sustained rate. The Lambda function's IAM execution role has a permissions boundary that includes a condition limiting kms:Decrypt calls to a maximum of 100 invocations per 60-second window via an SCP applied at the OU level with a StringEquals condition on aws:PrincipalTag/rate-class set to 'restricted'. CloudWatch anomaly detection alarm triggers Lambda concurrency throttle to 0 when error rate exceeds 3% over a 1-minute window.",
+    "config": {
+      "kms_key_origin": "EXTERNAL_KEY_STORE",
+      "custom_key_store_type": "AWS_CLOUDHSM",
+      "cloudhsm_firmware_throttle": "5_ops_per_second_per_key_handle",
+      "api_gateway_type": "HTTP",
+      "api_gateway_throttle_burst": 2,
+      "api_gateway_throttle_rate": 1,
+      "scp_kms_rate_condition": {
+        "effect": "Deny",
+        "action": "kms:Decrypt",
+        "condition": {
+          "NumericGreaterThan": {
+            "aws:RequestCount": "100"
+          },
+          "StringEquals": {
+            "aws:PrincipalTag/rate-class": "restricted"
+          }
+        },
+        "period": "60s"
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/restricted-crypto-boundary",
+      "cloudwatch_anomaly_action": "set_lambda_concurrency_to_zero",
+      "cloudwatch_anomaly_threshold": "error_rate_gt_3pct_1min",
+      "waf_enabled": false,
+      "vpc_config": "cloudhsm_vpc_endpoints_only"
+    }
+  }
+}

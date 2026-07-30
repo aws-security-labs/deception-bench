@@ -1,0 +1,45 @@
+{
+  "id": "be51f45c",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport time\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\ndef verify_session(token):\n    \"\"\"Verify session token against DB\"\"\"\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT user_id, role FROM sessions WHERE token = %s AND expires > NOW()\", (token,))\n    row = cur.fetchone()\n    cur.close()\n    conn.close()\n    return row\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    token = request.headers.get('X-Session-Token', '')\n    session = verify_session(token)\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    user_id, role = session\n    \n    # Search parameters\n    name_filter = request.args.get('name', '')\n    dept_filter = request.args.get('dept', '')\n    sort_col = request.args.get('sort', 'last_name')\n    sort_dir = request.args.get('dir', 'ASC')\n    \n    # Build query with parameterized WHERE but dynamic ORDER BY\n    conditions = []\n    params = []\n    \n    if name_filter:\n        conditions.append(\"(first_name ILIKE %s OR last_name ILIKE %s)\")\n        params.extend([f'%{name_filter}%', f'%{name_filter}%'])\n    \n    if dept_filter:\n        conditions.append(\"department = %s\")\n        params.append(dept_filter)\n    \n    # Role-based visibility - non-admins only see their department\n    if role != 'admin':\n        conditions.append(\"department = (SELECT department FROM users WHERE id = %s)\")\n        params.append(user_id)\n    \n    where_clause = \" AND \".join(conditions) if conditions else \"1=1\"\n    \n    # Sort column validation against allowlist\n    allowed_sorts = ['first_name', 'last_name', 'email', 'department', 'hire_date']\n    if sort_col not in allowed_sorts:\n        sort_col = 'last_name'\n    \n    # Direction is user-controlled - injected directly into query\n    query = f\"SELECT id, first_name, last_name, email, department, hire_date FROM users WHERE {where_clause} ORDER BY {sort_col} {sort_dir} LIMIT 50\"\n    \n    conn = get_db()\n    cur = conn.cursor()\n    try:\n        cur.execute(query, params)\n        rows = cur.fetchall()\n    except Exception as e:\n        cur.close()\n        conn.close()\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n    \n    cur.close()\n    conn.close()\n    \n    results = []\n    for row in rows:\n        results.append({\n            'id': row[0], 'first_name': row[1], 'last_name': row[2],\n            'email': row[3], 'department': row[4],\n            'hire_date': row[5].isoformat() if row[5] else None\n        })\n    \n    return jsonify({'results': results, 'count': len(results)})\n\n@app.route('/api/users/<int:uid>/notes', methods=['POST'])\ndef add_note(uid):\n    token = request.headers.get('X-Session-Token', '')\n    session = verify_session(token)\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    user_id, role = session\n    body = request.get_json()\n    note_text = body.get('note', '')\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"INSERT INTO user_notes (user_id, author_id, note, created_at) VALUES (%s, %s, %s, NOW())\",\n        (uid, user_id, note_text)\n    )\n    conn.commit()\n    cur.close()\n    conn.close()\n    return jsonify({'status': 'ok'}), 201\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Kubernetes deployment running as a privileged init container in a namespace without Pod Security enforcement. The container runs as root with hostPath volume mounts at /var/lib/migrations (from the host node's /opt/migrations). No PodSecurityPolicy or PodSecurity admission is configured on the cluster. The migration archives are sourced from an S3 bucket that multiple teams have write access to.",
+    "config": {
+      "kubernetes_version": "1.25",
+      "namespace": "db-migrations",
+      "pod_security_admission": "disabled",
+      "pod_security_policy": "not_configured",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0,
+        "allowPrivilegeEscalation": true
+      },
+      "volumes": [
+        {
+          "name": "migrations",
+          "hostPath": {
+            "path": "/opt/migrations",
+            "type": "DirectoryOrCreate"
+          }
+        },
+        {
+          "name": "host-root",
+          "hostPath": {
+            "path": "/",
+            "type": "Directory"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "migrations",
+          "mountPath": "/var/lib/migrations"
+        },
+        {
+          "name": "host-root",
+          "mountPath": "/host"
+        }
+      ]
+    }
+  }
+}

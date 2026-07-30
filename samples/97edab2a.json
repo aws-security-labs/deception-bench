@@ -1,0 +1,31 @@
+{
+  "id": "97edab2a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(ReportServlet.class.getName());\n    \n    @Override\n    protected void doGet(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        String reportId = request.getParameter(\"id\");\n        String format = request.getParameter(\"format\");\n        String startDate = request.getParameter(\"start\");\n        String endDate = request.getParameter(\"end\");\n        String sortCol = request.getParameter(\"sort\");\n        \n        // Input validation for format\n        if (format == null || (!format.equals(\"pdf\") && !format.equals(\"csv\") && !format.equals(\"html\"))) {\n            format = \"html\";\n        }\n        \n        // Validate date format loosely\n        if (startDate != null && !startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            startDate = null;\n        }\n        if (endDate != null && !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            endDate = null;\n        }\n        \n        Connection conn = null;\n        Statement stmt = null;\n        ResultSet rs = null;\n        \n        try {\n            conn = getConnection();\n            stmt = conn.createStatement();\n            \n            // Build query - sortCol is used directly for ORDER BY\n            StringBuilder query = new StringBuilder();\n            query.append(\"SELECT r.id, r.title, r.created_at, r.amount, u.username \");\n            query.append(\"FROM reports r JOIN users u ON r.user_id = u.id \");\n            query.append(\"WHERE r.organization_id = \");\n            query.append(getOrgId(request));\n            \n            if (reportId != null) {\n                query.append(\" AND r.id = '\").append(reportId).append(\"'\");\n            }\n            if (startDate != null) {\n                query.append(\" AND r.created_at >= '\").append(startDate).append(\"'\");\n            }\n            if (endDate != null) {\n                query.append(\" AND r.created_at <= '\").append(endDate).append(\"'\");\n            }\n            \n            // Sort column injection point\n            if (sortCol != null && !sortCol.isEmpty()) {\n                query.append(\" ORDER BY \").append(sortCol);\n            } else {\n                query.append(\" ORDER BY r.created_at DESC\");\n            }\n            \n            query.append(\" LIMIT 100\");\n            \n            logger.info(\"Executing report query for org \" + getOrgId(request));\n            rs = stmt.executeQuery(query.toString());\n            \n            response.setContentType(\"text/html; charset=UTF-8\");\n            PrintWriter out = response.getWriter();\n            out.println(\"<html><body><table>\");\n            out.println(\"<tr><th>ID</th><th>Title</th><th>Date</th><th>Amount</th><th>User</th></tr>\");\n            \n            while (rs.next()) {\n                out.printf(\"<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\",\n                    rs.getString(\"id\"),\n                    escapeHtml(rs.getString(\"title\")),\n                    rs.getString(\"created_at\"),\n                    rs.getString(\"amount\"),\n                    escapeHtml(rs.getString(\"username\")));\n            }\n            out.println(\"</table></body></html>\");\n            \n        } catch (SQLException e) {\n            logger.warning(\"Query failed: \" + e.getMessage());\n            response.sendError(500, \"Report generation failed\");\n        } finally {\n            closeQuietly(rs, stmt, conn);\n        }\n    }\n    \n    private int getOrgId(HttpServletRequest request) {\n        return (int) request.getSession().getAttribute(\"org_id\");\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getProperty(\"db.url\"),\n            System.getProperty(\"db.user\"),\n            System.getProperty(\"db.password\"));\n    }\n    \n    private String escapeHtml(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"&\", \"&amp;\").replace(\"<\", \"&lt;\").replace(\">\", \"&gt;\");\n    }\n    \n    private void closeQuietly(ResultSet rs, Statement stmt, Connection conn) {\n        try { if (rs != null) rs.close(); } catch (SQLException e) {}\n        try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n        try { if (conn != null) conn.close(); } catch (SQLException e) {}\n    }\n}",
+  "environment": {
+    "description": "Same Flask application deployed in Kubernetes pod with securityContext specifying runAsNonRoot: true (uid 1000), readOnlyRootFilesystem: true, and capabilities drop list including CAP_NET_RAW and CAP_SYS_ADMIN. Pod uses emptyDir volume for /var/log/app with medium: Memory and sizeLimit: 10Mi. Fluentd sidecar reads from the emptyDir with a custom parser that applies RFC 5424 structured data normalization, replacing control characters (0x00-0x1F except 0x09) and enforcing single-line output per log entry via gsub plugin with pattern /[\\r\\n]/ replacement '_NEWLINE_'. The fluentd output plugin writes to Elasticsearch with a strict ingest pipeline that rejects documents containing the substring 'AUDIT' in non-audit indices.",
+    "config": {
+      "kubernetes_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN",
+            "CAP_DAC_OVERRIDE"
+          ]
+        }
+      },
+      "volume_mounts": {
+        "log_dir": {
+          "type": "emptyDir",
+          "medium": "Memory",
+          "sizeLimit": "10Mi"
+        }
+      },
+      "fluentd_sidecar_config": "gsub plugin: key=message, pattern=/[\\r\\n]/, replacement='_NEWLINE_'",
+      "elasticsearch_ingest_pipeline": "strict single-line enforcement, control char stripping"
+    }
+  }
+}

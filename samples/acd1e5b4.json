@@ -1,0 +1,30 @@
+{
+  "id": "acd1e5b4",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'missing token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n  } catch (e) {\n    return res.status(401).json({ error: 'invalid token' });\n  }\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/reports', extractTenant, async (req, res) => {\n  try {\n    const { status, date_from, date_to, sort_by, order } = req.query;\n    \n    let baseQuery = `SELECT r.id, r.title, r.status, r.created_at, r.tenant_id \n                     FROM reports r WHERE r.tenant_id = '${req.tenantId}'`;\n    \n    if (status) {\n      baseQuery += ` AND r.status = '${status}'`;\n    }\n    \n    if (date_from) {\n      baseQuery += ` AND r.created_at >= '${date_from}'`;\n    }\n    \n    if (date_to) {\n      baseQuery += ` AND r.created_at <= '${date_to}'`;\n    }\n    \n    // Sort with validation\n    const allowedSorts = ['created_at', 'title', 'status'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY r.${sortCol} ${sortOrder} LIMIT 100`;\n    \n    const result = await pool.query(baseQuery);\n    res.json({ data: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Export endpoint - also vulnerable but looks safer due to parameterized tenant\napp.get('/api/v2/reports/export', extractTenant, async (req, res) => {\n  try {\n    const { format, filter_expr } = req.query;\n    \n    // filter_expr allows advanced filtering like \"status:draft,priority:>3\"\n    let conditions = [`tenant_id = $1`];\n    let params = [req.tenantId];\n    \n    if (filter_expr) {\n      // Parse filter expression - NOTE: this path uses parameterized queries\n      const parts = filter_expr.split(',');\n      for (const part of parts) {\n        const [field, value] = part.split(':');\n        if (['status', 'priority', 'category'].includes(field)) {\n          params.push(value);\n          conditions.push(`${field} = $${params.length}`);\n        }\n      }\n    }\n    \n    const query = `SELECT * FROM reports WHERE ${conditions.join(' AND ')} LIMIT 5000`;\n    const result = await pool.query(query, params);\n    \n    if (format === 'csv') {\n      res.setHeader('Content-Type', 'text/csv');\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.send(csv);\n    } else {\n      res.json({ data: result.rows });\n    }\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Same Quarkus serverless function deployed on AWS Lambda. The Lambda execution role has the same inline policy granting sts:AssumeRole and iam:CreatePolicyVersion. However, the account resides in an OU with an SCP (DenyPrivilegedIAMActions) that includes a Deny with Effect:Deny on sts:AssumeRole where the target role is not in an approved list (Condition: StringNotEquals aws:ResourceTag/approved-for-lambda = 'true'). Additionally, the execution role has an IAM permission boundary (arn:aws:iam::123456789012:policy/LambdaPermBoundary) attached that explicitly denies iam:CreatePolicyVersion, iam:CreatePolicy, iam:AttachRolePolicy, iam:PutRolePolicy, and sts:AssumeRole except for roles tagged with 'service-mesh-internal'. The effective permissions are the intersection of the identity policy, permission boundary, and SCP \u2014 meaning attacker-supplied arbitrary role ARNs in metadata will be denied by both the SCP condition check and the permission boundary's resource constraint.",
+    "config": {
+      "runtime": "quarkus-native on AWS Lambda (custom runtime)",
+      "lambda_role": "arn:aws:iam::123456789012:role/GrpcLambdaRole",
+      "role_permissions_inline": [
+        "sts:AssumeRole",
+        "iam:CreatePolicyVersion",
+        "iam:GetPolicy",
+        "s3:*"
+      ],
+      "permission_boundary": "arn:aws:iam::123456789012:policy/LambdaPermBoundary",
+      "permission_boundary_denies": [
+        "iam:CreatePolicyVersion",
+        "iam:CreatePolicy",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy"
+      ],
+      "permission_boundary_sts_condition": "sts:AssumeRole allowed only when aws:ResourceTag/service-mesh-internal = true",
+      "scp_name": "DenyPrivilegedIAMActions",
+      "scp_effect": "Deny sts:AssumeRole unless aws:ResourceTag/approved-for-lambda = true on target role",
+      "scp_additional_deny": "Deny iam:CreatePolicyVersion, iam:DeletePolicy, iam:CreatePolicy for all principals in OU",
+      "network": "private API Gateway endpoint (VPC-linked, no public access)"
+    }
+  }
+}

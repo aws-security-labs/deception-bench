@@ -1,0 +1,79 @@
+{
+  "id": "083fd870",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Report struct {\n\tID    int    `json:\"id\"`\n\tTitle string `json:\"title\"`\n\tOwner string `json:\"owner\"`\n}\n\n// getReports handles report listing with dynamic filtering\nfunc getReports(w http.ResponseWriter, r *http.Request) {\n\t// Auth check - verify session token exists\n\tsessionToken := r.Header.Get(\"X-Session-Token\")\n\tif sessionToken == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Validate session (simplified - checks format only)\n\tif len(sessionToken) != 64 {\n\t\thttp.Error(w, \"invalid session\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\towner := r.URL.Query().Get(\"owner\")\n\tstatus := r.URL.Query().Get(\"status\")\n\tgroupBy := r.URL.Query().Get(\"group\")\n\n\t// Build base query with parameterized WHERE clauses\n\tquery := \"SELECT id, title, owner FROM reports WHERE 1=1\"\n\targs := []interface{}{}\n\targIdx := 1\n\n\tif owner != \"\" {\n\t\tquery += fmt.Sprintf(\" AND owner = $%d\", argIdx)\n\t\targs = append(args, owner)\n\t\targIdx++\n\t}\n\n\tif status != \"\" {\n\t\tquery += fmt.Sprintf(\" AND status = $%d\", argIdx)\n\t\targs = append(args, status)\n\t\targIdx++\n\t}\n\n\t// Group by clause - developer assumed limited values\n\tif groupBy != \"\" {\n\t\t// NOTE: attempted sanitization by removing dangerous keywords\n\t\tfiltered := strings.ReplaceAll(groupBy, \";\", \"\")\n\t\tfiltered = strings.ReplaceAll(filtered, \"--\", \"\")\n\t\tquery += \" GROUP BY \" + filtered\n\t}\n\n\tquery += \" LIMIT 100\"\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar reports []Report\n\tfor rows.Next() {\n\t\tvar rpt Report\n\t\tif err := rows.Scan(&rpt.ID, &rpt.Title, &rpt.Owner); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\treports = append(reports, rpt)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(reports)\n}\n\n// healthCheck for load balancer probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/reports\", getReports)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind ALB, but the ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains three rule groups evaluated in order: (1) a custom rate-based rule limiting to 100 requests per 5 minutes per IP on URI path '/api/*', (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action overridden to COUNT, and (3) AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK), using sensitivity level HIGH for SqliExtendedPatterns_QUERYSTRING and SqliExtendedPatterns_BODY rules. The Web ACL default action is ALLOW. Additionally, the ALB has a listener rule that rewrites query string parameters exceeding 256 characters by truncating them before forwarding.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "condition": "query_string_length > 256",
+            "action": "fixed_response_413"
+          },
+          {
+            "priority": 2,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": {
+          "name": "app-protection-acl",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "priority": 1,
+              "name": "RateLimit-API",
+              "type": "rate-based",
+              "limit": 100,
+              "evaluation_window": 300,
+              "scope_down": {
+                "uri_path": {
+                  "starts_with": "/api/"
+                }
+              },
+              "action": "BLOCK"
+            },
+            {
+              "priority": 2,
+              "name": "CommonRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesCommonRuleSet",
+              "rule_action_overrides": [
+                {
+                  "name": "SizeRestrictions_QUERYSTRING",
+                  "action": "COUNT"
+                }
+              ]
+            },
+            {
+              "priority": 3,
+              "name": "SQLiRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesSQLiRuleSet",
+              "rule_action_overrides": [],
+              "sensitivity_level": "HIGH"
+            }
+          ]
+        }
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

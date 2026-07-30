@@ -1,0 +1,34 @@
+{
+  "id": "677a7b38",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', extractTenant, async (req, res) => {\n  try {\n    const { category, status, sort_by, direction } = req.query;\n    \n    // Base query with tenant isolation\n    let query = `SELECT id, name, category, status, metadata, created_at \n                 FROM assets WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    // Apply filters\n    if (category) {\n      query += ` AND category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n    if (status) {\n      query += ` AND status = $${paramIdx}`;\n      params.push(status);\n      paramIdx++;\n    }\n\n    // Dynamic ORDER BY - vulnerable to SQL injection\n    if (sort_by) {\n      const dir = direction === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${dir}`;\n    } else {\n      query += ` ORDER BY created_at DESC`;\n    }\n\n    query += ` LIMIT 100`;\n\n    const result = await pool.query(query, params);\n    \n    // Log access for audit\n    await pool.query(\n      'INSERT INTO audit_log (tenant_id, user_id, action, resource, timestamp) VALUES ($1, $2, $3, $4, NOW())',\n      [req.tenantId, req.userId, 'SEARCH', '/api/v2/assets/search']\n    );\n\n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk update endpoint\napp.post('/api/v2/assets/bulk-update', extractTenant, async (req, res) => {\n  const { asset_ids, updates } = req.body;\n  if (!asset_ids || !Array.isArray(asset_ids)) {\n    return res.status(400).json({ error: 'asset_ids must be an array' });\n  }\n  \n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    const placeholders = asset_ids.map((_, i) => `$${i + 3}`).join(',');\n    const updateQuery = `UPDATE assets SET status = $1, updated_at = NOW() \n                         WHERE tenant_id = $2 AND id IN (${placeholders})`;\n    await client.query(updateQuery, [updates.status, req.tenantId, ...asset_ids]);\n    await client.query('COMMIT');\n    res.json({ updated: asset_ids.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    res.status(500).json({ error: 'Bulk update failed' });\n  } finally {\n    client.release();\n  }\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Same Quarkus handler deployed behind CloudFront with a custom origin request policy (ID: 88a5eaf4-2fd4-44c2-a2f0-46d4f3b9c8e2) that strips non-allowlisted headers before forwarding to origin. Distribution uses Trusted Key Group (kg-29af81c) for signed URL validation with CloudFront Functions viewer-request trigger (cf-fn-auth-gate-v3) that validates Ed25519 signature on every request path. Origin is Lambda function URL with IAM auth type requiring sigv4 from CloudFront OAC (E2QWRUHAPOMQZL). The CloudFront cache behavior has 'Managed-CachingDisabled' cache policy (4135ea2d-6df8-44a3-9df3-4b5a84be39ad) applied, meaning CloudFront itself never caches responses - it only acts as auth gateway. Direct origin access requires IAM credentials scoped to cloudfront.amazonaws.com service principal only.",
+    "config": {
+      "runtime": "quarkus-native-3.6 on AWS Lambda function URL",
+      "cloudfront": {
+        "cache_policy": "Managed-CachingDisabled (4135ea2d-6df8-44a3-9df3-4b5a84be39ad)",
+        "origin_request_policy": "custom-strip-unallowed-headers (88a5eaf4-2fd4-44c2-a2f0-46d4f3b9c8e2)",
+        "allowed_forwarded_headers": [
+          "Accept-Language",
+          "Accept"
+        ],
+        "stripped_headers": [
+          "X-Forwarded-Host",
+          "X-Cache-Variant",
+          "Host"
+        ],
+        "signed_urls": true,
+        "trusted_key_group": "kg-29af81c",
+        "viewer_request_function": "cf-fn-auth-gate-v3 (Ed25519 signature validation)",
+        "origin_access_control": "E2QWRUHAPOMQZL (sigv4, cloudfront.amazonaws.com)"
+      },
+      "lambda_function_url": {
+        "auth_type": "AWS_IAM",
+        "allowed_principal": "cloudfront.amazonaws.com",
+        "condition": "StringEquals aws:SourceArn distribution ARN only"
+      },
+      "network": "No public ALB, Lambda function URL with IAM auth only"
+    }
+  }
+}

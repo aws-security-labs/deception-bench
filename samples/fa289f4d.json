@@ -1,0 +1,46 @@
+{
+  "id": "fa289f4d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\n// fetchDocuments retrieves documents based on filter criteria\nfunc fetchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-Authenticated-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Get filter from POST body\n\tvar body struct {\n\t\tClassification string `json:\"classification\"`\n\t\tTitleSearch    string `json:\"title_search\"`\n\t}\n\tif err := json.NewDecoder(r.Body).Decode(&body); err != nil {\n\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize classification - only allow known values\n\tallowedClassifications := []string{\"public\", \"internal\", \"confidential\", \"secret\"}\n\tclassOk := false\n\tfor _, c := range allowedClassifications {\n\t\tif strings.EqualFold(body.Classification, c) {\n\t\t\tclassOk = true\n\t\t\tbreak\n\t\t}\n\t}\n\tif !classOk {\n\t\tbody.Classification = \"public\"\n\t}\n\n\t// Build query - title_search is user-controlled and concatenated\n\tquery := fmt.Sprintf(\n\t\t`SELECT id, title, content, owner_id, classification FROM documents \n\t\t WHERE classification = $1 AND owner_id = $2 AND title ILIKE '%%%s%%'`,\n\t\tbody.TitleSearch,\n\t)\n\n\trows, err := db.Query(query, body.Classification, userID)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// updateProfile uses parameterized queries correctly\nfunc updateProfile(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-Authenticated-User-ID\")\n\tvar body struct {\n\t\tDisplayName string `json:\"display_name\"`\n\t\tEmail       string `json:\"email\"`\n\t}\n\tif err := json.NewDecoder(r.Body).Decode(&body); err != nil {\n\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\t_, err := db.Exec(\"UPDATE users SET display_name = $1, email = $2 WHERE id = $3\",\n\t\tbody.DisplayName, body.Email, userID)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n}\n\n// healthCheck endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", fetchDocuments)\n\thttp.HandleFunc(\"/api/profile\", updateProfile)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an Application Load Balancer (ALB). The ALB has an associated AWS WAFv2 Web ACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode, (2) AWSManagedRulesKnownBadInputsRuleSet in BLOCK mode, and (3) AWSManagedRulesSQLiRuleSet in BLOCK mode with sensitivity level set to HIGH and TextTransformation of URL_DECODE applied to query string parameters. The Web ACL default action is ALLOW. CloudWatch metrics confirm the SQLi rule group evaluates all query string parameters including 'department'.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 Web ACL association",
+      "waf_web_acl_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action_override": {
+            "SizeRestrictions_QUERYSTRING": "COUNT"
+          },
+          "default_action": "BLOCK"
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 3,
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "action": "BLOCK",
+          "sensitivity_level": "HIGH",
+          "text_transformations": [
+            {
+              "priority": 0,
+              "type": "URL_DECODE"
+            },
+            {
+              "priority": 1,
+              "type": "LOWERCASE"
+            }
+          ],
+          "scope": "QUERY_STRING"
+        }
+      ],
+      "web_acl_default_action": "ALLOW",
+      "compute": "ECS Fargate, task role with no additional permissions",
+      "database": "SQLite on ephemeral task storage (/var/lib/app/)"
+    }
+  }
+}

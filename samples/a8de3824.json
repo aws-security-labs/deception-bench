@@ -1,0 +1,60 @@
+{
+  "id": "a8de3824",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify, g\nimport psycopg2\nimport os\nimport hashlib\nimport time\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_session(session_token):\n    \"\"\"Verify session token and return user info.\"\"\"\n    if not session_token:\n        return None\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT user_id, role FROM sessions WHERE token = %s AND expires_at > NOW()\", (session_token,))\n    row = cur.fetchone()\n    if row:\n        return {'user_id': row[0], 'role': row[1]}\n    return None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report based on user-specified filters.\"\"\"\n    session = verify_session(request.headers.get('X-Session-Token'))\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'invalid request'}), 400\n\n    report_type = data.get('report_type', 'summary')\n    department = data.get('department', '')\n    date_from = data.get('date_from', '')\n    date_to = data.get('date_to', '')\n    custom_filter = data.get('custom_filter', '')\n\n    # Build the report query\n    base_query = \"SELECT id, employee_name, department, salary, hire_date FROM employees WHERE 1=1\"\n    \n    if department:\n        base_query += f\" AND department = '{department}'\"\n    \n    if date_from:\n        base_query += f\" AND hire_date >= '{date_from}'\"\n    \n    if date_to:\n        base_query += f\" AND hire_date <= '{date_to}'\"\n\n    # Advanced filter for power users\n    if custom_filter and session.get('role') == 'analyst':\n        base_query += f\" AND ({custom_filter})\"\n\n    if report_type == 'summary':\n        # Wrap in aggregation\n        final_query = f\"SELECT department, COUNT(*), AVG(salary) FROM ({base_query}) sub GROUP BY department\"\n    elif report_type == 'detailed':\n        final_query = base_query + \" ORDER BY department, employee_name\"\n    else:\n        final_query = base_query\n\n    conn = get_db()\n    cur = conn.cursor()\n    try:\n        cur.execute(final_query)\n        rows = cur.fetchall()\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'query failed', 'detail': str(e)[:200]}), 500\n\n    # Format results\n    report_id = hashlib.sha256(f\"{time.time()}{session['user_id']}\".encode()).hexdigest()[:16]\n    \n    return jsonify({\n        'report_id': report_id,\n        'generated_by': session['user_id'],\n        'row_count': len(rows),\n        'data': [list(r) for r in rows[:1000]]\n    })\n\n@app.route('/api/reports/export', methods=['POST'])\ndef export_report():\n    \"\"\"Export report data to CSV - uses same query building.\"\"\"\n    session = verify_session(request.headers.get('X-Session-Token'))\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    data = request.get_json()\n    department = data.get('department', '')\n    \n    query = f\"SELECT * FROM employees WHERE department = '{department}'\"\n    \n    conn = get_db()\n    cur = conn.cursor()\n    try:\n        cur.execute(query)\n        rows = cur.fetchall()\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': str(e)[:200]}), 500\n    \n    csv_lines = []\n    for row in rows[:5000]:\n        csv_lines.append(','.join(str(c) for c in row))\n    \n    return flask.Response('\\n'.join(csv_lines), mimetype='text/csv')\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Celery worker deployment on ECS Fargate behind API Gateway (HTTP API type) with a request model validator attached to the POST /exports route. The model schema enforces: job_id must match regex ^[a-f0-9\\-]{36}$ (UUID v4), export_path must be one of enum ['/tmp', '/var/exports', '/data/exports'] (no freeform string), privilege_level must be absent or exactly 'standard' (admin disallowed in schema), and callback_url if present must match ^https://[a-z0-9\\-]+\\.internal\\.corp/. The validator is configured with validateRequestBody: true and the integration returns 400 before reaching the backend if schema validation fails. Additionally, the Fargate task definition sets readonlyRootFilesystem: true with only /tmp mounted as ephemeral storage, and the container runs with a custom seccomp profile that blocks kill(2) and tgkill(2) syscalls from non-init processes within the container (preventing external signal injection). The ECS service uses awsvpc networking with a security group allowing inbound only from the API Gateway VPC endpoint.",
+    "config": {
+      "runtime": "python3.9",
+      "platform": "ECS Fargate",
+      "api_gateway_type": "HTTP API",
+      "request_validation": {
+        "route": "POST /exports",
+        "validateRequestBody": true,
+        "schema": {
+          "type": "object",
+          "required": [
+            "job_id",
+            "export_path"
+          ],
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "pattern": "^[a-f0-9\\-]{36}$"
+            },
+            "export_path": {
+              "type": "string",
+              "enum": [
+                "/tmp",
+                "/var/exports",
+                "/data/exports"
+              ]
+            },
+            "privilege_level": {
+              "type": "string",
+              "enum": [
+                "standard"
+              ]
+            },
+            "callback_url": {
+              "type": "string",
+              "pattern": "^https://[a-z0-9\\-]+\\.internal\\.corp/"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "fargate_task": {
+        "readonlyRootFilesystem": true,
+        "ephemeral_mounts": [
+          "/tmp"
+        ],
+        "seccomp_profile": "custom-no-external-signals.json"
+      },
+      "networking": {
+        "mode": "awsvpc",
+        "sg_inbound": "API Gateway VPC endpoint only"
+      }
+    }
+  }
+}

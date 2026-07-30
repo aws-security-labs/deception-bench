@@ -1,0 +1,19 @@
+{
+  "id": "0647a78f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// searchProducts handles product search with optional category filter\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"missing search query\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize query - remove obvious dangerous characters\n\tquery = strings.ReplaceAll(query, \";\", \"\")\n\tquery = strings.ReplaceAll(query, \"--\", \"\")\n\n\tbaseSQL := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE name ILIKE '%%%s%%'\", query)\n\n\tif category != \"\" {\n\t\t// Category is validated against known list\n\t\tvalidCategories := map[string]bool{\"electronics\": true, \"books\": true, \"clothing\": true, \"home\": true}\n\t\tif validCategories[strings.ToLower(category)] {\n\t\t\tbaseSQL += fmt.Sprintf(\" AND category = '%s'\", category)\n\t\t}\n\t}\n\n\t// Sort parameter - only allow specific columns\n\tswitch sortBy {\n\tcase \"price_asc\":\n\t\tbaseSQL += \" ORDER BY price ASC\"\n\tcase \"price_desc\":\n\t\tbaseSQL += \" ORDER BY price DESC\"\n\tcase \"name\":\n\t\tbaseSQL += \" ORDER BY name ASC\"\n\tdefault:\n\t\tbaseSQL += \" ORDER BY relevance DESC\"\n\t}\n\n\tbaseSQL += \" LIMIT 50\"\n\n\trows, err := db.Query(baseSQL)\n\tif err != nil {\n\t\thttp.Error(w, \"search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tjson := fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)\n\t\tw.Write([]byte(json))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"Listening on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Actix-web service deployed on ECS Fargate with a task role (arn:aws:iam::111222333444:role/OrderServiceRole) that has dynamodb:Query permission on table 'multi_tenant_orders' with no IAM condition keys. The table has a partition key 'tenant_id' and sort key 'order_date'. The role policy allows querying any item in the table regardless of attribute values. No VPC endpoint policy restrictions. Service is behind an ALB with no WAF attached.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/multi_tenant_orders"
+      },
+      "waf": "none",
+      "network": "public ALB, no VPC endpoint policy"
+    }
+  }
+}

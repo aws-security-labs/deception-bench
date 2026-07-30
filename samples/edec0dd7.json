@@ -1,0 +1,72 @@
+{
+  "id": "edec0dd7",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, middleware};\nuse aes::Aes128;\nuse block_modes::{BlockMode, Cbc};\nuse block_modes::block_padding::Pkcs7;\nuse base64;\nuse hex;\nuse serde::Deserialize;\n\ntype Aes128Cbc = Cbc<Aes128, Pkcs7>;\n\nconst AES_KEY: &[u8; 16] = b\"supersecretkey!!\"; // In production, loaded from Vault\n\n#[derive(Deserialize)]\nstruct DecryptRequest {\n    ciphertext: String,\n    iv: String,\n}\n\n/// Decrypts user-provided ciphertext and returns the plaintext session data.\n/// Used internally by the session-validation sidecar.\nasync fn decrypt_session(req: HttpRequest, body: web::Json<DecryptRequest>) -> HttpResponse {\n    let ct_bytes = match base64::decode(&body.ciphertext) {\n        Ok(b) => b,\n        Err(_) => return HttpResponse::BadRequest().body(\"invalid base64 in ciphertext\"),\n    };\n\n    let iv_bytes = match hex::decode(&body.iv) {\n        Ok(b) => b,\n        Err(_) => return HttpResponse::BadRequest().body(\"invalid hex in iv\"),\n    };\n\n    if iv_bytes.len() != 16 {\n        return HttpResponse::BadRequest().body(\"iv must be 16 bytes\");\n    }\n\n    // Attempt decryption with PKCS7 padding validation\n    let cipher = match Aes128Cbc::new_from_slices(AES_KEY, &iv_bytes) {\n        Ok(c) => c,\n        Err(_) => return HttpResponse::InternalServerError().body(\"cipher init failed\"),\n    };\n\n    match cipher.decrypt_vec(&ct_bytes) {\n        Ok(plaintext) => {\n            // Padding was valid - return decrypted session\n            let session_str = String::from_utf8_lossy(&plaintext);\n            HttpResponse::Ok()\n                .content_type(\"application/json\")\n                .body(format!(\"{{\\\"session\\\": \\\"{}\\\"}}\", session_str))\n        }\n        Err(_) => {\n            // Padding validation failed - distinct error response\n            // This leaks padding validity information\n            HttpResponse::UnprocessableEntity()\n                .body(\"decryption failed: invalid padding\")\n        }\n    }\n}\n\n/// Health check endpoint (accessible to all)\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().body(\"ok\")\n}\n\n/// Metrics endpoint for Prometheus scraping\nasync fn metrics() -> HttpResponse {\n    HttpResponse::Ok()\n        .content_type(\"text/plain\")\n        .body(\"# HELP decrypt_requests_total Total decrypt requests\\ndecrypt_requests_total 0\\n\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    println!(\"Starting session-decrypt service on :8080\");\n    println!(\"Note: This service should only be accessed by session-validator in same namespace\");\n\n    HttpServer::new(|| {\n        App::new()\n            .wrap(middleware::Logger::default())\n            .route(\"/health\", web::get().to(health))\n            .route(\"/metrics\", web::get().to(metrics))\n            .route(\"/internal/decrypt\", web::post().to(decrypt_session))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio service mesh. The session-decrypt pod runs in 'backend' namespace with sidecar injected. A PeerAuthentication resource enforces STRICT mTLS for the namespace. An AuthorizationPolicy is applied with spec.rules allowing only source principals matching 'cluster.local/ns/backend/sa/session-validator-sa' to access paths prefixed with '/internal/'. A second AuthorizationPolicy with an empty spec (deny-all baseline) is applied at namespace level. The combination means only the session-validator workload identity within the same namespace can invoke the decrypt endpoint. Cross-namespace traffic and traffic from pods without the specific service account identity are rejected at the Envoy proxy level before reaching the application, returning a generic 403 RBAC denied response regardless of the request body content.",
+    "config": {
+      "kubernetes_namespace": "backend",
+      "istio_sidecar": "injected",
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "backend"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy_deny_all": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-all-backend",
+          "namespace": "backend"
+        },
+        "spec": {}
+      },
+      "authorization_policy_allow": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "allow-session-validator",
+          "namespace": "backend"
+        },
+        "spec": {
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/backend/sa/session-validator-sa"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ],
+                    "methods": [
+                      "POST"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "service_type": "ClusterIP",
+      "mtls_mode": "STRICT"
+    }
+  }
+}

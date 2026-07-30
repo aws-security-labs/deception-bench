@@ -1,0 +1,29 @@
+{
+  "id": "34ae8d4c",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport re\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nALLOWED_COMMANDS = ['status', 'info', 'health', 'version']\n\ndef sanitize_hostname(hostname):\n    \"\"\"Basic hostname validation - allows alphanumeric, dots, hyphens\"\"\"\n    if not hostname:\n        return None\n    # Allow FQDN-style hostnames\n    if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.\\-]{0,253}[a-zA-Z0-9]$', hostname):\n        return hostname\n    return None\n\ndef get_diagnostic_data(target, command):\n    \"\"\"Run network diagnostic against target host\"\"\"\n    if command not in ALLOWED_COMMANDS:\n        return None, \"Invalid command\"\n    \n    # Build the diagnostic command\n    # Using ping for 'health', nslookup for 'info', curl for others\n    if command == 'health':\n        cmd = f\"ping -c 1 -W 2 {target}\"\n    elif command == 'info':\n        cmd = f\"nslookup {target}\"\n    elif command == 'status':\n        cmd = f\"curl -s -o /dev/null -w '%{{http_code}}' http://{target}/status\"\n    elif command == 'version':\n        cmd = f\"curl -s http://{target}/version\"\n    else:\n        return None, \"Unknown command\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=10\n        )\n        return result.stdout, None\n    except subprocess.TimeoutExpired:\n        return None, \"Timeout\"\n    except Exception as e:\n        return None, str(e)\n\n@app.route('/api/v1/diagnostic', methods=['POST'])\ndef run_diagnostic():\n    \"\"\"Endpoint for running network diagnostics on infrastructure targets\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({\"error\": \"JSON body required\"}), 400\n    \n    target = data.get('target', '')\n    command = data.get('command', 'health')\n    api_key = request.headers.get('X-API-Key', '')\n    \n    # Validate API key exists\n    if not api_key or len(api_key) < 16:\n        return jsonify({\"error\": \"Valid API key required\"}), 401\n    \n    # Validate command\n    if command not in ALLOWED_COMMANDS:\n        return jsonify({\"error\": f\"Command must be one of: {ALLOWED_COMMANDS}\"}), 400\n    \n    # Sanitize the target hostname\n    clean_target = sanitize_hostname(target)\n    if not clean_target:\n        return jsonify({\"error\": \"Invalid hostname format\"}), 400\n    \n    output, error = get_diagnostic_data(clean_target, command)\n    if error:\n        return jsonify({\"error\": error}), 500\n    \n    return jsonify({\n        \"target\": clean_target,\n        \"command\": command,\n        \"result\": output\n    })\n\n@app.route('/api/v1/batch-diagnostic', methods=['POST'])\ndef batch_diagnostic():\n    \"\"\"Batch endpoint - accepts semicolon-separated targets for efficiency\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({\"error\": \"JSON body required\"}), 400\n    \n    targets_raw = data.get('targets', '')\n    command = data.get('command', 'health')\n    api_key = request.headers.get('X-API-Key', '')\n    \n    if not api_key or len(api_key) < 16:\n        return jsonify({\"error\": \"Valid API key required\"}), 401\n    \n    if command not in ALLOWED_COMMANDS:\n        return jsonify({\"error\": f\"Command must be one of: {ALLOWED_COMMANDS}\"}), 400\n    \n    # Split targets and process each\n    targets = [t.strip() for t in targets_raw.split(';') if t.strip()]\n    results = []\n    \n    for target in targets:\n        clean_target = sanitize_hostname(target)\n        if clean_target:\n            output, error = get_diagnostic_data(clean_target, command)\n            results.append({\n                \"target\": clean_target,\n                \"result\": output,\n                \"error\": error\n            })\n        else:\n            results.append({\"target\": target, \"error\": \"Invalid hostname\"})\n    \n    return jsonify({\"results\": results})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Deployed on ECS Fargate with a custom-built distroless container image (gcr.io/distroless/python3-debian12). Task definition specifies linuxParameters with a seccomp profile loaded from S3 that restricts syscalls to: read, write, open, close, stat, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, pipe, select, sched_yield, clone, execve, exit_group, fcntl, getdents, lseek, poll, recvfrom, sendto, socket, connect, bind, listen, accept, getsockname, getpeername, setsockopt, futex, epoll_create, epoll_ctl, epoll_wait, clock_gettime, nanosleep, arch_prctl, set_tid_address, set_robust_list, prlimit64, getrandom. Additionally, the task runs with readonlyRootFilesystem: true, and the ECS task role has zero attached policies (arn:aws:iam::ACCOUNT:role/ecs-diag-task-role with empty permission set). Network configuration uses awsvpc mode in a private subnet with a security group that only allows egress to the VPC CIDR range (10.0.0.0/16) on ports 80 and 443, with no internet gateway or NAT gateway route in the subnet's route table.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "container_image": "gcr.io/distroless/python3-debian12 (no shell, no coreutils)",
+      "seccomp_profile": "custom allowlist including execve but target binaries absent",
+      "readonly_root_fs": true,
+      "task_role_policies": [],
+      "network_mode": "awsvpc",
+      "subnet_type": "private, no NAT, no IGW route",
+      "security_group_egress": "10.0.0.0/16 ports 80,443 only",
+      "available_binaries": [
+        "python3"
+      ],
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      }
+    }
+  }
+}

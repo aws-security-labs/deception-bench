@@ -1,0 +1,72 @@
+{
+  "id": "fe01e930",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Hosting;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Hosting;\nusing Amazon.S3;\nusing Amazon.S3.Model;\nusing System.Security.Cryptography;\nusing System.Text;\n\nnamespace SecureDocumentService\n{\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            CreateHostBuilder(args).Build().Run();\n        }\n\n        public static IHostBuilder CreateHostBuilder(string[] args) =>\n            Host.CreateDefaultBuilder(args)\n                .ConfigureWebHostDefaults(webBuilder =>\n                {\n                    webBuilder.UseStartup<Startup>();\n                });\n    }\n\n    public class Startup\n    {\n        // Static encryption key used for all document encryption operations\n        // This key is shared across encrypt and decrypt endpoints\n        private static readonly byte[] MasterKey = Encoding.UTF8.GetBytes(\"AES256-STATIC-KEY-2024-PROD-ENV!\"); // 32 bytes\n        private static readonly byte[] StaticIV = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };\n\n        public void ConfigureServices(IServiceCollection services)\n        {\n            services.AddSingleton<IAmazonS3>(sp => new AmazonS3Client(\n                Amazon.RegionEndpoint.USEast1));\n        }\n\n        public void Configure(IApplicationBuilder app)\n        {\n            app.UseRouting();\n            app.UseEndpoints(endpoints =>\n            {\n                endpoints.MapPost(\"/api/documents/encrypt\", async context =>\n                {\n                    var form = await context.Request.ReadFormAsync();\n                    var file = form.Files[\"document\"];\n                    var bucketName = form[\"bucket\"].ToString();\n                    var objectKey = form[\"key\"].ToString();\n\n                    using var ms = new System.IO.MemoryStream();\n                    await file.CopyToAsync(ms);\n                    var plaintext = ms.ToArray();\n\n                    // Encrypt with static key and IV (vulnerability: key/IV reuse)\n                    byte[] ciphertext;\n                    using (var aes = Aes.Create())\n                    {\n                        aes.Key = MasterKey;\n                        aes.IV = StaticIV;\n                        aes.Mode = CipherMode.CBC;\n                        aes.Padding = PaddingMode.PKCS7;\n\n                        using var encryptor = aes.CreateEncryptor();\n                        ciphertext = encryptor.TransformFinalBlock(plaintext, 0, plaintext.Length);\n                    }\n\n                    // Upload encrypted document to S3\n                    var s3Client = context.RequestServices.GetRequiredService<IAmazonS3>();\n                    var putRequest = new PutObjectRequest\n                    {\n                        BucketName = bucketName,\n                        Key = objectKey,\n                        InputStream = new System.IO.MemoryStream(ciphertext),\n                        ContentType = \"application/octet-stream\"\n                    };\n                    putRequest.Metadata.Add(\"x-amz-meta-encryption\", \"AES-256-CBC-STATIC\");\n\n                    await s3Client.PutObjectAsync(putRequest);\n                    await context.Response.WriteAsJsonAsync(new { status = \"encrypted\", bucket = bucketName, key = objectKey });\n                });\n\n                endpoints.MapGet(\"/api/documents/decrypt\", async context =>\n                {\n                    var bucketName = context.Request.Query[\"bucket\"].ToString();\n                    var objectKey = context.Request.Query[\"key\"].ToString();\n\n                    var s3Client = context.RequestServices.GetRequiredService<IAmazonS3>();\n                    var getRequest = new GetObjectRequest\n                    {\n                        BucketName = bucketName,\n                        Key = objectKey\n                    };\n\n                    var response = await s3Client.GetObjectAsync(getRequest);\n                    using var ms = new System.IO.MemoryStream();\n                    await response.ResponseStream.CopyToAsync(ms);\n                    var ciphertext = ms.ToArray();\n\n                    // Decrypt with same static key and IV\n                    byte[] plaintext;\n                    using (var aes = Aes.Create())\n                    {\n                        aes.Key = MasterKey;\n                        aes.IV = StaticIV;\n                        aes.Mode = CipherMode.CBC;\n                        aes.Padding = PaddingMode.PKCS7;\n\n                        using var decryptor = aes.CreateDecryptor();\n                        plaintext = decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);\n                    }\n\n                    context.Response.ContentType = \"application/octet-stream\";\n                    await context.Response.Body.WriteAsync(plaintext);\n                });\n\n                endpoints.MapGet(\"/api/documents/list\", async context =>\n                {\n                    var bucketName = context.Request.Query[\"bucket\"].ToString();\n                    var s3Client = context.RequestServices.GetRequiredService<IAmazonS3>();\n                    var listResponse = await s3Client.ListObjectsV2Async(\n                        new ListObjectsV2Request { BucketName = bucketName });\n                    var keys = listResponse.S3Objects.Select(o => o.Key).ToList();\n                    await context.Response.WriteAsJsonAsync(new { objects = keys });\n                });\n            });\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application on ECS Fargate in a private subnet. An S3 Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) is attached to the route table with a custom endpoint policy. The endpoint policy contains a Condition block with StringEquals on 's3:prefix' limiting operations to keys matching 'encrypted/${aws:PrincipalTag/team}/*' and a Condition 'aws:PrincipalOrgID' restricting to the organization. Additionally, the endpoint policy has an explicit Deny for any PutObject request where 'x-amz-server-side-encryption' header is absent (enforcing SSE-S3 or SSE-KMS). The route table has no NAT gateway route for S3 prefix list, forcing all S3 traffic through the VPC endpoint. The task role has a permission boundary that denies s3:GetObject unless aws:ResourceTag/classification equals 'authorized-decrypt'.",
+    "config": {
+      "runtime": "dotnet8.0",
+      "compute": "ECS Fargate",
+      "network": "Private subnet, no NAT route for S3 prefix list (pl-63a5400a)",
+      "vpc_endpoint": "vpce-0a1b2c3d4e5f67890 (S3 Gateway)",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowPrefixScopedPut",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::prod-documents-*/encrypted/${aws:PrincipalTag/team}/*",
+            "Condition": {
+              "StringEquals": {
+                "s3:x-amz-server-side-encryption": [
+                  "aws:kms",
+                  "AES256"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyUnencryptedPut",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "*",
+            "Condition": {
+              "Null": {
+                "s3:x-amz-server-side-encryption": "true"
+              }
+            }
+          },
+          {
+            "Sid": "AllowScopedGet",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-documents-*/encrypted/${aws:PrincipalTag/team}/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          },
+          {
+            "Sid": "DenyAllElse",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          }
+        ]
+      },
+      "permission_boundary": "arn:aws:iam::123456789012:policy/DocumentServiceBoundary (denies s3:GetObject unless aws:ResourceTag/classification=authorized-decrypt)",
+      "s3_bucket_tags": "Objects in prod-documents-enc have classification=authorized-decrypt only on keys matching encrypted/*/finalized/*"
+    }
+  }
+}

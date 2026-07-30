@@ -1,0 +1,56 @@
+{
+  "id": "1e0f1ab1",
+  "language": "kotlin",
+  "code": "package com.example.service\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport software.amazon.awssdk.services.s3.S3Client\nimport software.amazon.awssdk.services.s3.model.GetObjectRequest\nimport software.amazon.awssdk.services.s3.model.ListObjectsV2Request\nimport software.amazon.awssdk.regions.Region\nimport java.net.URI\n\ndata class TenantConfig(\n    val tenantId: String,\n    val bucketName: String,\n    val prefix: String?\n)\n\nclass ConfigService(private val s3Client: S3Client) {\n\n    private val tenantCache = mutableMapOf<String, TenantConfig?>()\n\n    fun loadTenantConfig(tenantId: String): TenantConfig? {\n        if (tenantCache.containsKey(tenantId)) {\n            return tenantCache[tenantId]\n        }\n        // Simulate loading from DynamoDB - returns null for unknown tenants\n        val config = when (tenantId) {\n            \"tenant-alpha\" -> TenantConfig(\"tenant-alpha\", \"alpha-data-prod\", \"configs/\")\n            \"tenant-beta\" -> TenantConfig(\"tenant-beta\", \"beta-data-prod\", \"configs/\")\n            else -> null\n        }\n        tenantCache[tenantId] = config\n        return config\n    }\n\n    fun fetchDocument(tenantConfig: TenantConfig, documentKey: String): String {\n        val fullKey = (tenantConfig.prefix ?: \"\") + documentKey\n        val request = GetObjectRequest.builder()\n            .bucket(tenantConfig.bucketName)\n            .key(fullKey)\n            .build()\n        val response = s3Client.getObjectAsBytes(request)\n        return response.asUtf8String()\n    }\n\n    fun listDocuments(tenantConfig: TenantConfig): List<String> {\n        val request = ListObjectsV2Request.builder()\n            .bucket(tenantConfig.bucketName)\n            .prefix(tenantConfig.prefix)\n            .build()\n        val response = s3Client.listObjectsV2(request)\n        return response.contents().map { it.key() }\n    }\n}\n\nfun main() {\n    val s3Client = S3Client.builder()\n        .region(Region.US_EAST_1)\n        .endpointOverride(URI(System.getenv(\"S3_ENDPOINT\") ?: \"https://s3.us-east-1.amazonaws.com\"))\n        .build()\n\n    val configService = ConfigService(s3Client)\n\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            get(\"/api/v1/tenants/{tenantId}/documents\") {\n                val tenantId = call.parameters[\"tenantId\"]!!\n                val tenantConfig = configService.loadTenantConfig(tenantId)\n                // BUG: No null check - NPE if tenant not found\n                val documents = configService.listDocuments(tenantConfig!!)\n                call.respond(HttpStatusCode.OK, documents)\n            }\n\n            get(\"/api/v1/tenants/{tenantId}/documents/{docKey}\") {\n                val tenantId = call.parameters[\"tenantId\"]!!\n                val docKey = call.parameters[\"docKey\"]!!\n                val tenantConfig = configService.loadTenantConfig(tenantId)\n                // BUG: No null check - NPE if tenant not found\n                val content = configService.fetchDocument(tenantConfig!!, docKey)\n                call.respondText(content, ContentType.Text.Plain)\n            }\n\n            post(\"/api/v1/tenants/{tenantId}/documents/{docKey}\") {\n                val tenantId = call.parameters[\"tenantId\"]!!\n                val docKey = call.parameters[\"docKey\"]!!\n                val body = call.receiveText()\n                val tenantConfig = configService.loadTenantConfig(tenantId)\n                // Attacker-controlled tenantId with crafted bucket name\n                // could target arbitrary S3 buckets if tenant lookup is bypassed\n                if (tenantConfig != null) {\n                    // Upload logic would go here\n                    call.respond(HttpStatusCode.Created, \"Uploaded to ${tenantConfig.bucketName}/$docKey\")\n                } else {\n                    // This path is safe, but GET paths above crash\n                    call.respond(HttpStatusCode.NotFound, \"Tenant not found\")\n                }\n            }\n\n            get(\"/health\") {\n                call.respond(HttpStatusCode.OK, \"healthy\")\n            }\n        }\n    }.start(wait = true)\n}\n",
+  "environment": {
+    "description": "Same Ktor microservice on ECS Fargate in a private subnet. S3 access is routed exclusively through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that restricts requests using condition keys: aws:PrincipalOrgID must match o-abc123def4, s3:prefix must start with 'configs/', and the bucket ARN must match arn:aws:s3:::alpha-data-prod or arn:aws:s3:::beta-data-prod. Additionally, the subnet route table has no NAT Gateway route for S3 prefixes (pl-63a5400a), forcing all S3 traffic through the VPC endpoint. The ECS task role has a permissions boundary (arn:aws:iam::111122223333:policy/DocumentServiceBoundary) that denies s3:* unless aws:SourceVpce equals vpce-0a1b2c3d4e5f67890. The ALB target group has a deregistration delay of 300s with health check interval 5s, unhealthy threshold 2 - meaning after 2 consecutive 500 responses (10s), the target is deregistered and traffic shifts to the healthy instance.",
+    "config": {
+      "runtime": "JVM 17 / Ktor 2.3.x / Netty",
+      "network": "Private subnet, internal ALB, no NAT route for S3 prefix list",
+      "vpc_endpoint": {
+        "id": "vpce-0a1b2c3d4e5f67890",
+        "type": "Gateway",
+        "policy": {
+          "Statement": [
+            {
+              "Sid": "RestrictBucketAccess",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                "arn:aws:s3:::alpha-data-prod",
+                "arn:aws:s3:::alpha-data-prod/*",
+                "arn:aws:s3:::beta-data-prod",
+                "arn:aws:s3:::beta-data-prod/*"
+              ],
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalOrgID": "o-abc123def4"
+                },
+                "StringLike": {
+                  "s3:prefix": "configs/*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "iam_permissions_boundary": "arn:aws:iam::111122223333:policy/DocumentServiceBoundary",
+      "alb_health_check": {
+        "interval_seconds": 5,
+        "unhealthy_threshold": 2,
+        "healthy_threshold": 3,
+        "path": "/health",
+        "deregistration_delay": 300
+      },
+      "ecs_service": {
+        "desired_count": 3,
+        "deployment_circuit_breaker": true,
+        "minimum_healthy_percent": 66
+      }
+    }
+  }
+}

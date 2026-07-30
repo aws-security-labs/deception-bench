@@ -1,0 +1,36 @@
+{
+  "id": "a98907d8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchRequest struct {\n\tQuery    string   `json:\"query\"`\n\tFields   []string `json:\"fields\"`\n\tOrderBy  string   `json:\"order_by\"`\n\tLimit    int      `json:\"limit\"`\n}\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=db port=5432 user=app dbname=store sslmode=disable\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc sanitizeField(f string) string {\n\t// Only allow known column names\n\tallowed := map[string]bool{\"id\": true, \"name\": true, \"price\": true, \"sku\": true, \"category\": true}\n\tif allowed[strings.ToLower(f)] {\n\t\treturn f\n\t}\n\treturn \"id\"\n}\n\nfunc buildSearchQuery(req SearchRequest) string {\n\tfields := \"id, name, price, sku\"\n\tif len(req.Fields) > 0 {\n\t\tsanitized := make([]string, 0)\n\t\tfor _, f := range req.Fields {\n\t\t\tsanitized = append(sanitized, sanitizeField(f))\n\t\t}\n\t\tfields = strings.Join(sanitized, \", \")\n\t}\n\n\t// Build WHERE clause with ILIKE for text search\n\twhere := fmt.Sprintf(\"WHERE name ILIKE '%%%s%%' OR sku ILIKE '%%%s%%'\", req.Query, req.Query)\n\n\t// Order by clause\n\torderClause := \"ORDER BY id ASC\"\n\tif req.OrderBy != \"\" {\n\t\t// We validate direction but the field itself uses sanitizeField\n\t\tparts := strings.SplitN(req.OrderBy, \" \", 2)\n\t\tfield := sanitizeField(parts[0])\n\t\tdir := \"ASC\"\n\t\tif len(parts) > 1 && strings.ToUpper(parts[1]) == \"DESC\" {\n\t\t\tdir = \"DESC\"\n\t\t}\n\t\torderClause = fmt.Sprintf(\"ORDER BY %s %s\", field, dir)\n\t}\n\n\tlimit := 50\n\tif req.Limit > 0 && req.Limit <= 200 {\n\t\tlimit = req.Limit\n\t}\n\n\treturn fmt.Sprintf(\"SELECT %s FROM products %s %s LIMIT %d\", fields, where, orderClause, limit)\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req SearchRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\tif len(req.Query) > 100 {\n\t\thttp.Error(w, \"Query too long\", 400)\n\t\treturn\n\t}\n\n\tquery := buildSearchQuery(req)\n\tlog.Printf(\"Executing: %s\", query)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application deployed behind AWS API Gateway (REST API type) with a request validator attached to the POST methods. The validator uses a JSON Schema model definition that enforces: 'Hostname' must match pattern '^[a-zA-Z0-9][a-zA-Z0-9\\\\-\\\\.]{0,252}$', 'Count' must be integer between 1-30, and 'Interface' property is NOT permitted in the schema (additionalProperties: false with only 'Hostname' and 'Count' defined). The API Gateway integration uses VPC Link to a private NLB. Request body passthrough behavior is set to 'NEVER' (rejects if content-type doesn't match model). The gateway returns 400 before the request reaches the backend if schema validation fails.",
+    "config": {
+      "gateway": "AWS API Gateway REST API",
+      "validator": "Request Validator (validate body)",
+      "model_schema": {
+        "type": "object",
+        "required": [
+          "Hostname",
+          "Count"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "Hostname": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9\\-\\.]{0,252}$",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "Count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30
+          }
+        }
+      },
+      "passthrough_behavior": "NEVER",
+      "integration": "VPC_LINK to private NLB",
+      "content_type_validation": "application/json only"
+    }
+  }
+}

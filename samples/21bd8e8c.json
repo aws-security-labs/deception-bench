@@ -1,0 +1,55 @@
+{
+  "id": "21bd8e8c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Product struct {\n\tID    int     `json:\"id\"`\n\tName  string  `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string  `json:\"sku\"`\n}\n\n// handleSearch handles product search with category filtering\nfunc handleSearch(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Validate sort parameter\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif sortBy != \"\" && !allowedSorts[sortBy] {\n\t\tsortBy = \"id\"\n\t}\n\tif sortBy == \"\" {\n\t\tsortBy = \"id\"\n\t}\n\n\t// Build query - category is parameterized, but min_price is interpolated\n\t// for legacy compatibility with the reporting engine that passes expressions\n\tbaseQuery := \"SELECT id, name, price, sku FROM products WHERE category = $1\"\n\n\tif minPrice != \"\" {\n\t\t// Legacy: reporting engine sends expressions like \"10.00\" or \"5.00+tax\"\n\t\t// We validate it looks numeric-ish but allow decimal points\n\t\tif !looksNumeric(minPrice) {\n\t\t\thttp.Error(w, \"invalid min_price\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\n\tbaseQuery += fmt.Sprintf(\" ORDER BY %s LIMIT 50\", sortBy)\n\n\trows, err := db.Query(baseQuery, category)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// looksNumeric checks if the string starts with a digit or decimal\n// and contains only digits, dots, and basic math operators\n// NOTE: This is intentionally weak validation for backward compat\nfunc looksNumeric(s string) bool {\n\tif len(s) == 0 || len(s) > 20 {\n\t\treturn false\n\t}\n\tfirst := s[0]\n\tif first != '.' && (first < '0' || first > '9') {\n\t\treturn false\n\t}\n\t// Allow digits, dots, +, -, *, / for expressions\n\tfor _, c := range s {\n\t\tif !strings.ContainsRune(\"0123456789.+-*/() \", c) {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n\n// handleHealth returns service health\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", handleSearch)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an AWS Application Load Balancer. The ALB has two listener rules evaluated in priority order: (1) Priority 5: path-pattern '/api/users/search' with query-string condition key 'q' routed to a fixed-response action returning 403 if the request also matches a custom Lambda@Edge function attached to the associated CloudFront distribution that inspects query parameters for characters in the set [';\"\\-\\-()UNION|union|SELECT|select|CAST|cast|CHAR|char|0x], returning 403 on match; (2) Priority 10: default forward to target group. Additionally, the ECS task role has no network egress except to the ALB via security group (no outbound internet for data exfiltration). The CloudFront distribution has a custom origin request policy that strips any query parameter value exceeding 64 bytes before forwarding to the ALB origin, and the ALB access logs feed into a GuardDuty-integrated anomaly detector. The critical control: CloudFront's origin request policy uses a custom policy (ID: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf) configured with QueryStringBehavior set to 'allExcept' with a ValueMaxLength of 64 bytes per parameter value \u2014 any query parameter value exceeding 64 bytes is truncated at the edge before reaching origin.",
+    "config": {
+      "cloudfront_distribution": {
+        "origin_request_policy": {
+          "id": "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf",
+          "query_strings": {
+            "behavior": "allExcept",
+            "value_max_length_bytes": 64
+          }
+        },
+        "lambda_at_edge": {
+          "event_type": "viewer-request",
+          "function": "sqli-pattern-detector-v3",
+          "action_on_match": "return 403",
+          "patterns": [
+            ";",
+            "\"",
+            "--",
+            "()",
+            "UNION",
+            "union",
+            "SELECT",
+            "select",
+            "CAST",
+            "cast",
+            "CHAR",
+            "char",
+            "0x"
+          ]
+        }
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "path_pattern": "/api/users/search",
+          "action": "forward"
+        },
+        {
+          "priority": 10,
+          "action": "forward_default"
+        }
+      ],
+      "ecs_task_security_group": {
+        "egress": "TCP/443 to ALB security group only",
+        "ingress": "TCP/8080 from ALB security group only"
+      },
+      "guardduty_integration": "enabled"
+    }
+  }
+}

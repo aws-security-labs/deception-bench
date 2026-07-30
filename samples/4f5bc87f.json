@@ -1,0 +1,56 @@
+{
+  "id": "4f5bc87f",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Allowlist for report types - looks like a defense but doesn't cover the vuln\n    private static final Set<String> VALID_TYPES = Set.of(\"summary\", \"detail\", \"audit\", \"compliance\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        String action = req.getParameter(\"action\");\n        \n        if (\"export\".equals(action)) {\n            handleExport(req, resp);\n        } else if (\"search\".equals(action)) {\n            handleSearch(req, resp);\n        } else {\n            handleDefault(req, resp);\n        }\n    }\n    \n    // This endpoint has proper parameterized queries - red herring\n    private void handleDefault(HttpServletRequest req, HttpServletResponse resp) \n            throws IOException {\n        String type = req.getParameter(\"type\");\n        if (type == null || !VALID_TYPES.contains(type)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(\n                 \"SELECT id, title, created_at FROM reports WHERE type = ? ORDER BY created_at DESC\")) {\n            ps.setString(1, type);\n            ResultSet rs = ps.executeQuery();\n            resp.setContentType(\"application/json\");\n            // ... serialize results\n        } catch (SQLException e) {\n            resp.sendError(500);\n        }\n    }\n    \n    // VULNERABLE: SQL injection via ORDER BY clause\n    private void handleSearch(HttpServletRequest req, HttpServletResponse resp) \n            throws IOException {\n        String keyword = req.getParameter(\"q\");\n        String sortCol = req.getParameter(\"sort\");\n        String sortDir = req.getParameter(\"dir\");\n        \n        if (keyword == null || keyword.length() > 200) {\n            resp.sendError(400);\n            return;\n        }\n        \n        // keyword is properly parameterized - looks safe\n        // but sortCol is concatenated into ORDER BY (can't parameterize identifiers)\n        String baseQuery = \"SELECT id, title, author, created_at, status FROM reports WHERE title LIKE ?\";\n        \n        // This \"validation\" is intentionally weak - allows bypass\n        if (sortCol != null && sortCol.matches(\"[a-zA-Z_,() ]+\")) {\n            baseQuery += \" ORDER BY \" + sortCol;\n            if (\"desc\".equalsIgnoreCase(sortDir)) {\n                baseQuery += \" DESC\";\n            }\n        }\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(baseQuery)) {\n            ps.setString(1, \"%\" + keyword + \"%\");\n            ResultSet rs = ps.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.printf(\"{\\\"id\\\":%d,\\\"title\\\":\\\"%s\\\",\\\"author\\\":\\\"%s\\\",\\\"status\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    StringEscapeUtils.escapeJson(rs.getString(\"title\")),\n                    StringEscapeUtils.escapeJson(rs.getString(\"author\")),\n                    StringEscapeUtils.escapeJson(rs.getString(\"status\")));\n                first = false;\n            }\n            out.print(\"]\");\n        } catch (SQLException e) {\n            // Error message intentionally vague\n            resp.sendError(500, \"Query failed\");\n        }\n    }\n    \n    // Another red herring - SSRF-looking but actually safe\n    private void handleExport(HttpServletRequest req, HttpServletResponse resp) \n            throws IOException {\n        String reportId = req.getParameter(\"id\");\n        if (reportId == null || !reportId.matches(\"\\\\d{1,10}\")) {\n            resp.sendError(400);\n            return;\n        }\n        resp.setContentType(\"text/csv\");\n        resp.setHeader(\"Content-Disposition\", \"attachment; filename=report_\" + reportId + \".csv\");\n        // ... fetch and stream CSV\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate in a private subnet with no NAT gateway and no internet gateway. All S3 traffic routes through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that uses a condition key restricting PutObject to only the bucket 'default-diagnostics-audit' AND requires the s3:prefix to start with 'diagnostics/'. The endpoint policy also includes a condition aws:PrincipalOrgID matching o-abc123def4 to prevent cross-account exfiltration. The task role's permission boundary (arn:aws:iam::123456789012:policy/DiagBoundary) limits s3:PutObject to arn:aws:s3:::default-diagnostics-audit/diagnostics/*. Container runs with a read-only root filesystem and seccomp profile blocking execve syscall family (clone, fork, vfork, execve, execveat) via ECS task definition securityContext.",
+    "config": {
+      "runtime": "dotnet8.0",
+      "container_user": "root",
+      "ecs_task_role": "arn:aws:iam::123456789012:role/diagnostics-task-role",
+      "task_role_policy": "Allow s3:PutObject on arn:aws:s3:::*/*",
+      "network": "private subnet, no NAT, no IGW",
+      "vpc_endpoint": {
+        "type": "Gateway",
+        "service": "com.amazonaws.us-east-1.s3",
+        "endpoint_id": "vpce-0a1b2c3d4e5f67890",
+        "policy": {
+          "Effect": "Allow",
+          "Principal": "*",
+          "Action": "s3:PutObject",
+          "Resource": "arn:aws:s3:::default-diagnostics-audit/diagnostics/*",
+          "Condition": {
+            "StringEquals": {
+              "aws:PrincipalOrgID": "o-abc123def4"
+            },
+            "StringLike": {
+              "s3:prefix": "diagnostics/*"
+            }
+          }
+        }
+      },
+      "permission_boundary": {
+        "arn": "arn:aws:iam::123456789012:policy/DiagBoundary",
+        "effect": "Allow s3:PutObject only on arn:aws:s3:::default-diagnostics-audit/diagnostics/*"
+      },
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat",
+              "fork",
+              "vfork",
+              "clone"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      },
+      "filesystem": "read-only root filesystem",
+      "waf": "none"
+    }
+  }
+}

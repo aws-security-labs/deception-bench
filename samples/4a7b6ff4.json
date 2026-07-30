@@ -1,0 +1,32 @@
+{
+  "id": "4a7b6ff4",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware: extract user from session token\napp.use(async (req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const result = await pool.query(\n      'SELECT user_id, role, org_id FROM sessions WHERE token = $1 AND expires_at > NOW()',\n      [token]\n    );\n    if (result.rows.length === 0) return res.status(401).json({ error: 'session expired' });\n    req.user = result.rows[0];\n    next();\n  } catch (e) {\n    next(e);\n  }\n});\n\n// Search endpoint for audit logs\napp.get('/api/v2/audit/search', async (req, res) => {\n  const { startDate, endDate, actor, action, resourceType, sortBy, sortOrder } = req.query;\n  \n  // Build base query with org isolation\n  let query = `SELECT id, actor_email, action, resource_type, resource_id, \n               details, ip_address, created_at \n               FROM audit_logs WHERE org_id = '${req.user.org_id}'`;\n  \n  // Apply filters\n  if (startDate) query += ` AND created_at >= '${startDate}'`;\n  if (endDate) query += ` AND created_at <= '${endDate}'`;\n  if (actor) query += ` AND actor_email ILIKE '%${actor}%'`;\n  if (action) query += ` AND action = '${action}'`;\n  if (resourceType) query += ` AND resource_type = '${resourceType}'`;\n  \n  // Sorting - validated against allowlist\n  const allowedSorts = ['created_at', 'actor_email', 'action', 'resource_type'];\n  const sort = allowedSorts.includes(sortBy) ? sortBy : 'created_at';\n  const order = sortOrder === 'ASC' ? 'ASC' : 'DESC';\n  query += ` ORDER BY ${sort} ${order}`;\n  \n  // Pagination\n  query += ` LIMIT 100`;\n  \n  try {\n    const result = await pool.query(query);\n    // Redact IP addresses for non-admin users\n    const rows = result.rows.map(row => {\n      if (req.user.role !== 'admin') {\n        row.ip_address = row.ip_address ? \n          row.ip_address.replace(/\\d+\\.\\d+$/, 'x.x') : null;\n      }\n      return row;\n    });\n    res.json({ data: rows, count: rows.length });\n  } catch (e) {\n    console.error('Audit search error:', e.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Export endpoint\napp.post('/api/v2/audit/export', async (req, res) => {\n  const { format, filters } = req.body;\n  if (req.user.role !== 'admin' && req.user.role !== 'auditor') {\n    return res.status(403).json({ error: 'insufficient permissions' });\n  }\n  \n  let query = `SELECT * FROM audit_logs WHERE org_id = '${req.user.org_id}'`;\n  if (filters?.startDate) query += ` AND created_at >= '${filters.startDate}'`;\n  if (filters?.endDate) query += ` AND created_at <= '${filters.endDate}'`;\n  \n  try {\n    const result = await pool.query(query);\n    const exportId = crypto.randomUUID();\n    // Queue export job\n    await pool.query(\n      'INSERT INTO export_jobs (id, user_id, org_id, row_count, status) VALUES ($1, $2, $3, $4, $5)',\n      [exportId, req.user.user_id, req.user.org_id, result.rows.length, 'processing']\n    );\n    res.json({ exportId, rowCount: result.rows.length });\n  } catch (e) {\n    console.error('Export error:', e.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Same Lambda deployment but the execution role's DynamoDB policy uses fine-grained access control with leading key condition. The IAM policy includes a Condition block with dynamodb:LeadingKeys ForAllValues:StringEquals set to ${cognito-identity.amazonaws.com:sub}, and a separate StringEquals condition on dynamodb:Attributes limited to ['tenantId','reportId','title','createdAt','status']. The templatePath attribute is NOT in the allowed attributes list. Additionally, the Lambda function has a resource-based policy restricting invocation to the specific API Gateway stage ARN, and the DynamoDB table has a separate GSI-based access pattern where templatePath is only readable through a service-linked role used by an internal batch processor.",
+    "config": {
+      "runtime": "provided.al2 (Quarkus native)",
+      "iam_role_policy": {
+        "Effect": "Allow",
+        "Action": "dynamodb:GetItem",
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/reports",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": "${cognito-identity.amazonaws.com:sub}",
+            "dynamodb:Attributes": [
+              "tenantId",
+              "reportId",
+              "title",
+              "createdAt",
+              "status"
+            ]
+          }
+        }
+      },
+      "dynamodb_table": "reports (PK: tenantId, SK: reportId) with attribute-level restriction",
+      "api_gateway": "REST API with Cognito authorizer, resource policy restricts to VPC endpoint",
+      "lambda_layer": "includes wkhtmltopdf and csvtool binaries",
+      "note": "templatePath attribute excluded from IAM-allowed attributes projection"
+    }
+  }
+}

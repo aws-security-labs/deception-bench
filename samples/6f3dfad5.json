@@ -1,0 +1,32 @@
+{
+  "id": "6f3dfad5",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Allowlist of safe columns for ordering\n    private static final String[] SAFE_ORDER_COLS = {\"created_at\", \"amount\", \"status\", \"id\"};\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String userId = (String) req.getAttribute(\"authenticated_user_id\");\n        if (userId == null) {\n            resp.sendError(401);\n            return;\n        }\n        \n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String category = req.getParameter(\"category\");\n        String orderBy = req.getParameter(\"order_by\");\n        String direction = req.getParameter(\"dir\");\n        \n        // Validate date format\n        if (startDate != null && !startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid start date\");\n            return;\n        }\n        if (endDate != null && !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid end date\");\n            return;\n        }\n        \n        // Validate direction\n        if (direction != null && !direction.equalsIgnoreCase(\"ASC\") && !direction.equalsIgnoreCase(\"DESC\")) {\n            direction = \"DESC\";\n        }\n        \n        // Build query with parameterized user_id\n        StringBuilder sql = new StringBuilder();\n        sql.append(\"SELECT id, amount, category, status, created_at FROM transactions WHERE user_id = ?\");\n        \n        if (startDate != null) {\n            sql.append(\" AND created_at >= '\" + startDate + \"'\");\n        }\n        if (endDate != null) {\n            sql.append(\" AND created_at <= '\" + endDate + \"'\");\n        }\n        \n        // Category filter - uses concatenation for IN clause\n        if (category != null && !category.isEmpty()) {\n            // Developer note: category is a comma-separated list like \"food,transport\"\n            // We split and quote each value\n            String[] cats = category.split(\",\");\n            StringBuilder inClause = new StringBuilder(\" AND category IN (\");\n            for (int i = 0; i < cats.length; i++) {\n                if (i > 0) inClause.append(\",\");\n                inClause.append(\"'\" + cats[i].trim() + \"'\");\n            }\n            inClause.append(\")\");\n            sql.append(inClause);\n        }\n        \n        // Order by - validated against allowlist\n        if (orderBy != null && isValidOrderColumn(orderBy)) {\n            sql.append(\" ORDER BY \" + orderBy + \" \" + (direction != null ? direction : \"DESC\"));\n        } else {\n            sql.append(\" ORDER BY created_at DESC\");\n        }\n        \n        sql.append(\" LIMIT 100\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql.toString())) {\n            \n            stmt.setString(1, userId);\n            ResultSet rs = stmt.executeQuery();\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"amount\", rs.getDouble(\"amount\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                row.put(\"status\", rs.getString(\"status\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private boolean isValidOrderColumn(String col) {\n        for (String safe : SAFE_ORDER_COLS) {\n            if (safe.equalsIgnoreCase(col)) return true;\n        }\n        return false;\n    }\n}",
+  "environment": {
+    "description": "Same Go microservice deployed on ECS Fargate, but fronted by AWS API Gateway (HTTP API type) with a request validator attached to the PATCH /api/v1/profile route. The route uses an OpenAPI 3.0 schema model (content-type application/json) that defines the request body with 'additionalProperties: false' and only permits the properties 'username' (string, maxLength 64) and 'email' (string, format email, maxLength 128). The API Gateway request validator is configured with 'validateRequestBody: true'. Requests containing any JSON property not in the schema (such as 'role', 'is_admin', 'quota_gb', 'billing_id', 'verified') receive a 400 response from the gateway before reaching the backend. Note: the validator operates on the parsed JSON body and rejects payloads with undeclared keys due to the additionalProperties constraint. The integration uses VPC Link to the internal ALB which forwards to the ECS service.",
+    "config": {
+      "runtime": "ECS Fargate, Go 1.21",
+      "api_gateway": "AWS API Gateway HTTP API with OpenAPI 3.0 model validation",
+      "route_config": "PATCH /api/v1/profile with request validator (validateRequestBody: true)",
+      "schema_model": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 128
+          }
+        },
+        "additionalProperties": false,
+        "required": []
+      },
+      "validator_behavior": "Returns 400 Bad Request for any payload with properties not defined in schema",
+      "integration": "VPC Link to internal ALB -> ECS target group",
+      "auth": "API Gateway JWT authorizer + sidecar sets X-Authenticated-User-ID"
+    }
+  }
+}

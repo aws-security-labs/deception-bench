@@ -1,0 +1,41 @@
+{
+  "id": "d59d84d3",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tDescription string  `json:\"description\"`\n\tPrice       float64 `json:\"price\"`\n\tSKU         string  `json:\"sku\"`\n\tCostPrice   float64 `json:\"cost_price,omitempty\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeOrderBy attempts to prevent injection in ORDER BY clauses\n// by removing dangerous keywords from the sort parameter\nfunc sanitizeOrderBy(input string) string {\n\tdangerous := []string{\"DROP\", \"DELETE\", \"INSERT\", \"UPDATE\", \"ALTER\", \"TRUNCATE\"}\n\tresult := input\n\tfor _, kw := range dangerous {\n\t\tresult = strings.ReplaceAll(strings.ToUpper(result), kw, \"\")\n\t}\n\treturn input // BUG: returns original input, not sanitized result\n}\n\n// validateCategory checks category exists using parameterized query\nfunc validateCategory(category string) (bool, error) {\n\tvar exists bool\n\terr := db.QueryRow(\"SELECT EXISTS(SELECT 1 FROM categories WHERE slug = $1)\", category).Scan(&exists)\n\treturn exists, err\n}\n\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Validate category exists (parameterized - safe)\n\texists, err := validateCategory(category)\n\tif err != nil || !exists {\n\t\thttp.Error(w, \"invalid category\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query with parameterized WHERE clause\n\tquery := \"SELECT id, name, description, price, sku FROM products WHERE category_slug = $1\"\n\targs := []interface{}{category}\n\targIdx := 2\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= $%d\", argIdx)\n\t\targs = append(args, minPrice)\n\t\targIdx++\n\t}\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= $%d\", argIdx)\n\t\targs = append(args, maxPrice)\n\t\targIdx++\n\t}\n\n\t// ORDER BY clause - vulnerable to injection\n\tif sortBy != \"\" {\n\t\tsanitized := sanitizeOrderBy(sortBy)\n\t\tquery += \" ORDER BY \" + sanitized\n\t} else {\n\t\tquery += \" ORDER BY name ASC\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with condition path-pattern /api/* that has an associated WAFv2 WebACL. The WebACL contains a single custom rule group with a RegexPatternSet-based rule that inspects QUERY_STRING with pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)` in BLOCK action with priority 1, plus a rate-based rule at 100 requests per 5 minutes per source IP at priority 2. (3) Priority 99: default action forward to target group. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc ENI security group which allows outbound only to pl-63a5400a (com.amazonaws.us-east-1.logs prefix list) on port 443.",
+    "config": {
+      "compute": "ECS Fargate, task CPU 512, memory 1024, platform version 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "sql-pattern-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)"
+              }
+            }
+          },
+          {
+            "name": "rate-limit",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "rate_based": {
+                "limit": 100,
+                "aggregate_key_type": "IP"
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "security_group_egress": "outbound 443 to pl-63a5400a only (CloudWatch Logs VPC endpoint)",
+      "vpc": "private subnets, no internet gateway, no NAT gateway"
+    }
+  }
+}

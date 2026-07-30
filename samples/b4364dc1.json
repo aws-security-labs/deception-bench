@@ -1,0 +1,93 @@
+{
+  "id": "b4364dc1",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/archives_controller.rb\nrequire 'zip'\nrequire 'fileutils'\nrequire 'net/http'\n\nmodule Api\n  module V1\n    class ArchivesController < ApplicationController\n      before_action :authenticate_user!\n      \n      UPLOAD_DIR = Rails.root.join('tmp', 'uploads')\n      EXTRACT_DIR = Rails.root.join('tmp', 'extracted')\n      \n      def create\n        uploaded_file = params[:archive]\n        \n        unless uploaded_file.content_type == 'application/zip'\n          return render json: { error: 'Only ZIP files accepted' }, status: :unprocessable_entity\n        end\n        \n        if uploaded_file.size > 50.megabytes\n          return render json: { error: 'File too large' }, status: :unprocessable_entity\n        end\n        \n        archive_path = UPLOAD_DIR.join(\"#{SecureRandom.hex(8)}.zip\")\n        FileUtils.mkdir_p(UPLOAD_DIR)\n        File.open(archive_path, 'wb') { |f| f.write(uploaded_file.read) }\n        \n        extracted_files = extract_archive(archive_path)\n        \n        # Post-extraction: notify metadata service about new files\n        notify_processing_service(extracted_files)\n        \n        render json: { \n          message: 'Archive processed successfully',\n          files: extracted_files.map { |f| File.basename(f) }\n        }, status: :ok\n      rescue Zip::Error => e\n        render json: { error: \"Invalid archive: #{e.message}\" }, status: :unprocessable_entity\n      rescue StandardError => e\n        Rails.logger.error(\"Archive processing failed: #{e.message}\")\n        render json: { error: 'Processing failed' }, status: :internal_server_error\n      ensure\n        FileUtils.rm_f(archive_path) if archive_path\n      end\n      \n      private\n      \n      def extract_archive(archive_path)\n        extracted = []\n        session_dir = EXTRACT_DIR.join(SecureRandom.hex(12))\n        FileUtils.mkdir_p(session_dir)\n        \n        Zip::File.open(archive_path) do |zip_file|\n          zip_file.each do |entry|\n            # Basic size check per entry\n            next if entry.size > 10.megabytes\n            \n            dest_path = File.join(session_dir, entry.name)\n            \n            # Ensure parent directory exists\n            FileUtils.mkdir_p(File.dirname(dest_path))\n            \n            # Extract the entry\n            entry.extract(dest_path)\n            extracted << dest_path\n          end\n        end\n        \n        extracted\n      end\n      \n      def notify_processing_service(files)\n        return if files.empty?\n        \n        # Notify the internal processing pipeline via cloud metadata-adjacent service\n        metadata_endpoint = ENV.fetch('PROCESSING_CALLBACK_URL', 'http://169.254.169.254/latest/meta-data/')\n        \n        begin\n          uri = URI(metadata_endpoint)\n          http = Net::HTTP.new(uri.host, uri.port)\n          http.open_timeout = 3\n          http.read_timeout = 5\n          \n          request = Net::HTTP::Post.new(uri.path)\n          request['Content-Type'] = 'application/json'\n          request['X-Internal-Token'] = ENV.fetch('INTERNAL_SERVICE_TOKEN', '')\n          request.body = { files: files.map { |f| File.basename(f) }, timestamp: Time.now.iso8601 }.to_json\n          \n          response = http.request(request)\n          Rails.logger.info(\"Processing notification sent: #{response.code}\")\n        rescue StandardError => e\n          Rails.logger.warn(\"Failed to notify processing service: #{e.message}\")\n        end\n      end\n    end\n  end\nend",
+  "environment": {
+    "description": "Same Rails application deployed in namespace 'api-workloads' on EKS 1.28. Calico CNI with GlobalNetworkPolicy 'deny-cloud-metadata' applied at cluster scope matching all pods with label app-tier=web. Policy spec: egress deny to CIDR 169.254.169.254/32 on all ports. Additionally, a namespace-scoped NetworkPolicy 'api-workloads-restricted-egress' with podSelector matchLabels app=archive-processor defines egress rules allowing only TCP/443 to endpoints matching label role=internal-api and TCP/5432 to label role=database. Default deny-all egress policy exists for the namespace. Pod runs with securityContext fsGroup 1000, runAsNonRoot true. Note: the Calico policy uses 'order: 100' which means it evaluates after namespace-scoped policies but the deny action takes precedence over any allow in lower-order policies for the specific CIDR match.",
+    "config": {
+      "kubernetes_namespace": "api-workloads",
+      "cni": "calico-3.26",
+      "global_network_policy": {
+        "name": "deny-cloud-metadata",
+        "spec": {
+          "order": 100,
+          "selector": "app-tier == 'web'",
+          "types": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "action": "Deny",
+              "destination": {
+                "nets": [
+                  "169.254.169.254/32"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "namespace_network_policy": {
+        "name": "api-workloads-restricted-egress",
+        "podSelector": {
+          "matchLabels": {
+            "app": "archive-processor"
+          }
+        },
+        "policyTypes": [
+          "Egress"
+        ],
+        "egress": [
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "role": "internal-api"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 443,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "role": "database"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "default_deny_egress": true,
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "fsGroup": 1000,
+        "readOnlyRootFilesystem": false
+      },
+      "pod_labels": {
+        "app": "archive-processor",
+        "app-tier": "web"
+      },
+      "env_vars": {
+        "PROCESSING_CALLBACK_URL": "https://processing.internal-api.svc.cluster.local/callback",
+        "INTERNAL_SERVICE_TOKEN": "eyJhbGciOiJSUzI1NiJ9..."
+      }
+    }
+  }
+}

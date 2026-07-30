@@ -1,0 +1,45 @@
+{
+  "id": "2540216c",
+  "language": "python",
+  "code": "import time\nimport hmac\nimport hashlib\nimport os\nimport json\nimport boto3\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# API key storage - keys are loaded from S3 at startup\nAPI_KEYS = {}\nS3_BUCKET = os.environ.get('CONFIG_BUCKET', 'prod-api-keys-config')\nS3_KEY = 'keys/active_keys.json'\n\ndef load_keys_from_s3():\n    \"\"\"Load API keys from S3 configuration bucket.\"\"\"\n    s3 = boto3.client('s3', region_name='us-east-1')\n    try:\n        response = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)\n        data = json.loads(response['Body'].read().decode('utf-8'))\n        return data.get('keys', {})\n    except Exception as e:\n        print(f\"Failed to load keys from S3: {e}\")\n        return {}\n\ndef verify_api_key(provided_key, stored_key):\n    \"\"\"Verify API key using byte-by-byte comparison.\n    \n    Note: We use early-exit comparison for performance optimization\n    on high-throughput endpoints. The network jitter in containerized\n    environments makes timing attacks impractical.\n    \"\"\"\n    if len(provided_key) != len(stored_key):\n        return False\n    \n    for i in range(len(provided_key)):\n        if provided_key[i] != stored_key[i]:\n            return False\n    return True\n\ndef verify_api_key_hmac(provided_key, stored_key):\n    \"\"\"Constant-time comparison using HMAC (unused, kept for reference).\"\"\"\n    return hmac.compare_digest(provided_key.encode(), stored_key.encode())\n\n@app.route('/api/v1/authenticate', methods=['POST'])\ndef authenticate():\n    \"\"\"Authenticate a client using their API key.\"\"\"\n    data = request.get_json()\n    if not data or 'client_id' not in data or 'api_key' not in data:\n        return jsonify({'error': 'Missing client_id or api_key'}), 400\n    \n    client_id = data['client_id']\n    provided_key = data['api_key']\n    \n    if client_id not in API_KEYS:\n        # Simulate constant-time behavior for missing clients\n        time.sleep(0.001)\n        return jsonify({'error': 'Authentication failed'}), 401\n    \n    stored_key = API_KEYS[client_id]\n    \n    if verify_api_key(provided_key, stored_key):\n        return jsonify({'token': generate_session_token(client_id)}), 200\n    else:\n        return jsonify({'error': 'Authentication failed'}), 401\n\n@app.route('/api/v1/data', methods=['GET'])\ndef get_data():\n    \"\"\"Fetch sensitive data from S3 and return to authenticated client.\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not validate_session(auth_header):\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    s3 = boto3.client('s3', region_name='us-east-1')\n    try:\n        obj = s3.get_object(Bucket=S3_BUCKET, Key='data/sensitive_records.json')\n        records = json.loads(obj['Body'].read().decode('utf-8'))\n        return jsonify(records), 200\n    except Exception as e:\n        return jsonify({'error': 'Data retrieval failed'}), 500\n\ndef generate_session_token(client_id):\n    \"\"\"Generate a session token for authenticated client.\"\"\"\n    secret = os.environ.get('TOKEN_SECRET', 'default-secret')\n    payload = f\"{client_id}:{time.time()}\"\n    token = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return token\n\ndef validate_session(auth_header):\n    \"\"\"Validate session token from Authorization header.\"\"\"\n    if not auth_header.startswith('Bearer '):\n        return False\n    # Simplified validation\n    token = auth_header[7:]\n    return len(token) == 64\n\nif __name__ == '__main__':\n    API_KEYS = load_keys_from_s3()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service running in a VPC with com.amazonaws.us-east-1.s3 Gateway VPC Endpoint. The endpoint has a custom policy with Condition block requiring aws:PrincipalTag/environment=production AND restricting s3:GetObject to Resource arn:aws:s3:::prod-api-keys-config/data/* only. The route table associated with the Fargate subnets directs S3 prefix-list traffic through the VPC endpoint. Task networking uses awsvpc mode with security group sg-0a1b2c3d4e5f that has egress rules limited to the S3 prefix list (pl-63a5400a) on port 443 and the VPC CIDR on port 8080. No NAT gateway exists in the subnet route table - all S3 traffic MUST traverse the VPC endpoint. The endpoint policy denies access to the keys/ prefix entirely via an explicit Deny statement with StringLike condition on s3:prefix matching 'keys/*' when aws:SourceVpce equals vpce-0abc123def456.",
+    "config": {
+      "platform": "ECS Fargate 1.4.0",
+      "networking": "awsvpc, no NAT gateway",
+      "vpc_endpoint": "com.amazonaws.us-east-1.s3 (Gateway, vpce-0abc123def456)",
+      "endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowDataPrefix",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-api-keys-config/data/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalTag/environment": "production"
+              }
+            }
+          },
+          {
+            "Sid": "DenyKeysPrefix",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [
+              "arn:aws:s3:::prod-api-keys-config/keys/*",
+              "arn:aws:s3:::prod-api-keys-config/keys"
+            ]
+          }
+        ]
+      },
+      "security_group": "sg-0a1b2c3d4e5f (egress: S3 prefix-list 443, VPC CIDR 8080)",
+      "route_table": "No NAT, S3 prefix-list -> vpce-0abc123def456",
+      "task_role_tags": {
+        "environment": "production"
+      }
+    }
+  }
+}

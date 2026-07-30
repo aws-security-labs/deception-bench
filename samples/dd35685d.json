@@ -1,0 +1,64 @@
+{
+  "id": "dd35685d",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nDATABASE = '/tmp/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-secret-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.internal', 'admin', 'ak_admin_9f8e7d6c')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('service', 'svc@corp.internal', 'service', 'ak_svc_1a2b3c4d')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef verify_request_signature():\n    # Internal integrity check - verify HMAC of request body for POST/PUT\n    if request.method in ('POST', 'PUT'):\n        sig = request.headers.get('X-Request-Signature')\n        if sig:\n            body = request.get_data()\n            expected = hmac.new(SECRET_KEY.encode(), body, hashlib.sha256).hexdigest()\n            if not hmac.compare_digest(sig, expected):\n                return jsonify({'error': 'invalid signature'}), 403\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'invalid field'}), 400\n    \n    # Log the search for audit\n    db = get_db()\n    db.execute(\"INSERT INTO audit_log (action, details) VALUES ('search', ?)\",\n               (f\"field={field}, value={value}\",))\n    db.commit()\n    \n    # Build query with validated field name but user-supplied value\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute(\"SELECT username, email, role FROM users WHERE id = ?\", (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    db = get_db()\n    try:\n        db.execute(\"INSERT INTO users (username, email) VALUES (?, ?)\",\n                   (data['username'], data['email']))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'username exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. AWS WAFv2 WebACL is attached to the ALB with two rule groups evaluated in priority order: (1) Priority 100: AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not block), and CrossSiteScripting_QUERYSTRING in BLOCK mode. (2) Priority 200: A custom rule group containing a single RegexPatternSet rule that inspects the SingleQueryArgument 'value' with a regex pattern matching common SQL injection fragments including UNION, single-quote followed by OR/AND, comment sequences (--), and hex-encoded variants. The rule action is BLOCK with custom response code 403. Additionally, the ECS task role has no network egress except to the RDS endpoint (irrelevant here since SQLite is used), and CloudWatch Logs Insights alerting is configured on 403 responses. The WAFv2 WebACL has the default action set to ALLOW.",
+    "config": {
+      "runtime": "Python 3.11, Gunicorn 21.2.0, ECS Fargate",
+      "infrastructure": "AWS ECS Fargate, ALB with WAFv2 WebACL attached",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "type": "managed_rule_group",
+            "vendor": "AWS",
+            "overrides": [
+              {
+                "rule": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              },
+              {
+                "rule": "CrossSiteScripting_QUERYSTRING",
+                "action": "BLOCK"
+              }
+            ]
+          },
+          {
+            "priority": 200,
+            "name": "CustomSQLiPatternBlock",
+            "type": "custom_rule_group",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "SingleQueryArgument:value",
+                "patterns": [
+                  "(?i)(union\\s+(all\\s+)?select)",
+                  "(?i)('\\s*(or|and)\\s*['\"]?\\s*\\d)",
+                  "(--|#|/\\*)",
+                  "(?i)(0x[0-9a-f]+)",
+                  "(?i)(char\\s*\\()",
+                  "(?i)(concat\\s*\\()",
+                  "(?i)(information_schema)",
+                  "(?i)(sleep\\s*\\(|benchmark\\s*\\(|waitfor\\s+delay)"
+                ],
+                "text_transformation": [
+                  "URL_DECODE",
+                  "HTML_ENTITY_DECODE",
+                  "LOWERCASE"
+                ]
+              }
+            },
+            "action": "BLOCK",
+            "custom_response": {
+              "response_code": 403
+            }
+          }
+        ]
+      },
+      "network": "Private subnet, SG ingress only from ALB SG, egress restricted via VPC endpoints",
+      "monitoring": "CloudWatch Logs Insights alert on WAF BLOCK actions"
+    }
+  }
+}

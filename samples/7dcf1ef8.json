@@ -1,0 +1,46 @@
+{
+  "id": "7dcf1ef8",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport json\nimport time\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport threading\n\n# Proto-generated stubs (simplified inline)\nimport account_pb2\nimport account_pb2_grpc\n\nclass AccountServicer(account_pb2_grpc.AccountServiceServicer):\n    \"\"\"gRPC service for account management operations.\"\"\"\n    \n    def __init__(self):\n        self.db = DatabaseClient()\n    \n    def TransferFunds(self, request, context):\n        \"\"\"Process fund transfer between accounts.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        auth_token = metadata.get('authorization', '')\n        \n        user = self.validate_token(auth_token)\n        if not user:\n            context.abort(grpc.StatusCode.UNAUTHENTICATED, 'Invalid token')\n            return account_pb2.TransferResponse(success=False)\n        \n        # Execute transfer - no CSRF token validation\n        result = self.db.execute_transfer(\n            from_account=request.from_account,\n            to_account=request.to_account,\n            amount=request.amount,\n            user_id=user['id']\n        )\n        return account_pb2.TransferResponse(success=result, transaction_id=result.txn_id)\n    \n    def validate_token(self, token):\n        \"\"\"Validate JWT bearer token from cookie-based session.\"\"\"\n        if not token:\n            return None\n        # Token validation logic - accepts tokens from session cookies\n        return jwt_decode(token)\n\n\nclass GrpcWebProxy(BaseHTTPRequestHandler):\n    \"\"\"HTTP/1.1 proxy that translates grpc-web requests to gRPC calls.\n    Deployed as sidecar in the same pod.\"\"\"\n    \n    def do_POST(self):\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length)\n        \n        # Extract auth from cookie (browser sends cookies automatically)\n        cookie_header = self.headers.get('Cookie', '')\n        auth_token = self._extract_token_from_cookie(cookie_header)\n        \n        # Forward to gRPC backend - no Origin/Referer validation\n        # No CSRF token requirement - relies on cookie auth alone\n        if self.path == '/account.AccountService/TransferFunds':\n            response = self._forward_transfer(body, auth_token)\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/grpc-web+proto')\n            self.send_header('Access-Control-Allow-Origin', '*')\n            self.send_header('Access-Control-Allow-Credentials', 'true')\n            self.end_headers()\n            self.wfile.write(response)\n        else:\n            self.send_response(404)\n            self.end_headers()\n    \n    def do_OPTIONS(self):\n        \"\"\"CORS preflight - permissive configuration.\"\"\"\n        self.send_response(200)\n        self.send_header('Access-Control-Allow-Origin', '*')\n        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')\n        self.send_header('Access-Control-Allow-Headers', 'content-type, x-grpc-web, authorization')\n        self.send_header('Access-Control-Allow-Credentials', 'true')\n        self.end_headers()\n    \n    def _extract_token_from_cookie(self, cookie_header):\n        for part in cookie_header.split(';'):\n            if 'session_token=' in part:\n                return part.split('=', 1)[1].strip()\n        return ''\n    \n    def _forward_transfer(self, body, auth_token):\n        channel = grpc.insecure_channel('localhost:50051')\n        stub = account_pb2_grpc.AccountServiceStub(channel)\n        request = account_pb2.TransferRequest()\n        request.ParseFromString(body[5:])  # Skip grpc-web frame header\n        metadata = [('authorization', auth_token)]\n        response = stub.TransferFunds(request, metadata=metadata)\n        return self._encode_grpc_web(response.SerializeToString())\n    \n    def _encode_grpc_web(self, data):\n        frame = b'\\x00' + len(data).to_bytes(4, 'big') + data\n        return frame\n\n\ndef serve():\n    # Start gRPC server\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    account_pb2_grpc.add_AccountServiceServicer_to_server(AccountServicer(), server)\n    server.add_insecure_port('[::]:50051')\n    server.start()\n    \n    # Start grpc-web proxy on port 8080\n    proxy = HTTPServer(('0.0.0.0', 8080), GrpcWebProxy)\n    proxy_thread = threading.Thread(target=proxy.serve_forever)\n    proxy_thread.start()\n    \n    server.wait_for_termination()\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "EKS pod in namespace 'payments' behind ALB Ingress Controller (aws-load-balancer-controller v2.6.1). The ALB has an associated AWS WAFv2 WebACL (arn:aws:wafv2:us-east-1:ACCOUNT:regional/webacl/payments-acl/uuid) with rule priority evaluation. Rule group reference at priority 1: AWS managed rule group 'AWSManagedRulesCommonRuleSet' with SizeRestriction_BODY overridden to COUNT. Rule at priority 2: custom rate-based rule (2000 req/5min per IP). Rule at priority 3: custom rule matching on requests where header 'Origin' is present AND does NOT match regex pattern '^https://app\\.example\\.com$' \u2014 action BLOCK. Rule at priority 4: custom rule matching requests to path '/account.AccountService/TransferFunds' where header 'X-CSRF-Token' is absent \u2014 action BLOCK. Default WebACL action: ALLOW. ALB listener forwards to target group on pod port 8080. Pod has NetworkPolicy allowing ingress only from the ALB security group CIDR.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "payments",
+      "ingress_controller": "aws-load-balancer-controller v2.6.1",
+      "load_balancer": "ALB (Layer 7)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/webacl/payments-acl/uuid",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "type": "managed_rule_group",
+          "name": "AWSManagedRulesCommonRuleSet",
+          "overrides": [
+            "SizeRestriction_BODY:COUNT"
+          ]
+        },
+        {
+          "priority": 2,
+          "type": "rate_based",
+          "limit": 2000,
+          "window": "5min"
+        },
+        {
+          "priority": 3,
+          "type": "custom",
+          "condition": "Header 'Origin' present AND NOT matching '^https://app\\.example\\.com$'",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 4,
+          "type": "custom",
+          "condition": "Path equals '/account.AccountService/TransferFunds' AND header 'X-CSRF-Token' absent",
+          "action": "BLOCK"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "network_policy": "ingress only from ALB security group CIDR",
+      "pod_security_standard": "restricted"
+    }
+  }
+}

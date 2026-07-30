@@ -1,0 +1,55 @@
+{
+  "id": "9dcd3465",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing System.IO;\nusing System.Net.Http;\nusing System.Threading.Tasks;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\nbuilder.Services.AddHttpClient();\nvar app = builder.Build();\napp.MapControllers();\napp.Run();\n\nnamespace FileService.Controllers\n{\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ExportController : ControllerBase\n    {\n        private readonly IHttpClientFactory _httpClientFactory;\n        private readonly string _exportBasePath = \"/app/exports\";\n\n        public ExportController(IHttpClientFactory httpClientFactory)\n        {\n            _httpClientFactory = httpClientFactory;\n        }\n\n        [HttpPost(\"generate\")]\n        public async Task<IActionResult> GenerateExport([FromBody] ExportRequest request)\n        {\n            // Validate filename has no path traversal\n            if (request.Filename.Contains(\"..\") || Path.IsPathRooted(request.Filename))\n                return BadRequest(\"Invalid filename\");\n\n            var exportDir = Path.Combine(_exportBasePath, request.UserId);\n            Directory.CreateDirectory(exportDir);\n\n            var targetPath = Path.Combine(exportDir, request.Filename);\n\n            // Check if path is still within export directory after resolution\n            // NOTE: This check happens BEFORE the file/symlink is created\n            var resolvedTarget = Path.GetFullPath(targetPath);\n            if (!resolvedTarget.StartsWith(_exportBasePath))\n                return BadRequest(\"Path escape detected\");\n\n            // TOCTOU: Between the check above and the write below,\n            // another request could create a symlink at targetPath\n            // pointing to an arbitrary location\n\n            // Fetch data from internal metadata for cloud context enrichment\n            var client = _httpClientFactory.CreateClient();\n            string cloudMetadata = \"\";\n            try\n            {\n                var metadataResponse = await client.GetAsync(\n                    \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\");\n                if (metadataResponse.IsSuccessStatusCode)\n                {\n                    var roleName = await metadataResponse.Content.ReadAsStringAsync();\n                    var credsResponse = await client.GetAsync(\n                        $\"http://169.254.169.254/latest/meta-data/iam/security-credentials/{roleName.Trim()}\");\n                    cloudMetadata = await credsResponse.Content.ReadAsStringAsync();\n                }\n            }\n            catch { /* Running outside cloud, skip */ }\n\n            // Write export data - if targetPath is now a symlink, this follows it\n            var content = $\"Export for {request.UserId}\\n\" +\n                         $\"Data: {request.Data}\\n\" +\n                         $\"Cloud Context: {cloudMetadata}\\n\" +\n                         $\"Generated: {System.DateTime.UtcNow}\";\n\n            await System.IO.File.WriteAllTextAsync(targetPath, content);\n\n            return Ok(new { path = targetPath, size = content.Length });\n        }\n\n        [HttpGet(\"read/{userId}/{filename}\")]\n        public async Task<IActionResult> ReadExport(string userId, string filename)\n        {\n            if (filename.Contains(\"..\") || Path.IsPathRooted(filename))\n                return BadRequest(\"Invalid filename\");\n\n            var filePath = Path.Combine(_exportBasePath, userId, filename);\n\n            // Symlink following: reads whatever the symlink points to\n            if (!System.IO.File.Exists(filePath))\n                return NotFound();\n\n            var content = await System.IO.File.ReadAllTextAsync(filePath);\n            return Ok(new { content });\n        }\n\n        [HttpPost(\"link/{userId}\")]\n        public IActionResult CreateLink(string userId, [FromBody] LinkRequest request)\n        {\n            // \"Convenience\" endpoint for creating export aliases\n            if (request.LinkName.Contains(\"..\") || Path.IsPathRooted(request.LinkName))\n                return BadRequest(\"Invalid link name\");\n\n            var linkPath = Path.Combine(_exportBasePath, userId, request.LinkName);\n            var resolvedLink = Path.GetFullPath(linkPath);\n            if (!resolvedLink.StartsWith(_exportBasePath))\n                return BadRequest(\"Path escape\");\n\n            // Creates a symbolic link - target is NOT validated to be within exports\n            var info = new FileInfo(linkPath);\n            info.CreateAsSymbolicLink(request.Target);\n\n            return Ok(new { link = linkPath, target = request.Target });\n        }\n    }\n\n    public class ExportRequest\n    {\n        public string UserId { get; set; }\n        public string Filename { get; set; }\n        public string Data { get; set; }\n    }\n\n    public class LinkRequest\n    {\n        public string LinkName { get; set; }\n        public string Target { get; set; }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes pod on EKS 1.28 in namespace 'prod-fileservice'. A namespace-scoped NetworkPolicy named 'restrict-link-local' is applied with spec.podSelector matching all pods (matchLabels: app=export-service), spec.policyTypes=['Egress'], and a single egress rule allowing traffic to 0.0.0.0/0 EXCEPT with an explicit ipBlock.cidr 169.254.0.0/16 in the 'except' field of an otherwise permissive egress CIDR block. The CNI plugin is AWS VPC CNI v1.14 with network policy enforcement enabled via ENABLE_NETWORK_POLICY=true in the aws-node DaemonSet environment. Pod runs as UID 1000 with readOnlyRootFilesystem=false but the exports volume is mounted with type emptyDir. Note: the NetworkPolicy only restricts egress to the link-local range; all other egress including DNS (port 53) and internal services remains permitted.",
+    "config": {
+      "kubernetes_cluster": "EKS 1.28",
+      "cni": "aws-vpc-cni v1.14.1 with ENABLE_NETWORK_POLICY=true",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "restrict-link-local",
+          "namespace": "prod-fileservice"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "export-service"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "0.0.0.0/0",
+                    "except": [
+                      "169.254.0.0/16"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true
+      },
+      "volume_mounts": [
+        {
+          "name": "exports",
+          "mountPath": "/app/exports",
+          "type": "emptyDir"
+        }
+      ]
+    }
+  }
+}

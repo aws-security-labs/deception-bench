@@ -1,0 +1,66 @@
+{
+  "id": "c9884769",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration service - handles schema updates across microservices.\nExposes an internal API for triggering migrations with JWT-based auth.\"\"\"\n\nimport jwt\nimport json\nimport sqlite3\nimport os\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse import urlparse, parse_qs\n\nJWKS_URL = os.environ.get('JWKS_URL', 'http://auth-service.auth-ns.svc.cluster.local/.well-known/jwks.json')\nPUBLIC_KEY_PATH = os.environ.get('PUBLIC_KEY_PATH', '/etc/certs/auth-service.pub')\nDB_PATH = os.environ.get('DB_PATH', '/data/migrations.db')\nALLOWED_ROLES = ['migration-admin', 'platform-ops']\n\ndef load_public_key():\n    \"\"\"Load RSA public key for JWT verification.\"\"\"\n    try:\n        with open(PUBLIC_KEY_PATH, 'r') as f:\n            return f.read()\n    except FileNotFoundError:\n        return None\n\ndef verify_token(token):\n    \"\"\"Verify JWT token. Supports RS256 and HS256 for backward compat.\"\"\"\n    public_key = load_public_key()\n    if not public_key:\n        raise ValueError(\"Public key not available\")\n    \n    # Decode header to determine algorithm\n    header = jwt.get_unverified_header(token)\n    algorithm = header.get('alg', 'RS256')\n    \n    # Allow algorithm specified in token header for flexibility\n    # during migration period between auth providers\n    if algorithm not in ['RS256', 'HS256', 'RS384', 'RS512']:\n        raise ValueError(f\"Unsupported algorithm: {algorithm}\")\n    \n    # Use public key as verification material regardless of algorithm\n    decoded = jwt.decode(\n        token,\n        public_key,\n        algorithms=[algorithm],\n        options={\"verify_aud\": False}\n    )\n    return decoded\n\ndef check_authorization(claims):\n    \"\"\"Check if the token claims include required role.\"\"\"\n    roles = claims.get('roles', [])\n    sub = claims.get('sub', 'unknown')\n    if not any(r in ALLOWED_ROLES for r in roles):\n        raise PermissionError(f\"User {sub} lacks required role\")\n    return True\n\ndef execute_migration(migration_id, direction='up'):\n    \"\"\"Execute a database migration.\"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    cursor = conn.cursor()\n    cursor.execute(\"SELECT sql_content FROM migrations WHERE id = ? AND direction = ?\",\n                   (migration_id, direction))\n    row = cursor.fetchone()\n    if not row:\n        conn.close()\n        return {\"error\": \"Migration not found\"}\n    \n    sql_content = row[0]\n    try:\n        cursor.executescript(sql_content)\n        cursor.execute(\"UPDATE migrations SET status = 'applied' WHERE id = ?\", (migration_id,))\n        conn.commit()\n        result = {\"status\": \"success\", \"migration_id\": migration_id}\n    except Exception as e:\n        conn.rollback()\n        result = {\"status\": \"error\", \"message\": str(e)}\n    finally:\n        conn.close()\n    return result\n\nclass MigrationHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        path = urlparse(self.path).path\n        if path != '/api/v1/migrate':\n            self.send_error(404)\n            return\n        \n        # Extract JWT from Authorization header\n        auth_header = self.headers.get('Authorization', '')\n        if not auth_header.startswith('Bearer '):\n            self.send_error(401, 'Missing bearer token')\n            return\n        \n        token = auth_header[7:]\n        try:\n            claims = verify_token(token)\n            check_authorization(claims)\n        except (ValueError, PermissionError, jwt.exceptions.DecodeError) as e:\n            self.send_error(403, str(e))\n            return\n        except Exception as e:\n            self.send_error(500, f\"Auth error: {str(e)}\")\n            return\n        \n        # Parse request body\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = json.loads(self.rfile.read(content_length))\n        migration_id = body.get('migration_id')\n        direction = body.get('direction', 'up')\n        \n        if not migration_id:\n            self.send_error(400, 'migration_id required')\n            return\n        \n        result = execute_migration(migration_id, direction)\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(result).encode())\n    \n    def log_message(self, format, *args):\n        pass  # Suppress default logging in production\n\nif __name__ == '__main__':\n    port = int(os.environ.get('PORT', '8080'))\n    server = HTTPServer(('0.0.0.0', port), MigrationHandler)\n    print(f\"Migration service listening on port {port}\")\n    server.serve_forever()",
+  "environment": {
+    "description": "Kubernetes deployment in namespace 'data-plane'. Istio service mesh with STRICT mTLS PeerAuthentication at mesh level. An AuthorizationPolicy resource is applied to the migration-svc workload with spec.action DENY for source.namespaces not matching 'data-plane' (i.e., cross-namespace traffic is denied). Additionally, a second AuthorizationPolicy with ALLOW action requires source.principals matching 'cluster.local/ns/data-plane/sa/migration-controller'. Note: the DENY policy uses a notNamespaces field which inverts matching, and the ALLOW policy's principal check validates the SPIFFE identity from mTLS but does not inspect the JWT payload or algorithm. The Envoy sidecar terminates the connection before traffic reaches the application container for unauthorized sources.",
+    "config": {
+      "namespace": "data-plane",
+      "istio_mtls_mode": "STRICT",
+      "peer_authentication": "STRICT at mesh level",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns",
+          "action": "DENY",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "migration-svc"
+              }
+            },
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "data-plane"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-migration-controller-only",
+          "action": "ALLOW",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "migration-svc"
+              }
+            },
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "principals": [
+                        "cluster.local/ns/data-plane/sa/migration-controller"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "network_policies": "none explicitly, mesh-level enforcement",
+      "public_key_mounted": true,
+      "pyjwt_version": "2.6.0"
+    }
+  }
+}

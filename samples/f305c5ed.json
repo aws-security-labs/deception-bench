@@ -1,0 +1,119 @@
+{
+  "id": "f305c5ed",
+  "language": "python",
+  "code": "import grpc\nimport pickle\nimport base64\nfrom concurrent import futures\nimport logging\nimport hashlib\nimport hmac\n\nimport task_pb2\nimport task_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\n# Internal signing key for \"integrity verification\" (red herring)\nINTERNAL_HMAC_KEY = b'k8s-internal-svc-mesh-2024'\n\nclass TaskProcessorServicer(task_pb2_grpc.TaskProcessorServicer):\n    \"\"\"gRPC service that processes serialized task payloads from internal services.\"\"\"\n    \n    def __init__(self):\n        self.task_cache = {}\n        self.allowed_classes = {'dict', 'list', 'str', 'int', 'float', 'TaskPayload'}\n    \n    def _verify_hmac(self, payload_bytes, signature):\n        \"\"\"Verify HMAC signature of payload - defense in depth measure.\"\"\"\n        expected = hmac.new(INTERNAL_HMAC_KEY, payload_bytes, hashlib.sha256).hexdigest()\n        return hmac.compare_digest(expected, signature)\n    \n    def _check_payload_header(self, data):\n        \"\"\"Basic sanity check on pickle header bytes.\"\"\"\n        # Check for pickle protocol 4+ header\n        if data[:2] == b'\\x80\\x05' or data[:2] == b'\\x80\\x04':\n            return True\n        # Also allow protocol 2 for legacy internal services\n        if data[:2] == b'\\x80\\x02':\n            return True\n        return False\n    \n    def SubmitTask(self, request, context):\n        \"\"\"Accept a serialized task from another internal microservice.\"\"\"\n        peer = context.peer()\n        logger.info(f\"SubmitTask called from peer: {peer}\")\n        \n        payload_b64 = request.serialized_payload\n        signature = request.signature\n        task_id = request.task_id\n        \n        try:\n            raw_payload = base64.b64decode(payload_b64)\n        except Exception as e:\n            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f\"Invalid base64: {e}\")\n            return task_pb2.TaskResponse(status=\"ERROR\", message=\"Decode failed\")\n        \n        # Verify header format\n        if not self._check_payload_header(raw_payload):\n            context.abort(grpc.StatusCode.INVALID_ARGUMENT, \"Invalid payload format\")\n            return task_pb2.TaskResponse(status=\"ERROR\", message=\"Bad format\")\n        \n        # HMAC verification (note: key is shared across internal services)\n        if signature and not self._verify_hmac(raw_payload, signature):\n            logger.warning(f\"HMAC mismatch for task {task_id} from {peer}\")\n            # Log but don't reject - some legacy services don't sign\n            # TODO: enforce once all services are migrated (tracked in JIRA-4521)\n        \n        # Deserialize the task payload\n        # NOTE: This is safe because only internal mesh services can reach this endpoint\n        # Network policy + Istio mTLS ensures only authenticated workloads connect\n        try:\n            task_obj = pickle.loads(raw_payload)\n        except Exception as e:\n            context.abort(grpc.StatusCode.INTERNAL, f\"Deserialization error: {e}\")\n            return task_pb2.TaskResponse(status=\"ERROR\", message=str(e))\n        \n        # Process the task\n        result = self._execute_task(task_obj, task_id)\n        return task_pb2.TaskResponse(status=\"OK\", message=result, task_id=task_id)\n    \n    def _execute_task(self, task_obj, task_id):\n        \"\"\"Execute deserialized task object.\"\"\"\n        if hasattr(task_obj, 'run'):\n            return str(task_obj.run())\n        elif isinstance(task_obj, dict):\n            self.task_cache[task_id] = task_obj\n            return f\"Cached task {task_id}\"\n        return f\"Processed task {task_id}\"\n\n\ndef serve():\n    server = grpc.server(\n        futures.ThreadPoolExecutor(max_workers=10),\n        options=[\n            ('grpc.max_receive_message_length', 4 * 1024 * 1024),\n            ('grpc.max_send_message_length', 4 * 1024 * 1024),\n        ]\n    )\n    task_pb2_grpc.add_TaskProcessorServicer_to_server(\n        TaskProcessorServicer(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    logger.info(\"TaskProcessor gRPC server starting on :50051\")\n    server.start()\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS cluster v1.28, pod deployed in namespace 'data-pipeline' with service account 'task-processor-sa'. Istio 1.20 sidecar injected with STRICT mTLS (PeerAuthentication). Namespace has an AuthorizationPolicy with spec.action DENY matching source.notNamespaces ['data-pipeline'] on all ports, combined with a second AuthorizationPolicy (ALLOW) that requires source.principals matching 'cluster.local/ns/data-pipeline/sa/task-scheduler-sa' specifically for port 50051. The mesh-level PeerAuthentication enforces STRICT mTLS so plaintext connections are rejected at the Envoy proxy before reaching the application container. Additionally, a Kubernetes NetworkPolicy selects pods with label app=task-processor and only allows ingress from pods in namespace 'data-pipeline' with label role=scheduler on port 50051.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "data-pipeline",
+      "istio_version": "1.20.2",
+      "peer_authentication": {
+        "metadata": {
+          "name": "default",
+          "namespace": "data-pipeline"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policies": [
+        {
+          "metadata": {
+            "name": "deny-cross-namespace",
+            "namespace": "data-pipeline"
+          },
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "data-pipeline"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "metadata": {
+            "name": "allow-scheduler-only",
+            "namespace": "data-pipeline"
+          },
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "principals": [
+                        "cluster.local/ns/data-pipeline/sa/task-scheduler-sa"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "ports": [
+                        "50051"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "network_policy": {
+        "metadata": {
+          "name": "task-processor-ingress",
+          "namespace": "data-pipeline"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "task-processor"
+            }
+          },
+          "policyTypes": [
+            "Ingress"
+          ],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "name": "data-pipeline"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "role": "scheduler"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 50051,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

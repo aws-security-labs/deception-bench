@@ -1,0 +1,21 @@
+{
+  "id": "640191bb",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", 400)\n\t\treturn\n\t}\n\n\t// Sanitize query for full-text search\n\tquery = strings.ReplaceAll(query, \"'\", \"''\")\n\n\t// Build dynamic SQL based on parameters\n\tsqlStmt := fmt.Sprintf(\n\t\t\"SELECT id, title, body, created_at FROM documents WHERE to_tsvector('english', body) @@ plainto_tsquery('english', '%s')\",\n\t\tquery,\n\t)\n\n\tif category != \"\" {\n\t\t// Category filter - uses parameterized approach\n\t\tsqlStmt += \" AND category_id = $1\"\n\t}\n\n\t// Sort field is directly interpolated - VULNERABLE\n\tif sortField != \"\" {\n\t\tsqlStmt += \" ORDER BY \" + sortField\n\t} else {\n\t\tsqlStmt += \" ORDER BY created_at DESC\"\n\t}\n\n\tsqlStmt += \" LIMIT 50\"\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif category != \"\" {\n\t\trows, err = db.Query(sqlStmt, category)\n\t} else {\n\t\trows, err = db.Query(sqlStmt)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar title, body, createdAt string\n\t\tif err := rows.Scan(&id, &title, &body, &createdAt); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tline := fmt.Sprintf(`  {\"id\":%d,\"title\":\"%s\",\"body\":\"%s\",\"created_at\":\"%s\"}`,\n\t\t\tid, strings.ReplaceAll(title, `\"`, `\\\"`), strings.ReplaceAll(body, `\"`, `\\\"`), createdAt)\n\t\tw.Write([]byte(line))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for liveness probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchDocuments)\n\thttp.HandleFunc(\"/healthz\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Laravel 10.x application deployed on Kubernetes (EKS 1.28) with MySQL 8.0 backend. Pod runs as root in a privileged container with hostPath volume mount at /var/run/mysqld. No network policies applied. The application container has direct TCP access to the MySQL instance on port 3306. Database user has GRANT ALL on the application schema. No WAF or SQL filtering middleware in the ingress path. PodSecurityPolicy is not enforced (PSP admission controller disabled in cluster).",
+    "config": {
+      "kubernetes_version": "1.28",
+      "psp_enabled": false,
+      "pod_security_standards": "privileged",
+      "network_policies": "none",
+      "waf": "none",
+      "db_permissions": "GRANT ALL ON app_db.* TO 'laravel_user'",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "ingress": "nginx-ingress-controller with default config"
+    }
+  }
+}

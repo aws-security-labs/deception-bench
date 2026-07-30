@@ -1,0 +1,39 @@
+{
+  "id": "f2e5d5cf",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify, g\nimport psycopg2\nimport psycopg2.extras\nimport os\nimport hashlib\nimport time\n\napp = flask.Flask(__name__)\n\nDB_DSN = os.environ.get('DATABASE_URL', 'postgresql://webapp:webapp@db:5432/appdb')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(DB_DSN)\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports flexible filtering.\"\"\"\n    query_field = request.args.get('field', 'username')\n    query_value = request.args.get('q', '')\n    page = request.args.get('page', '1')\n    limit = request.args.get('limit', '20')\n    \n    # Validate page and limit are integers\n    try:\n        page = int(page)\n        limit = min(int(limit), 100)\n    except ValueError:\n        return jsonify({'error': 'Invalid pagination'}), 400\n    \n    offset = (page - 1) * limit\n    \n    # Field whitelist - but note the LIKE pattern is still user-controlled\n    allowed_fields = ['username', 'email', 'display_name', 'department', 'role']\n    if query_field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    \n    # Build query - field is validated above, but value goes into LIKE\n    sql = f\"SELECT id, username, email, display_name, department, role, created_at FROM users WHERE {query_field} LIKE %s ORDER BY created_at DESC LIMIT %s OFFSET %s\"\n    \n    cur.execute(sql, (f'%{query_value}%', limit, offset))\n    results = cur.fetchall()\n    \n    return jsonify({'users': results, 'page': page, 'limit': limit})\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report with custom SQL for authorized analysts.\"\"\"\n    auth_token = request.headers.get('X-Auth-Token', '')\n    if not _verify_analyst_token(auth_token):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    report_type = request.json.get('type', '')\n    filters = request.json.get('filters', {})\n    \n    conn = get_db()\n    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    \n    if report_type == 'custom':\n        # Custom query support for analysts\n        custom_query = request.json.get('query', '')\n        # Basic sanitization - remove obvious dangerous patterns\n        dangerous = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE', '--', ';']\n        query_upper = custom_query.upper()\n        for d in dangerous:\n            if d in query_upper:\n                return jsonify({'error': f'Disallowed keyword: {d}'}), 400\n        \n        cur.execute(custom_query)\n        results = cur.fetchall()\n    elif report_type == 'department_summary':\n        dept = filters.get('department', '')\n        sql = \"SELECT department, COUNT(*) as cnt, MAX(created_at) as latest FROM users WHERE department = '\" + dept + \"' GROUP BY department\"\n        cur.execute(sql)\n        results = cur.fetchall()\n    else:\n        return jsonify({'error': 'Unknown report type'}), 400\n    \n    return jsonify({'report': results})\n\ndef _verify_analyst_token(token):\n    \"\"\"Verify analyst bearer token against stored hashes.\"\"\"\n    if not token:\n        return False\n    token_hash = hashlib.sha256(token.encode()).hexdigest()\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT 1 FROM analyst_tokens WHERE token_hash = %s AND expires_at > NOW()\", (token_hash,))\n    return cur.fetchone() is not None\n\n@app.route('/api/users/<int:user_id>/notes', methods=['POST'])\ndef add_user_note(user_id):\n    \"\"\"Add a note to a user profile.\"\"\"\n    auth_token = request.headers.get('X-Auth-Token', '')\n    if not _verify_analyst_token(auth_token):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    note_text = request.json.get('note', '')\n    conn = get_db()\n    cur = conn.cursor()\n    # Parameterized - this one is safe\n    cur.execute(\"INSERT INTO user_notes (user_id, note, created_at) VALUES (%s, %s, NOW())\", (user_id, note_text))\n    conn.commit()\n    return jsonify({'status': 'ok'}), 201\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Celery worker deployed in Kubernetes pod with a read-only root filesystem overlay. The /var/lib/exports path is backed by an emptyDir volume with a 500Mi size limit. The pod runs with a seccomp profile (RuntimeDefault augmented with a custom profile that denies symlink/symlinkat syscalls via SCMP_ACT_ERRNO). Additionally, the pod security context sets allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, and drops ALL capabilities. The /tmp/export_staging is a separate emptyDir tmpfs mount. The node kernel has fs.protected_symlinks=1 (Ubuntu default). PostgreSQL connection uses a dedicated role 'export_worker_ro' with SELECT-only grants and RLS policy: CREATE POLICY tenant_iso ON documents USING (tenant_id = current_setting('app.current_tenant')::uuid); the role cannot UPDATE the filename column. Note: the seccomp profile is loaded via a localhost/ profile reference in the pod annotation, not a full OCI hook \u2014 the profile JSON explicitly lists 'symlink' and 'symlinkat' in the denied syscalls array with SCMP_ACT_ERRNO action.",
+    "config": {
+      "runtime": "Kubernetes 1.28, containerd 1.7",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "seccomp_profile": {
+        "type": "Localhost",
+        "localhostProfile": "profiles/export-worker-hardened.json",
+        "denied_syscalls": [
+          "symlink",
+          "symlinkat"
+        ],
+        "default_action": "SCMP_ACT_ALLOW",
+        "deny_action": "SCMP_ACT_ERRNO"
+      },
+      "volumes": {
+        "/var/lib/exports": "emptyDir (500Mi limit, not host-bound)",
+        "/tmp/export_staging": "emptyDir (tmpfs, 200Mi)"
+      },
+      "kernel_params": "fs.protected_symlinks=1",
+      "db_role": "export_worker_ro (SELECT only, no UPDATE/INSERT on documents)",
+      "db_rls": "CREATE POLICY tenant_iso ON documents USING (tenant_id = current_setting('app.current_tenant')::uuid)"
+    }
+  }
+}

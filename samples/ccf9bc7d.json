@@ -1,0 +1,26 @@
+{
+  "id": "ccf9bc7d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype AuditEntry struct {\n\tAction string `json:\"action\"`\n\tUser   string `json:\"user\"`\n\tDetail string `json:\"detail\"`\n}\n\nfunc logAudit(entry AuditEntry) {\n\tdata, _ := json.Marshal(entry)\n\tlog.Printf(\"AUDIT: %s\", string(data))\n}\n\n// sanitizeForDisplay removes angle brackets to prevent XSS in responses\nfunc sanitizeForDisplay(input string) string {\n\tinput = strings.ReplaceAll(input, \"<\", \"&lt;\")\n\tinput = strings.ReplaceAll(input, \">\", \"&gt;\")\n\treturn input\n}\n\nfunc handleInventorySearch(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\twarehouse := r.URL.Query().Get(\"warehouse\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category parameter required\", 400)\n\t\treturn\n\t}\n\n\t// Build query with warehouse filter\n\tquery := fmt.Sprintf(\n\t\t\"SELECT item_id, name, quantity, unit_price FROM inventory WHERE category = '%s'\",\n\t\tcategory,\n\t)\n\n\tif warehouse != \"\" {\n\t\tquery += fmt.Sprintf(\" AND warehouse_code = '%s'\", warehouse)\n\t}\n\n\tquery += \" ORDER BY name LIMIT 100\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlogAudit(AuditEntry{Action: \"search_error\", Detail: err.Error()})\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\ttype Item struct {\n\t\tID       int     `json:\"id\"`\n\t\tName     string  `json:\"name\"`\n\t\tQuantity int     `json:\"quantity\"`\n\t\tPrice    float64 `json:\"price\"`\n\t}\n\n\tvar items []Item\n\tfor rows.Next() {\n\t\tvar item Item\n\t\tif err := rows.Scan(&item.ID, &item.Name, &item.Quantity, &item.Price); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\titem.Name = sanitizeForDisplay(item.Name)\n\t\titems = append(items, item)\n\t}\n\n\tlogAudit(AuditEntry{Action: \"inventory_search\", User: r.Header.Get(\"X-Auth-User\"), Detail: category})\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(items)\n}\n\nfunc handleHealthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdefer db.Close()\n\n\tdb.SetMaxOpenConns(10)\n\tdb.SetMaxIdleConns(5)\n\n\thttp.HandleFunc(\"/api/inventory/search\", handleInventorySearch)\n\thttp.HandleFunc(\"/health\", handleHealthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has two listener rules applied in priority order. Priority 1: a custom rule matching path pattern /api/users/search with a fixed query-string condition requiring the presence of a 'token' key, forwarding to the target group. Priority 2: AWS WAF WebACL association with rule group containing (a) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to BLOCK for query strings exceeding 128 bytes, and (b) a custom regex-match rule on query string values using pattern `['\";\\-\\-]|UNION|SELECT|OR\\s+\\d+=\\d+` with BLOCK action and priority 0 (evaluated first). The ECS task role has no network egress except to the RDS proxy endpoint (not relevant here but noted). The container runs with a read-only root filesystem and the SQLite DB is mounted from an EFS volume with uid-restricted access.",
+    "config": {
+      "load_balancer": "ALB with HTTP/HTTPS listener",
+      "waf_web_acl": {
+        "rule_1_priority_0": {
+          "name": "custom-sqli-query-regex",
+          "statement": "RegexMatchStatement on AllQueryArguments with pattern ['\";\\-\\-]|UNION|SELECT|OR\\s+\\d+=\\d+",
+          "action": "BLOCK"
+        },
+        "rule_2_priority_1": {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING action BLOCK at 128 bytes"
+        }
+      },
+      "alb_listener_rule_priority_1": "path=/api/users/search requires query-string key 'token' present",
+      "ecs_task_network": "egress restricted to VPC endpoints only",
+      "container_filesystem": "read-only root, EFS mount at /var/lib/app with uid=1000 restriction",
+      "runtime": "gunicorn --workers 2 --bind 0.0.0.0:8080 app:app"
+    }
+  }
+}

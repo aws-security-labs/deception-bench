@@ -1,0 +1,24 @@
+{
+  "id": "c4f1a439",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"archive/zip\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n)\n\nconst uploadDir = \"/var/app/uploads\"\nconst extractDir = \"/var/app/extracted\"\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/upload\", uploadHandler)\n\thttp.HandleFunc(\"/extract\", extractHandler)\n\tfmt.Println(\"Starting archive service on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc uploadHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tfile, header, err := r.FormFile(\"archive\")\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to read file\", http.StatusBadRequest)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Only accept .zip files\n\tif !strings.HasSuffix(header.Filename, \".zip\") {\n\t\thttp.Error(w, \"Only .zip files accepted\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tos.MkdirAll(uploadDir, 0755)\n\tdst, err := os.Create(filepath.Join(uploadDir, header.Filename))\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to save file\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer dst.Close()\n\tio.Copy(dst, file)\n\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(fmt.Sprintf(`{\"saved\":\"%s\"}`, header.Filename)))\n}\n\nfunc extractHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tfilename := r.FormValue(\"filename\")\n\tif filename == \"\" {\n\t\thttp.Error(w, \"filename required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize the filename parameter itself\n\tfilename = filepath.Base(filename)\n\tarchivePath := filepath.Join(uploadDir, filename)\n\n\treader, err := zip.OpenReader(archivePath)\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to open archive\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer reader.Close()\n\n\tos.MkdirAll(extractDir, 0755)\n\n\tvar extracted []string\n\tfor _, f := range reader.File {\n\t\t// Attempt to prevent directory traversal by cleaning the path\n\t\tcleanName := filepath.Clean(f.Name)\n\t\t// Note: filepath.Clean does NOT strip leading \"../\" sequences\n\t\t// when they resolve above the root - this is the vulnerability\n\t\ttargetPath := filepath.Join(extractDir, cleanName)\n\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(targetPath, f.Mode())\n\t\t\tcontinue\n\t\t}\n\n\t\tos.MkdirAll(filepath.Dir(targetPath), 0755)\n\t\toutFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())\n\t\tif err != nil {\n\t\t\tcontinue\n\t\t}\n\n\t\trc, err := f.Open()\n\t\tif err != nil {\n\t\t\toutFile.Close()\n\t\t\tcontinue\n\t\t}\n\n\t\tio.Copy(outFile, rc)\n\t\trc.Close()\n\t\toutFile.Close()\n\t\textracted = append(extracted, targetPath)\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(fmt.Sprintf(`{\"extracted\":%d}`, len(extracted))))\n}\n",
+  "environment": {
+    "description": "Service deployed on ECS Fargate in an isolated subnet (no NAT, no IGW route). Subnet route table contains only local VPC CIDR route (10.0.0.0/16 -> local). Service is fronted by a Network Load Balancer registered as an AWS PrivateLink endpoint service (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f). Consumers connect via interface VPC endpoint in their own VPC. The endpoint service has an allowlist of specific AWS account IDs (principal ARNs) that can create endpoint connections, and requires manual acceptance. The NLB target group health check path is /health. There is no internet gateway, no NAT gateway, and no VPC peering to any VPC with internet access in the account. The subnet's network ACL denies all inbound traffic from 0.0.0.0/0 except from the 10.0.0.0/8 range. DNS resolution for the service is only available via the VPC endpoint's private DNS name.",
+    "config": {
+      "network": "isolated subnet, route table: 10.0.0.0/16 -> local only",
+      "nat_gateway": "none",
+      "internet_gateway": "none in VPC",
+      "vpc_peering": "none with internet-routable VPCs",
+      "nlb": "internal, registered as PrivateLink endpoint service",
+      "endpoint_service": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f",
+      "acceptance_required": true,
+      "allowed_principals": [
+        "arn:aws:iam::111122223333:root",
+        "arn:aws:iam::444455556666:root"
+      ],
+      "network_acl": "deny inbound from 0.0.0.0/0, allow 10.0.0.0/8",
+      "container": "root user, rw filesystem",
+      "dns": "private hosted zone only, no public DNS"
+    }
+  }
+}

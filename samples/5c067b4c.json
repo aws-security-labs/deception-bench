@@ -1,0 +1,27 @@
+{
+  "id": "5c067b4c",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse import urlparse, parse_qs\nimport json\nimport time\n\nDB_PATH = '/var/data/app.db'\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, role TEXT, api_key TEXT)')\n    c.execute('CREATE TABLE IF NOT EXISTS sessions (token TEXT, user_id INTEGER, expires INTEGER)')\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (1, 'admin', 'admin@corp.internal', 'superadmin', 'sk-9f8e7d6c5b4a3210')\")\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (2, 'svc-reader', 'reader@corp.internal', 'readonly', 'sk-1a2b3c4d5e6f7890')\")\n    conn.commit()\n    conn.close()\n\ndef validate_session(token):\n    \"\"\"Check if session token is valid and not expired\"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('SELECT user_id FROM sessions WHERE token = ? AND expires > ?', (token, int(time.time())))\n    row = c.fetchone()\n    conn.close()\n    return row[0] if row else None\n\ndef get_user_role(user_id):\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('SELECT role FROM users WHERE id = ?', (user_id,))\n    row = c.fetchone()\n    conn.close()\n    return row[0] if row else None\n\nclass AppHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urlparse(self.path)\n        params = parse_qs(parsed.query)\n\n        if parsed.path == '/api/v2/users/lookup':\n            # Session validation\n            session_token = self.headers.get('X-Session-Token', '')\n            user_id = validate_session(session_token)\n            if not user_id:\n                self.send_response(401)\n                self.end_headers()\n                self.wfile.write(b'{\"error\":\"unauthorized\"}')\n                return\n\n            # Role check - only admins can search\n            role = get_user_role(user_id)\n            if role not in ('superadmin', 'admin'):\n                self.send_response(403)\n                self.end_headers()\n                self.wfile.write(b'{\"error\":\"forbidden\"}')\n                return\n\n            # Get search parameters\n            search_field = params.get('field', ['username'])[0]\n            search_value = params.get('q', [''])[0]\n\n            # Field whitelist check\n            allowed_fields = ['username', 'email', 'role']\n            if search_field not in allowed_fields:\n                self.send_response(400)\n                self.end_headers()\n                self.wfile.write(b'{\"error\":\"invalid field\"}')\n                return\n\n            # NOTE: search_field is validated above, but search_value is user input\n            # The developer assumed the session+role check is sufficient access control\n            query = f\"SELECT id, username, email, role FROM users WHERE {search_field} LIKE '%{search_value}%'\"\n\n            conn = sqlite3.connect(DB_PATH)\n            c = conn.cursor()\n            try:\n                c.execute(query)\n                results = [{'id': r[0], 'username': r[1], 'email': r[2], 'role': r[3]} for r in c.fetchall()]\n                self.send_response(200)\n                self.send_header('Content-Type', 'application/json')\n                self.end_headers()\n                self.wfile.write(json.dumps({'results': results}).encode())\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(json.dumps({'error': str(e)}).encode())\n            finally:\n                conn.close()\n\n        elif parsed.path == '/health':\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(b'{\"status\":\"ok\"}')\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def log_message(self, format, *args):\n        pass\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), AppHandler)\n    server.serve_forever()",
+  "environment": {
+    "description": "FastAPI application packaged as a Lambda function behind a Lambda Function URL. The Function URL is configured with AuthType=AWS_IAM. The Lambda execution role has a resource-based policy that only grants lambda:InvokeFunctionUrl to principals within the same AWS Organization (condition: aws:PrincipalOrgID). No public access is granted via the resource policy. The function URL does not have an associated CloudFront distribution or API Gateway. Direct HTTP callers without valid SigV4 signatures from an authorized principal receive HTTP 403 {\"Message\":\"Forbidden\"} from the Lambda service before the function code executes.",
+    "config": {
+      "deployment": "AWS Lambda with Function URL",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          }
+        },
+        "Resource": "arn:aws:lambda:us-east-1:123456789012:function:memory-pool-service"
+      },
+      "public_access_block": true,
+      "cors_config": "none",
+      "runtime": "python3.11",
+      "handler": "mangum adapter wrapping FastAPI app"
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "id": "4bfdc3b9",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport hmac\nimport json\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport sqlite3\nimport tempfile\nimport re\n\napp = Flask(__name__)\napp.config['UPLOAD_DIR'] = '/var/data/reports'\napp.config['DB_PATH'] = '/var/data/reports.db'\napp.config['SECRET_KEY'] = os.environ.get('APP_SECRET', 'changeme')\n\ndef get_db():\n    conn = sqlite3.connect(app.config['DB_PATH'])\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef init_db():\n    db = get_db()\n    db.execute('''CREATE TABLE IF NOT EXISTS reports (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        owner TEXT NOT NULL,\n        filename TEXT NOT NULL,\n        category TEXT NOT NULL,\n        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n\n@app.before_first_request\ndef setup():\n    init_db()\n    os.makedirs(app.config['UPLOAD_DIR'], exist_ok=True)\n\ndef authenticate(req):\n    token = req.headers.get('Authorization', '').replace('Bearer ', '')\n    if not token:\n        return None\n    # JWT-like token: base64(header).base64(payload).signature\n    # Simplified: we trust the 'sub' claim after HMAC verification\n    parts = token.split('.')\n    if len(parts) != 3:\n        return None\n    import base64\n    try:\n        payload = json.loads(base64.urlsafe_b64decode(parts[1] + '=='))\n        msg = parts[0] + '.' + parts[1]\n        sig = hmac.new(app.config['SECRET_KEY'].encode(), msg.encode(), hashlib.sha256).hexdigest()\n        if hmac.compare_digest(sig, parts[2]):\n            return payload.get('sub')\n    except Exception:\n        pass\n    return None\n\n@app.route('/api/v1/reports', methods=['POST'])\ndef upload_report():\n    user = authenticate(request)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    f = request.files.get('file')\n    category = request.form.get('category', 'general')\n    if not f:\n        return jsonify({'error': 'no file'}), 400\n    \n    filename = secure_filename(f.filename)\n    filepath = os.path.join(app.config['UPLOAD_DIR'], user, category, filename)\n    os.makedirs(os.path.dirname(filepath), exist_ok=True)\n    f.save(filepath)\n    \n    db = get_db()\n    db.execute('INSERT INTO reports (owner, filename, category) VALUES (?, ?, ?)',\n               (user, filename, category))\n    db.commit()\n    return jsonify({'status': 'uploaded', 'path': f'{user}/{category}/{filename}'}), 201\n\n@app.route('/api/v1/reports/export', methods=['GET'])\ndef export_reports():\n    user = authenticate(request)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    # Allow filtering by category with flexible matching\n    category_filter = request.args.get('category', '')\n    sort_field = request.args.get('sort', 'created_at')\n    sort_dir = request.args.get('dir', 'ASC')\n    \n    # Validate sort direction\n    if sort_dir.upper() not in ('ASC', 'DESC'):\n        sort_dir = 'ASC'\n    \n    # Build query - owner is always filtered server-side\n    db = get_db()\n    if category_filter:\n        # Use LIKE for flexible category matching\n        query = f\"SELECT * FROM reports WHERE owner = ? AND category LIKE ? ORDER BY {sort_field} {sort_dir}\"\n        rows = db.execute(query, (user, f'%{category_filter}%')).fetchall()\n    else:\n        query = f\"SELECT * FROM reports WHERE owner = ? ORDER BY {sort_field} {sort_dir}\"\n        rows = db.execute(query, (user,)).fetchall()\n    \n    results = [dict(r) for r in rows]\n    return jsonify({'reports': results, 'count': len(results)})\n\n@app.route('/api/v1/reports/download', methods=['GET'])\ndef download_report():\n    user = authenticate(request)\n    if not user:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    report_id = request.args.get('id')\n    db = get_db()\n    row = db.execute('SELECT * FROM reports WHERE id = ? AND owner = ?', (report_id, user)).fetchone()\n    if not row:\n        return jsonify({'error': 'not found'}), 404\n    \n    filepath = os.path.join(app.config['UPLOAD_DIR'], row['owner'], row['category'], row['filename'])\n    if not os.path.exists(filepath):\n        return jsonify({'error': 'file missing'}), 404\n    return send_file(filepath)\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed in an EKS cluster with Cilium CNI. Three independent controls are active: (1) A CiliumNetworkPolicy with L7 HTTP rules that restricts the /api/v1/diagnostics path to only accept connections from pods with label 'app.kubernetes.io/component=prometheus-blackbox-exporter' within the same namespace, dropping all other ingress to that path at the proxy layer. (2) The pod runs with a custom seccomp profile (stored as a localhost profile at /var/lib/kubelet/seccomp/profiles/noexec.json) that blocks the execve, execveat, and fork syscalls via SCMP_ACT_ERRNO. (3) An OPA Gatekeeper ConstraintTemplate 'K8sBlockPrivilegedExec' that mutates any pod spec to inject the seccomp annotation and validates that no container in the namespace has CAP_SYS_ADMIN or runs as UID 0.",
+    "config": {
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "restrict-diagnostics",
+          "namespace": "app-prod"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "webhook-service"
+            }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "app.kubernetes.io/component": "prometheus-blackbox-exporter"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "5000",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "http": [
+                      {
+                        "method": "POST",
+                        "path": "/api/v1/diagnostics"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "fromEntities": [
+                "world"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "5000",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "http": [
+                      {
+                        "method": "POST",
+                        "path": "/api/v1/webhook/deploy"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat",
+              "fork",
+              "vfork",
+              "clone"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "args": []
+          }
+        ]
+      },
+      "opa_gatekeeper_constraint": {
+        "apiVersion": "constraints.gatekeeper.sh/v1beta1",
+        "kind": "K8sBlockPrivilegedExec",
+        "metadata": {
+          "name": "block-exec-app-prod"
+        },
+        "spec": {
+          "match": {
+            "kinds": [
+              {
+                "apiGroups": [
+                  ""
+                ],
+                "kinds": [
+                  "Pod"
+                ]
+              }
+            ],
+            "namespaces": [
+              "app-prod"
+            ]
+          },
+          "parameters": {
+            "blockedCapabilities": [
+              "CAP_SYS_ADMIN"
+            ],
+            "maxRunAsUser": 65534,
+            "requiredSeccompProfile": "localhost/noexec.json"
+          }
+        }
+      }
+    }
+  }
+}

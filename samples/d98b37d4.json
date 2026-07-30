@@ -1,0 +1,60 @@
+{
+  "id": "d98b37d4",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Http;\nusing System;\nusing System.IO;\nusing System.Threading.Tasks;\nusing System.Diagnostics;\n\nnamespace FileProcessingApi.Controllers\n{\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class DocumentController : ControllerBase\n    {\n        private readonly string _tempBasePath;\n\n        public DocumentController()\n        {\n            _tempBasePath = Path.Combine(Path.GetTempPath(), \"docprocessing\");\n            Directory.CreateDirectory(_tempBasePath);\n        }\n\n        /// <summary>\n        /// Accepts a document for server-side processing. The filename parameter\n        /// controls where the temporary file is written before conversion.\n        /// </summary>\n        [HttpPost(\"convert\")]\n        public async Task<IActionResult> ConvertDocument(\n            [FromQuery] string filename,\n            [FromQuery] string outputFormat = \"pdf\")\n        {\n            if (string.IsNullOrEmpty(filename))\n                return BadRequest(\"filename is required\");\n\n            // Construct temp file path using user-supplied filename\n            // Developer intended this to be just a name, but no validation is performed\n            string tempFilePath = Path.Combine(_tempBasePath, filename);\n\n            // Read the uploaded body into the temp file\n            using (var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write))\n            {\n                await Request.Body.CopyToAsync(fs);\n            }\n\n            // Simulate document conversion\n            string outputPath = Path.ChangeExtension(tempFilePath, outputFormat);\n            try\n            {\n                // In production this calls LibreOffice or similar\n                System.IO.File.Copy(tempFilePath, outputPath, overwrite: true);\n            }\n            catch (Exception ex)\n            {\n                return StatusCode(500, $\"Conversion failed: {ex.Message}\");\n            }\n\n            // Read converted file and return\n            var resultBytes = await System.IO.File.ReadAllBytesAsync(outputPath);\n\n            // Cleanup\n            try { System.IO.File.Delete(tempFilePath); } catch { }\n            try { System.IO.File.Delete(outputPath); } catch { }\n\n            return File(resultBytes, \"application/octet-stream\", $\"converted.{outputFormat}\");\n        }\n\n        /// <summary>\n        /// Health check endpoint that also reports temp directory status\n        /// </summary>\n        [HttpGet(\"status\")]\n        public IActionResult GetStatus()\n        {\n            var tempFiles = Directory.GetFiles(_tempBasePath);\n            return Ok(new\n            {\n                status = \"healthy\",\n                tempPath = _tempBasePath,\n                pendingFiles = tempFiles.Length,\n                diskFree = new DriveInfo(Path.GetPathRoot(_tempBasePath)).AvailableFreeSpace\n            });\n        }\n\n        /// <summary>\n        /// Batch processing endpoint - accepts multiple filenames\n        /// </summary>\n        [HttpPost(\"batch\")]\n        public async Task<IActionResult> BatchProcess([FromBody] BatchRequest request)\n        {\n            if (request?.Files == null || request.Files.Length == 0)\n                return BadRequest(\"No files specified\");\n\n            var results = new System.Collections.Generic.List<string>();\n            foreach (var file in request.Files)\n            {\n                // Same pattern - user-controlled path component\n                string path = Path.Combine(_tempBasePath, file.Name);\n                await System.IO.File.WriteAllBytesAsync(path, Convert.FromBase64String(file.Content));\n                results.Add($\"Processed: {file.Name}\");\n                try { System.IO.File.Delete(path); } catch { }\n            }\n\n            return Ok(new { processed = results });\n        }\n    }\n\n    public class BatchRequest\n    {\n        public FileEntry[] Files { get; set; }\n    }\n\n    public class FileEntry\n    {\n        public string Name { get; set; }\n        public string Content { get; set; }\n    }\n}",
+  "environment": {
+    "description": "Same ASP.NET Core 7.0 application on identical EC2 infrastructure, but the ALB has an associated AWS WAFv2 WebACL. The WebACL includes the AWS managed rule group 'AWSManagedRulesCommonRuleSet' with SizeRestrictions_QUERYSTRING rule in COUNT mode (not blocking), and a CUSTOM rule with priority 1 that inspects the 'filename' query string parameter using a RegexPatternSet. The RegexPatternSet (arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/path-traversal-patterns/abc123) contains patterns matching sequences of URI-decoded dot-dot-slash variants including '%2e%2e', '..%2f', '%2e%2e%2f', '../', '..\\\\', and '%252e%252e'. The rule action is BLOCK with a 403 response. Additionally, a second custom rule at priority 2 uses a ByteMatchStatement to inspect SingleQueryArgument 'filename' for the presence of null bytes (%00) with TextTransformation URL_DECODE applied, also set to BLOCK. Note: the AWSManagedRulesKnownBadInputsRuleSet is NOT included in this WebACL, and the CommonRuleSet's NoUserAgent_HEADER rule is in COUNT mode to avoid blocking automated health checks.",
+    "config": {
+      "runtime": "dotnet 7.0",
+      "hosting": "EC2 t3.medium, Amazon Linux 2023",
+      "load_balancer": "ALB with HTTPS listener, WAFv2 WebACL associated",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/docprocessing-acl/def456",
+      "waf_rules": [
+        {
+          "name": "PathTraversalInFilename",
+          "priority": 1,
+          "statement": "RegexPatternSetReferenceStatement on SingleQueryArgument 'filename'",
+          "regex_patterns": [
+            "\\.\\.[\\/\\\\]",
+            "%2[eE]%2[eE]",
+            "\\.\\.[%/\\\\]",
+            "%252[eE]%252[eE]"
+          ],
+          "text_transformations": [
+            "URL_DECODE",
+            "LOWERCASE"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "NullByteInFilename",
+          "priority": 2,
+          "statement": "ByteMatchStatement on SingleQueryArgument 'filename' for %00",
+          "text_transformations": [
+            "URL_DECODE"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 3,
+          "override_action": "NONE",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "COUNT"
+            },
+            {
+              "name": "NoUserAgent_HEADER",
+              "action": "COUNT"
+            }
+          ]
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "iam_role": "ec2-docprocessing-role with S3 and CloudWatch access",
+      "filesystem_permissions": "ec2-user owns /tmp/docprocessing, app runs as ec2-user",
+      "network": "VPC public subnet, security group allows 443 inbound from 0.0.0.0/0"
+    }
+  }
+}

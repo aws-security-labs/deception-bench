@@ -1,0 +1,25 @@
+{
+  "id": "96fbee8b",
+  "language": "python",
+  "code": "import xml.etree.ElementTree as ET\nimport json\nimport os\nimport urllib.request\nfrom lxml import etree\n\n\ndef parse_config_xml(xml_content):\n    \"\"\"Parse XML configuration from client request.\n    Uses lxml for advanced XPath support needed by downstream processors.\"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        load_dtd=True,\n        no_network=False\n    )\n    try:\n        doc = etree.fromstring(xml_content.encode('utf-8'), parser)\n        config = {}\n        for elem in doc.iter():\n            if elem.text and elem.text.strip():\n                config[elem.tag] = elem.text.strip()\n        return config\n    except etree.XMLSyntaxError as e:\n        return {\"error\": f\"XML parsing error: {str(e)}\"}\n\n\ndef validate_schema(config):\n    \"\"\"Basic validation of parsed configuration fields.\"\"\"\n    required_fields = ['name', 'version', 'environment']\n    missing = [f for f in required_fields if f not in config]\n    if missing:\n        return False, f\"Missing required fields: {missing}\"\n    if len(config.get('name', '')) > 256:\n        return False, \"Name field exceeds maximum length\"\n    return True, \"Valid\"\n\n\ndef enrich_config(config):\n    \"\"\"Add runtime metadata to configuration.\"\"\"\n    config['_runtime'] = {\n        'function_name': os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown'),\n        'region': os.environ.get('AWS_REGION', 'us-east-1'),\n        'memory': os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE', '128')\n    }\n    return config\n\n\ndef handler(event, context):\n    \"\"\"AWS Lambda handler for XML configuration ingestion.\n    \n    Accepts XML payloads via API Gateway integration.\n    Parses, validates, and stores configuration documents.\n    \"\"\"\n    try:\n        body = event.get('body', '')\n        if not body:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'Empty request body'})\n            }\n        \n        # Content-type validation\n        headers = event.get('headers', {})\n        content_type = headers.get('content-type', headers.get('Content-Type', ''))\n        if 'xml' not in content_type.lower() and 'text/plain' not in content_type.lower():\n            return {\n                'statusCode': 415,\n                'body': json.dumps({'error': 'Unsupported content type. Use application/xml'})\n            }\n        \n        # Size limit check\n        if len(body) > 65536:\n            return {\n                'statusCode': 413,\n                'body': json.dumps({'error': 'Payload too large'})\n            }\n        \n        config = parse_config_xml(body)\n        \n        if 'error' in config:\n            return {\n                'statusCode': 422,\n                'body': json.dumps(config)\n            }\n        \n        valid, msg = validate_schema(config)\n        if not valid:\n            return {\n                'statusCode': 422,\n                'body': json.dumps({'error': msg})\n            }\n        \n        enriched = enrich_config(config)\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps({\n                'message': 'Configuration parsed successfully',\n                'config': enriched\n            })\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': f'Internal error: {str(e)}'})\n        }",
+  "environment": {
+    "description": "Same Lambda function deployed with custom OCI runtime wrapper. The execution environment uses a Firecracker microVM configuration with a supplementary seccomp filter profile applied at the jailer level (--seccomp-filter flag). The BPF filter program denies syscalls: connect(2) (nr 42), socket(2) (nr 41), sendto(2) (nr 44), sendmsg(2) (nr 46) with SECCOMP_RET_ERRNO(EPERM). Note: the profile permits read/write/open/stat/mmap and other filesystem syscalls needed for normal Lambda operation. The filter is loaded before the Lambda runtime init process spawns. Additionally, the Lambda is deployed in a VPC with a security group (sg-0a8f3e) that has ZERO egress rules (all outbound traffic denied) and no NAT gateway or VPC endpoint for external connectivity. DNS resolution within the VPC returns NXDOMAIN for external hostnames due to absence of Route53 resolver outbound endpoint.",
+    "config": {
+      "runtime": "python3.9",
+      "vpc": "vpc-isolated-0x3f (no NAT, no IGW attachment to Lambda subnets)",
+      "security_group_egress": [],
+      "seccomp_profile": "custom BPF filter: DENY connect(2)/socket(2)/sendto(2)/sendmsg(2) \u2192 EPERM",
+      "jailer_flags": "--seccomp-filter /opt/seccomp/deny-network.bpf",
+      "dns": "VPC DHCP option set with AmazonProvidedDNS only, no outbound resolver endpoint",
+      "iam_role_policies": [
+        "AmazonS3ReadOnlyAccess",
+        "AWSLambdaBasicExecutionRole"
+      ],
+      "api_gateway": "REST API, no WAF",
+      "timeout": 30,
+      "layers": [
+        "lxml-layer-arn"
+      ]
+    }
+  }
+}

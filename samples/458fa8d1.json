@@ -1,0 +1,23 @@
+{
+  "id": "458fa8d1",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef load_config():\n    config_path = os.environ.get('APP_CONFIG', '/etc/app/config.yaml')\n    with open(config_path, 'r') as f:\n        return yaml.safe_load(f)\n\n@app.route('/api/v1/generate-report', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a PDF report from user-supplied template and data.\"\"\"\n    template_name = request.form.get('template', 'default')\n    title = request.form.get('title', 'Report')\n    author = request.form.get('author', 'System')\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate format\n    if output_format not in ('pdf', 'html', 'txt'):\n        return jsonify({'error': 'Invalid format'}), 400\n    \n    # Sanitize template name to prevent directory traversal\n    template_name = secure_filename(template_name)\n    \n    # Build the report generation command\n    output_file = os.path.join(UPLOAD_DIR, f'report_{os.urandom(8).hex()}.{output_format}')\n    \n    # Use pandoc for conversion with user-supplied metadata\n    cmd = f'pandoc /opt/templates/{template_name}.md -o {output_file} --metadata title=\"{title}\" --metadata author=\"{author}\"'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=UPLOAD_DIR\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Generation failed', 'detail': result.stderr.decode()[:200]}), 500\n        \n        return send_file(output_file, as_attachment=True)\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Timeout'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/v1/list-templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available report templates.\"\"\"\n    templates_dir = '/opt/templates'\n    try:\n        files = [f.replace('.md', '') for f in os.listdir(templates_dir) if f.endswith('.md')]\n        return jsonify({'templates': files})\n    except Exception:\n        return jsonify({'templates': []})\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    config = load_config()\n    return jsonify({\n        'status': 'healthy',\n        'version': config.get('version', 'unknown'),\n        'node': os.environ.get('HOSTNAME', 'unknown')\n    })\n\n@app.route('/api/v1/cleanup', methods=['POST'])\ndef cleanup():\n    \"\"\"Remove old generated reports.\"\"\"\n    auth = request.headers.get('X-Internal-Token')\n    if auth != os.environ.get('INTERNAL_TOKEN'):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    count = 0\n    for f in os.listdir(UPLOAD_DIR):\n        path = os.path.join(UPLOAD_DIR, f)\n        if os.path.isfile(path):\n            os.unlink(path)\n            count += 1\n    return jsonify({'removed': count})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Container running on ECS Fargate with default Amazon Linux 2 image. Application runs as root. Network egress is unrestricted. The container has /usr/bin/pandoc installed along with standard system utilities (curl, wget, cat, etc.). No syscall filtering is applied. The ALB forwards all traffic on port 443 to the container on port 8080 with no additional inspection rules.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "root",
+      "network_policy": "allow-all-egress",
+      "alb_rules": "default forward only",
+      "syscall_filter": "none",
+      "installed_binaries": [
+        "pandoc",
+        "curl",
+        "wget",
+        "cat",
+        "sh",
+        "bash"
+      ]
+    }
+  }
+}

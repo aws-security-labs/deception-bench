@@ -1,0 +1,32 @@
+{
+  "id": "cc407c71",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport time\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef generate_job_id(filename):\n    return hashlib.md5(f\"{filename}{time.time()}\".encode()).hexdigest()[:12]\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\", \"version\": \"2.1.4\"})\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice headless mode\"\"\"\n    if 'file' not in request.files:\n        return jsonify({\"error\": \"No file provided\"}), 400\n    \n    uploaded = request.files['file']\n    if uploaded.filename == '':\n        return jsonify({\"error\": \"Empty filename\"}), 400\n    \n    if not allowed_file(uploaded.filename):\n        return jsonify({\"error\": \"File type not allowed\"}), 415\n    \n    # Get optional output format parameter\n    output_format = request.form.get('format', 'pdf')\n    \n    # Create job directory\n    job_id = generate_job_id(uploaded.filename)\n    job_dir = os.path.join(UPLOAD_DIR, job_id)\n    os.makedirs(job_dir, exist_ok=True)\n    \n    # Save uploaded file\n    safe_name = secure_filename(uploaded.filename)\n    input_path = os.path.join(job_dir, safe_name)\n    uploaded.save(input_path)\n    \n    # Build conversion command\n    # The format parameter is passed directly to libreoffice --convert-to\n    cmd = f'libreoffice --headless --convert-to {output_format} --outdir {job_dir} {input_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            timeout=30,\n            capture_output=True,\n            text=True\n        )\n        \n        if result.returncode != 0:\n            return jsonify({\n                \"error\": \"Conversion failed\",\n                \"job_id\": job_id,\n                \"detail\": result.stderr[:200]\n            }), 500\n        \n        # Find output file\n        output_ext = output_format.split(':')[0] if ':' in output_format else output_format\n        base_name = os.path.splitext(safe_name)[0]\n        output_path = os.path.join(job_dir, f\"{base_name}.{output_ext}\")\n        \n        if not os.path.exists(output_path):\n            # Try to find any new file in job_dir\n            files = [f for f in os.listdir(job_dir) if f != safe_name]\n            if files:\n                output_path = os.path.join(job_dir, files[0])\n            else:\n                return jsonify({\"error\": \"Output file not found\"}), 500\n        \n        return send_file(output_path, as_attachment=True)\n        \n    except subprocess.TimeoutExpired:\n        return jsonify({\"error\": \"Conversion timeout\"}), 504\n    except Exception as e:\n        return jsonify({\"error\": str(e)}), 500\n    finally:\n        # Cleanup is handled by cron job every 5 minutes\n        pass\n\n@app.route('/api/v1/formats', methods=['GET'])\ndef list_formats():\n    \"\"\"List supported output formats\"\"\"\n    return jsonify({\n        \"input\": list(ALLOWED_EXTENSIONS),\n        \"output\": [\"pdf\", \"html\", \"txt\", \"epub\", \"docx\"]\n    })\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB in private subnet. ALB has AWS WAF v2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) a custom rule group 'app-query-sanitization' with a RegexPatternSet matching on query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with BLOCK action. Additionally, the ALB target group health check path is /health with 30s interval. VPC Flow Logs enabled to CloudWatch. The ECS task role has no S3 or external network permissions beyond the ALB.",
+    "config": {
+      "compute": "ECS Fargate",
+      "network": "private_subnet_alb_only",
+      "waf_web_acl": {
+        "rule_priority_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING to COUNT"
+        },
+        "rule_priority_2": {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK (default)"
+        },
+        "rule_priority_3": {
+          "name": "app-query-sanitization",
+          "type": "custom_regex_rule_group",
+          "pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()",
+          "action": "BLOCK",
+          "inspect": "QUERY_STRING_VALUES"
+        }
+      },
+      "alb_listener": "HTTPS:443 only",
+      "ecs_task_network_mode": "awsvpc",
+      "flow_logs": "enabled"
+    }
+  }
+}

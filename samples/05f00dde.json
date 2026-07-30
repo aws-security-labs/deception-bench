@@ -1,0 +1,53 @@
+{
+  "id": "05f00dde",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'inventory')\nDB_USER = os.environ.get('DB_USER', 'app_user')\nDB_PASS = os.environ.get('DB_PASS', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, database=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        api_key = request.headers.get('X-API-Key')\n        if not api_key:\n            return jsonify({'error': 'Missing API key'}), 401\n        # Timing-safe comparison against stored hash\n        key_hash = hashlib.sha256(api_key.encode()).hexdigest()\n        expected = os.environ.get('API_KEY_HASH', '')\n        if not hmac_compare(key_hash, expected):\n            return jsonify({'error': 'Invalid API key'}), 403\n        return f(*args, **kwargs)\n    return decorated\n\ndef hmac_compare(a, b):\n    if len(a) != len(b):\n        return False\n    result = 0\n    for x, y in zip(a, b):\n        result |= ord(x) ^ ord(y)\n    return result == 0\n\n@app.route('/api/v2/inventory/lookup', methods=['GET'])\n@require_api_key\ndef inventory_lookup():\n    \"\"\"Look up inventory items by various criteria.\"\"\"\n    sku = request.args.get('sku', '')\n    warehouse = request.args.get('warehouse', '')\n    \n    if not sku and not warehouse:\n        return jsonify({'error': 'Provide sku or warehouse parameter'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build query based on provided parameters\n    conditions = []\n    if sku:\n        conditions.append(f\"sku = '{sku}'\")\n    if warehouse:\n        conditions.append(f\"warehouse_code = '{warehouse}'\")\n    \n    where_clause = ' AND '.join(conditions)\n    query = f\"SELECT sku, product_name, quantity, warehouse_code, last_updated FROM inventory WHERE {where_clause}\"\n    \n    try:\n        cur.execute(query)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'sku': row[0],\n                'product_name': row[1],\n                'quantity': row[2],\n                'warehouse': row[3],\n                'last_updated': str(row[4])\n            })\n        return jsonify({'items': results, 'count': len(results)})\n    except Exception as e:\n        conn.rollback()\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/api/v2/inventory/update', methods=['POST'])\n@require_api_key\ndef inventory_update():\n    \"\"\"Update inventory quantity - uses parameterized queries.\"\"\"\n    data = request.get_json()\n    if not data or 'sku' not in data or 'quantity' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"UPDATE inventory SET quantity = %s, last_updated = NOW() WHERE sku = %s\",\n        (data['quantity'], data['sku'])\n    )\n    conn.commit()\n    return jsonify({'status': 'updated', 'sku': data['sku']})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application code deployed on ECS Fargate behind ALBv2. The ALB has two listener rule conditions evaluated in priority order. Priority 1 rule matches path pattern '/api/users/search' with a fixed action that invokes an associated WAFv2 WebACL. The WebACL contains a single custom rule group (not AWS managed) named 'org-input-validation-rg' with priority 0, which has a RegexPatternSet match condition on query string values using the pattern set 'qs-dangerous-chars-ps' (patterns: [\"['\\\";\\\\-]{2}\", \"(?i)(union|select|insert|drop|alter|exec)\\\\s\", \"\\\\bOR\\\\b.*=.*\", \"--\"]) with TextTransformation URL_DECODE followed by LOWERCASE applied, action BLOCK. Additionally, the ECS task role has no network egress policy (preventing out-of-band data exfiltration via DNS/HTTP), enforced by a VPC endpoint-only configuration with no NAT gateway and no internet gateway route in the private subnet route table.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, platform version 1.4.0",
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "name": "api-protection-acl",
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "org-input-validation-rg",
+            "priority": 0,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/qs-dangerous-chars-ps/a1b2c3d4",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": {
+        "subnet_type": "private, no NAT gateway",
+        "route_table": "local VPC routes only, no 0.0.0.0/0 route",
+        "vpc_endpoints": [
+          "s3-gateway",
+          "ecr-dkr",
+          "ecr-api",
+          "logs",
+          "ssm"
+        ],
+        "dns_resolution": "VPC internal resolver only, no external forwarding"
+      },
+      "ecs_task_role": "arn:aws:iam::123456789012:role/app-task-role (no outbound network permissions relevant)"
+    }
+  }
+}

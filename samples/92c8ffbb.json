@@ -1,0 +1,29 @@
+{
+  "id": "92c8ffbb",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport org.apache.commons.text.lookup.StringLookupFactory;\n\npublic class TemplateServlet extends HttpServlet {\n    private static final Map<String, String> TEMPLATES = new HashMap<>();\n    \n    static {\n        TEMPLATES.put(\"welcome\", \"Hello ${user.name}, your account #${user.id} is active.\");\n        TEMPLATES.put(\"alert\", \"ALERT: ${alert.message} at ${alert.timestamp}\");\n        TEMPLATES.put(\"report\", \"Report for ${report.title}: ${report.summary}\");\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String templateName = req.getParameter(\"template\");\n        String customTemplate = req.getParameter(\"custom\");\n        String userData = req.getParameter(\"data\");\n        \n        if (templateName == null && customTemplate == null) {\n            resp.sendError(400, \"Missing template or custom parameter\");\n            return;\n        }\n        \n        String templateStr;\n        if (customTemplate != null && !customTemplate.isEmpty()) {\n            // Allow custom templates for premium users\n            String premiumHeader = req.getHeader(\"X-Premium-User\");\n            if (premiumHeader == null || !premiumHeader.equals(\"true\")) {\n                resp.sendError(403, \"Custom templates require premium access\");\n                return;\n            }\n            templateStr = customTemplate;\n        } else {\n            templateStr = TEMPLATES.get(templateName);\n            if (templateStr == null) {\n                resp.sendError(404, \"Template not found\");\n                return;\n            }\n        }\n        \n        // Parse user data as key=value pairs\n        Map<String, String> values = new HashMap<>();\n        if (userData != null) {\n            for (String pair : userData.split(\"&\")) {\n                String[] kv = pair.split(\"=\", 2);\n                if (kv.length == 2) {\n                    values.put(URLDecoder.decode(kv[0], \"UTF-8\"),\n                              URLDecoder.decode(kv[1], \"UTF-8\"));\n                }\n            }\n        }\n        \n        // Perform substitution using Apache Commons Text\n        StringSubstitutor substitutor = new StringSubstitutor(\n            StringLookupFactory.INSTANCE.interpolatorStringLookup(values, null, true)\n        );\n        substitutor.setEnableSubstitutionInVariables(true);\n        \n        String result = substitutor.replace(templateStr);\n        \n        resp.setContentType(\"text/plain\");\n        resp.getWriter().write(result);\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setContentType(\"application/json\");\n        StringBuilder sb = new StringBuilder(\"{\\\"templates\\\":[\");\n        int i = 0;\n        for (String key : TEMPLATES.keySet()) {\n            if (i++ > 0) sb.append(\",\");\n            sb.append(\"\\\"\" + key + \"\\\"\");\n        }\n        sb.append(\"]}\");\n        resp.getWriter().write(sb.toString());\n    }\n}",
+  "environment": {
+    "description": "Same container image deployed on GKE Autopilot cluster with Pod Security Standards enforced at 'restricted' level. The container spec sets readOnlyRootFilesystem: true in the securityContext. No emptyDir, hostPath, or persistent volume claims are attached to the pod. The container's ephemeral storage is limited to 0Mi via resources.limits.ephemeral-storage. Node-level gVisor (runsc) sandbox is enabled via RuntimeClass 'gvisor' which intercepts all syscalls including open/openat with O_WRONLY/O_RDWR flags against the overlay filesystem. The service mesh (Istio sidecar) enforces mTLS but does not restrict file operations.",
+    "config": {
+      "kubernetes_pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": [],
+      "volumeMounts": [],
+      "resources": {
+        "limits": {
+          "ephemeral-storage": "0Mi"
+        }
+      },
+      "runtimeClassName": "gvisor",
+      "pod_security_standard": "restricted",
+      "notes": "No writable mount points exist. /tmp, /app/uploads, /app/extracted are all part of the read-only root filesystem overlay. Container will receive EROFS (errno 30) on any write syscall."
+    }
+  }
+}

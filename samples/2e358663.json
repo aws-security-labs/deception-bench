@@ -1,0 +1,55 @@
+{
+  "id": "2e358663",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom input sanitizer - strips common attack patterns\n    private String sanitizeInput(String input) {\n        if (input == null) return null;\n        // Remove script tags and event handlers\n        input = input.replaceAll(\"(?i)<script[^>]*>.*?</script>\", \"\");\n        input = input.replaceAll(\"(?i)on\\\\w+\\\\s*=\", \"\");\n        // Remove comment sequences that could break out of strings\n        input = input.replaceAll(\"/\\\\*\", \"\").replaceAll(\"\\\\*/\", \"\");\n        // Limit length\n        if (input.length() > 200) input = input.substring(0, 200);\n        return input;\n    }\n    \n    // Validates report type against allowed values\n    private boolean isValidReportType(String type) {\n        return type != null && type.matches(\"^(sales|inventory|users|audit)$\");\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        HttpSession session = req.getSession(false);\n        if (session == null || session.getAttribute(\"userId\") == null) {\n            resp.sendError(401, \"Unauthorized\");\n            return;\n        }\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortColumn = req.getParameter(\"sort\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Sanitize user inputs\n        dateRange = sanitizeInput(dateRange);\n        sortColumn = sanitizeInput(sortColumn);\n        filterExpr = sanitizeInput(filterExpr);\n        \n        String tableName = \"report_\" + reportType;\n        \n        // Build query with parameterized date range but dynamic sort/filter\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT * FROM \").append(tableName);\n        query.append(\" WHERE created_at BETWEEN ? AND ?\");\n        \n        if (filterExpr != null && !filterExpr.isEmpty()) {\n            // Filter expressions like \"status=active\" or \"region=US\"\n            query.append(\" AND \").append(filterExpr);\n        }\n        \n        if (sortColumn != null && !sortColumn.isEmpty()) {\n            query.append(\" ORDER BY \").append(sortColumn);\n        }\n        \n        query.append(\" LIMIT 1000\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n            \n            String[] dates = parseDateRange(dateRange);\n            stmt.setString(1, dates[0]);\n            stmt.setString(2, dates[1]);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnName(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            // Log but don't expose internal details\n            log(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String[] parseDateRange(String range) {\n        if (range == null || !range.contains(\"|\")) {\n            return new String[]{\"2024-01-01\", \"2024-12-31\"};\n        }\n        String[] parts = range.split(\"\\\\|\");\n        return new String[]{parts[0].trim(), parts[1].trim()};\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10 application deployed in a Kubernetes cluster with Istio 1.20 service mesh. The auth-service pod runs in the 'auth' namespace with strict mTLS (PeerAuthentication STRICT mode). An Istio AuthorizationPolicy is applied to the auth-service workload that evaluates source namespace and request attributes. The policy specifies: (1) requests with header 'X-Internal-Service' matching any value are ONLY permitted when source.namespace is in ['session-mgmt', 'sso-infra'] \u2014 external traffic entering via istio-ingressgateway has source.namespace='istio-system' and the gateway's VirtualService strips X-Internal-Service headers via a HeaderOperations removeRequestHeaders rule before routing to the auth namespace. (2) The AuthorizationPolicy uses a DENY action for requests carrying X-Internal-Service header where source.principal does not match 'cluster.local/ns/session-mgmt/sa/session-manager-sa' or 'cluster.local/ns/sso-infra/sa/sso-gateway-sa'. The envoy sidecar enforces this at L7 before the request reaches the application container.",
+    "config": {
+      "kubernetes_namespace": "auth",
+      "service_mesh": "istio-1.20",
+      "mtls_mode": "STRICT",
+      "peer_authentication": "namespace-wide STRICT PeerAuthentication",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-external-internal-header",
+          "namespace": "auth"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/session-mgmt/sa/session-manager-sa",
+                      "cluster.local/ns/sso-infra/sa/sso-gateway-sa"
+                    ]
+                  }
+                }
+              ],
+              "when": [
+                {
+                  "key": "request.headers[x-internal-service]",
+                  "notValues": [
+                    ""
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "virtual_service_header_ops": {
+        "route_destination": "auth-service.auth.svc.cluster.local",
+        "request_headers_to_remove": [
+          "x-internal-service",
+          "x-internal-token"
+        ]
+      },
+      "ingress_gateway": "istio-ingressgateway in istio-system namespace"
+    }
+  }
+}

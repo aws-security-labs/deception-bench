@@ -1,0 +1,27 @@
+{
+  "id": "0635400d",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\n# Database connection pool\ndef get_db():\n    return psycopg2.connect(\n        host=os.environ.get('DB_HOST', 'localhost'),\n        port=int(os.environ.get('DB_PORT', 5432)),\n        dbname=os.environ.get('DB_NAME', 'appdb'),\n        user=os.environ.get('DB_USER', 'app_service'),\n        password=os.environ.get('DB_PASS', '')\n    )\n\ndef verify_api_key(api_key):\n    \"\"\"Verify API key against stored hash\"\"\"\n    expected = os.environ.get('API_KEY_HASH', '')\n    return hmac.compare_digest(\n        hashlib.sha256(api_key.encode()).hexdigest(),\n        expected\n    )\n\n@app.route('/api/v2/users/search', methods=['GET'])\ndef search_users():\n    api_key = request.headers.get('X-API-Key', '')\n    if not verify_api_key(api_key):\n        return jsonify({'error': 'unauthorized'}), 401\n\n    username = request.args.get('username', '')\n    department = request.args.get('dept', '')\n    include_inactive = request.args.get('include_inactive', 'false')\n\n    # Build search query with filters\n    base_query = \"SELECT id, username, email, department, role FROM users WHERE 1=1\"\n    \n    if username:\n        # Parameterized - safe\n        base_query += \" AND username ILIKE %s\"\n        params = ['%' + username + '%']\n    else:\n        params = []\n\n    if department:\n        # Direct string interpolation - VULNERABLE\n        base_query += f\" AND department = '{department}'\"\n\n    if include_inactive.lower() != 'true':\n        base_query += \" AND active = true\"\n\n    base_query += \" ORDER BY username LIMIT 50\"\n\n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(base_query, params if params else None)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'username': row[1],\n                'email': row[2],\n                'department': row[3],\n                'role': row[4]\n            })\n        cur.close()\n        conn.close()\n        return jsonify({'users': results, 'count': len(results)})\n    except psycopg2.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/users/<int:user_id>/permissions', methods=['GET'])\ndef get_permissions(user_id):\n    api_key = request.headers.get('X-API-Key', '')\n    if not verify_api_key(api_key):\n        return jsonify({'error': 'unauthorized'}), 401\n\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT permission_name FROM user_permissions WHERE user_id = %s\", (user_id,))\n    perms = [r[0] for r in cur.fetchall()]\n    cur.close()\n    conn.close()\n    return jsonify({'user_id': user_id, 'permissions': perms})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(\"SELECT 1\")\n        cur.close()\n        conn.close()\n        return jsonify({'status': 'healthy'})\n    except Exception:\n        return jsonify({'status': 'unhealthy'}), 503\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Jenkins CI worker node running Ubuntu 22.04. The artifact_processor plugin executes under a custom AppArmor profile 'ci-artifact-proc' loaded via aa-enforce. The profile specifies: deny capability dac_override, file read rules limited to /var/lib/jenkins/workspace/** and /tmp/pipeline-**, with explicit deny on /etc/shadow, /etc/passwd, /var/lib/jenkins/secrets/**, and a catch-all 'deny /** rw' for paths not in the allowlist. Profile was generated using aa-logprof after a training period. Note: the profile permits network access (inet stream) for artifact downloads and allows writing to /tmp/manifest-*. The profile hash (sha256:a4f2e8...) is pinned in the node provisioning Ansible playbook.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "ci_system": "Jenkins 2.401.1",
+      "user": "jenkins",
+      "mac_policy": "AppArmor enforce mode, profile 'ci-artifact-proc'",
+      "apparmor_profile_rules": [
+        "file read /var/lib/jenkins/workspace/**",
+        "file read /tmp/pipeline-**",
+        "file write /tmp/manifest-*",
+        "deny /etc/shadow r",
+        "deny /etc/passwd r",
+        "deny /var/lib/jenkins/secrets/** r",
+        "deny /** rw (catch-all for unlisted paths)",
+        "network inet stream",
+        "capability net_bind_service"
+      ],
+      "profile_enforcement": "aa-enforce /etc/apparmor.d/ci-artifact-proc",
+      "pipeline_trigger": "PR-based, config from repository"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "3d48bb6b",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String tenantId = (String) req.getAttribute(\"X-Tenant-Id\");\n\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n\n        // Validate format parameter\n        if (format != null && !format.matches(\"^(pdf|csv|json)$\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - reportId is used to look up report metadata\n            String query = \"SELECT r.title, r.created_at, r.data, r.owner_id \" +\n                          \"FROM reports r \" +\n                          \"WHERE r.id = '\" + reportId + \"' \" +\n                          \"AND r.tenant_id = '\" + tenantId + \"'\";\n\n            log.info(\"Executing report query for tenant: \" + tenantId);\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.print(\"\\\"title\\\":\\\"\" + escapeJson(rs.getString(\"title\")) + \"\\\",\");\n                out.print(\"\\\"created_at\\\":\\\"\" + rs.getString(\"created_at\") + \"\\\",\");\n                out.print(\"\\\"data\\\":\" + rs.getString(\"data\") + \",\");\n                out.print(\"\\\"owner_id\\\":\\\"\" + rs.getString(\"owner_id\") + \"\\\"\");\n                first = false;\n            }\n            out.print(\"}\");\n            out.flush();\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch report generation endpoint\n        String body = req.getReader().lines()\n            .reduce(\"\", (acc, line) -> acc + line);\n        String tenantId = (String) req.getAttribute(\"X-Tenant-Id\");\n        String userId = (String) req.getAttribute(\"X-User-Id\");\n\n        Connection conn = null;\n        PreparedStatement pstmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            pstmt = conn.prepareStatement(\n                \"INSERT INTO report_jobs (tenant_id, user_id, config, status) VALUES (?, ?, ?::jsonb, 'pending')\");\n            pstmt.setString(1, tenantId);\n            pstmt.setString(2, userId);\n            pstmt.setString(3, body);\n            pstmt.executeUpdate();\n            resp.setStatus(202);\n        } catch (SQLException e) {\n            log.severe(\"Failed to queue report: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            try { if (pstmt != null) pstmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Same plugin deployed in a hardened namespace with the following runtime characteristics: (1) Credentials are managed by HashiCorp Vault dynamic secrets engine with a max_ttl of 60s and use_limit of 1 (single-use tokens that are consumed on first pipeline execution and cannot be replayed); (2) The Kubernetes NetworkPolicy applies an egress rule restricting the pod to only communicate with the internal registry IP (10.96.44.12/32) on port 443 and the Vault agent sidecar on localhost:8200 \u2014 no other egress is permitted including DNS resolution for external hosts; (3) An OPA Gatekeeper ConstraintTemplate `K8sPipelineConfigSanitizer` validates all inbound JSON payloads to the /api/pipeline/*/config endpoint via an admission webhook sidecar (envoy filter) that strips any keys matching the regex `^(__proto__|constructor|prototype)$` at any nesting depth before the request reaches the application.",
+    "config": {
+      "vault_dynamic_secrets": {
+        "engine": "kv-v2",
+        "max_ttl": "60s",
+        "use_limit": 1,
+        "revocation": "immediate_on_expiry"
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "to": "10.96.44.12/32",
+            "port": 443,
+            "protocol": "TCP"
+          },
+          {
+            "to": "127.0.0.1",
+            "port": 8200,
+            "protocol": "TCP"
+          }
+        ],
+        "deny_all_other_egress": true
+      },
+      "opa_gatekeeper_constraint": {
+        "template": "K8sPipelineConfigSanitizer",
+        "enforcement": "deny",
+        "description": "Envoy ext_authz filter strips prototype pollution keys from JSON bodies"
+      }
+    }
+  }
+}

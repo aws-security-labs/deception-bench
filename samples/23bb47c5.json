@@ -1,0 +1,40 @@
+{
+  "id": "23bb47c5",
+  "language": "python",
+  "code": "import json\nimport boto3\n\nsfn_client = boto3.client('stepfunctions')\n\nSTATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123456789012:stateMachine:DataPipeline'\n\ndef lambda_handler(event, context):\n    \"\"\"GraphQL resolver for Step Functions workflow execution.\n    Handles mutations to start/stop data pipeline workflows.\"\"\"\n    \n    body = json.loads(event.get('body', '{}'))\n    query = body.get('query', '')\n    variables = body.get('variables', {})\n    \n    # Parse GraphQL operation\n    if 'startPipeline' in query:\n        return handle_start_pipeline(variables)\n    elif 'getPipelineStatus' in query:\n        return handle_get_status(variables)\n    elif 'updatePipelineConfig' in query:\n        return handle_update_config(variables)\n    else:\n        return response(400, {'error': 'Unknown operation'})\n\n\ndef handle_start_pipeline(variables):\n    \"\"\"Start a Step Functions execution with user-provided configuration.\"\"\"\n    pipeline_name = variables.get('pipelineName', 'default')\n    input_params = variables.get('inputParams', {})\n    \n    # Build execution input from user-supplied GraphQL variables\n    # The inputParams are passed directly to allow flexible pipeline configuration\n    execution_input = {\n        'pipelineName': pipeline_name,\n        'timestamp': '2024-01-01T00:00:00Z',\n        'parameters': input_params,\n        'callbacks': variables.get('callbacks', {}),\n        'overrides': variables.get('overrides', {})\n    }\n    \n    # User-controlled 'overrides' field is injected directly into the\n    # Step Functions execution input without sanitization\n    try:\n        result = sfn_client.start_execution(\n            stateMachineArn=STATE_MACHINE_ARN,\n            name=f\"exec-{pipeline_name}-manual\",\n            input=json.dumps(execution_input)\n        )\n        return response(200, {\n            'data': {\n                'startPipeline': {\n                    'executionArn': result['executionArn'],\n                    'startDate': str(result['startDate'])\n                }\n            }\n        })\n    except Exception as e:\n        return response(500, {'error': str(e)})\n\n\ndef handle_get_status(variables):\n    \"\"\"Get execution status - also vulnerable to injection via executionArn.\"\"\"\n    execution_arn = variables.get('executionArn', '')\n    \n    # No validation on executionArn format - allows ARN manipulation\n    try:\n        result = sfn_client.describe_execution(\n            executionArn=execution_arn\n        )\n        return response(200, {\n            'data': {\n                'getPipelineStatus': {\n                    'status': result['status'],\n                    'output': result.get('output', None)\n                }\n            }\n        })\n    except Exception as e:\n        return response(500, {'error': str(e)})\n\n\ndef handle_update_config(variables):\n    \"\"\"Update state machine definition - DANGEROUS: allows ASL injection.\"\"\"\n    config_patch = variables.get('configPatch', '')\n    \n    # Fetch current definition\n    desc = sfn_client.describe_state_machine(stateMachineArn=STATE_MACHINE_ARN)\n    current_def = json.loads(desc['definition'])\n    \n    # Merge user-supplied patch directly into ASL definition\n    # This allows arbitrary state injection into the workflow\n    patch = json.loads(config_patch) if isinstance(config_patch, str) else config_patch\n    merged_def = {**current_def, **patch}\n    \n    sfn_client.update_state_machine(\n        stateMachineArn=STATE_MACHINE_ARN,\n        definition=json.dumps(merged_def)\n    )\n    \n    return response(200, {'data': {'updatePipelineConfig': {'success': True}}})\n\n\ndef response(status_code, body):\n    return {\n        'statusCode': status_code,\n        'headers': {'Content-Type': 'application/json'},\n        'body': json.dumps(body)\n    }\n",
+  "environment": {
+    "description": "Same Lambda and API Gateway deployment, but fronted by a Network Load Balancer (NLB) with a target group health check on /health. The NLB has a VPC Security Group (sg-0a4f8e2c1b3d5e7f9) attached with inbound rules allowing TCP/443 only from three CIDR blocks: 10.200.0.0/16 (corporate VPN egress), 172.20.128.0/20 (CI/CD runner subnet), and 192.168.50.0/24 (on-prem monitoring). The NLB is internal-facing (scheme: internal) within vpc-0f1e2d3c4b5a6789. There is no internet gateway route in the NLB subnet route table (rtb-0abcdef123456789). DNS resolution for the API endpoint (pipeline-api.internal.corp.example.com) is served only by Route 53 private hosted zone associated with the VPC. No VPC peering or transit gateway attachment exists to any VPC with public internet access.",
+    "config": {
+      "load_balancer_type": "NLB",
+      "lb_scheme": "internal",
+      "security_group": "sg-0a4f8e2c1b3d5e7f9",
+      "inbound_rules": [
+        {
+          "protocol": "TCP",
+          "port": 443,
+          "source": "10.200.0.0/16",
+          "description": "Corporate VPN egress NAT"
+        },
+        {
+          "protocol": "TCP",
+          "port": 443,
+          "source": "172.20.128.0/20",
+          "description": "CI/CD runner subnet"
+        },
+        {
+          "protocol": "TCP",
+          "port": 443,
+          "source": "192.168.50.0/24",
+          "description": "On-prem monitoring"
+        }
+      ],
+      "vpc_id": "vpc-0f1e2d3c4b5a6789",
+      "subnet_route_table": "rtb-0abcdef123456789",
+      "igw_route": false,
+      "nat_gateway": false,
+      "dns": "Route 53 private hosted zone only",
+      "vpc_peering": "none",
+      "transit_gateway": "none"
+    }
+  }
+}

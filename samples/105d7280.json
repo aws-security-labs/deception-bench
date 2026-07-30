@@ -1,0 +1,57 @@
+{
+  "id": "105d7280",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.regex.Pattern;\n\npublic class UserProfileServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_FIELDS = Pattern.compile(\"^(display_name|bio|location|website)$\");\n    \n    // Note: parameterized queries used for VALUES but not for column selection\n    // Column names cannot be parameterized in JDBC PreparedStatement\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String userId = (String) req.getSession().getAttribute(\"authenticated_user_id\");\n        if (userId == null) {\n            resp.sendError(401);\n            return;\n        }\n        \n        String fieldName = req.getParameter(\"field\");\n        String fieldValue = req.getParameter(\"value\");\n        \n        if (fieldName == null || fieldValue == null) {\n            resp.sendError(400, \"Missing parameters\");\n            return;\n        }\n        \n        // Length check to prevent overly long inputs\n        if (fieldName.length() > 64 || fieldValue.length() > 500) {\n            resp.sendError(400, \"Input too long\");\n            return;\n        }\n        \n        // Developer's note: SAFE_FIELDS regex validates allowed column names\n        // but the check below has a logic error - it logs but doesn't block\n        if (!SAFE_FIELDS.matcher(fieldName).matches()) {\n            System.err.println(\"WARN: unusual field name requested: \" + fieldName);\n            // TODO: should we block here? Leaving open for extensibility\n            // Product team wants dynamic field support for custom profile attrs\n        }\n        \n        Connection conn = null;\n        try {\n            conn = getDataSource().getConnection();\n            \n            // Using string concatenation for column name since PreparedStatement\n            // doesn't support parameterized identifiers\n            String sql = \"UPDATE user_profiles SET \" + fieldName + \" = ? WHERE user_id = ?\";\n            \n            PreparedStatement pstmt = conn.prepareStatement(sql);\n            pstmt.setString(1, fieldValue);\n            pstmt.setString(2, userId);\n            \n            int rows = pstmt.executeUpdate();\n            \n            if (rows > 0) {\n                resp.setStatus(200);\n                resp.getWriter().write(\"{\\\"status\\\":\\\"updated\\\"}\");\n            } else {\n                resp.sendError(404, \"Profile not found\");\n            }\n            \n            pstmt.close();\n        } catch (SQLException e) {\n            // Return generic error to avoid leaking DB info\n            System.err.println(\"DB error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String userId = req.getParameter(\"id\");\n        if (userId == null) {\n            resp.sendError(400);\n            return;\n        }\n        \n        Connection conn = null;\n        try {\n            conn = getDataSource().getConnection();\n            PreparedStatement pstmt = conn.prepareStatement(\n                \"SELECT display_name, bio, location, website FROM user_profiles WHERE user_id = ?\");\n            pstmt.setString(1, userId);\n            ResultSet rs = pstmt.executeQuery();\n            \n            if (rs.next()) {\n                resp.setContentType(\"application/json\");\n                resp.getWriter().write(String.format(\n                    \"{\\\"display_name\\\":\\\"%s\\\",\\\"bio\\\":\\\"%s\\\",\\\"location\\\":\\\"%s\\\",\\\"website\\\":\\\"%s\\\"}\",\n                    escapeJson(rs.getString(1)),\n                    escapeJson(rs.getString(2)),\n                    escapeJson(rs.getString(3)),\n                    escapeJson(rs.getString(4))\n                ));\n            } else {\n                resp.sendError(404);\n            }\n            rs.close();\n            pstmt.close();\n        } catch (SQLException e) {\n            resp.sendError(500);\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n    \n    private String escapeJson(String s) {\n        if (s == null) return \"\";\n        return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n    \n    private javax.sql.DataSource getDataSource() throws SQLException {\n        try {\n            javax.naming.Context ctx = new javax.naming.InitialContext();\n            return (javax.sql.DataSource) ctx.lookup(\"java:comp/env/jdbc/profiledb\");\n        } catch (javax.naming.NamingException e) {\n            throw new SQLException(\"DataSource lookup failed\", e);\n        }\n    }\n}",
+  "environment": {
+    "description": "AWS deployment with API Gateway (REST API type) using a request validator resource (validateRequestBody: true) attached to the POST /orders method. The method integration request has a Model schema (application/json content type) defined with a JSON Schema draft-04 specification requiring: 'action' must be an enum of exactly ['CREATE'], 'orderId' must match pattern ^[A-Z]{2}[0-9]{8}$ (max 10 chars), and all fields (customerEmail, amount, items) are required with strict types. The API Gateway model rejects any request where 'action' is not 'CREATE' with a 400 response before the message reaches the Lambda/SQS pipeline. A separate internal EventBridge rule handles state transitions (UPDATE/DELETE/PROCESS) triggered only by verified internal service events with IAM-authenticated PutEvents calls from the order-processing service role (arn:aws:iam::*:role/order-svc-internal) which enforces sequential processing via a Step Functions state machine with a Map state maxConcurrency of 1.",
+    "config": {
+      "api_gateway_type": "REST_API",
+      "request_validator": "VALIDATE_BODY",
+      "model_schema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "required": [
+          "action",
+          "orderId",
+          "customerEmail",
+          "amount",
+          "items"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "CREATE"
+            ]
+          },
+          "orderId": {
+            "type": "string",
+            "pattern": "^[A-Z]{2}[0-9]{8}$",
+            "maxLength": 10
+          },
+          "customerEmail": {
+            "type": "string",
+            "format": "email"
+          },
+          "amount": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 99999.99
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50
+          }
+        },
+        "additionalProperties": false
+      },
+      "state_transitions": "EVENTBRIDGE_INTERNAL_ONLY",
+      "transition_auth": "IAM_ROLE_order-svc-internal",
+      "step_functions_max_concurrency": 1,
+      "sqs_queue_type": "FIFO",
+      "fifo_message_group": "orderId",
+      "consumer_concurrency": "SEQUENTIAL_PER_ORDER"
+    }
+  }
+}

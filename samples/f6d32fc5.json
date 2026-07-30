@@ -1,0 +1,28 @@
+{
+  "id": "f6d32fc5",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/data_processor_controller.rb\nclass Api::V1::DataProcessorController < ApplicationController\n  skip_before_action :verify_authenticity_token\n\n  # Process binary payload from IoT devices\n  def process_payload\n    raw_data = request.body.read\n    device_id = params[:device_id]\n    \n    # Validate device registration\n    device = Device.find_by(hardware_id: device_id)\n    unless device\n      render json: { error: 'Unregistered device' }, status: :unauthorized\n      return\n    end\n\n    # Parse the binary telemetry frame\n    result = parse_telemetry_frame(raw_data, device)\n    \n    if result[:success]\n      TelemetryRecord.create!(\n        device: device,\n        temperature: result[:temperature],\n        pressure: result[:pressure],\n        raw_hex: raw_data.unpack1('H*')\n      )\n      render json: { status: 'accepted', record_id: result[:record_id] }\n    else\n      render json: { error: result[:error] }, status: :unprocessable_entity\n    end\n  end\n\n  # Bulk import endpoint for historical data migration\n  def bulk_import\n    import_file = params[:file]\n    batch_size = params[:batch_size]&.to_i || 100\n    \n    unless import_file.respond_to?(:read)\n      render json: { error: 'File required' }, status: :bad_request\n      return\n    end\n\n    # Use native extension for high-performance parsing\n    # This calls into a C extension for speed\n    records = NativeTelemetryParser.parse_bulk(\n      import_file.read,\n      batch_size,\n      params[:format] || 'binary_v2'\n    )\n\n    imported = 0\n    records.each_slice(batch_size) do |batch|\n      TelemetryRecord.insert_all(batch)\n      imported += batch.length\n    end\n\n    render json: { imported: imported }\n  end\n\n  private\n\n  def parse_telemetry_frame(data, device)\n    # Header: 4 bytes magic, 2 bytes version, 2 bytes length\n    return { success: false, error: 'Too short' } if data.bytesize < 8\n\n    magic = data[0..3]\n    return { success: false, error: 'Bad magic' } unless magic == \"\\xDE\\xAD\\xBE\\xEF\"\n\n    version = data[4..5].unpack1('S<')\n    declared_length = data[6..7].unpack1('S<')\n\n    # The native parser uses declared_length to allocate a stack buffer\n    # and copies data into it without bounds checking against actual data size\n    parsed = NativeTelemetryParser.parse_frame(\n      data,\n      declared_length,\n      device.firmware_version\n    )\n\n    {\n      success: true,\n      temperature: parsed[:temp],\n      pressure: parsed[:pressure],\n      record_id: SecureRandom.uuid\n    }\n  rescue NativeTelemetryParser::ParseError => e\n    { success: false, error: e.message }\n  end\nend\n\n# ext/native_telemetry_parser/native_telemetry_parser.c (simplified representation)\n# VALUE parse_frame(VALUE self, VALUE data, VALUE declared_len, VALUE fw_version) {\n#   int len = NUM2INT(declared_len);\n#   char stack_buf[4096];  // Fixed stack buffer\n#   char *src = RSTRING_PTR(data);\n#   // BUG: copies 'len' bytes from src into stack_buf without checking\n#   // if len > 4096 or if len > RSTRING_LEN(data)\n#   memcpy(stack_buf, src + 8, len);  // Skip 8-byte header\n#   // ... parse fields from stack_buf ...\n# }",
+  "environment": {
+    "description": "Rails 7.1 application deployed on EC2 instance (m5.large) in a private subnet (10.0.4.0/24) within a VPC that has NO NAT Gateway, NO NAT Instance, and NO VPC endpoints for any AWS service other than the DynamoDB gateway endpoint used by the application. The subnet's route table contains only the local VPC route (10.0.0.0/16 -> local) with no 0.0.0.0/0 route entry. The VPC has no Internet Gateway attached. Network ACLs on the subnet explicitly deny all egress to 0.0.0.0/0 on all ports except TCP 443 to the DynamoDB gateway endpoint prefix list (pl-02cd2c6b). The security group attached to the instance allows egress only to the VPC CIDR on port 5432 (PostgreSQL) and to the DynamoDB prefix list on 443. Ingress reaches the application only through an internal ALB in a separate private subnet. The NativeTelemetryParser C extension is compiled with the same flags as production (-fno-stack-protector) and ASLR remains disabled for firmware compatibility. The instance IAM role has no permissions beyond dynamodb:PutItem and dynamodb:GetItem scoped to a single table.",
+    "config": {
+      "subnet_type": "private",
+      "subnet_cidr": "10.0.4.0/24",
+      "route_table": "10.0.0.0/16 -> local (no other routes)",
+      "internet_gateway": "none attached to VPC",
+      "nat_gateway": "none",
+      "nat_instance": "none",
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.dynamodb (gateway)"
+      ],
+      "network_acl_egress": "DENY 0.0.0.0/0 ALL except TCP 443 to pl-02cd2c6b",
+      "security_group_egress": [
+        "10.0.0.0/16:5432",
+        "pl-02cd2c6b:443"
+      ],
+      "aslr": "disabled",
+      "stack_protector": "disabled",
+      "instance_role_policy": "dynamodb:PutItem,GetItem on arn:aws:dynamodb:us-east-1:123456789012:table/TelemetryRecords",
+      "ingress_path": "internal ALB in 10.0.2.0/24 -> target group -> instance:3000"
+    }
+  }
+}

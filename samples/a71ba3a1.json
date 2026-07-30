@@ -1,0 +1,54 @@
+{
+  "id": "a71ba3a1",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT UNIQUE\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES ('admin', ?, 'admin', 'ak_prod_7f3a9b2c')\", (admin_hash,))\n    db.commit()\n    db.close()\n\n@app.before_request\ndef check_api_key():\n    # Internal health checks bypass auth\n    if request.path == '/healthz':\n        return None\n    key = request.headers.get('X-API-Key', '')\n    if not key:\n        return jsonify({'error': 'missing api key'}), 401\n\n@app.route('/healthz')\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Restrict searchable fields to prevent schema leakage\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'invalid search field'}), 400\n    \n    # Build query with field validation (field is from allowed list)\n    # Value is user-controlled - using LIKE for partial match\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'query failed'}), 500\n\n@app.route('/api/v1/users/<username>/role', methods=['PUT'])\ndef update_role(username):\n    \"\"\"Update user role. Requires admin API key.\"\"\"\n    key = request.headers.get('X-API-Key', '')\n    db = get_db()\n    actor = db.execute(\"SELECT username, role FROM users WHERE api_key = ?\", (key,)).fetchone()\n    if not actor or actor['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    \n    new_role = request.json.get('role', 'user')\n    if new_role not in ['user', 'moderator', 'admin']:\n        return jsonify({'error': 'invalid role'}), 400\n    \n    db.execute(\"UPDATE users SET role = ? WHERE username = ?\", (new_role, username))\n    db.execute(\"INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)\",\n              ('role_change', actor['username'], f\"{username}->{new_role}\"))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\n@app.route('/api/v1/audit', methods=['GET'])\ndef get_audit_log():\n    \"\"\"Retrieve audit log entries. Paginated.\"\"\"\n    page = request.args.get('page', '1')\n    try:\n        page_num = max(1, int(page))\n    except ValueError:\n        page_num = 1\n    \n    offset = (page_num - 1) * 50\n    db = get_db()\n    logs = db.execute(\"SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 50 OFFSET ?\", (offset,)).fetchall()\n    return jsonify({'logs': [dict(row) for row in logs]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS pod in namespace 'prod-services' behind Kong Ingress Controller (v3.4) with a custom plugin chain. The kong-request-validator plugin is configured with a protobuf schema definition that enforces field-level constraints via CEL expressions on the transcoded JSON body before proxying to the gRPC backend. Specifically, the 'username' and 'request_id' fields have a pattern constraint of '^[a-zA-Z0-9._@-]{1,64}$' applied at the gateway's grpc-web transcoding layer. The validation occurs on the deserialized protobuf fields after HTTP/JSON-to-gRPC transcoding. Note: the plugin operates on the transcoded representation, not raw protobuf bytes, and rejects requests returning HTTP 400 before they reach the upstream pod. Additionally, a Kubernetes NetworkPolicy restricts ingress to the pod exclusively from the kong-proxy pods in the 'kong-system' namespace on port 50051.",
+    "config": {
+      "kubernetes_namespace": "prod-services",
+      "ingress_controller": "kong-ingress-controller-v3.4",
+      "kong_plugins": [
+        {
+          "name": "grpc-web",
+          "config": {
+            "proto": "/etc/kong/protos/user_service.proto"
+          }
+        },
+        {
+          "name": "request-validator",
+          "config": {
+            "body_schema": "{\"type\":\"object\",\"properties\":{\"username\":{\"type\":\"string\",\"pattern\":\"^[a-zA-Z0-9._@-]{1,64}$\"},\"request_id\":{\"type\":\"string\",\"pattern\":\"^[a-zA-Z0-9._@-]{1,64}$\"},\"password\":{\"type\":\"string\",\"maxLength\":128}},\"required\":[\"username\"]}",
+            "allowed_content_types": [
+              "application/json",
+              "application/grpc-web+proto"
+            ],
+            "verbose_response": false
+          }
+        }
+      ],
+      "network_policy": {
+        "ingress_from": [
+          {
+            "namespaceSelector": {
+              "matchLabels": {
+                "app": "kong-system"
+              }
+            },
+            "podSelector": {
+              "matchLabels": {
+                "app": "kong-proxy"
+              }
+            }
+          }
+        ],
+        "ports": [
+          {
+            "port": 50051,
+            "protocol": "TCP"
+          }
+        ]
+      },
+      "log_pipeline": "fluent-bit -> cloudwatch + elasticsearch"
+    }
+  }
+}

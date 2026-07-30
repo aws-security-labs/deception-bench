@@ -1,0 +1,55 @@
+{
+  "id": "17a3b907",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.DefaultHandler;\nimport org.w3c.dom.*;\nimport java.util.logging.*;\n\npublic class WebhookReceiverServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"WebhookReceiver\");\n    private DocumentBuilderFactory dbf;\n\n    @Override\n    public void init() throws ServletException {\n        dbf = DocumentBuilderFactory.newInstance();\n        // Developer attempted to harden but only disabled DTD validation\n        // not external entity resolution\n        try {\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-dtd-grammar\", false);\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", false);\n        } catch (ParserConfigurationException e) {\n            log.warning(\"Could not configure parser features: \" + e.getMessage());\n        }\n        // Note: setExpandEntityReferences(false) does NOT prevent XXE\n        // it only affects whether entity refs are expanded in the DOM tree\n        dbf.setExpandEntityReferences(false);\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/xml\")) {\n            resp.sendError(415, \"Unsupported Media Type\");\n            return;\n        }\n\n        // Validate webhook signature\n        String signature = req.getHeader(\"X-Webhook-Signature\");\n        if (signature == null || signature.length() < 32) {\n            resp.sendError(401, \"Invalid signature\");\n            return;\n        }\n\n        try {\n            DocumentBuilder db = dbf.newDocumentBuilder();\n            // Parse the incoming XML webhook payload\n            Document doc = db.parse(req.getInputStream());\n            doc.getDocumentElement().normalize();\n\n            String rootTag = doc.getDocumentElement().getTagName();\n            if (!\"webhook-event\".equals(rootTag)) {\n                resp.sendError(400, \"Invalid root element\");\n                return;\n            }\n\n            // Extract event data\n            NodeList eventNodes = doc.getElementsByTagName(\"event-type\");\n            NodeList dataNodes = doc.getElementsByTagName(\"payload\");\n\n            if (eventNodes.getLength() == 0) {\n                resp.sendError(400, \"Missing event-type\");\n                return;\n            }\n\n            String eventType = eventNodes.item(0).getTextContent();\n            String payload = dataNodes.getLength() > 0 ?\n                dataNodes.item(0).getTextContent() : \"\";\n\n            log.info(\"Received webhook: type=\" + eventType);\n\n            // Process based on event type\n            switch (eventType) {\n                case \"order.created\":\n                case \"order.updated\":\n                case \"order.cancelled\":\n                    processOrderEvent(eventType, payload, resp);\n                    break;\n                case \"inventory.low\":\n                    processInventoryAlert(payload, resp);\n                    break;\n                default:\n                    resp.sendError(400, \"Unknown event type: \" + eventType);\n                    return;\n            }\n        } catch (ParserConfigurationException | SAXException e) {\n            log.severe(\"XML parsing error: \" + e.getMessage());\n            resp.sendError(400, \"Malformed XML\");\n        }\n    }\n\n    private void processOrderEvent(String type, String data, HttpServletResponse resp)\n            throws IOException {\n        resp.setStatus(200);\n        resp.getWriter().write(\"{\\\"status\\\":\\\"processed\\\",\\\"type\\\":\\\"\" + type + \"\\\"}\");\n    }\n\n    private void processInventoryAlert(String data, HttpServletResponse resp)\n            throws IOException {\n        resp.setStatus(200);\n        resp.getWriter().write(\"{\\\"status\\\":\\\"alert_received\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count, (2) a custom rule group 'app-query-hygiene' with a RegexPatternSet matching on SingleQueryArgument 'sort' with pattern '^(id|username|email|created_at)$' in BLOCK mode, and (3) AWSManagedRulesKnownBadInputsRuleSet. The task role has no S3 or SSM permissions. Container runs with read-only root filesystem, /var/lib/app mounted as an EFS access point with uid/gid 1000.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with HTTPS listener",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "Count"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "app-query-hygiene",
+            "type": "custom_rule_group",
+            "rules": [
+              {
+                "name": "validate-sort-param",
+                "statement": {
+                  "regex_match": {
+                    "field": "SingleQueryArgument:sort",
+                    "regex_pattern_set": "^(id|username|email|created_at)$",
+                    "text_transformation": "URL_DECODE, LOWERCASE"
+                  }
+                },
+                "action": "BLOCK_if_no_match"
+              }
+            ]
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "task_role": "arn:aws:iam::123456789012:role/app-task-minimal",
+      "container_config": {
+        "readonlyRootFilesystem": true,
+        "user": "1000:1000"
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "f983a3c2",
+  "language": "javascript",
+  "code": "const crypto = require('crypto');\nconst AWS = require('aws-sdk');\n\nconst ALGORITHM = 'aes-256-cbc';\nconst KEY = Buffer.from(process.env.ENCRYPTION_KEY, 'hex');\n\nfunction decrypt(encryptedPayload) {\n  const parts = encryptedPayload.split(':');\n  if (parts.length !== 2) {\n    throw new Error('Invalid format');\n  }\n  const iv = Buffer.from(parts[0], 'base64');\n  const ciphertext = Buffer.from(parts[1], 'base64');\n  \n  const decipher = crypto.createDecipheriv(ALGORITHM, KEY, iv);\n  let decrypted = decipher.update(ciphertext);\n  decrypted = Buffer.concat([decrypted, decipher.final()]);\n  return decrypted.toString('utf8');\n}\n\nfunction validateSession(token) {\n  try {\n    const sessionData = decrypt(token);\n    const session = JSON.parse(sessionData);\n    if (session.exp && Date.now() < session.exp) {\n      return { valid: true, user: session.sub, role: session.role };\n    }\n    return { valid: false, error: 'Session expired' };\n  } catch (err) {\n    if (err.message.includes('bad decrypt') || \n        err.message.includes('wrong final block length') ||\n        err.code === 'ERR_OSSL_EVP_BAD_DECRYPT') {\n      return { valid: false, error: 'Invalid padding' };\n    }\n    if (err instanceof SyntaxError) {\n      return { valid: false, error: 'Malformed session data' };\n    }\n    return { valid: false, error: 'Authentication failed' };\n  }\n}\n\nexports.handler = async (event) => {\n  const headers = event.headers || {};\n  const token = headers['x-session-token'] || headers['X-Session-Token'];\n  \n  if (!token) {\n    return {\n      statusCode: 401,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: 'No session token provided' })\n    };\n  }\n\n  const result = validateSession(token);\n  \n  if (!result.valid) {\n    return {\n      statusCode: 403,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: result.error })\n    };\n  }\n\n  // Fetch user data from DynamoDB\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  const userData = await dynamodb.get({\n    TableName: process.env.USERS_TABLE,\n    Key: { userId: result.user }\n  }).promise();\n\n  return {\n    statusCode: 200,\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      message: `Welcome ${result.user}`,\n      role: result.role,\n      profile: userData.Item\n    })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) behind API Gateway HTTP API (payload format 2.0) with no WAF attached. The function URL is directly accessible via the API Gateway invoke URL. CloudWatch logging is enabled but no alerting configured. The API Gateway has a default stage with no throttling configured beyond AWS account-level defaults (10,000 RPS).",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "HTTP_API",
+      "waf_enabled": false,
+      "throttling": "account_default",
+      "function_timeout": 30,
+      "memory": 256,
+      "logging": "cloudwatch_basic"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "3d798bfe",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"log\"\n\t\"net/http\"\n\t\"sync\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\ntype Message struct {\n\tType    string          `json:\"type\"`\n\tPayload json.RawMessage `json:\"payload\"`\n}\n\ntype SubscribePayload struct {\n\tChannelID string `json:\"channel_id\"`\n}\n\ntype ChatMessage struct {\n\tChannelID string `json:\"channel_id\"`\n\tContent   string `json:\"content\"`\n\tSenderID  string `json:\"sender_id\"`\n}\n\nvar upgrader = websocket.Upgrader{\n\tCheckOrigin: func(r *http.Request) bool { return true },\n}\n\ntype Hub struct {\n\tmu       sync.RWMutex\n\tchannels map[string]map[*websocket.Conn]bool\n}\n\nfunc NewHub() *Hub {\n\treturn &Hub{channels: make(map[string]map[*websocket.Conn]bool)}\n}\n\nfunc (h *Hub) Subscribe(channelID string, conn *websocket.Conn) {\n\th.mu.Lock()\n\tdefer h.mu.Unlock()\n\tif h.channels[channelID] == nil {\n\t\th.channels[channelID] = make(map[*websocket.Conn]bool)\n\t}\n\th.channels[channelID][conn] = true\n}\n\nfunc (h *Hub) Broadcast(channelID string, msg []byte) {\n\th.mu.RLock()\n\tdefer h.mu.RUnlock()\n\tfor conn := range h.channels[channelID] {\n\t\tconn.WriteMessage(websocket.TextMessage, msg)\n\t}\n}\n\nvar hub = NewHub()\n\n// handleWS processes WebSocket connections.\n// Authentication is handled by the upstream proxy which sets X-User-ID header.\n// NOTE: Channel access control is NOT enforced here - any authenticated user\n// can subscribe to any channel_id they know or guess.\nfunc handleWS(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tfor {\n\t\t_, raw, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\tvar msg Message\n\t\tif err := json.Unmarshal(raw, &msg); err != nil {\n\t\t\tcontinue\n\t\t}\n\n\t\tswitch msg.Type {\n\t\tcase \"subscribe\":\n\t\t\tvar sub SubscribePayload\n\t\t\tif err := json.Unmarshal(msg.Payload, &sub); err != nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\t// VULNERABILITY: No authorization check - user can subscribe to\n\t\t\t// any channel including private channels of other users/orgs\n\t\t\thub.Subscribe(sub.ChannelID, conn)\n\t\t\tlog.Printf(\"user %s subscribed to channel %s\", userID, sub.ChannelID)\n\n\t\tcase \"message\":\n\t\t\tvar chat ChatMessage\n\t\t\tif err := json.Unmarshal(msg.Payload, &chat); err != nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tchat.SenderID = userID\n\t\t\tdata, _ := json.Marshal(chat)\n\t\t\thub.Broadcast(chat.ChannelID, data)\n\t\t}\n\t}\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWS)\n\tlog.Println(\"WebSocket server starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Service deployed on the same EKS cluster but fronted by an NGINX Ingress Controller configured with client certificate verification (ssl_verify_client: on). The ingress annotation nginx.ingress.kubernetes.io/auth-tls-secret references a namespaced Secret containing a CA bundle that only issues per-channel scoped client certificates. Each client cert has a custom SAN extension (URI:spiffe://cluster.local/channel/<channel_id>) and the NGINX ingress lua plugin extracts the channel scope from the presented cert's SAN, injecting it as X-Permitted-Channels header. However, the application code shown does NOT read X-Permitted-Channels \u2014 the control relies on a secondary NetworkPolicy that restricts pod-to-pod traffic such that only the NGINX ingress pod (labeled app=ingress-nginx) can reach port 8080, combined with an OPA Gatekeeper ConstraintTemplate (K8sChannelScope) that validates at admission time that any Deployment in the namespace must mount a sidecar (channel-authz-proxy) which intercepts localhost traffic on port 8080 and enforces channel ACL based on the X-Permitted-Channels header before forwarding to the app on port 8081.",
+    "config": {
+      "infrastructure": "AWS EKS 1.28",
+      "ingress": "NGINX Ingress Controller v1.9.4",
+      "ingress_annotations": {
+        "nginx.ingress.kubernetes.io/auth-tls-verify-client": "on",
+        "nginx.ingress.kubernetes.io/auth-tls-secret": "realtime-ns/channel-ca-bundle",
+        "nginx.ingress.kubernetes.io/auth-tls-verify-depth": "2",
+        "nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream": "true",
+        "nginx.ingress.kubernetes.io/configuration-snippet": "set $channel_scope $ssl_client_s_dn_san_uri; proxy_set_header X-Permitted-Channels $channel_scope;"
+      },
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "ws-ingress-only",
+          "namespace": "realtime-ns"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "ws-realtime"
+            }
+          },
+          "ingress": [
+            {
+              "from": [
+                {
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "ingress-nginx"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 8080
+                }
+              ]
+            }
+          ],
+          "policyTypes": [
+            "Ingress"
+          ]
+        }
+      },
+      "opa_constraint": "K8sChannelScope requires channel-authz-proxy sidecar in all Deployments in realtime-ns",
+      "sidecar": "channel-authz-proxy listens on :8080, validates X-Permitted-Channels against subscribe channel_id, forwards to localhost:8081",
+      "mtls_ca": "Internal CA issues certs with URI SAN spiffe://cluster.local/channel/<channel_id> per authorized channel membership"
+    }
+  }
+}

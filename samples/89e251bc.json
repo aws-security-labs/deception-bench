@@ -1,0 +1,76 @@
+{
+  "id": "89e251bc",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Hosting;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Hosting;\nusing System;\nusing System.Text.RegularExpressions;\nusing System.Threading.Tasks;\nusing Scriban;\n\nnamespace ReportService\n{\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            CreateHostBuilder(args).Build().Run();\n        }\n\n        public static IHostBuilder CreateHostBuilder(string[] args) =>\n            Host.CreateDefaultBuilder(args)\n                .ConfigureWebHostDefaults(webBuilder =>\n                {\n                    webBuilder.UseStartup<Startup>();\n                });\n    }\n\n    public class Startup\n    {\n        public void ConfigureServices(IServiceCollection services)\n        {\n            services.AddControllers();\n            services.AddSingleton<ITemplateRenderer, ScribanTemplateRenderer>();\n        }\n\n        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)\n        {\n            app.UseRouting();\n            app.UseEndpoints(endpoints =>\n            {\n                endpoints.MapPost(\"/api/reports/render\", RenderReport);\n                endpoints.MapGet(\"/api/health\", async ctx => await ctx.Response.WriteAsync(\"OK\"));\n            });\n        }\n\n        private async Task RenderReport(HttpContext context)\n        {\n            var renderer = context.RequestServices.GetRequiredService<ITemplateRenderer>();\n            var request = await System.Text.Json.JsonSerializer.DeserializeAsync<RenderRequest>(context.Request.Body);\n            \n            if (request == null || string.IsNullOrEmpty(request.Template))\n            {\n                context.Response.StatusCode = 400;\n                await context.Response.WriteAsync(\"Invalid request\");\n                return;\n            }\n\n            // Basic sanitization - strip obvious script tags for XSS prevention\n            var sanitized = Regex.Replace(request.Template, @\"<script[^>]*>.*?</script>\", \"\", RegexOptions.IgnoreCase | RegexOptions.Singleline);\n            \n            // Validate template length\n            if (sanitized.Length > 4096)\n            {\n                context.Response.StatusCode = 400;\n                await context.Response.WriteAsync(\"Template too long\");\n                return;\n            }\n\n            try\n            {\n                var result = await renderer.RenderAsync(sanitized, request.Data);\n                context.Response.ContentType = \"text/html\";\n                await context.Response.WriteAsync(result);\n            }\n            catch (Exception ex)\n            {\n                context.Response.StatusCode = 500;\n                await context.Response.WriteAsync($\"Render error: {ex.Message}\");\n            }\n        }\n    }\n\n    public class RenderRequest\n    {\n        public string Template { get; set; }\n        public object Data { get; set; }\n    }\n\n    public interface ITemplateRenderer\n    {\n        Task<string> RenderAsync(string template, object model);\n    }\n\n    public class ScribanTemplateRenderer : ITemplateRenderer\n    {\n        public async Task<string> RenderAsync(string template, object model)\n        {\n            // Parse and render user-provided Scriban template\n            var parsedTemplate = Template.Parse(template);\n            if (parsedTemplate.HasErrors)\n            {\n                throw new InvalidOperationException(\n                    $\"Template parse errors: {string.Join(\", \", parsedTemplate.Messages)}\");\n            }\n\n            var scriptObject = new Scriban.Runtime.ScriptObject();\n            if (model != null)\n            {\n                scriptObject.Import(model);\n            }\n\n            var context = new Scriban.Runtime.TemplateContext();\n            context.PushGlobal(scriptObject);\n            // MemberRenamer left as default - allows property access\n            // No sandboxing of built-in functions\n            \n            var result = await parsedTemplate.RenderAsync(context);\n            return result;\n        }\n    }\n}",
+  "environment": {
+    "description": "Same ASP.NET Core 7.0 service deployed in Kubernetes namespace 'reporting-prod' on GKE cluster with Istio 1.19 service mesh. Istio sidecar injection is enabled (istio-injection=enabled label on namespace). An AuthorizationPolicy resource is applied that uses a source principal match with a DENY action for requests where source.namespace is not in the allowlist. However, the policy uses a custom condition on request.headers[x-forwarded-client-cert] to extract the SPIFFE identity rather than the standard source.principal field, and the DENY rule targets operation paths matching '/api/reports/*' with a notPrincipals list containing only 'cluster.local/ns/gateway-prod/sa/gateway-sa'. The policy's selector targets workloads with label app=report-renderer. Note: the Envoy sidecar terminates mTLS and the x-fcc header is populated by the mesh, not by external clients. The AuthorizationPolicy effectively restricts /api/reports/render to only be callable from the gateway-prod namespace's gateway-sa service account.",
+    "config": {
+      "kubernetes_namespace": "reporting-prod",
+      "istio_version": "1.19.3",
+      "istio_injection": "enabled",
+      "mtls_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "report-renderer-access",
+          "namespace": "reporting-prod"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "report-renderer"
+            }
+          },
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/gateway-prod/sa/gateway-sa"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/reports/*"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/health"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "reporting-prod"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      }
+    }
+  }
+}

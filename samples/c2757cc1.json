@@ -1,0 +1,36 @@
+{
+  "id": "c2757cc1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with optional category filter\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\tif category == \"\" {\n\t\tcategory = \"all\"\n\t}\n\tif sortField == \"\" {\n\t\tsortField = \"name\"\n\t}\n\n\t// Build query - parameterized for category and min_price\n\tvar query string\n\tvar args []interface{}\n\n\tif category == \"all\" {\n\t\tquery = \"SELECT id, name, price, description FROM products WHERE active = true\"\n\t} else {\n\t\tquery = \"SELECT id, name, price, description FROM products WHERE active = true AND category = $1\"\n\t\targs = append(args, category)\n\t}\n\n\tif minPrice != \"\" {\n\t\tif len(args) == 0 {\n\t\t\tquery += \" AND price >= $1\"\n\t\t} else {\n\t\t\tquery += fmt.Sprintf(\" AND price >= $%d\", len(args)+1)\n\t\t}\n\t\targs = append(args, minPrice)\n\t}\n\n\t// Sort field - validated against allowlist... but the check has a flaw\n\tallowedSorts := []string{\"name\", \"price\", \"created_at\", \"rating\"}\n\tsortValid := false\n\tfor _, allowed := range allowedSorts {\n\t\tif strings.HasPrefix(sortField, allowed) {\n\t\t\tsortValid = true\n\t\t\tbreak\n\t\t}\n\t}\n\n\tif !sortValid {\n\t\tsortField = \"name\"\n\t}\n\n\t// ORDER BY is appended directly - can't use parameterized queries for identifiers\n\tquery += \" ORDER BY \" + sortField\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tw.Write([]byte(fmt.Sprintf(`  {\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\tlog.Println(\"Starting product search service on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Kafka consumer deployed in EKS. However, messages are produced exclusively through an AWS API Gateway (REST API) endpoint with a request model validator attached to the POST /api/v1/user-lookup method. The model schema defines 'username' as type string with pattern '^[a-zA-Z0-9._-]{1,64}$' and the validator is configured with 'validateRequestBody: true'. The API Gateway integration is a direct Kafka REST Proxy integration (via VPC link to MSK Connect) that extracts the validated 'username' field and publishes it as the message value. There is no alternative path to produce to the 'user-lookup-requests' topic \u2014 the MSK cluster security configuration uses IAM authentication and only the API Gateway execution role (arn:aws:iam::*:role/apigw-kafka-producer-role) has kafka-cluster:WriteData permission on the topic. Additionally, the Kafka cluster has a topic-level ACL that denies WRITE from any principal other than the API Gateway role.",
+    "config": {
+      "runtime": "EKS 1.28, Go 1.21",
+      "ingress": "AWS API Gateway REST API with request validator",
+      "request_model": {
+        "type": "object",
+        "required": [
+          "username",
+          "request_id"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9._-]{1,64}$",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "validator_config": "validateRequestBody: true, validateRequestParameters: true",
+      "kafka": "MSK cluster, IAM auth, topic ACL WRITE restricted to apigw-kafka-producer-role only",
+      "ldap": "OpenLDAP 2.6, bind required for search",
+      "network": "MSK in private subnet, no direct client access outside VPC link"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "efce19e7",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.util.Base64;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.WebServlet;\nimport org.apache.commons.collections4.Transformer;\nimport org.apache.commons.collections4.functors.*;\nimport org.apache.commons.collections4.map.LazyMap;\nimport org.apache.commons.collections4.keyvalue.TiedMapEntry;\n\n/**\n * CI/CD Pipeline Plugin - Build Artifact Cache Handler\n * Accepts serialized BuildCacheEntry objects from trusted build agents\n * to populate the shared artifact cache for downstream pipeline stages.\n */\n@WebServlet(\"/api/v2/cache/artifact\")\npublic class ArtifactCacheServlet extends HttpServlet {\n\n    private static final String CACHE_DIR = \"/var/lib/pipeline/cache\";\n    private static final long MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        \n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/x-java-serialized-object\")) {\n            resp.sendError(415, \"Unsupported media type\");\n            return;\n        }\n\n        // Validate agent token header\n        String agentToken = req.getHeader(\"X-Pipeline-Agent-Token\");\n        if (agentToken == null || agentToken.isEmpty()) {\n            resp.sendError(401, \"Missing agent token\");\n            return;\n        }\n\n        // Size check\n        if (req.getContentLengthLong() > MAX_PAYLOAD_SIZE) {\n            resp.sendError(413, \"Payload too large\");\n            return;\n        }\n\n        try {\n            // Deserialize the cache entry from the build agent\n            ObjectInputStream ois = new ObjectInputStream(req.getInputStream());\n            Object cacheEntry = ois.readObject();\n            ois.close();\n\n            if (cacheEntry instanceof BuildCacheEntry) {\n                BuildCacheEntry entry = (BuildCacheEntry) cacheEntry;\n                persistCacheEntry(entry);\n                resp.setStatus(201);\n                resp.getWriter().write(\"{\\\"status\\\":\\\"cached\\\",\\\"key\\\":\\\"\" + entry.getKey() + \"\\\"}\");\n            } else {\n                resp.sendError(400, \"Invalid cache entry type\");\n            }\n        } catch (ClassNotFoundException e) {\n            resp.sendError(400, \"Unknown class in payload\");\n        } catch (IOException e) {\n            resp.sendError(500, \"Cache write failed: \" + e.getMessage());\n        }\n    }\n\n    private void persistCacheEntry(BuildCacheEntry entry) throws IOException {\n        File cacheFile = new File(CACHE_DIR, entry.getKey() + \".dat\");\n        try (FileOutputStream fos = new FileOutputStream(cacheFile);\n             ObjectOutputStream oos = new ObjectOutputStream(fos)) {\n            oos.writeObject(entry);\n        }\n    }\n}\n\nclass BuildCacheEntry implements Serializable {\n    private static final long serialVersionUID = 1L;\n    private String key;\n    private byte[] data;\n    private long timestamp;\n    private String checksum;\n\n    public BuildCacheEntry(String key, byte[] data) {\n        this.key = key;\n        this.data = data;\n        this.timestamp = System.currentTimeMillis();\n    }\n\n    public String getKey() { return key; }\n    public byte[] getData() { return data; }\n    public long getTimestamp() { return timestamp; }\n    public String getChecksum() { return checksum; }\n    public void setChecksum(String checksum) { this.checksum = checksum; }\n}",
+  "environment": {
+    "description": "Same plugin deployed via Helm chart with pod spec override: securityContext.readOnlyRootFilesystem=true at container level, no emptyDir or tmpfs volume mounts defined, /tmp is part of the read-only overlay. The container uses a distroless base image (gcr.io/distroless/java17-debian11) which has no shell binaries (/bin/sh, /bin/bash, etc. are absent). The pod runs with a Kubernetes SecurityContext that sets runAsNonRoot=true, runAsUser=65534, and drops ALL capabilities. No writable volume is mounted at any path including /var/lib/pipeline/cache, /tmp, /dev/shm, or /proc/self. The OCI runtime spec has a seccomp profile that blocks execve, execveat, and fork syscalls (based on RuntimeDefault with additional deny list). Note: the Java ObjectInputStream deserialization still occurs and the gadget chain fires, but the final payload (Runtime.exec or ProcessBuilder) fails because (1) no writable filesystem location exists to drop payloads, (2) no shell binary exists in the image, (3) execve/execveat syscalls are blocked by seccomp even if a binary path were somehow resolved, and (4) fork is blocked preventing any child process creation.",
+    "config": {
+      "container_image": "gcr.io/distroless/java17-debian11",
+      "kubernetes_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "seccomp_profile": {
+        "type": "Localhost",
+        "localhostProfile": "profiles/pipeline-plugin-hardened.json",
+        "blocked_syscalls": [
+          "execve",
+          "execveat",
+          "fork",
+          "vfork",
+          "clone"
+        ]
+      },
+      "volumes": [],
+      "volume_mounts": [],
+      "shell_binaries_present": false
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "4ea836ba",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/users.db')\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT NOT NULL,\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        target_user TEXT,\n        performed_by TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        api_key = request.headers.get('X-API-Key')\n        if not api_key:\n            return jsonify({'error': 'Missing API key'}), 401\n        db = get_db()\n        user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n        if not user:\n            return jsonify({'error': 'Invalid API key'}), 403\n        g.current_user = dict(user)\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/users/search', methods=['GET'])\n@verify_api_key\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': f'Invalid field. Allowed: {allowed_fields}'}), 400\n    \n    if not value or len(value) > 100:\n        return jsonify({'error': 'Query must be 1-100 chars'}), 400\n    \n    # Build query with field from whitelist - seems safe\n    # But the value is concatenated directly for LIKE pattern\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = get_db().execute(query).fetchall()\n        return jsonify({'users': [dict(r) for r in results]})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\n@verify_api_key\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\n@verify_api_key\ndef create_user():\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Admin only'}), 403\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password = data.get('password', 'changeme')\n    pw_hash = hashlib.sha256(password.encode()).hexdigest()\n    api_key = hmac.new(SECRET_KEY.encode(), data['username'].encode(), hashlib.sha256).hexdigest()[:32]\n    \n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, email, password_hash, api_key) VALUES (?, ?, ?, ?)',\n                   (data['username'], data['email'], pw_hash, api_key))\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', '0') == '1')",
+  "environment": {
+    "description": "Same Ktor microservice deployed in namespace 'template-engine' on the same GKE cluster with Istio 1.20 service mesh. Istio sidecar injection is enabled (istio-injection=enabled label). An AuthorizationPolicy resource is applied that uses a source principal match with a namespace-scoped condition: spec.rules[].from[].source.namespaces is set to ['template-engine'] only, meaning only pods within the same namespace can reach the service. Additionally, a PeerAuthentication resource enforces STRICT mTLS for the namespace. However, the AuthorizationPolicy uses 'action: ALLOW' with the namespace restriction rather than an explicit DENY, and the policy's selector matches workload label 'app: template-renderer'. Note: the actual deployment uses label 'app: template-renderer' on the pod spec. External traffic from other namespaces (including 'web-app' where user-controlled input originates) is rejected at the Envoy proxy level with a 403 RBAC denied response before reaching the application container.",
+    "config": {
+      "kubernetes_cluster": "GKE 1.28",
+      "namespace": "template-engine",
+      "istio_version": "1.20.2",
+      "istio_injection": "enabled",
+      "peer_authentication": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "template-svc-access",
+          "namespace": "template-engine"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "template-renderer"
+            }
+          },
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "namespaces": [
+                      "template-engine"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "service_type": "ClusterIP",
+      "calling_services": "Only an internal orchestrator pod in 'template-engine' namespace calls this service with hardcoded safe templates"
+    }
+  }
+}

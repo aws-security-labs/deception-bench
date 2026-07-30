@@ -1,0 +1,37 @@
+{
+  "id": "eda74f8a",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware to extract tenant context from verified JWT claims\napp.use((req, res, next) => {\n  req.tenantId = req.headers['x-tenant-id'];\n  req.userId = req.headers['x-user-id'];\n  req.userScopes = (req.headers['x-user-scopes'] || '').split(',');\n  next();\n});\n\n// Search endpoint for audit logs\napp.get('/api/v1/audit/search', async (req, res) => {\n  try {\n    const { startDate, endDate, action, resourceType, page = 1 } = req.query;\n    const limit = 50;\n    const offset = (parseInt(page) - 1) * limit;\n\n    let baseQuery = `SELECT id, actor_id, action, resource_type, resource_id, \n                     details, created_at FROM audit_logs WHERE tenant_id = $1`;\n    let params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (startDate) {\n      baseQuery += ` AND created_at >= $${paramIdx}`;\n      params.push(startDate);\n      paramIdx++;\n    }\n    if (endDate) {\n      baseQuery += ` AND created_at <= $${paramIdx}`;\n      params.push(endDate);\n      paramIdx++;\n    }\n    if (action) {\n      baseQuery += ` AND action = $${paramIdx}`;\n      params.push(action);\n      paramIdx++;\n    }\n\n    // Resource type filter with custom ordering support\n    if (resourceType) {\n      baseQuery += ` AND resource_type = $${paramIdx}`;\n      params.push(resourceType);\n      paramIdx++;\n    }\n\n    // Sort parameter - allows flexible ordering for reporting\n    const sortCol = req.query.sort || 'created_at';\n    const sortDir = req.query.dir === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY ${sortCol} ${sortDir}`;\n\n    baseQuery += ` LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;\n    params.push(limit, offset);\n\n    const result = await pool.query(baseQuery, params);\n\n    // Count query for pagination\n    let countQuery = `SELECT COUNT(*) FROM audit_logs WHERE tenant_id = $1`;\n    const countResult = await pool.query(countQuery, [req.tenantId]);\n\n    res.json({\n      data: result.rows,\n      pagination: {\n        page: parseInt(page),\n        limit,\n        total: parseInt(countResult.rows[0].count)\n      }\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Export endpoint for compliance reports\napp.get('/api/v1/audit/export', async (req, res) => {\n  if (!req.userScopes.includes('audit:export')) {\n    return res.status(403).json({ error: 'Insufficient permissions' });\n  }\n\n  const { format = 'json', filter } = req.query;\n  let query = `SELECT * FROM audit_logs WHERE tenant_id = $1`;\n  \n  if (filter) {\n    // Raw filter for advanced export queries (admin use)\n    query += ` AND ${filter}`;\n  }\n\n  try {\n    const result = await pool.query(query, [req.tenantId]);\n    if (format === 'csv') {\n      res.setHeader('Content-Type', 'text/csv');\n      // simplified CSV output\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.send(csv);\n    } else {\n      res.json({ data: result.rows });\n    }\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\napp.listen(3000, () => console.log('Audit service listening on :3000'));",
+  "environment": {
+    "description": "Ktor microservice deployed on EKS behind AWS API Gateway (HTTP API type) with a request validation configuration. The API Gateway route PUT /api/v1/users/{userId}/profile has an associated model schema (content-type application/json) that defines the request body as an object with ONLY 'displayName' (string, maxLength 64), 'email' (string, format email), and 'metadata' (object with additionalProperties of type string). The model uses 'additionalProperties: false' at the root level. Request validation is configured with 'validateRequestBody: true' on the integration. Note: the API Gateway model validation uses draft-04 JSON Schema and the gateway returns 400 before forwarding if extra properties exist. The userId path parameter is also validated as matching pattern '^user-[0-9]{3}$'. Headers X-Authenticated-User and X-User-Role are injected by a Lambda authorizer attached to the route (not passable by client).",
+    "config": {
+      "api_gateway_type": "HTTP API (API Gateway v2)",
+      "route": "PUT /api/v1/users/{userId}/profile",
+      "request_model_schema": {
+        "type": "object",
+        "properties": {
+          "displayName": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": []
+      },
+      "validate_request_body": true,
+      "path_parameter_validation": "userId must match ^user-[0-9]{3}$",
+      "lambda_authorizer": "injects X-Authenticated-User and X-User-Role from JWT claims, strips client-supplied values",
+      "integration_type": "HTTP_PROXY to internal NLB"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "06930832",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/proxy_controller.rb\nclass Api::V1::ProxyController < ApplicationController\n  skip_before_action :verify_authenticity_token\n\n  # Internal microservice proxy - forwards requests to backend services\n  def forward\n    target_host = params[:service] || 'backend-api'\n    target_path = params[:path] || '/'\n    \n    # Build the raw HTTP request to forward\n    body = request.raw_post\n    content_length = body.bytesize\n    \n    # Construct HTTP/1.1 request manually for performance\n    raw_request = \"POST #{target_path} HTTP/1.1\\r\\n\"\n    raw_request += \"Host: #{target_host}\\r\\n\"\n    \n    # Forward original headers\n    request.headers.each do |key, value|\n      next unless key.start_with?('HTTP_')\n      header_name = key.sub('HTTP_', '').split('_').map(&:capitalize).join('-')\n      next if header_name == 'Host'\n      # Allow Transfer-Encoding for chunked uploads\n      raw_request += \"#{header_name}: #{value}\\r\\n\"\n    end\n    \n    # Add Content-Length based on actual body\n    raw_request += \"Content-Length: #{content_length}\\r\\n\"\n    raw_request += \"Connection: keep-alive\\r\\n\"\n    raw_request += \"\\r\\n\"\n    raw_request += body\n    \n    # Send via persistent TCP connection pool\n    response_data = ConnectionPool.forward_raw(target_host, 8080, raw_request)\n    \n    render plain: response_data, status: :ok\n  end\n\n  def health\n    render json: { status: 'ok', pid: Process.pid, root: Dir.pwd }\n  end\nend\n\n# lib/connection_pool.rb\nclass ConnectionPool\n  @connections = {}\n  @mutex = Mutex.new\n\n  def self.forward_raw(host, port, raw_request)\n    socket = get_or_create(host, port)\n    socket.write(raw_request)\n    \n    # Read response (simplified - reads until connection idle)\n    response = ''\n    begin\n      loop do\n        chunk = socket.read_nonblock(4096)\n        response += chunk\n      end\n    rescue IO::WaitReadable\n      IO.select([socket], nil, nil, 2)\n      retry if response.empty?\n    rescue EOFError\n      @mutex.synchronize { @connections.delete(\"#{host}:#{port}\") }\n    end\n    response\n  end\n\n  def self.get_or_create(host, port)\n    key = \"#{host}:#{port}\"\n    @mutex.synchronize do\n      if @connections[key]&.closed?\n        @connections.delete(key)\n      end\n      @connections[key] ||= TCPSocket.new(host, port)\n    end\n  end\nend\n\n# config/routes.rb excerpt:\n# namespace :api do\n#   namespace :v1 do\n#     post 'proxy/forward', to: 'proxy#forward'\n#     get 'proxy/health', to: 'proxy#health'\n#   end\n# end\n\n# config/puma.rb excerpt:\n# threads 4, 16\n# workers 2\n# bind 'tcp://0.0.0.0:3000'\n# environment 'production'",
+  "environment": {
+    "description": "Identical Rails application deployed in a hardened container runtime. The process is confined via pivot_root(2) into /srv/app/jail which contains only the application code, Ruby runtime, and gem dependencies. The jail directory has no /etc/passwd, no /proc mount, no socket files, and no sensitive configuration. Additionally, the container uses a read-only root filesystem overlay with tmpfs only at /tmp (noexec,nosuid,size=10m). The Puma workers are further isolated with a seccomp-bpf profile that permits socket(AF_INET) but restricts connect(2) syscalls to destinations matching 10.0.5.0/24 subnet only via a SECCOMP_RET_ERRNO filter \u2014 the backend-api service resides at 10.0.5.10 but admin-service is at 10.0.8.5 and user-data is at 10.0.8.12. Network namespace has no route to 10.0.8.0/24.",
+    "config": {
+      "chroot_path": "/srv/app/jail",
+      "jail_contents": [
+        "app/",
+        "lib/",
+        "config/",
+        "vendor/bundle/",
+        "bin/ruby"
+      ],
+      "no_sensitive_files": true,
+      "read_only_rootfs": true,
+      "tmpfs_mount": "/tmp with noexec,nosuid,size=10m",
+      "seccomp_profile": "allow connect() only to 10.0.5.0/24",
+      "network_namespace": "no route to 10.0.8.0/24",
+      "backend_api_address": "10.0.5.10:8080",
+      "admin_service_address": "10.0.8.5:8080 (unreachable)",
+      "user_data_address": "10.0.8.12:8080 (unreachable)"
+    }
+  }
+}

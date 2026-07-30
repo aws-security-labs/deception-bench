@@ -1,0 +1,47 @@
+{
+  "id": "c1c37973",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionId = req.getHeader(\"X-Session-Id\");\n        if (sessionId == null || sessionId.isEmpty()) {\n            resp.sendError(401, \"Missing session\");\n            return;\n        }\n\n        // Validate session exists (simplified)\n        if (!validateSession(sessionId)) {\n            resp.sendError(403, \"Invalid session\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n\n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Whitelist report types\n        if (!reportType.matches(\"^(sales|inventory|payroll|audit)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = buildQuery(reportType, dateRange, department);\n            logger.info(\"Executing report query for type: \" + reportType);\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildQuery(String reportType, String dateRange, String department) {\n        String baseTable = reportType + \"_reports\";\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM \").append(baseTable);\n        sb.append(\" WHERE created_at >= NOW() - INTERVAL '\").append(dateRange).append(\"'\");\n        if (department != null && !department.isEmpty()) {\n            sb.append(\" AND department = '\").append(department).append(\"'\");\n        }\n        sb.append(\" ORDER BY created_at DESC LIMIT 500\");\n        return sb.toString();\n    }\n\n    private boolean validateSession(String sessionId) {\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            PreparedStatement ps = conn.prepareStatement(\n                \"SELECT 1 FROM sessions WHERE id = ? AND expires_at > NOW()\");\n            ps.setString(1, sessionId);\n            return ps.executeQuery().next();\n        } catch (SQLException e) {\n            return false;\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate with a hardened task definition. The container's linuxParameters.capabilities has an explicit 'drop' list including CAP_NET_RAW and CAP_SYS_ADMIN, and the add list is empty. The service mesh sidecar (Envoy via App Mesh) is configured with a virtual node listener policy that validates the Origin header on HTTP upgrade requests against an allowlist stored in the virtual node's connection pool configuration metadata. Additionally, the task's seccomp profile (runtime/default augmented via ECS agent configuration parameter ECS_SELINUX_CAPABLE=true with a custom SELinux type) restricts raw socket syscalls. The Envoy sidecar intercepts all inbound traffic on port 4000 via iptables REDIRECT rules managed by the proxyConfiguration in the task definition, meaning no direct client-to-application WebSocket connection is possible without passing through the sidecar's origin validation filter.",
+    "config": {
+      "runtime": "Node.js 20 on ECS Fargate",
+      "container_capabilities_drop": [
+        "CAP_NET_RAW",
+        "CAP_SYS_ADMIN",
+        "CAP_NET_BIND_SERVICE"
+      ],
+      "container_capabilities_add": [],
+      "service_mesh": "AWS App Mesh with Envoy sidecar (v1.27.2)",
+      "envoy_filter": "envoy.filters.http.lua with origin_allowlist check on Upgrade requests",
+      "proxy_configuration": {
+        "type": "APPMESH",
+        "containerName": "envoy",
+        "properties": [
+          {
+            "name": "IgnoredUID",
+            "value": "1337"
+          },
+          {
+            "name": "ProxyIngressPort",
+            "value": "15000"
+          },
+          {
+            "name": "ProxyEgressPort",
+            "value": "15001"
+          },
+          {
+            "name": "AppPorts",
+            "value": "4000"
+          }
+        ]
+      },
+      "envoy_origin_allowlist": [
+        "https://app.example.com",
+        "https://admin.example.com"
+      ],
+      "seccomp_profile": "runtime/default with additional blocked syscalls: socket(AF_PACKET), socket(AF_RAW)",
+      "selinux_context": "system_u:system_r:container_net_restricted_t:s0"
+    }
+  }
+}

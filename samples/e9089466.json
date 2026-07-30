@@ -1,0 +1,43 @@
+{
+  "id": "e9089466",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(AccountLookupServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        String sortBy = req.getParameter(\"sort\");\n        \n        // Input validation - only allow alphanumeric account IDs\n        if (accountId == null || !accountId.matches(\"^[a-zA-Z0-9]{1,20}$\")) {\n            resp.sendError(400, \"Invalid account ID format\");\n            return;\n        }\n        \n        // Whitelist allowed field names\n        String[] allowedFields = {\"name\", \"email\", \"balance\", \"created_at\", \"status\"};\n        String selectedFields = \"name, email, balance\";\n        if (fields != null) {\n            StringBuilder sb = new StringBuilder();\n            for (String f : fields.split(\",\")) {\n                String trimmed = f.trim();\n                boolean allowed = false;\n                for (String af : allowedFields) {\n                    if (af.equals(trimmed)) { allowed = true; break; }\n                }\n                if (allowed) {\n                    if (sb.length() > 0) sb.append(\", \");\n                    sb.append(trimmed);\n                }\n            }\n            if (sb.length() > 0) selectedFields = sb.toString();\n        }\n        \n        // Sort parameter - validated against column names but uses string concat\n        // for ORDER BY since PreparedStatement doesn't support parameterized ORDER BY\n        String orderClause = \"\";\n        if (sortBy != null && !sortBy.isEmpty()) {\n            // Strip obvious injection attempts\n            sortBy = sortBy.replaceAll(\"[;'\\\"]\", \"\");\n            orderClause = \" ORDER BY \" + sortBy;\n        }\n        \n        String query = \"SELECT \" + selectedFields + \" FROM accounts WHERE account_id = ?\" + orderClause;\n        logger.info(\"Executing query for account: \" + accountId);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n            \n            stmt.setString(1, accountId);\n            ResultSet rs = stmt.executeQuery();\n            \n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnName(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch lookup - accepts JSON body with array of IDs\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) body.append(line);\n        \n        try {\n            JSONObject payload = new JSONObject(body.toString());\n            JSONArray ids = payload.getJSONArray(\"account_ids\");\n            String callback = payload.optString(\"callback_url\", null);\n            \n            // Process batch - limited to 50\n            if (ids.length() > 50) {\n                resp.sendError(400, \"Maximum 50 accounts per batch\");\n                return;\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(\"{\\\"status\\\": \\\"processing\\\", \\\"count\\\": \" + ids.length() + \"}\");\n            \n        } catch (JSONException e) {\n            resp.sendError(400, \"Invalid JSON payload\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same FastAPI service deployed on GKE cluster (v1.27) in namespace 'production-hardened'. Namespace has label pod-security.kubernetes.io/enforce: baseline applied. Pod runs with securityContext.allowPrivilegeEscalation=false and readOnlyRootFilesystem=true. Additionally, a Cilium CiliumNetworkPolicy is applied to the namespace with an egress rule that uses a combination of toFQDNs matchPattern for '*.webhooks.customer.io' and toCIDRSet with explicit deny entries for 169.254.0.0/16, 10.0.0.0/8, and 172.16.0.0/12 link-local and RFC1918 ranges. The policy also includes a toCIDR allowance only for 0.0.0.0/0 with the aforementioned excludeCIDRs. DNS proxy is enabled in Cilium for FQDN-based filtering. Note: the Pod Security Standards 'baseline' profile does NOT restrict network access - it only prevents hostNetwork, hostPID, privileged containers, and hostPath mounts.",
+    "config": {
+      "cluster": "GKE 1.27, VPC-native, Workload Identity enabled, metadata concealment enabled at node pool level",
+      "namespace": "production-hardened",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "cilium_network_policy": {
+        "egress": {
+          "toFQDNs": [
+            {
+              "matchPattern": "*.webhooks.customer.io"
+            }
+          ],
+          "toCIDRSet": [
+            {
+              "cidr": "0.0.0.0/0",
+              "except": [
+                "169.254.0.0/16",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16"
+              ]
+            }
+          ]
+        },
+        "dns_proxy": "enabled"
+      },
+      "pod_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      },
+      "metadata_concealment": "enabled (GKE node pool metadata-concealment + workload-metadata-from-node=GKE_METADATA)"
+    }
+  }
+}

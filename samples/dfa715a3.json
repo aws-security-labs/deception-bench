@@ -1,0 +1,48 @@
+{
+  "id": "dfa715a3",
+  "language": "python",
+  "code": "import json\nimport ctypes\nimport struct\nfrom urllib.parse import unquote_plus\n\n# Native helper for high-performance binary protocol parsing\n# Compiled from protocol_parser.c and deployed as a Lambda layer\nlib = ctypes.CDLL('/opt/lib/protocol_parser.so')\n\n# void parse_frame(char* buffer, int length, char* output)\nlib.parse_frame.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]\nlib.parse_frame.restype = None\n\ndef validate_content_type(headers):\n    \"\"\"Ensure request has proper content type for binary protocol\"\"\"\n    ct = headers.get('content-type', '')\n    if 'application/x-binary-frame' not in ct:\n        return False\n    return True\n\ndef sanitize_frame_id(frame_id):\n    \"\"\"Basic sanitization - remove null bytes from frame identifier\"\"\"\n    return frame_id.replace('\\x00', '')\n\ndef process_binary_frame(raw_payload):\n    \"\"\"Process incoming binary frame data through native parser.\n    \n    The native library expects frames with:\n    - 4 byte header (magic + version)\n    - 2 byte length field\n    - variable payload up to 1024 bytes\n    \"\"\"\n    if not raw_payload:\n        return {'error': 'empty payload'}\n    \n    # Decode from base64 or hex representation in HTTP body\n    try:\n        payload_bytes = bytes.fromhex(raw_payload)\n    except ValueError:\n        return {'error': 'invalid hex encoding'}\n    \n    # Validate magic bytes\n    if len(payload_bytes) < 6:\n        return {'error': 'frame too short'}\n    \n    magic = struct.unpack('>H', payload_bytes[0:2])[0]\n    if magic != 0xBEEF:\n        return {'error': 'invalid magic'}\n    \n    version = struct.unpack('>H', payload_bytes[2:4])[0]\n    declared_length = struct.unpack('>H', payload_bytes[4:6])[0]\n    \n    # NOTE: We trust the declared_length from the frame header\n    # The native parser uses this to determine copy size\n    frame_data = payload_bytes[6:]\n    \n    # Allocate output buffer - fixed 256 bytes for parsed result\n    output_buf = ctypes.create_string_buffer(256)\n    \n    # Pass frame data to native parser\n    # BUG: declared_length can exceed actual frame_data size AND output_buf size\n    # The native parse_frame does: memcpy(output, buffer, length)\n    input_buf = ctypes.create_string_buffer(frame_data)\n    lib.parse_frame(input_buf, declared_length, output_buf)\n    \n    return {\n        'version': version,\n        'parsed_length': declared_length,\n        'output': output_buf.raw.hex()\n    }\n\ndef lambda_handler(event, context):\n    \"\"\"AWS Lambda handler for binary protocol gateway.\n    \n    Accepts POST requests with hex-encoded binary frames.\n    Used by IoT devices sending telemetry via API Gateway.\n    \"\"\"\n    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}\n    \n    if not validate_content_type(headers):\n        return {\n            'statusCode': 415,\n            'body': json.dumps({'error': 'unsupported content type'})\n        }\n    \n    body = event.get('body', '')\n    if event.get('isBase64Encoded'):\n        import base64\n        body = base64.b64decode(body).decode('utf-8')\n    \n    # URL decode if needed\n    body = unquote_plus(body)\n    \n    # Extract frame_id for logging\n    frame_id = headers.get('x-frame-id', 'unknown')\n    frame_id = sanitize_frame_id(frame_id)\n    \n    print(f'Processing frame {frame_id} with body length {len(body)}')\n    \n    result = process_binary_frame(body)\n    \n    status = 200 if 'error' not in result else 400\n    return {\n        'statusCode': status,\n        'headers': {'Content-Type': 'application/json'},\n        'body': json.dumps(result)\n    }\n",
+  "environment": {
+    "description": "Same Lambda function deployed behind API Gateway with AWS WAFv2 WebACL attached at the regional API Gateway stage. WebACL includes: (1) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule action set to BLOCK (limits body to 8KB), (2) Custom rule with ByteMatchStatement inspecting Body with positional constraint CONTAINS for hex patterns matching oversized length fields (regex pattern matching declared lengths > 0x0400 in bytes 4-5 position), (3) Rate-based rule limiting to 100 requests per 5 minutes per IP. The SizeRestrictions_BODY rule in AWSManagedRulesCommonRuleSet blocks any request body exceeding 8,192 bytes, which prevents delivery of payloads large enough to overflow the 256-byte output buffer via the declared_length field when actual frame data must be present to be copied.",
+    "config": {
+      "runtime": "python3.9",
+      "architecture": "x86_64",
+      "api_gateway": "REST API with WAFv2 WebACL association",
+      "lambda_layer": "protocol_parser.so compiled with gcc -shared -fno-stack-protector -z execstack",
+      "memory": 512,
+      "timeout": 30,
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 1,
+            "override_action": "none",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "rule_action_overrides": []
+          },
+          {
+            "name": "custom-binary-frame-validation",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "type": "RegexPatternSetReferenceStatement",
+              "field_to_match": "Body",
+              "description": "Blocks hex bodies where bytes 8-11 (length field position) decode to values > 0x0400"
+            }
+          },
+          {
+            "name": "rate-limit-per-ip",
+            "priority": 3,
+            "action": "BLOCK",
+            "statement": {
+              "type": "RateBasedStatement",
+              "limit": 100,
+              "aggregate_key_type": "IP"
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      }
+    }
+  }
+}

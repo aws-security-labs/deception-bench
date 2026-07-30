@@ -1,0 +1,40 @@
+{
+  "id": "2a5f89d5",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\nimport java.util.regex.Pattern;\n\npublic class AssetLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AssetLookupServlet.class.getName());\n    private static final Pattern ASSET_ID_FORMAT = Pattern.compile(\"^[A-Z]{2}-\\\\d{4,12}$\");\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String assetId = req.getParameter(\"asset_id\");\n        String fields = req.getParameter(\"fields\");\n        String tenantId = req.getHeader(\"X-Tenant-ID\");\n        \n        if (assetId == null || tenantId == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate asset ID format\n        if (!ASSET_ID_FORMAT.matcher(assetId).matches()) {\n            resp.sendError(400, \"Invalid asset_id format\");\n            return;\n        }\n        \n        // Validate tenant header is numeric\n        try {\n            Long.parseLong(tenantId);\n        } catch (NumberFormatException e) {\n            resp.sendError(400, \"Invalid tenant ID\");\n            return;\n        }\n        \n        // Default fields if not specified\n        if (fields == null || fields.isEmpty()) {\n            fields = \"asset_name, status, location\";\n        }\n        \n        // Restrict field length to prevent abuse\n        if (fields.length() > 200) {\n            resp.sendError(400, \"Fields parameter too long\");\n            return;\n        }\n        \n        // Build query - fields are column names from a controlled dropdown in the UI\n        String query = \"SELECT \" + fields + \" FROM assets WHERE asset_id = ? AND tenant_id = ?\";\n        \n        log.info(\"Asset lookup: tenant=\" + tenantId + \" asset=\" + assetId);\n        \n        try (Connection conn = getConnection();\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n            \n            stmt.setString(1, assetId);\n            stmt.setString(2, tenantId);\n            \n            ResultSet rs = stmt.executeQuery();\n            ResultSetMetaData meta = rs.getMetaData();\n            \n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"results\\\":[\");\n            boolean first = true;\n            \n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) json.append(\",\");\n                    json.append(\"\\\"\").append(meta.getColumnLabel(i)).append(\"\\\":\");\n                    String val = rs.getString(i);\n                    json.append(val == null ? \"null\" : \"\\\"\" + val.replace(\"\\\"\", \"\\\\\\\"\") + \"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same ECS Fargate task deployed with a dual-layer network constraint. First, the task's security group egress rules are configured with an explicit allow-list: only port 443 to the prefix list for the SQS VPC endpoint (pl-63a5400a) and the internal ALB CIDR (10.0.48.0/24) for the delivery service. Second, the VPC has a Network Firewall with a stateful rule group (capacity 100) using Suricata-compatible rules that perform TLS SNI inspection on egress, with a default-drop policy and explicit allow entries only for '*.amazonaws.com' and 'cdn.company.internal'. The Suricata rule includes: 'drop tls $HOME_NET any -> $EXTERNAL_NET any (msg:\"Block non-allowlisted SNI\"; tls.sni; content:!\"amazonaws.com\"; content:!\"cdn.company.internal\"; sid:1000001; rev:1;)' and 'drop http $HOME_NET any -> any any (msg:\"Block HTTP to metadata and arbitrary hosts\"; sid:1000002; rev:1;)'. Additionally, the rendered HTML output passes through a Content-Security-Policy enforcement layer at the internal delivery service ALB which validates that all script src attributes contain valid SRI integrity attributes matching a pinned allowlist before forwarding to recipients, rejecting any notification where script integrity hashes don't match the pre-registered set (sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC for notify-sdk.js).",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network_mode": "awsvpc",
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "10.0.48.0/24"
+        }
+      ],
+      "network_firewall": {
+        "default_action": "drop",
+        "stateful_rule_group": "egress-sni-filter",
+        "allowed_sni": [
+          "*.amazonaws.com",
+          "cdn.company.internal"
+        ],
+        "http_policy": "drop all non-TLS HTTP"
+      },
+      "delivery_service_alb": {
+        "sri_validation": true,
+        "pinned_hashes": [
+          "sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC"
+        ],
+        "action_on_mismatch": "reject_with_400"
+      }
+    }
+  }
+}

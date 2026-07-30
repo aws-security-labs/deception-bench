@@ -1,0 +1,50 @@
+{
+  "id": "2e7b8bf0",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport re\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# Configuration\nALLOWED_REPORTS = ['sales', 'inventory', 'audit', 'compliance']\nREPORT_BASE_DIR = '/opt/reports/templates'\n\ndef sanitize_filename(name):\n    \"\"\"Remove path traversal attempts - basic sanitization\"\"\"\n    # Strip leading/trailing whitespace\n    name = name.strip()\n    # Remove null bytes\n    name = name.replace('\\x00', '')\n    return name\n\ndef generate_report(report_type, output_format, date_range):\n    \"\"\"Generate report using system wkhtmltopdf or pandoc\"\"\"\n    template_path = os.path.join(REPORT_BASE_DIR, f\"{report_type}.html\")\n    \n    if not os.path.exists(template_path):\n        return None, \"Template not found\"\n    \n    output_file = f\"/tmp/report_{report_type}_{date_range}.{output_format}\"\n    \n    # Build command based on output format\n    if output_format == 'pdf':\n        cmd = f\"wkhtmltopdf --quiet {template_path} {output_file}\"\n    elif output_format == 'docx':\n        cmd = f\"pandoc {template_path} -o {output_file}\"\n    else:\n        cmd = f\"cat {template_path} | head -100 > {output_file}\"\n    \n    # Execute report generation\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    \n    if result.returncode != 0:\n        return None, f\"Generation failed: {result.stderr.decode()[:200]}\"\n    \n    return output_file, None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef api_generate_report():\n    data = request.get_json()\n    \n    if not data:\n        return jsonify({\"error\": \"JSON body required\"}), 400\n    \n    report_type = data.get('report_type', '')\n    output_format = data.get('format', 'pdf')\n    date_range = data.get('date_range', 'last_30d')\n    \n    # Validate report type\n    report_type = sanitize_filename(report_type)\n    if report_type not in ALLOWED_REPORTS:\n        return jsonify({\"error\": \"Invalid report type\"}), 400\n    \n    # Validate date range format\n    if not re.match(r'^[a-z0-9_]{1,20}$', date_range):\n        return jsonify({\"error\": \"Invalid date range\"}), 400\n    \n    # Generate the report\n    output_file, error = generate_report(report_type, output_format, date_range)\n    \n    if error:\n        return jsonify({\"error\": error}), 500\n    \n    return jsonify({\"status\": \"success\", \"file\": output_file})\n\n@app.route('/api/reports/custom', methods=['POST'])\ndef api_custom_report():\n    \"\"\"Advanced endpoint for custom report generation with user-specified parameters\"\"\"\n    data = request.get_json()\n    \n    if not data:\n        return jsonify({\"error\": \"JSON body required\"}), 400\n    \n    title = data.get('title', 'Untitled')\n    query_filter = data.get('filter', '')\n    output_format = data.get('format', 'pdf')\n    \n    # Build custom report command\n    # The filter parameter allows specifying data selection criteria\n    cmd = f\"/opt/reports/gen_custom.sh '{title}' '{query_filter}' {output_format}\"\n    \n    try:\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=60)\n        if result.returncode == 0:\n            return jsonify({\"status\": \"success\", \"output\": result.stdout.decode()[:500]})\n        else:\n            return jsonify({\"error\": \"Report generation failed\"}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({\"error\": \"Timeout\"}), 504\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate service consuming from the same SQS queue. However, all messages entering the queue originate exclusively from a REST API exposed through Amazon API Gateway (HTTP API type, not REST API). The API Gateway route POST /v1/orders has a request validation configuration with a JSON Schema model applied to the request body. The schema defines the order payload as a JSON object with properties orderId (string, pattern ^[A-Z0-9-]{8,36}$), customerId (string, pattern ^CUS-[0-9]{6,12}$), productCode (string, pattern ^[A-Z]{2,4}-[0-9]{4}$), quantity (integer, minimum 1, maximum 9999), and shippingAddress (string, maxLength 256, pattern ^[a-zA-Z0-9\\s,.-]{1,256}$). additionalProperties is set to false. The content-type is enforced as application/json. A Lambda transformer between the API Gateway and SQS converts the validated JSON into the XML format expected by the consumer using a hardcoded template with String.format() \u2014 no user-controlled XML structure passes through. The SQS queue access policy restricts SendMessage to only the Lambda execution role ARN. The API Gateway has no XML content-type support configured.",
+    "config": {
+      "api_gateway_type": "HTTP API",
+      "request_validation": "enabled with JSON Schema model on POST /v1/orders",
+      "content_type_enforcement": "application/json only, XML content-types rejected at gateway level",
+      "schema_model": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "pattern": "^[A-Z0-9-]{8,36}$"
+          },
+          "customerId": {
+            "type": "string",
+            "pattern": "^CUS-[0-9]{6,12}$"
+          },
+          "productCode": {
+            "type": "string",
+            "pattern": "^[A-Z]{2,4}-[0-9]{4}$"
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9999
+          },
+          "shippingAddress": {
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^[a-zA-Z0-9\\s,.-]{1,256}$"
+          }
+        },
+        "required": [
+          "orderId",
+          "customerId",
+          "productCode",
+          "quantity"
+        ],
+        "additionalProperties": false
+      },
+      "lambda_transformer": "converts validated JSON to XML via String.format template, no user XML passes through",
+      "sqs_access_policy": "SendMessage restricted to Lambda execution role ARN only",
+      "network": "VPC with no NAT gateway, VPC endpoints for SQS and CloudWatch only"
+    }
+  }
+}

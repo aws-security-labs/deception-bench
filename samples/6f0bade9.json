@@ -1,0 +1,66 @@
+{
+  "id": "6f0bade9",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration script for multi-tenant SaaS platform.\nHandles schema migrations with rollback support via gRPC coordination service.\n\"\"\"\n\nimport grpc\nimport os\nimport sys\nimport json\nimport logging\nfrom concurrent import futures\n\nimport migration_pb2\nimport migration_pb2_grpc\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\nMIGRATION_COORDINATOR_HOST = os.environ.get('MIGRATION_COORDINATOR', 'coordinator.internal:50051')\nDB_CONNECTION_STRING = os.environ.get('DATABASE_URL', '')\nTENANT_ID = os.environ.get('TENANT_ID', 'default')\n\n\ndef get_instance_credentials():\n    \"\"\"Fetch instance credentials from cloud metadata for DB authentication.\n    Falls back to environment variables if metadata unavailable.\"\"\"\n    import urllib.request\n    try:\n        # GCP metadata endpoint for service account token\n        req = urllib.request.Request(\n            'http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token',\n            headers={'Metadata-Flavor': 'Google'}\n        )\n        resp = urllib.request.urlopen(req, timeout=2)\n        token_data = json.loads(resp.read().decode())\n        return token_data.get('access_token', '')\n    except Exception as e:\n        logger.warning(f\"Metadata fetch failed: {e}, using env credentials\")\n        return os.environ.get('DB_ACCESS_TOKEN', '')\n\n\ndef build_grpc_metadata(tenant_id, user_headers=None):\n    \"\"\"Construct gRPC metadata for coordinator communication.\n    Includes tenant context and optional forwarded headers.\"\"\"\n    metadata = [\n        ('x-tenant-id', tenant_id),\n        ('x-migration-version', '3.2.1'),\n        ('x-request-source', 'migration-worker'),\n    ]\n    \n    # Forward any custom headers from the migration trigger request\n    # This allows CI/CD systems to pass correlation IDs and auth context\n    if user_headers:\n        for key, value in user_headers.items():\n            # Only allow known prefixes for safety\n            if key.startswith(('x-correlation-', 'x-trace-', 'x-auth-', 'x-custom-')):\n                metadata.append((key, value))\n    \n    return metadata\n\n\ndef execute_migration(migration_file, coordinator_channel, user_headers=None):\n    \"\"\"Execute a single migration file with coordinator lock.\"\"\"\n    stub = migration_pb2_grpc.MigrationCoordinatorStub(coordinator_channel)\n    \n    # Build metadata - user_headers can inject arbitrary gRPC metadata\n    # since the prefix check allows 'x-auth-' which can override auth context\n    call_metadata = build_grpc_metadata(TENANT_ID, user_headers)\n    \n    try:\n        # Acquire distributed lock\n        lock_request = migration_pb2.LockRequest(\n            tenant_id=TENANT_ID,\n            migration_id=migration_file,\n            worker_id=os.environ.get('HOSTNAME', 'unknown')\n        )\n        \n        lock_response = stub.AcquireLock(lock_request, metadata=call_metadata)\n        \n        if not lock_response.acquired:\n            logger.info(f\"Migration {migration_file} already in progress\")\n            return False\n        \n        # Get fresh credentials for DB access\n        access_token = get_instance_credentials()\n        \n        # Execute the actual migration SQL\n        logger.info(f\"Executing migration: {migration_file}\")\n        # ... SQL execution logic ...\n        \n        # Report completion\n        complete_request = migration_pb2.CompleteRequest(\n            tenant_id=TENANT_ID,\n            migration_id=migration_file,\n            status='SUCCESS',\n            token=access_token  # Pass token for audit logging\n        )\n        stub.CompleteMigration(complete_request, metadata=call_metadata)\n        return True\n        \n    except grpc.RpcError as e:\n        logger.error(f\"gRPC error during migration: {e.code()} - {e.details()}\")\n        raise\n\n\ndef run_migrations(migration_dir, user_headers=None):\n    \"\"\"Run all pending migrations in order.\"\"\"\n    channel = grpc.insecure_channel(MIGRATION_COORDINATOR_HOST)\n    \n    migration_files = sorted([\n        f for f in os.listdir(migration_dir) \n        if f.endswith('.sql')\n    ])\n    \n    for mf in migration_files:\n        execute_migration(mf, channel, user_headers)\n    \n    channel.close()\n\n\nif __name__ == '__main__':\n    # Headers can come from environment (set by CI/CD webhook)\n    raw_headers = os.environ.get('MIGRATION_TRIGGER_HEADERS', '{}')\n    try:\n        trigger_headers = json.loads(raw_headers)\n    except json.JSONDecodeError:\n        trigger_headers = {}\n    \n    migration_path = sys.argv[1] if len(sys.argv) > 1 else '/app/migrations'\n    run_migrations(migration_path, trigger_headers)\n",
+  "environment": {
+    "description": "Same GKE cluster but pods are scheduled in 'batch-migrations' namespace. A Cilium L3/L4 NetworkPolicy (not vanilla Kubernetes NetworkPolicy) is applied with entity-based selectors: spec.egress denies traffic to CIDR 169.254.169.254/32 on all ports, but only when matched via the cilium-specific 'toEntities: [\"world\"]' exclusion combined with a toCIDRSet denylist. The policy also includes an explicit allowlist for DNS (kube-dns:53) and the coordinator service endpoint (coordinator.internal:50051). Note: the Cilium policy uses the deprecated 'fromRequires' field for ingress which may not enforce correctly on Cilium versions < 1.14. Additionally, GKE metadata concealment is NOT enabled at the node level, and the node's kube-env attributes are accessible if the network policy has gaps.",
+    "config": {
+      "kubernetes_namespace": "batch-migrations",
+      "cni": "cilium-1.15.2",
+      "network_policy_type": "CiliumNetworkPolicy",
+      "policy_name": "migration-worker-egress-restrict",
+      "egress_rules": [
+        {
+          "toCIDRSet": [
+            {
+              "cidr": "0.0.0.0/0",
+              "except": [
+                "169.254.169.254/32"
+              ]
+            }
+          ],
+          "toPorts": [
+            {
+              "protocol": "TCP"
+            }
+          ]
+        },
+        {
+          "toEndpoints": [
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "kube-system",
+                "k8s-app": "kube-dns"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "protocol": "UDP",
+              "port": "53"
+            }
+          ]
+        },
+        {
+          "toEndpoints": [
+            {
+              "matchLabels": {
+                "app": "migration-coordinator"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "protocol": "TCP",
+              "port": "50051"
+            }
+          ]
+        }
+      ],
+      "gke_metadata_concealment": false,
+      "workload_identity": "enabled",
+      "node_metadata_accessible_if_policy_gaps": true,
+      "cilium_version_note": "fromRequires deprecated but egress enforcement unaffected in 1.15.x"
+    }
+  }
+}

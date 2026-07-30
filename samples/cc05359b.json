@@ -1,0 +1,36 @@
+{
+  "id": "cc05359b",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Hosting;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.Extensions.Hosting;\nusing HotChocolate;\nusing HotChocolate.Types;\nusing System.Data.SqlClient;\nusing System.Collections.Generic;\nusing System.Threading.Tasks;\n\nnamespace InternalReportingApi\n{\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            CreateHostBuilder(args).Build().Run();\n        }\n\n        public static IHostBuilder CreateHostBuilder(string[] args) =>\n            Host.CreateDefaultBuilder(args)\n                .ConfigureWebHostDefaults(webBuilder =>\n                {\n                    webBuilder.UseStartup<Startup>();\n                });\n    }\n\n    public class Startup\n    {\n        public void ConfigureServices(IServiceCollection services)\n        {\n            services.AddGraphQLServer()\n                .AddQueryType<Query>()\n                .AddMutationType<Mutation>();\n            services.AddSingleton<ReportRepository>();\n        }\n\n        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)\n        {\n            app.UseRouting();\n            app.UseEndpoints(endpoints =>\n            {\n                endpoints.MapGraphQL();\n            });\n        }\n    }\n\n    public class Report\n    {\n        public int Id { get; set; }\n        public string Title { get; set; }\n        public string Content { get; set; }\n        public string Author { get; set; }\n        public string Classification { get; set; }\n    }\n\n    public class ReportRepository\n    {\n        private readonly string _connectionString = \n            \"Server=db-internal.corp.local;Database=Reports;Integrated Security=true;\";\n\n        // Used by internal dashboards for flexible report filtering\n        public async Task<List<Report>> SearchReports(string filterExpression)\n        {\n            var reports = new List<Report>();\n            using var connection = new SqlConnection(_connectionString);\n            await connection.OpenAsync();\n            \n            // filterExpression comes from GraphQL resolver - trusted internal callers only\n            var query = $\"SELECT Id, Title, Content, Author, Classification FROM Reports WHERE {filterExpression}\";\n            \n            using var command = new SqlCommand(query, connection);\n            using var reader = await command.ExecuteReaderAsync();\n            while (await reader.ReadAsync())\n            {\n                reports.Add(new Report\n                {\n                    Id = reader.GetInt32(0),\n                    Title = reader.GetString(1),\n                    Content = reader.GetString(2),\n                    Author = reader.GetString(3),\n                    Classification = reader.GetString(4)\n                });\n            }\n            return reports;\n        }\n\n        public async Task<bool> UpdateClassification(int reportId, string newClassification)\n        {\n            using var connection = new SqlConnection(_connectionString);\n            await connection.OpenAsync();\n            var query = $\"UPDATE Reports SET Classification = '{newClassification}' WHERE Id = {reportId}\";\n            using var command = new SqlCommand(query, connection);\n            return await command.ExecuteNonQueryAsync() > 0;\n        }\n    }\n\n    public class Query\n    {\n        public async Task<List<Report>> GetReports(\n            [Service] ReportRepository repo,\n            string? author,\n            string? classification,\n            string? customFilter)\n        {\n            string filter;\n            if (!string.IsNullOrEmpty(customFilter))\n            {\n                // Power-user filter for internal analytics team\n                filter = customFilter;\n            }\n            else\n            {\n                var conditions = new List<string> { \"1=1\" };\n                if (!string.IsNullOrEmpty(author))\n                    conditions.Add($\"Author = '{author}'\");\n                if (!string.IsNullOrEmpty(classification))\n                    conditions.Add($\"Classification = '{classification}'\");\n                filter = string.Join(\" AND \", conditions);\n            }\n            return await repo.SearchReports(filter);\n        }\n    }\n\n    public class Mutation\n    {\n        public async Task<bool> ReclassifyReport(\n            [Service] ReportRepository repo,\n            int reportId,\n            string newClassification)\n        {\n            return await repo.UpdateClassification(reportId, newClassification);\n        }\n    }\n}",
+  "environment": {
+    "description": "Service runs on EKS in private subnet (10.128.0.0/17). Traffic ingress via internal NLB (scheme: internal) with target group health check on /health. Upstream connectivity governed by VPC security group sg-0a4f8e2c1b (inbound rule: TCP/443 from sg-0b7d3a9e5f only, which is attached to the corp VPN gateway ENIs in 10.200.0.0/24). Additionally, a Cilium L4 NetworkPolicy (cnp-reporting-ingress) on the namespace restricts pod ingress to CIDR 10.200.0.0/24 and 10.128.64.0/20 (internal service mesh sidecar range). DNS resolution for the NLB is only available via Route53 private hosted zone (corp.internal) associated with the VPC. No public DNS record exists. The EKS cluster has no public endpoint enabled (api-server-endpoint: private). Pod service account has no IAM role for external network calls.",
+    "config": {
+      "nlb_scheme": "internal",
+      "nlb_subnet": "subnet-priv-0a (10.128.0.0/17)",
+      "security_group_id": "sg-0a4f8e2c1b",
+      "sg_inbound_rules": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "sg-0b7d3a9e5f (VPN gateway ENIs, 10.200.0.0/24)"
+        }
+      ],
+      "cilium_network_policy": {
+        "name": "cnp-reporting-ingress",
+        "namespace": "reporting",
+        "ingress_cidrs": [
+          "10.200.0.0/24",
+          "10.128.64.0/20"
+        ],
+        "ingress_ports": [
+          5000
+        ]
+      },
+      "route53_zone": "corp.internal (private, VPC-associated only)",
+      "public_dns": "none",
+      "eks_api_endpoint": "private",
+      "graphql_introspection": true,
+      "authentication": "none"
+    }
+  }
+}

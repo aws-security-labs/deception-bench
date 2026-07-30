@@ -1,0 +1,47 @@
+{
+  "id": "bd9a24a5",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.*;\n\n@WebServlet(\"/api/reports\")\npublic class ReportServlet extends HttpServlet {\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String format = req.getParameter(\"format\");\n        \n        // Template-based query construction for flexible reporting\n        Map<String, String> params = new HashMap<>();\n        params.put(\"table\", getTableForType(reportType));\n        params.put(\"range_filter\", buildRangeClause(dateRange));\n        params.put(\"sort_column\", sortCol != null ? sortCol : \"created_at\");\n        \n        String queryTemplate = \"SELECT id, name, amount, created_at FROM ${table} \"\n            + \"WHERE status = 'active' ${range_filter} \"\n            + \"ORDER BY ${sort_column} DESC LIMIT 500\";\n        \n        StringSubstitutor sub = new StringSubstitutor(params);\n        String finalQuery = sub.replace(queryTemplate);\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(finalQuery)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"id\\\": %d, \\\"name\\\": \\\"%s\\\", \\\"amount\\\": %.2f}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getDouble(\"amount\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n            \n        } catch (SQLException e) {\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\": \\\"Query failed\\\"}\");\n        }\n    }\n    \n    private String getTableForType(String type) {\n        // Allowlist for table names\n        switch (type != null ? type : \"sales\") {\n            case \"sales\": return \"sales_records\";\n            case \"inventory\": return \"inventory_log\";\n            case \"users\": return \"user_activity\";\n            default: return \"sales_records\";\n        }\n    }\n    \n    private String buildRangeClause(String range) {\n        if (range == null || range.isEmpty()) return \"\";\n        // Supports: 7d, 30d, 90d, custom ISO dates\n        if (range.matches(\"\\\\d+d\")) {\n            int days = Integer.parseInt(range.replace(\"d\", \"\"));\n            return \"AND created_at >= NOW() - INTERVAL '\" + days + \" days'\";\n        }\n        return \"AND created_at >= '\" + range + \"'\";\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EKS 1.28 with a hardened pod security context. The container securityContext specifies drop: [ALL] with add: [NET_BIND_SERVICE] only. A Cilium L4 network policy is attached to the pod's namespace restricting egress to port 8080 on service CIDR 10.96.0.0/12 and port 443 on 0.0.0.0/0 (for external OAuth providers). The policy uses a CiliumNetworkPolicy with egressDeny rules for 169.254.0.0/16 (link-local) and 10.0.0.0/8 except the service CIDR. Node-level iptables PREROUTING chain has a DROP rule for packets from pod CIDR destined to 169.254.169.254. Additionally, the EKS node group has IMDSv2 enforced (HttpTokens: required) with hop limit set to 1, preventing containerized workloads from reaching IMDS even if network access were possible.",
+    "config": {
+      "runtime": "dotnet8-alpine",
+      "orchestrator": "EKS 1.28",
+      "pod_security_context": {
+        "drop": [
+          "ALL"
+        ],
+        "add": [
+          "NET_BIND_SERVICE"
+        ]
+      },
+      "cilium_network_policy": {
+        "egress_allow": [
+          {
+            "cidr": "10.96.0.0/12",
+            "port": 8080
+          },
+          {
+            "cidr": "0.0.0.0/0",
+            "port": 443
+          }
+        ],
+        "egress_deny": [
+          {
+            "cidr": "169.254.0.0/16"
+          },
+          {
+            "cidr": "10.0.0.0/8",
+            "except": "10.96.0.0/12"
+          }
+        ]
+      },
+      "node_iptables": "DROP packets from pod CIDR to 169.254.169.254",
+      "imds_config": {
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1
+      },
+      "service_mesh": "none"
+    }
+  }
+}

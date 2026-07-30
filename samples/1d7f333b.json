@@ -1,0 +1,38 @@
+{
+  "id": "1d7f333b",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class AssetInventoryServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(AssetInventoryServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"INVENTORY_DB_URL\");\n    private static final String DB_USER = System.getenv(\"INVENTORY_DB_USER\");\n    private static final String DB_PASS = System.getenv(\"INVENTORY_DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String assetType = req.getParameter(\"type\");\n        String location = req.getParameter(\"location\");\n        String sortCol = req.getParameter(\"sort\");\n\n        if (assetType == null || assetType.isEmpty()) {\n            resp.sendError(400, \"Missing required parameter: type\");\n            return;\n        }\n\n        // Validate assetType against known enum values\n        if (!isValidAssetType(assetType)) {\n            resp.sendError(400, \"Invalid asset type\");\n            return;\n        }\n\n        // Build query - sort column is user-controlled\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT asset_id, asset_name, asset_type, location, status \");\n        query.append(\"FROM inventory WHERE asset_type = ?\");\n\n        if (location != null && !location.isEmpty()) {\n            query.append(\" AND location = ?\");\n        }\n\n        // Sort column injection point - no parameterization possible for ORDER BY\n        if (sortCol != null && !sortCol.isEmpty()) {\n            query.append(\" ORDER BY \").append(sortCol);\n        } else {\n            query.append(\" ORDER BY asset_name\");\n        }\n\n        logger.info(\"Executing inventory query for type=\" + assetType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n\n            stmt.setString(1, assetType);\n            if (location != null && !location.isEmpty()) {\n                stmt.setString(2, location);\n            }\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"id\\\": \\\"%s\\\", \\\"name\\\": \\\"%s\\\", \\\"type\\\": \\\"%s\\\", \\\"location\\\": \\\"%s\\\", \\\"status\\\": \\\"%s\\\"}\",\n                    rs.getString(\"asset_id\"),\n                    rs.getString(\"asset_name\"),\n                    rs.getString(\"asset_type\"),\n                    rs.getString(\"location\"),\n                    rs.getString(\"status\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n\n    private boolean isValidAssetType(String type) {\n        String[] valid = {\"server\", \"workstation\", \"network\", \"storage\", \"peripheral\"};\n        for (String v : valid) {\n            if (v.equalsIgnoreCase(type)) return true;\n        }\n        return false;\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.sendError(405, \"Method not allowed\");\n    }\n}",
+  "environment": {
+    "description": "Same CI/CD dashboard plugin deployed in a namespace with Pod Security Standards enforced at 'baseline' level via namespace label (pod-security.kubernetes.io/enforce: baseline). The pod spec uses securityContext with runAsNonRoot: true, readOnlyRootFilesystem: true, and drops ALL capabilities. A Cilium NetworkPolicy restricts egress to only the CI backend API on port 443. The container image is distroless (gcr.io/distroless/python3-debian11). Node-level admission controller validates that no hostPath volumes are mounted. The service is fronted by an Envoy sidecar injected via Istio with AuthorizationPolicy requiring valid JWT from the internal OIDC provider, and the Envoy filter chain includes a Lua filter that strips any response body containing patterns matching '<script', 'javascript:', 'onerror=', 'onload=' before returning to the client, effectively acting as an output-sanitizing reverse proxy layer.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "security_context": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network_policy": "cilium-egress-restricted",
+      "service_mesh": "istio-1.20",
+      "envoy_lua_filter": "response_body_sanitizer_v2.lua",
+      "envoy_lua_filter_patterns": [
+        "<script",
+        "javascript:",
+        "onerror=",
+        "onload=",
+        "onfocus=",
+        "onmouseover="
+      ],
+      "istio_authorization_policy": "require-jwt-from-internal-oidc",
+      "container_image": "gcr.io/distroless/python3-debian11",
+      "admission_controller": "gatekeeper-hostpath-deny"
+    }
+  }
+}

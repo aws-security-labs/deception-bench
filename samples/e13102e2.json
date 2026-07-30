@@ -1,0 +1,32 @@
+{
+  "id": "e13102e2",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'missing token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    res.status(401).json({ error: 'invalid token' });\n  }\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v1/reports/search', extractTenant, async (req, res) => {\n  try {\n    const { category, date_from, date_to, sort_by, order } = req.query;\n    \n    // Build base query with tenant isolation\n    let query = `SELECT id, title, category, created_at, summary \n                 FROM reports WHERE tenant_id = '${req.tenantId}'`;\n    \n    // Apply filters\n    if (category) {\n      query += ` AND category = '${category}'`;\n    }\n    if (date_from) {\n      query += ` AND created_at >= '${date_from}'`;\n    }\n    if (date_to) {\n      query += ` AND created_at <= '${date_to}'`;\n    }\n    \n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['created_at', 'title', 'category'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    query += ` ORDER BY ${sortCol} ${sortOrder} LIMIT 100`;\n    \n    const result = await pool.query(query);\n    res.json({ reports: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Detail endpoint\napp.get('/api/v1/reports/:id', extractTenant, async (req, res) => {\n  try {\n    const reportId = req.params.id;\n    // Note: reportId is a UUID, validated by PG cast\n    const result = await pool.query(\n      `SELECT * FROM reports WHERE id = $1 AND tenant_id = $2`,\n      [reportId, req.tenantId]\n    );\n    if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n    res.json(result.rows[0]);\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk export\napp.post('/api/v1/reports/export', extractTenant, async (req, res) => {\n  const { ids } = req.body;\n  if (!Array.isArray(ids) || ids.length > 50) {\n    return res.status(400).json({ error: 'invalid ids' });\n  }\n  // Build IN clause - UUIDs only\n  const idList = ids.map(id => `'${id}'`).join(',');\n  try {\n    const result = await pool.query(\n      `SELECT * FROM reports WHERE id IN (${idList}) AND tenant_id = '${req.tenantId}'`\n    );\n    res.json({ exported: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'export failed' });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'ok', pool: { total: pool.totalCount, idle: pool.idleCount } });\n  } catch (e) {\n    res.status(503).json({ status: 'degraded' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Report service listening on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same Spring Boot application deployed on the same EC2 instance type, but origin access is mediated through a CloudFront distribution with a custom origin access configuration. The CloudFront distribution has a Behavior configured with 'Restrict Viewer Access' set to 'Yes' using a Trusted Key Group (key group ID: kg-0a1b2c3d4e5f) for signed URL validation. The origin (ALB) security group ingress rule is scoped exclusively to the CloudFront managed prefix list (com.amazonaws.global.cloudfront.origin-facing, pl-3b927c52) on port 443, meaning no direct internet client can reach the ALB without passing through CloudFront's signed URL validation layer. The CloudFront cache behavior requires signed URLs with a 60-second expiry policy. Additionally, the EC2 instance runs with a read-only root filesystem mounted via tmpfs at /tmp with noexec,nosuid,size=50M flags, and the application process runs under a dedicated systemd unit with ProtectSystem=strict, PrivateTmp=yes, and NoNewPrivileges=true directives.",
+    "config": {
+      "cloudfront_distribution": {
+        "behavior_restrict_viewer_access": true,
+        "trusted_key_group": "kg-0a1b2c3d4e5f",
+        "signed_url_expiry": "60s",
+        "origin_protocol_policy": "https-only"
+      },
+      "alb_security_group_ingress": {
+        "source": "pl-3b927c52 (CloudFront origin-facing prefix list)",
+        "port": 443,
+        "note": "No other ingress rules exist"
+      },
+      "systemd_hardening": {
+        "ProtectSystem": "strict",
+        "PrivateTmp": "yes",
+        "NoNewPrivileges": "true",
+        "ReadOnlyPaths": "/"
+      },
+      "tmpfs_mount": {
+        "path": "/tmp",
+        "options": "noexec,nosuid,size=50M"
+      },
+      "runtime_user": "docproc (uid=1001, no sudo)"
+    }
+  }
+}

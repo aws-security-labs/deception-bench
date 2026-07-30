@@ -1,0 +1,27 @@
+{
+  "id": "ac5d790a",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string, g\nimport sqlite3\nimport html\nimport os\n\napp = Flask(__name__)\nDATABASE = '/tmp/notes.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS notes\n                  (id INTEGER PRIMARY KEY AUTOINCREMENT,\n                   title TEXT NOT NULL,\n                   content TEXT NOT NULL,\n                   author TEXT NOT NULL,\n                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\nNOTE_TEMPLATE = '''\n<!DOCTYPE html>\n<html>\n<head><title>{{ title }}</title></head>\n<body>\n  <h1>Team Notes</h1>\n  <div class=\"notes-container\">\n    {% for note in notes %}\n    <div class=\"note-card\">\n      <h3>{{ note[1] }}</h3>\n      <div class=\"note-content\">{{ note[2] | safe }}</div>\n      <span class=\"author\">By: {{ note[3] }}</span>\n    </div>\n    {% endfor %}\n  </div>\n  <form method=\"POST\" action=\"/notes/add\">\n    <input name=\"title\" placeholder=\"Title\" required>\n    <textarea name=\"content\" placeholder=\"Content (supports HTML formatting)\" required></textarea>\n    <input name=\"author\" placeholder=\"Your name\" required>\n    <button type=\"submit\">Add Note</button>\n  </form>\n</body>\n</html>\n'''\n\n@app.route('/notes')\ndef list_notes():\n    db = get_db()\n    cursor = db.execute('SELECT id, title, content, author FROM notes ORDER BY created_at DESC')\n    notes = cursor.fetchall()\n    return render_template_string(NOTE_TEMPLATE, title=\"Team Notes\", notes=notes)\n\n@app.route('/notes/add', methods=['POST'])\ndef add_note():\n    title = request.form.get('title', '')\n    content = request.form.get('content', '')\n    author = request.form.get('author', '')\n    \n    # Sanitize title and author but allow HTML in content for formatting\n    title = html.escape(title)\n    author = html.escape(author)\n    \n    # Content allows basic HTML - we trust internal team users\n    # CLI import tool also feeds into this endpoint\n    \n    db = get_db()\n    db.execute('INSERT INTO notes (title, content, author) VALUES (?, ?, ?)',\n               (title, content, author))\n    db.commit()\n    return '<script>window.location=\"/notes\"</script>', 201\n\n@app.route('/notes/<int:note_id>')\ndef get_note(note_id):\n    db = get_db()\n    cursor = db.execute('SELECT id, title, content, author FROM notes WHERE id = ?', (note_id,))\n    note = cursor.fetchone()\n    if note is None:\n        return 'Not found', 404\n    return render_template_string('''\n    <h2>{{ note[1] }}</h2>\n    <div>{{ note[2] | safe }}</div>\n    <p>Author: {{ note[3] }}</p>\n    ''', note=note)\n\n# CLI import endpoint - used by internal tooling to bulk-import notes\n@app.route('/api/import', methods=['POST'])\ndef import_notes():\n    data = request.get_json()\n    if not data or 'notes' not in data:\n        return {'error': 'Invalid payload'}, 400\n    \n    db = get_db()\n    imported = 0\n    for note in data['notes']:\n        # CLI tool sends pre-formatted content from markdown conversion\n        title = html.escape(note.get('title', 'Untitled'))\n        content = note.get('content', '')  # Raw HTML from markdown renderer\n        author = html.escape(note.get('author', 'system'))\n        db.execute('INSERT INTO notes (title, content, author) VALUES (?, ?, ?)',\n                   (title, content, author))\n        imported += 1\n    db.commit()\n    return {'imported': imported}, 201\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)\n",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an Application Load Balancer. The ALB has a response header action on the default listener rule (priority 1, condition: path-pattern '*') that injects a fixed header into every HTTP response. The header action appends 'content-security-policy' with value 'default-src \\'self\\'; script-src \\'none\\'; object-src \\'none\\'; base-uri \\'self\\'' using the 'add' action type. Note: this is an ALB-level response header injection, not application-level middleware - the Flask app itself sets no CSP headers. The ECS task role has no additional permissions beyond ECR pull and CloudWatch logs. The CLI import tool runs in the same VPC but the /api/import endpoint is still accessible.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, 0.5 vCPU / 1GB",
+      "load_balancer": "ALB with HTTPS listener, ACM certificate",
+      "alb_listener_rule": {
+        "priority": 1,
+        "condition": "path-pattern: *",
+        "action_type": "fixed-response-header",
+        "response_header_actions": [
+          {
+            "header_name": "content-security-policy",
+            "header_value": "default-src 'self'; script-src 'none'; object-src 'none'; base-uri 'self'",
+            "action": "add"
+          }
+        ]
+      },
+      "network": "Private subnet, ALB in public subnet",
+      "security_group": "ECS tasks only accept traffic from ALB SG",
+      "cli_tool": "Same Jenkins pipeline, VPC endpoint access to ECS service"
+    }
+  }
+}

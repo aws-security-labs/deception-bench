@@ -1,0 +1,97 @@
+{
+  "id": "7446260d",
+  "language": "typescript",
+  "code": "// src/users/users.controller.ts\nimport { Controller, Get, Param, Query, HttpException, HttpStatus } from '@nestjs/common';\nimport { UsersService } from './users.service';\n\n@Controller('users')\nexport class UsersController {\n  constructor(private readonly usersService: UsersService) {}\n\n  @Get('profile/:username')\n  async getProfile(@Param('username') username: string) {\n    // Normalize unicode to NFC form for consistent storage lookup\n    const normalizedUsername = username.normalize('NFC');\n    \n    // Check against blocklist of admin/privileged accounts\n    const blockedUsers = ['admin', 'root', 'administrator', 'superuser', 'system'];\n    \n    if (blockedUsers.includes(username.toLowerCase())) {\n      throw new HttpException('Access denied: cannot view privileged profiles', HttpStatus.FORBIDDEN);\n    }\n    \n    // After blocklist check, use normalized form for DB lookup\n    const profile = await this.usersService.findByUsername(normalizedUsername);\n    if (!profile) {\n      throw new HttpException('User not found', HttpStatus.NOT_FOUND);\n    }\n    return profile;\n  }\n\n  @Get('search')\n  async searchUsers(@Query('q') query: string) {\n    // Normalize search input\n    const normalizedQuery = query.normalize('NFKC');\n    \n    // Basic input validation - reject if contains path traversal\n    if (query.includes('..') || query.includes('/')) {\n      throw new HttpException('Invalid search query', HttpStatus.BAD_REQUEST);\n    }\n    \n    // Use normalized form for search (NFKC collapses compatibility chars)\n    return this.usersService.searchUsers(normalizedQuery);\n  }\n}\n\n// src/users/users.service.ts\nimport { Injectable } from '@nestjs/common';\nimport { InjectRepository } from '@nestjs/typeorm';\nimport { Repository } from 'typeorm';\nimport { User } from './user.entity';\n\n@Injectable()\nexport class UsersService {\n  constructor(\n    @InjectRepository(User)\n    private usersRepository: Repository<User>,\n  ) {}\n\n  async findByUsername(username: string): Promise<User | null> {\n    // Direct query with normalized username\n    return this.usersRepository.findOne({ where: { username } });\n  }\n\n  async searchUsers(query: string): Promise<User[]> {\n    // LIKE query with normalized input\n    return this.usersRepository\n      .createQueryBuilder('user')\n      .where('user.username LIKE :query OR user.displayName LIKE :query', {\n        query: `%${query}%`,\n      })\n      .limit(20)\n      .getMany();\n  }\n}\n\n// src/users/user.entity.ts\nimport { Entity, Column, PrimaryGeneratedColumn } from 'typeorm';\n\n@Entity()\nexport class User {\n  @PrimaryGeneratedColumn()\n  id: number;\n\n  @Column({ unique: true })\n  username: string;\n\n  @Column()\n  displayName: string;\n\n  @Column({ nullable: true })\n  email: string;\n\n  @Column({ default: 'user' })\n  role: string;\n\n  @Column({ nullable: true })\n  internalNotes: string; // sensitive field, only visible to admin service\n}\n\n// src/admin/admin.controller.ts\nimport { Controller, Get, Param } from '@nestjs/common';\nimport { UsersService } from '../users/users.service';\n\n@Controller('internal/admin')\nexport class AdminController {\n  constructor(private readonly usersService: UsersService) {}\n\n  @Get('user-details/:username')\n  async getFullUserDetails(@Param('username') username: string) {\n    // Internal endpoint - returns full user record including internalNotes\n    // Should only be accessible from admin namespace via service mesh\n    const user = await this.usersService.findByUsername(username.normalize('NFC'));\n    return user;\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice deployed in namespace 'user-service-ns' on GKE cluster with Istio 1.19. Istio PeerAuthentication set to STRICT mTLS for the mesh. An AuthorizationPolicy resource is applied in the 'user-service-ns' namespace with a DENY action matching source principals from namespaces other than 'user-service-ns' itself for paths prefixed with '/users/' \u2014 however, a separate CUSTOM action AuthorizationPolicy delegates '/internal/*' path authorization to an ext-authz provider ('admin-authz-grpc.istio-system.svc.cluster.local') which validates that the source workload identity matches 'cluster.local/ns/admin-ns/sa/admin-service-account'. The ext-authz provider is registered in the mesh config extensionProviders array. Note: the DENY policy only covers '/users/' prefix paths and does NOT explicitly mention '/internal/' paths \u2014 the '/internal/' paths are gated solely by the CUSTOM ext-authz policy which requires the specific SPIFFE identity.",
+    "config": {
+      "kubernetes_namespace": "user-service-ns",
+      "istio_version": "1.19.3",
+      "istio_mtls_mode": "STRICT",
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "user-service-ns"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy_deny": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-ns-users",
+          "namespace": "user-service-ns"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "user-service-ns"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/users/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "authorization_policy_custom": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "internal-admin-ext-authz",
+          "namespace": "user-service-ns"
+        },
+        "spec": {
+          "action": "CUSTOM",
+          "provider": {
+            "name": "admin-authz-grpc"
+          },
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "mesh_config_extension_providers": [
+        {
+          "name": "admin-authz-grpc",
+          "envoyExtAuthz": {
+            "service": "admin-authz-grpc.istio-system.svc.cluster.local",
+            "port": 9001,
+            "failOpen": false
+          }
+        }
+      ],
+      "ext_authz_validation": "Validates source SPIFFE URI matches spiffe://cluster.local/ns/admin-ns/sa/admin-service-account"
+    }
+  }
+}

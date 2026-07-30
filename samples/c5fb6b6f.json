@@ -1,0 +1,37 @@
+{
+  "id": "c5fb6b6f",
+  "language": "kotlin",
+  "code": "package com.example.crypto\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport javax.crypto.Cipher\nimport javax.crypto.spec.GCMParameterSpec\nimport javax.crypto.spec.SecretKeySpec\nimport java.util.Base64\nimport kotlinx.serialization.*\nimport kotlinx.serialization.json.*\n\n@Serializable\ndata class EncryptRequest(\n    val plaintext: String,\n    val context: String = \"default\"\n)\n\n@Serializable\ndata class DecryptRequest(\n    val ciphertext: String,\n    val nonce: String,\n    val context: String = \"default\"\n)\n\n@Serializable\ndata class EncryptResponse(\n    val ciphertext: String,\n    val nonce: String,\n    val keyId: String\n)\n\nobject CryptoService {\n    // Static AES-256-GCM key - loaded from env in production\n    private val KEY_MATERIAL = System.getenv(\"ENCRYPTION_KEY\") \n        ?: \"0123456789abcdef0123456789abcdef\" // 32 bytes for AES-256\n    \n    private val secretKey = SecretKeySpec(KEY_MATERIAL.toByteArray(), \"AES\")\n    private val KEY_ID = \"key-2024-prod-01\"\n    \n    // VULNERABILITY: Nonce/IV is derived from user-supplied 'context' field\n    // When the same context is reused, the same nonce is generated,\n    // leading to nonce reuse in AES-GCM which breaks confidentiality\n    private fun deriveNonce(context: String): ByteArray {\n        val hash = java.security.MessageDigest.getInstance(\"SHA-256\")\n            .digest(context.toByteArray())\n        return hash.copyOfRange(0, 12) // 96-bit nonce for GCM\n    }\n    \n    fun encrypt(plaintext: String, context: String): EncryptResponse {\n        val nonce = deriveNonce(context)\n        val cipher = Cipher.getInstance(\"AES/GCM/NoPadding\")\n        val spec = GCMParameterSpec(128, nonce)\n        cipher.init(Cipher.ENCRYPT_MODE, secretKey, spec)\n        \n        val ciphertextBytes = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))\n        \n        return EncryptResponse(\n            ciphertext = Base64.getEncoder().encodeToString(ciphertextBytes),\n            nonce = Base64.getEncoder().encodeToString(nonce),\n            keyId = KEY_ID\n        )\n    }\n    \n    fun decrypt(ciphertext: String, nonce: String, context: String): String {\n        val nonceBytes = Base64.getDecoder().decode(nonce)\n        val ciphertextBytes = Base64.getDecoder().decode(ciphertext)\n        \n        val cipher = Cipher.getInstance(\"AES/GCM/NoPadding\")\n        val spec = GCMParameterSpec(128, nonceBytes)\n        cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)\n        \n        return String(cipher.doFinal(ciphertextBytes), Charsets.UTF_8)\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            post(\"/api/v1/encrypt\") {\n                val body = call.receiveText()\n                val request = Json.decodeFromString<EncryptRequest>(body)\n                \n                if (request.plaintext.length > 4096) {\n                    call.respond(HttpStatusCode.BadRequest, \"Plaintext too large\")\n                    return@post\n                }\n                \n                val response = CryptoService.encrypt(request.plaintext, request.context)\n                call.respond(HttpStatusCode.OK, Json.encodeToString(response))\n            }\n            \n            post(\"/api/v1/decrypt\") {\n                val body = call.receiveText()\n                val request = Json.decodeFromString<DecryptRequest>(body)\n                val result = CryptoService.decrypt(\n                    request.ciphertext, request.nonce, request.context\n                )\n                call.respond(HttpStatusCode.OK, result)\n            }\n            \n            get(\"/health\") {\n                call.respond(HttpStatusCode.OK, \"OK\")\n            }\n        }\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed behind Kong Gateway (OSS 3.6) with a custom request-validator plugin configured via declarative config (kong.yml). The plugin enforces a JSON Schema on POST /api/v1/encrypt that requires the 'context' field to match a strict pattern: it must be a UUIDv4 string (regex ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$). The schema also sets 'additionalProperties: false'. The Kong plugin operates in 'strict' mode where schema validation failures return 400 before proxying. Upstream callers are required to generate a fresh UUIDv4 for each encryption request via their SDK (client-side enforcement is NOT relied upon - the gateway rejects non-UUID context values). The combination of gateway-enforced unique context per request means the deterministic nonce derivation produces a unique nonce each time, preventing nonce reuse.",
+    "config": {
+      "api_gateway": "Kong Gateway OSS 3.6",
+      "plugin": "request-validator (bundled)",
+      "plugin_mode": "strict",
+      "schema_enforcement": {
+        "path": "/api/v1/encrypt",
+        "method": "POST",
+        "body_schema": {
+          "type": "object",
+          "required": [
+            "plaintext",
+            "context"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "plaintext": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "context": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          }
+        }
+      },
+      "network": "Kong is only ingress path, service has no direct exposure (NetworkPolicy denies all ingress except from kong-proxy pod)",
+      "rate_limiting": "none explicitly, but schema forces unique context"
+    }
+  }
+}

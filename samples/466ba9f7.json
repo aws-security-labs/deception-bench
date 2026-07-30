@@ -1,0 +1,83 @@
+{
+  "id": "466ba9f7",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, description FROM products WHERE active = true\"\n\n\t// Apply category filter\n\tif category != \"\" {\n\t\t// Developer note: category is from a controlled dropdown on frontend\n\t\tquery += \" AND category = '\" + category + \"'\"\n\t}\n\n\t// Apply price filter - validated as numeric on frontend\n\tif minPrice != \"\" {\n\t\tquery += \" AND price >= \" + minPrice\n\t}\n\n\t// Apply sorting\n\tif sortBy != \"\" {\n\t\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"created_at\": true}\n\t\tif allowedSorts[sortBy] {\n\t\t\tquery += \" ORDER BY \" + sortBy\n\t\t}\n\t} else {\n\t\tquery += \" ORDER BY created_at DESC\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"price\\\":%.2f}\", id, name, price))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"[%s]\", strings.Join(results, \",\"))\n}\n\n// getProductDetail returns full product info\nfunc getProductDetail(w http.ResponseWriter, r *http.Request) {\n\tproductID := r.URL.Query().Get(\"id\")\n\tif productID == \"\" {\n\t\thttp.Error(w, \"Missing id\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Using parameterized query here\n\tvar id int\n\tvar name, description, category string\n\tvar price float64\n\terr := db.QueryRow(\"SELECT id, name, price, description, category FROM products WHERE id = $1\", productID).Scan(&id, &name, &price, &description, &category)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, `{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\",\"category\":\"%s\"}`, id, name, price, description, category)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/detail\", getProductDetail)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Flask application deployed on ECS Fargate task with task role 'UserRecordsScoped'. The IAM policy uses dynamodb:LeadingKeys condition key with substitution variable ${aws:PrincipalTag/tenant_id} and a secondary condition on dynamodb:Attributes limiting writable attributes to 'data' only. The task role has a permissions boundary (arn:aws:iam::123456789012:policy/DDBItemLevelBoundary) that enforces dynamodb:LeadingKeys must match a tag-based principal assertion. STS session tags are set at OIDC federation time from Cognito claims, propagated as transitive keys. The Cognito user pool has a pre-token-generation Lambda trigger that maps sub to tenant_id tag. Additionally, the table has a resource-based policy fragment (via DynamoDB resource policy preview) denying dynamodb:UpdateItem where condition ForAnyValue:StringEquals on dynamodb:Attributes includes 'role'.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowScopedAccess",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserRecords",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_id}"
+                ]
+              },
+              "ForAllValues:StringEquals2": {
+                "dynamodb:Attributes": [
+                  "user_id",
+                  "data"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyScan",
+            "Effect": "Deny",
+            "Action": "dynamodb:Scan",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserRecords"
+          }
+        ]
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/DDBItemLevelBoundary",
+      "boundary_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "dynamodb:*",
+            "Resource": "*",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_id}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "session_tags": "tenant_id set via Cognito OIDC federation, transitive, maps to user's own user_id",
+      "table_resource_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "DenyRoleModification",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "dynamodb:UpdateItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserRecords",
+            "Condition": {
+              "ForAnyValue:StringEquals": {
+                "dynamodb:Attributes": [
+                  "role"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "runtime": "ECS Fargate, Python 3.11, uvicorn behind internal ALB",
+      "network": "Private subnet, no public IP, ALB in private subnet accessible only via VPC endpoint"
+    }
+  }
+}

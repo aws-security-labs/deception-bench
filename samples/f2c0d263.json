@@ -1,0 +1,39 @@
+{
+  "id": "f2c0d263",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID        int    `json:\"id\"`\n\tTitle     string `json:\"title\"`\n\tContent   string `json:\"content\"`\n\tOwnerID   int    `json:\"owner_id\"`\n\tClassification string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// getDocuments returns documents based on filter criteria\nfunc getDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\") // set by auth proxy\n\tclassFilter := r.URL.Query().Get(\"classification\")\n\ttagFilter := r.URL.Query().Get(\"tag\")\n\n\t// Base query with user restriction\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = %s\",\n\t\tuserID,\n\t)\n\n\t// Apply classification filter\n\tif classFilter != \"\" {\n\t\tquery += \" AND classification = '\" + classFilter + \"'\"\n\t}\n\n\t// Apply tag filter via subquery\n\tif tagFilter != \"\" {\n\t\tquery += fmt.Sprintf(\" AND id IN (SELECT document_id FROM document_tags WHERE tag = '%s')\", tagFilter)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\thttp.Error(w, \"query error\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// searchDocuments provides full-text search\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tsearchTerm := r.URL.Query().Get(\"q\")\n\n\tif searchTerm == \"\" {\n\t\thttp.Error(w, \"missing search term\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Attempt to sanitize - remove obvious dangerous chars\n\tsearchTerm = strings.ReplaceAll(searchTerm, \";\", \"\")\n\tsearchTerm = strings.ReplaceAll(searchTerm, \"--\", \"\")\n\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = %s AND (title ILIKE '%%%s%%' OR content ILIKE '%%%s%%')\",\n\t\tuserID, searchTerm, searchTerm,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\thttp.Error(w, \"search error\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Search error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents\", getDocuments)\n\thttp.HandleFunc(\"/api/search\", searchDocuments)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALB. ALB has AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet priority 1 in COUNT mode for baseline telemetry, (2) a custom rule group 'internal-query-sanitizer' priority 2 containing a single RegexPatternSet rule matching URI query string parameters against pattern '(?i)(union|select|insert|update|delete|drop|;|--|\\/\\*|\\*\\/|sleep|benchmark|extractvalue|updatexml|load_file|into\\s+outfile|case\\s+when)' with action BLOCK and field-to-match set to 'AllQueryArguments' with text transformation URL_DECODE followed by LOWERCASE, (3) AWSManagedRulesSQLiRuleSet priority 3 in COUNT mode only (not blocking, used for detection metrics). CloudWatch alarm on SQLi detection count >0 triggers SNS notification to security team.",
+    "config": {
+      "load_balancer": "AWS ALBv2 with WAFv2 WebACL association",
+      "wafv2_webacl_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "action_override": "COUNT",
+          "purpose": "baseline visibility"
+        },
+        {
+          "name": "internal-query-sanitizer",
+          "priority": 2,
+          "action": "BLOCK",
+          "type": "custom RegexPatternSet on AllQueryArguments",
+          "text_transformations": [
+            "URL_DECODE",
+            "LOWERCASE"
+          ],
+          "pattern": "(?i)(union|select|insert|update|delete|drop|;|--|\\/\\*|\\*\\/|sleep|benchmark|extractvalue|updatexml|load_file|into\\s+outfile|case\\s+when)"
+        },
+        {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 3,
+          "action_override": "COUNT",
+          "purpose": "detection and CloudWatch metrics only"
+        }
+      ],
+      "compute": "ECS Fargate 1.4.0, task role with no additional permissions",
+      "monitoring": "CloudWatch alarm on WAF SQLi metric, SNS to security-ops",
+      "database": "SQLite 3.39 on EFS mount /var/app/data"
+    }
+  }
+}

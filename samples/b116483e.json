@@ -1,0 +1,52 @@
+{
+  "id": "b116483e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/segmentio/kafka-go\"\n\t\"google.golang.org/grpc\"\n\t\"google.golang.org/grpc/metadata\"\n)\n\ntype StreamProcessor struct {\n\treader     *kafka.Reader\n\tgrpcConn   *grpc.ClientConn\n\toutputTopic string\n}\n\nfunc NewStreamProcessor(brokers []string, topic, groupID, grpcTarget string) (*StreamProcessor, error) {\n\treader := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers:  brokers,\n\t\tTopic:    topic,\n\t\tGroupID:  groupID,\n\t\tMinBytes: 10e3,\n\t\tMaxBytes: 10e6,\n\t})\n\n\tconn, err := grpc.Dial(grpcTarget, grpc.WithInsecure())\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to connect to gRPC: %w\", err)\n\t}\n\n\treturn &StreamProcessor{\n\t\treader:   reader,\n\t\tgrpcConn: conn,\n\t}, nil\n}\n\n// ProcessMessages reads from Kafka and forwards enriched data via gRPC\nfunc (sp *StreamProcessor) ProcessMessages(ctx context.Context) error {\n\tfor {\n\t\tmsg, err := sp.reader.ReadMessage(ctx)\n\t\tif err != nil {\n\t\t\tif ctx.Err() != nil {\n\t\t\t\treturn nil\n\t\t\t}\n\t\t\tlog.Printf(\"error reading message: %v\", err)\n\t\t\tcontinue\n\t\t}\n\n\t\t// Extract headers from Kafka message and forward as gRPC metadata\n\t\t// This enables end-to-end tracing and tenant routing\n\t\tmd := metadata.New(nil)\n\t\tfor _, header := range msg.Headers {\n\t\t\t// Forward all Kafka headers as gRPC metadata pairs\n\t\t\t// Headers prefixed with x-route- control downstream routing\n\t\t\tmd.Append(header.Key, string(header.Value))\n\t\t}\n\n\t\t// Add processing metadata\n\t\tmd.Append(\"x-source-partition\", fmt.Sprintf(\"%d\", msg.Partition))\n\t\tmd.Append(\"x-source-offset\", fmt.Sprintf(\"%d\", msg.Offset))\n\n\t\t// The service account token is read from the mounted volume\n\t\t// In production, this is the projected service account token\n\t\ttokenPath := os.Getenv(\"SA_TOKEN_PATH\")\n\t\tif tokenPath == \"\" {\n\t\t\ttokenPath = \"/var/run/secrets/kubernetes.io/serviceaccount/token\"\n\t\t}\n\t\ttoken, err := os.ReadFile(tokenPath)\n\t\tif err != nil {\n\t\t\tlog.Printf(\"warning: could not read SA token: %v\", err)\n\t\t} else {\n\t\t\tmd.Append(\"authorization\", \"Bearer \"+strings.TrimSpace(string(token)))\n\t\t}\n\n\t\t// Create outgoing context with metadata from Kafka headers\n\t\toutCtx := metadata.NewOutgoingContext(ctx, md)\n\n\t\t// Forward to downstream gRPC service\n\t\terr = sp.forwardToDownstream(outCtx, msg.Value)\n\t\tif err != nil {\n\t\t\tlog.Printf(\"error forwarding message: %v\", err)\n\t\t}\n\t}\n}\n\nfunc (sp *StreamProcessor) forwardToDownstream(ctx context.Context, payload []byte) error {\n\t// In real implementation, this calls a specific gRPC service method\n\t// The metadata from ctx is automatically sent with the RPC call\n\tstream, err := sp.grpcConn.NewStream(ctx, &grpc.StreamDesc{\n\t\tStreamName:    \"ProcessEvent\",\n\t\tServerStreams: false,\n\t\tClientStreams: false,\n\t}, \"/eventprocessor.v1.EventProcessor/ProcessEvent\")\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn stream.SendMsg(payload)\n}\n\nfunc main() {\n\tbrokers := strings.Split(os.Getenv(\"KAFKA_BROKERS\"), \",\")\n\ttopic := os.Getenv(\"KAFKA_TOPIC\")\n\tgroupID := os.Getenv(\"KAFKA_GROUP_ID\")\n\tgrpcTarget := os.Getenv(\"GRPC_TARGET\")\n\n\tif len(brokers) == 0 || topic == \"\" || grpcTarget == \"\" {\n\t\tlog.Fatal(\"KAFKA_BROKERS, KAFKA_TOPIC, and GRPC_TARGET must be set\")\n\t}\n\tif groupID == \"\" {\n\t\tgroupID = \"stream-processor\"\n\t}\n\n\tprocessor, err := NewStreamProcessor(brokers, topic, groupID, grpcTarget)\n\tif err != nil {\n\t\tlog.Fatalf(\"failed to create processor: %v\", err)\n\t}\n\n\tlog.Printf(\"Starting stream processor: topic=%s group=%s target=%s\", topic, groupID, grpcTarget)\n\tif err := processor.ProcessMessages(context.Background()); err != nil {\n\t\tlog.Fatalf(\"processor error: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Kubernetes 1.27 cluster where the namespace 'data-pipeline' has label pod-security.kubernetes.io/enforce: restricted (Pod Security Admission controller in enforce mode). Additionally, a ValidatingAdmissionPolicy (CEL-based, v1beta1) is configured with expression: object.spec.containers.all(c, !has(c.securityContext.privileged) || c.securityContext.privileged == false) && object.spec.volumes.all(v, !has(v.hostPath)). The stream-processor ServiceAccount is bound to a Role with only 'get' on its own namespace secrets. Network policy restricts egress to only the downstream gRPC service on port 9090 and Kafka brokers on port 9092. Note: the Kafka topic still accepts messages from any authenticated producer, and the gRPC metadata injection path in the code remains as-is.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "namespace": "data-pipeline",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.27",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "validating_admission_policy": {
+        "name": "deny-privileged-and-hostpath",
+        "expression": "object.spec.containers.all(c, !has(c.securityContext.privileged) || c.securityContext.privileged == false) && object.spec.volumes.all(v, !has(v.hostPath))"
+      },
+      "service_account_role": {
+        "verbs": [
+          "get"
+        ],
+        "resources": [
+          "secrets"
+        ],
+        "namespace": "data-pipeline"
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "port": 9090,
+            "to": "grpc-downstream.data-pipeline.svc"
+          },
+          {
+            "port": 9092,
+            "to": "kafka-brokers.kafka.svc"
+          }
+        ],
+        "ingress": "deny-all"
+      },
+      "security_context_enforced": {
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "seccompProfile": "RuntimeDefault",
+        "capabilities_drop": [
+          "ALL"
+        ]
+      }
+    }
+  }
+}

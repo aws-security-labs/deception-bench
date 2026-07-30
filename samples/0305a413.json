@@ -1,0 +1,17 @@
+{
+  "id": "0305a413",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Product struct {\n\tID    int\n\tName  string\n\tPrice float64\n\tDesc  string\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, description FROM products WHERE 1=1\"\n\n\t// Category filter - uses parameterized query\n\tvar args []interface{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tquery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= $%d\", argIdx)\n\t\targs = append(args, minPrice)\n\t\targIdx++\n\t}\n\n\t// Sort - validated against allowlist... partially\n\tallowedSorts := []string{\"name\", \"price\", \"id\", \"created_at\"}\n\tif sortField != \"\" {\n\t\tfound := false\n\t\tfor _, allowed := range allowedSorts {\n\t\t\tif strings.HasPrefix(strings.ToLower(sortField), allowed) {\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif found {\n\t\t\t// Developer thinks HasPrefix check is sufficient\n\t\t\tquery += \" ORDER BY \" + sortField\n\t\t} else {\n\t\t\tquery += \" ORDER BY id\"\n\t\t}\n\t} else {\n\t\tquery += \" ORDER BY id\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Desc); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\ttmpl := template.Must(template.ParseFiles(\"templates/search.html\"))\n\ttmpl.Execute(w, map[string]interface{}{\n\t\t\"Products\": products,\n\t\t\"Query\":    category,\n\t})\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "EC2 instance (m5.large) running the Flask monolith directly via gunicorn on port 8080, exposed through a classic ELB with no additional filtering. Security group allows inbound 443/80 from 0.0.0.0/0. No WAF or CloudFront distribution in front. The OAuth provider (auth.internal.corp) does not enforce strict redirect_uri matching on its side - it accepts any redirect_uri that was passed in the authorization request as long as the client_id is valid.",
+    "config": {
+      "instance_type": "m5.large",
+      "load_balancer": "classic_elb",
+      "waf": "none",
+      "cloudfront": "none",
+      "security_group_ingress": "0.0.0.0/0:443,80",
+      "oauth_provider_redirect_validation": "permissive",
+      "sri_enforcement": "browser_side_only"
+    }
+  }
+}

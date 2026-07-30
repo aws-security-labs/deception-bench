@@ -1,0 +1,61 @@
+{
+  "id": "641aa7b4",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/app/data/users.db'\nSECRET_KEY = os.environ.get('APP_SECRET', 'dev-key-change-me')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department or role. Requires valid API key.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    # Validate API key\n    key_hash = hashlib.sha256(api_key.encode()).hexdigest()\n    caller = db.execute('SELECT * FROM users WHERE api_key = ?', (key_hash,)).fetchone()\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    # Log the search action\n    department = request.args.get('department', '')\n    role_filter = request.args.get('role', '')\n    sort_by = request.args.get('sort', 'username')\n    order = request.args.get('order', 'ASC')\n    \n    # Build query - department and role are parameterized\n    # sort_by allows ordering results\n    allowed_orders = ('ASC', 'DESC')\n    if order.upper() not in allowed_orders:\n        order = 'ASC'\n    \n    # NOTE: sort_by is validated against column names\n    allowed_columns = ('username', 'email', 'department', 'role', 'id')\n    \n    query = \"SELECT id, username, email, department, role FROM users WHERE 1=1\"\n    params = []\n    \n    if department:\n        query += \" AND department = ?\"\n        params.append(department)\n    if role_filter:\n        query += \" AND role = ?\"\n        params.append(role_filter)\n    \n    # Vulnerability: sort_by is checked but the check result isn't used to gate the query\n    if sort_by not in allowed_columns:\n        # Log suspicious input but still use a \"safe\" default... except we don't\n        app.logger.warning(f\"Invalid sort column attempted: {sort_by}\")\n        # BUG: falls through without reassigning sort_by\n    \n    query += f\" ORDER BY {sort_by} {order}\"\n    \n    try:\n        results = db.execute(query, params).fetchall()\n    except sqlite3.OperationalError as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 400\n    \n    # Audit log\n    db.execute('INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)',\n               ('user_search', caller['username'], f'dept={department},role={role_filter}'))\n    db.commit()\n    \n    users = [dict(row) for row in results]\n    return jsonify({'results': users, 'count': len(users)})\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    key_hash = hashlib.sha256(api_key.encode()).hexdigest()\n    caller = db.execute('SELECT * FROM users WHERE api_key = ?', (key_hash,)).fetchone()\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    user = db.execute('SELECT id, username, email, department, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'User not found'}), 404\n    \n    return jsonify(dict(user))\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with two rule groups: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, and (2) a custom rule group 'internal-sqli-heuristics' with a single RegexPatternSet rule that inspects SingleQueryArgument 'sort' for pattern '^[a-zA-Z_]{1,20}$' with action BLOCK (non-matching requests get 403). The ECS task role has no additional permissions. CloudWatch logs capture all blocked requests. The task runs with readonlyRootFilesystem=true and the database is mounted from EFS with encryption at rest.",
+    "config": {
+      "runtime": "ECS Fargate, platform version 1.4.0, Python 3.11-slim container",
+      "waf_web_acl": {
+        "rule_group_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "COUNT"
+            }
+          ]
+        },
+        "rule_group_2": {
+          "name": "internal-sqli-heuristics",
+          "scope": "REGIONAL",
+          "rules": [
+            {
+              "name": "sort-param-allowlist",
+              "priority": 1,
+              "statement": {
+                "regexPatternSetReferenceStatement": {
+                  "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sort-allowlist/abc123",
+                  "fieldToMatch": {
+                    "singleQueryArgument": {
+                      "name": "sort"
+                    }
+                  },
+                  "textTransformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              },
+              "action": "BLOCK_if_no_match",
+              "description": "Blocks requests where sort param does not match ^[a-zA-Z_]{1,20}$"
+            }
+          ]
+        }
+      },
+      "network": "Private subnet, ALB in public subnet, SG allows only ALB traffic to task",
+      "ecs_task_definition": {
+        "readonlyRootFilesystem": true,
+        "user": "1001:1001"
+      },
+      "database": "SQLite on EFS mount /var/app/data, encrypted at rest with AWS-managed key"
+    }
+  }
+}

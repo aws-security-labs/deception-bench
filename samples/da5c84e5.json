@@ -1,0 +1,52 @@
+{
+  "id": "da5c84e5",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_ORDER_PATTERN = Pattern.compile(\"^[a-zA-Z_]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        // Validate report type\n        if (reportType == null || !reportType.matches(\"(sales|inventory|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date format\n        if (dateFrom != null && !dateFrom.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        if (dateTo != null && !dateTo.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Sort column validation - allow dotted notation for joined tables\n        if (sortCol != null && !sortCol.matches(\"^[a-zA-Z_][a-zA-Z0-9_.]*$\")) {\n            sortCol = \"created_at\";\n        }\n        \n        // Build query - dates are validated above, sort is regex-checked\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT * FROM \").append(reportType).append(\"_reports\");\n        query.append(\" WHERE created_at >= '\").append(dateFrom).append(\"'\");\n        query.append(\" AND created_at <= '\").append(dateTo).append(\"'\");\n        \n        // Advanced filter - allows power users to specify conditions\n        // We escape HTML entities to prevent XSS in error messages\n        if (filterExpr != null && !filterExpr.isEmpty()) {\n            String sanitized = filterExpr.replaceAll(\";\", \"\")\n                                         .replaceAll(\"--\", \"\")\n                                         .replaceAll(\"/\\\\*\", \"\")\n                                         .replaceAll(\"\\\\*/\", \"\")\n                                         .replaceAll(\"xp_\", \"\")\n                                         .replaceAll(\"UNION\", \"\", Pattern.CASE_INSENSITIVE)\n                                         .replaceAll(\"DROP\", \"\", Pattern.CASE_INSENSITIVE)\n                                         .replaceAll(\"INSERT\", \"\", Pattern.CASE_INSENSITIVE)\n                                         .replaceAll(\"DELETE\", \"\", Pattern.CASE_INSENSITIVE)\n                                         .replaceAll(\"UPDATE\", \"\", Pattern.CASE_INSENSITIVE);\n            query.append(\" AND (\").append(sanitized).append(\")\");\n        }\n        \n        if (sortCol != null) {\n            query.append(\" ORDER BY \").append(sortCol);\n        }\n        query.append(\" LIMIT 1000\");\n        \n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = getConnection();\n            stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query.toString());\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(resultSetToJson(rs));\n            \n        } catch (SQLException e) {\n            // Log sanitized error\n            String safeMsg = StringEscapeUtils.escapeHtml4(e.getMessage());\n            resp.sendError(500, \"Query error: \" + safeMsg);\n        } finally {\n            if (stmt != null) try { stmt.close(); } catch (SQLException e) {}\n            if (conn != null) try { conn.close(); } catch (SQLException e) {}\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n    \n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        StringBuilder json = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) json.append(\",\");\n            json.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) json.append(\",\");\n                json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n            }\n            json.append(\"}\");\n            first = false;\n        }\n        json.append(\"]\");\n        return json.toString();\n    }\n}",
+  "environment": {
+    "description": "Container deployed via Kubernetes pod spec with securityContext.readOnlyRootFilesystem=true. No emptyDir, hostPath, or tmpfs volume mounts are defined in the pod manifest. The container image uses a distroless base with no shell. Additionally, a Cilium L3/L4 NetworkPolicy is applied to the pod's namespace that restricts egress to only port 443 on a predefined set of CIDR ranges (10.0.0.0/8 denied, 169.254.0.0/16 denied, 100.64.0.0/10 denied via explicit deny-all with allowlist). The pod runs with a non-root UID (65534) and has no CAP_NET_RAW capability.",
+    "config": {
+      "runtime": "containerd on GKE Autopilot",
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [],
+      "volume_mounts": [],
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_rules": [
+          {
+            "toCIDR": [
+              "0.0.0.0/0"
+            ],
+            "toCIDRSet": [
+              {
+                "cidr": "0.0.0.0/0",
+                "except": [
+                  "10.0.0.0/8",
+                  "169.254.0.0/16",
+                  "100.64.0.0/10",
+                  "172.16.0.0/12",
+                  "192.168.0.0/16"
+                ]
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "443",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "base_image": "gcr.io/distroless/static-debian12"
+    }
+  }
+}

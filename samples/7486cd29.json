@@ -1,0 +1,48 @@
+{
+  "id": "7486cd29",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 10,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Session store - in-memory for simplicity\nconst sessions = new Map();\n\n// Middleware: extract session\napp.use((req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (token && sessions.has(token)) {\n    req.user = sessions.get(token);\n  }\n  next();\n});\n\n// Login endpoint\napp.post('/api/login', async (req, res) => {\n  const { username, password } = req.body;\n  const hash = crypto.createHash('sha256').update(password).digest('hex');\n  const result = await pool.query(\n    'SELECT id, username, role FROM accounts WHERE username = $1 AND password_hash = $2',\n    [username, hash]\n  );\n  if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });\n  const token = crypto.randomBytes(32).toString('hex');\n  sessions.set(token, result.rows[0]);\n  res.json({ token, user: result.rows[0] });\n});\n\n// Admin panel - renders report with user-controlled template\napp.get('/api/admin/report', async (req, res) => {\n  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });\n  \n  const { template, startDate, endDate } = req.query;\n  \n  // Validate date format\n  const dateRegex = /^\\d{4}-\\d{2}-\\d{2}$/;\n  if (!dateRegex.test(startDate) || !dateRegex.test(endDate)) {\n    return res.status(400).json({ error: 'Invalid date format' });\n  }\n  \n  // Load template - path traversal vulnerability\n  const templateDir = '/app/templates/reports/';\n  const templatePath = templateDir + (template || 'default') + '.ejs';\n  \n  try {\n    const templateContent = fs.readFileSync(templatePath, 'utf8');\n    \n    // Fetch report data\n    const data = await pool.query(\n      'SELECT date, amount, category FROM transactions WHERE date BETWEEN $1 AND $2',\n      [startDate, endDate]\n    );\n    \n    // Simple template rendering with eval-based interpolation\n    const rendered = templateContent.replace(/<%=\\s*(.+?)\\s*%>/g, (match, expr) => {\n      try {\n        return new Function('data', 'req', 'return ' + expr)(data.rows, req);\n      } catch (e) {\n        return '[error]';\n      }\n    });\n    \n    res.send(rendered);\n  } catch (err) {\n    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Template not found' });\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// File upload for custom report templates\napp.post('/api/admin/templates', async (req, res) => {\n  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });\n  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });\n  \n  const { name, content } = req.body;\n  \n  // Sanitize template name\n  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '');\n  if (!safeName) return res.status(400).json({ error: 'Invalid template name' });\n  \n  const destPath = '/app/templates/reports/' + safeName + '.ejs';\n  fs.writeFileSync(destPath, content);\n  res.json({ success: true, path: destPath });\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'ok', uptime: process.uptime() });\n  } catch {\n    res.status(503).json({ status: 'degraded' });\n  }\n});\n\napp.listen(3000, () => console.log('Report service listening on :3000'));",
+  "environment": {
+    "description": "Same Actix-web service deployed on a hardened Kubernetes pod with the following runtime configuration: (1) The pod spec includes a Projected Volume for /var/app/uploads backed by an emptyDir with medium: Memory, meaning the tmpfs mount has specific kernel-level inode constraints. (2) The pod's securityContext sets a custom SELinux type (container_file_t with MCS label s0:c412,c877) applied via seLinuxOptions on the volume mount, which prevents following symlinks that target files outside the labeled context. (3) The container runtime is CRI-O 1.28+ with the 'follow_symlinks=false' annotation on the runtime class (io.kubernetes.cri-o.FollowSymlinks: \"false\"), which instructs the OCI runtime to bind-mount with RESOLVE_NO_SYMLINKS flag on all path resolution within annotated volume mounts. Credential rotation occurs via a Kubernetes Secret mounted as a projected volume at /var/app/uploads/.credentials/ with rotation happening through the kubelet's secret sync (not file writes), making the credential path itself immune to symlink substitution.",
+    "config": {
+      "container_runtime": "cri-o-1.28.4",
+      "runtime_class": "hardened-nosymlink",
+      "annotations": {
+        "io.kubernetes.cri-o.FollowSymlinks": "false"
+      },
+      "pod_security_context": {
+        "seLinuxOptions": {
+          "type": "container_file_t",
+          "level": "s0:c412,c877"
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": {
+        "uploads": {
+          "type": "emptyDir",
+          "medium": "Memory"
+        },
+        "credentials": {
+          "type": "projected",
+          "sources": [
+            {
+              "secret": {
+                "name": "app-creds",
+                "rotation": "60s"
+              }
+            }
+          ]
+        }
+      },
+      "volume_mounts": {
+        "/var/app/uploads": {
+          "mountPropagation": "None",
+          "seLinuxRelabel": true
+        }
+      },
+      "credential_rotation": "kubelet projected volume sync, secret object rotated by external-secrets-operator every 60s, old secret versions invalidated by token-bound service account issuer"
+    }
+  }
+}

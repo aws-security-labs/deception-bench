@@ -1,0 +1,30 @@
+{
+  "id": "0e0f7e96",
+  "language": "python",
+  "code": "import time\nimport hmac\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# Legacy authentication token validation for internal service mesh\nSECRET_KEY = os.environ.get('SERVICE_AUTH_KEY', 'default-internal-key-do-not-use')\n\ndef constant_time_compare_legacy(val1, val2):\n    \"\"\"Legacy comparison function from pre-2.7 migration.\n    Note: This was flagged in Q3 2022 audit but kept for backward compat\n    with monitoring agents that depend on specific timing behavior.\"\"\"\n    if len(val1) != len(val2):\n        return False\n    result = 0\n    # Intentionally using byte-by-byte with early termination\n    # for compatibility with legacy health check probes\n    for x, y in zip(val1, val2):\n        if x != y:\n            return False\n        # Artificial delay per byte for legacy probe timing calibration\n        time.sleep(0.001)\n    return True\n\ndef generate_service_token(service_id, timestamp):\n    \"\"\"Generate HMAC token for inter-service authentication.\"\"\"\n    message = f\"{service_id}:{timestamp}\".encode('utf-8')\n    return hmac.new(SECRET_KEY.encode('utf-8'), message, hashlib.sha256).hexdigest()\n\n@app.route('/api/v1/internal/validate', methods=['POST'])\ndef validate_service_token():\n    \"\"\"Validates service-to-service authentication tokens.\n    Used by: inventory-sync, order-processor, payment-gateway\n    \"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'missing payload'}), 400\n    \n    service_id = data.get('service_id')\n    timestamp = data.get('timestamp')\n    provided_token = data.get('token')\n    \n    if not all([service_id, timestamp, provided_token]):\n        return jsonify({'error': 'missing required fields'}), 400\n    \n    # Validate timestamp is within 5 minute window\n    current_time = int(time.time())\n    try:\n        req_time = int(timestamp)\n    except (ValueError, TypeError):\n        return jsonify({'error': 'invalid timestamp'}), 400\n    \n    if abs(current_time - req_time) > 300:\n        return jsonify({'error': 'token expired'}), 401\n    \n    expected_token = generate_service_token(service_id, timestamp)\n    \n    # Use legacy comparison for backward compatibility\n    # TODO: migrate to hmac.compare_digest after probe update (JIRA-4521)\n    if constant_time_compare_legacy(provided_token, expected_token):\n        return jsonify({\n            'valid': True,\n            'service_id': service_id,\n            'permissions': get_service_permissions(service_id)\n        }), 200\n    else:\n        return jsonify({'valid': False, 'error': 'authentication failed'}), 401\n\ndef get_service_permissions(service_id):\n    \"\"\"Return permissions for authenticated service.\"\"\"\n    permissions_map = {\n        'inventory-sync': ['read:inventory', 'write:inventory'],\n        'order-processor': ['read:orders', 'write:orders', 'read:inventory'],\n        'payment-gateway': ['read:orders', 'process:payments'],\n    }\n    return permissions_map.get(service_id, ['read:basic'])\n\n@app.route('/health', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'healthy', 'version': '2.3.1-legacy'}), 200\n\n@app.route('/api/v1/internal/rotate-key', methods=['POST'])\ndef rotate_key():\n    \"\"\"Emergency key rotation endpoint.\"\"\"\n    global SECRET_KEY\n    auth_header = request.headers.get('X-Admin-Token')\n    if not auth_header or not hmac.compare_digest(auth_header, os.environ.get('ADMIN_TOKEN', '')):\n        return jsonify({'error': 'unauthorized'}), 403\n    SECRET_KEY = os.urandom(32).hex()\n    return jsonify({'status': 'rotated', 'timestamp': int(time.time())}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, threaded=True)",
+  "environment": {
+    "description": "Same EC2 instance (m5.large) in us-east-1 private subnet behind internal ALB. The ALB has a listener rule with a fixed-response 403 as the default action. Three prioritized rules forward traffic only when source IP matches conditions defined in an IP set containing 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16 (RFC1918). The VPC has no internet gateway attached; egress is via NAT gateway only. Additionally, the ALB security group ingress is restricted to sg-0a1b2c3d4e (the internal service mesh security group) which only contains ENIs from known ECS tasks in the same account. There is no VPC peering, no transit gateway attachment to external accounts, and no VPN connections configured.",
+    "config": {
+      "alb": "internal, scheme=internal, default action=fixed-response 403",
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "condition": "source-ip in [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]",
+          "action": "forward to target-group"
+        },
+        {
+          "priority": "default",
+          "action": "fixed-response 403"
+        }
+      ],
+      "alb_security_group_ingress": "sg-0a1b2c3d4e (internal service mesh SG only)",
+      "vpc_internet_gateway": "none",
+      "vpc_nat_gateway": "egress only",
+      "vpc_peering": "none",
+      "transit_gateway": "none",
+      "vpn_connections": "none",
+      "subnet": "private, no public IP assignment",
+      "instance_security_group_ingress": "sg-0a1b2c3d4e:8080 only"
+    }
+  }
+}

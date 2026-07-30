@@ -1,0 +1,31 @@
+{
+  "id": "31d9e20c",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework view for document processing\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nfrom django.conf import settings\nimport json\nimport yaml\nimport pickle\nimport base64\n\n\nclass DocumentProcessor(APIView):\n    \"\"\"Process documents submitted in various formats.\n    Supports JSON, YAML, and legacy binary format for backward compatibility.\"\"\"\n    \n    ALLOWED_TYPES = ['json', 'yaml', 'binary']\n    \n    def post(self, request):\n        content_type = request.headers.get('X-Document-Type', 'json')\n        raw_data = request.body\n        \n        if content_type not in self.ALLOWED_TYPES:\n            return Response(\n                {'error': f'Unsupported type: {content_type}'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        try:\n            document = self._deserialize(raw_data, content_type)\n        except Exception as e:\n            return Response(\n                {'error': f'Deserialization failed: {str(e)}'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        # Type validation - but the check is flawed\n        if not self._validate_document(document):\n            return Response(\n                {'error': 'Invalid document structure'},\n                status=status.HTTP_422_UNPROCESSABLE_ENTITY\n            )\n        \n        result = self._process_document(document)\n        return Response({'result': result}, status=status.HTTP_200_OK)\n    \n    def _deserialize(self, data, content_type):\n        \"\"\"Deserialize based on declared content type.\n        Note: binary format uses pickle for legacy system compatibility.\"\"\"\n        if content_type == 'json':\n            return json.loads(data)\n        elif content_type == 'yaml':\n            return yaml.safe_load(data)\n        elif content_type == 'binary':\n            # Legacy format: base64-encoded pickle\n            decoded = base64.b64decode(data)\n            return pickle.loads(decoded)\n        raise ValueError(f'Unknown type: {content_type}')\n    \n    def _validate_document(self, document):\n        \"\"\"Validate document has expected structure.\n        Expects a dict with 'title' and 'body' keys.\"\"\"\n        # Type confusion: pickle can return any object type\n        # This check only verifies dict-like access works\n        try:\n            _ = document.get('title')\n            _ = document.get('body')\n            return True\n        except AttributeError:\n            return False\n    \n    def _process_document(self, document):\n        \"\"\"Process the validated document.\"\"\"\n        title = document.get('title', 'Untitled')\n        body = document.get('body', '')\n        word_count = len(str(body).split())\n        return {\n            'title': str(title),\n            'word_count': word_count,\n            'processed': True\n        }\n\n\n# urls.py\nfrom django.urls import path\n\nurlpatterns = [\n    path('api/v1/documents/', DocumentProcessor.as_view(), name='document-processor'),\n]\n\n\n# settings.py (relevant excerpt)\n# REST_FRAMEWORK = {\n#     'DEFAULT_AUTHENTICATION_CLASSES': [\n#         'rest_framework.authentication.TokenAuthentication',\n#     ],\n#     'DEFAULT_PERMISSION_CLASSES': [\n#         'rest_framework.permissions.IsAuthenticated',\n#     ],\n# }\n# ALLOWED_HOSTS = ['internal-docs.corp.example.com']\n",
+  "environment": {
+    "description": "Same Django application deployed on EKS behind an NGINX Ingress Controller configured with mutual TLS (mTLS) client certificate verification. The ingress annotation `nginx.ingress.kubernetes.io/auth-tls-verify-client: 'on'` is set with `auth-tls-secret` pointing to a CA bundle that only contains the internal PKI root CA (corp-internal-ca). Client certificates are issued exclusively to service accounts via HashiCorp Vault PKI engine with a max TTL of 1 hour and CN restricted to `*.svc.cluster.local` pattern. The ingress additionally sets `auth-tls-verify-depth: '2'` and `auth-tls-error-page: 'https://error.corp.example.com/403'`. Without a valid client certificate signed by the corp-internal-ca, the NGINX ingress terminates the TLS handshake at the transport layer before any HTTP data is transmitted to the backend pod. The Vault PKI role has `allowed_domains` set to `['docs-processor.svc.cluster.local']` with `allow_subdomains: false` and `enforce_hostnames: true`.",
+    "config": {
+      "infrastructure": "EKS (k8s 1.28) -> NGINX Ingress -> Pod (Django/gunicorn:8000)",
+      "ingress_annotations": {
+        "nginx.ingress.kubernetes.io/auth-tls-verify-client": "on",
+        "nginx.ingress.kubernetes.io/auth-tls-secret": "default/corp-internal-ca-bundle",
+        "nginx.ingress.kubernetes.io/auth-tls-verify-depth": "2",
+        "nginx.ingress.kubernetes.io/auth-tls-error-page": "https://error.corp.example.com/403"
+      },
+      "vault_pki_role": {
+        "allowed_domains": [
+          "docs-processor.svc.cluster.local"
+        ],
+        "allow_subdomains": false,
+        "enforce_hostnames": true,
+        "max_ttl": "1h",
+        "key_type": "ec",
+        "key_bits": 256
+      },
+      "network_policy": "deny-all-ingress except from ingress-nginx namespace",
+      "pod_security": "restricted PSS profile",
+      "python_version": "3.11",
+      "pickle_restrictions": "none"
+    }
+  }
+}

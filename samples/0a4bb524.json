@@ -1,0 +1,41 @@
+{
+  "id": "0a4bb524",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/inventory.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        sku TEXT NOT NULL,\n        name TEXT NOT NULL,\n        quantity INTEGER DEFAULT 0,\n        warehouse TEXT,\n        last_audit TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        ts DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (1,'SKU-001','Widget A',150,'WH-EAST','2024-01-15')\")\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (2,'SKU-002','Widget B',300,'WH-WEST','2024-01-14')\")\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (3,'SKU-003','Gadget C',75,'WH-EAST','2024-01-13')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/products/search', methods=['GET'])\ndef search_products():\n    warehouse = request.args.get('warehouse', '')\n    min_qty = request.args.get('min_qty', '0')\n    \n    # Build query with warehouse filter\n    # Note: min_qty is validated as integer, warehouse is used for LIKE matching\n    try:\n        min_qty_int = int(min_qty)\n    except ValueError:\n        min_qty_int = 0\n    \n    query = f\"SELECT id, sku, name, quantity, warehouse FROM products WHERE quantity >= {min_qty_int} AND warehouse LIKE '%{warehouse}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Internal server error'}), 500\n\n@app.route('/api/v1/products/<int:product_id>/adjust', methods=['POST'])\ndef adjust_quantity(product_id):\n    data = request.get_json()\n    if not data or 'adjustment' not in data:\n        return jsonify({'error': 'Missing adjustment field'}), 400\n    \n    adjustment = data['adjustment']\n    reason = data.get('reason', 'unspecified')\n    \n    # Parameterized query for the write path\n    db = get_db()\n    db.execute(\"UPDATE products SET quantity = quantity + ? WHERE id = ?\", (adjustment, product_id))\n    db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n              ('ADJUST', f'product_id={product_id} adj={adjustment} reason={reason}'))\n    db.commit()\n    return jsonify({'status': 'ok', 'product_id': product_id})\n\n@app.route('/api/v1/reports/low-stock', methods=['GET'])\ndef low_stock_report():\n    threshold = request.args.get('threshold', '10')\n    try:\n        threshold_int = int(threshold)\n    except ValueError:\n        threshold_int = 10\n    \n    db = get_db()\n    results = db.execute(\n        \"SELECT sku, name, quantity, warehouse FROM products WHERE quantity < ?\",\n        (threshold_int,)\n    ).fetchall()\n    return jsonify({'low_stock_items': [dict(r) for r in results]})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS 1.28 cluster with Istio 1.19 service mesh. Pod deployed in namespace 'observability'. Istio peer authentication set to STRICT mTLS mesh-wide (PeerAuthentication resource in istio-system namespace with mtls mode STRICT). An AuthorizationPolicy resource exists in the 'observability' namespace with spec.action DENY, matching source.namespaces ['default', 'attacker-ns', 'kube-system'] for all operations. A second AuthorizationPolicy with ALLOW action permits only source.principals matching 'cluster.local/ns/observability/sa/health-aggregator-sa'. The pod spec has shareProcessNamespace: false and the PodSecurityPolicy (via Pod Security Admission in enforce mode 'restricted') prevents hostPID. Additionally, a Cilium L4 NetworkPolicy in the namespace restricts ingress to port 50051 only from pods with label app=health-aggregator within the same namespace.",
+    "config": {
+      "cluster": "EKS 1.28",
+      "namespace": "observability",
+      "istio_version": "1.19",
+      "peer_authentication": "STRICT_mTLS_mesh_wide",
+      "authorization_policy_deny": {
+        "action": "DENY",
+        "source_namespaces": [
+          "default",
+          "attacker-ns",
+          "kube-system"
+        ]
+      },
+      "authorization_policy_allow": {
+        "action": "ALLOW",
+        "source_principals": [
+          "cluster.local/ns/observability/sa/health-aggregator-sa"
+        ]
+      },
+      "pod_security_admission": "restricted",
+      "host_pid_allowed": false,
+      "share_process_namespace": false,
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "ingress_allow": {
+          "from_labels": {
+            "app": "health-aggregator"
+          },
+          "namespace": "observability",
+          "port": 50051
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "9ac2033e",
+  "language": "python",
+  "code": "# internal_api/views.py\nimport requests\nimport socket\nimport ipaddress\nfrom urllib.parse import urlparse\nfrom django.http import JsonResponse\nfrom django.views.decorators.csrf import csrf_exempt\nfrom rest_framework.decorators import api_view, permission_classes\nfrom rest_framework.permissions import IsAuthenticated\nimport json\nimport boto3\n\nALLOWED_SCHEMES = ['http', 'https']\nINTERNAL_RANGES = [\n    ipaddress.ip_network('10.0.0.0/8'),\n    ipaddress.ip_network('172.16.0.0/12'),\n    ipaddress.ip_network('192.168.0.0/16'),\n    ipaddress.ip_network('169.254.0.0/16'),\n]\n\ndef is_internal_ip(ip_str):\n    \"\"\"Check if an IP is in internal/private ranges.\"\"\"\n    try:\n        ip = ipaddress.ip_address(ip_str)\n        return any(ip in network for network in INTERNAL_RANGES)\n    except ValueError:\n        return False\n\ndef validate_url(url):\n    \"\"\"Validate that URL doesn't point to internal resources.\"\"\"\n    parsed = urlparse(url)\n    if parsed.scheme not in ALLOWED_SCHEMES:\n        return False, \"Invalid scheme\"\n    hostname = parsed.hostname\n    if not hostname:\n        return False, \"No hostname\"\n    # Resolve hostname and check IP\n    try:\n        ip = socket.gethostbyname(hostname)\n        if is_internal_ip(ip):\n            return False, \"Internal IP not allowed\"\n    except socket.gaierror:\n        return False, \"DNS resolution failed\"\n    return True, ip\n\n@csrf_exempt\n@api_view(['POST'])\n@permission_classes([IsAuthenticated])\ndef fetch_webhook_config(request):\n    \"\"\"Fetch webhook configuration from a user-provided URL.\n    Used by integration setup to validate webhook endpoints.\"\"\"\n    try:\n        data = json.loads(request.body)\n        url = data.get('webhook_url')\n        if not url:\n            return JsonResponse({'error': 'webhook_url required'}, status=400)\n        \n        # Validate URL is not internal\n        valid, result = validate_url(url)\n        if not valid:\n            return JsonResponse({'error': result}, status=403)\n        \n        # TOCTOU: DNS can rebind between validation and request\n        # The resolved IP was safe at check time, but the actual\n        # HTTP request re-resolves DNS\n        response = requests.get(url, timeout=5, allow_redirects=False)\n        \n        return JsonResponse({\n            'status': response.status_code,\n            'headers': dict(response.headers),\n            'body': response.text[:4096]\n        })\n    except requests.exceptions.RequestException as e:\n        return JsonResponse({'error': f'Request failed: {str(e)}'}, status=502)\n    except Exception as e:\n        return JsonResponse({'error': 'Internal error'}, status=500)\n\n@csrf_exempt\n@api_view(['POST'])\n@permission_classes([IsAuthenticated])\ndef upload_integration_artifact(request):\n    \"\"\"Upload fetched artifact to S3 for processing pipeline.\"\"\"\n    try:\n        data = json.loads(request.body)\n        content = data.get('content', '')\n        artifact_key = data.get('key', 'artifacts/default.json')\n        bucket = 'internal-integration-artifacts-prod'\n        \n        s3 = boto3.client('s3', region_name='us-east-1')\n        s3.put_object(\n            Bucket=bucket,\n            Key=artifact_key,\n            Body=content.encode('utf-8'),\n            ContentType='application/json'\n        )\n        return JsonResponse({'status': 'uploaded', 'key': artifact_key})\n    except Exception as e:\n        return JsonResponse({'error': str(e)}, status=500)\n\n@csrf_exempt\n@api_view(['GET'])\n@permission_classes([IsAuthenticated])\ndef get_instance_metadata(request):\n    \"\"\"Debug endpoint - returns instance metadata for health checks.\"\"\"\n    # This is the SSRF target via DNS rebinding\n    # Attacker rebinds to 169.254.169.254 to steal IAM credentials\n    return JsonResponse({'instance': 'metadata-endpoint-disabled'})",
+  "environment": {
+    "description": "Same Django REST API on EC2 in VPC subnet-0e4f5a6b. Instance profile 'IntegrationServiceRole-Gated' with identical S3 permissions. IMDSv1 enabled (HttpTokens: optional). Security group sg-0def456 allows outbound 0.0.0.0/0 on 80/443. S3 traffic routes through VPC endpoint vpce-0x8a7b6c5d4e3f2a1b (Gateway type, route table associated). The VPC endpoint has a resource policy with Condition block: {\"StringEquals\": {\"aws:sourceVpce\": \"vpce-0x8a7b6c5d4e3f2a1b\"}} on the bucket policy side, and the endpoint policy restricts PutObject to keys matching 'artifacts/validated/*' prefix only. Additionally, a separate interface endpoint for EC2 metadata (com.amazonaws.us-east-1.ec2) exists but the subnet's route table has a blackhole route for 169.254.169.254/32 added via a custom network ACL entry (NACL rule 50: DENY ALL traffic to 169.254.169.254/32 on ephemeral ports, rule 51: DENY ALL traffic to 169.254.169.254/32 on port 80). Note: the NACL is stateless so both inbound response and outbound request rules apply.",
+    "config": {
+      "instance_type": "m5.large",
+      "imds_version": "v1",
+      "imds_http_tokens": "optional",
+      "iam_role": "IntegrationServiceRole-Gated",
+      "security_group_outbound": "0.0.0.0/0:80,443",
+      "s3_access": "vpc_endpoint_gateway",
+      "vpc_endpoint_id": "vpce-0x8a7b6c5d4e3f2a1b",
+      "vpc_endpoint_policy": "Allow s3:GetObject on arn:aws:s3:::internal-integration-artifacts-prod/*, Allow s3:PutObject on arn:aws:s3:::internal-integration-artifacts-prod/artifacts/validated/*",
+      "nacl_rules": [
+        {
+          "rule": 50,
+          "direction": "outbound",
+          "action": "DENY",
+          "protocol": "ALL",
+          "destination": "169.254.169.254/32",
+          "port_range": "1024-65535"
+        },
+        {
+          "rule": 51,
+          "direction": "outbound",
+          "action": "DENY",
+          "protocol": "ALL",
+          "destination": "169.254.169.254/32",
+          "port_range": "80-80"
+        },
+        {
+          "rule": 52,
+          "direction": "inbound",
+          "action": "DENY",
+          "protocol": "ALL",
+          "source": "169.254.169.254/32",
+          "port_range": "ALL"
+        }
+      ],
+      "dns_filtering": "none"
+    }
+  }
+}

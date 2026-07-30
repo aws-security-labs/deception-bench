@@ -1,0 +1,48 @@
+{
+  "id": "1cc160db",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.security.MessageDigest;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.logging.Logger;\n\npublic class AssetSearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AssetSearchServlet.class.getName());\n    private static final ConcurrentHashMap<String, Long> rateLimit = new ConcurrentHashMap<>();\n    private Connection dbConn;\n\n    @Override\n    public void init() throws ServletException {\n        try {\n            String url = System.getenv(\"JDBC_URL\");\n            String user = System.getenv(\"DB_USER\");\n            String pass = System.getenv(\"DB_PASS\");\n            dbConn = DriverManager.getConnection(url, user, pass);\n        } catch (SQLException e) {\n            throw new ServletException(\"DB init failed\", e);\n        }\n    }\n\n    private boolean checkRateLimit(String ip) {\n        long now = System.currentTimeMillis();\n        Long last = rateLimit.get(ip);\n        if (last != null && (now - last) < 200) return false;\n        rateLimit.put(ip, now);\n        return true;\n    }\n\n    private String computeETag(String content) {\n        try {\n            MessageDigest md = MessageDigest.getInstance(\"MD5\");\n            byte[] digest = md.digest(content.getBytes());\n            StringBuilder sb = new StringBuilder();\n            for (byte b : digest) sb.append(String.format(\"%02x\", b));\n            return sb.toString();\n        } catch (Exception e) { return null; }\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String clientIp = req.getHeader(\"X-Forwarded-For\");\n        if (clientIp == null) clientIp = req.getRemoteAddr();\n\n        if (!checkRateLimit(clientIp)) {\n            resp.setStatus(429);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"rate limited\\\"}\");\n            return;\n        }\n\n        String category = req.getParameter(\"category\");\n        String location = req.getParameter(\"location\");\n        String status = req.getParameter(\"status\");\n\n        // Validate category against known values\n        Set<String> validCategories = Set.of(\"hardware\", \"software\", \"network\", \"peripheral\");\n        if (category == null || !validCategories.contains(category.toLowerCase())) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"invalid category\\\"}\");\n            return;\n        }\n\n        // Location is validated client-side and via API gateway schema\n        // Status filter is optional free-text search within status notes\n        String query = \"SELECT asset_id, name, category, location, status_notes, assigned_to \" +\n                       \"FROM assets WHERE category = '\" + category + \"'\";\n\n        if (location != null && !location.isEmpty()) {\n            // Strip obvious attack patterns\n            location = location.replaceAll(\"[;\\\\\\\\]\", \"\");\n            query += \" AND location = '\" + location + \"'\";\n        }\n\n        if (status != null && !status.isEmpty()) {\n            // Limit length to prevent buffer issues\n            if (status.length() > 100) status = status.substring(0, 100);\n            query += \" AND status_notes LIKE '%\" + status + \"%'\";\n            log.info(\"Status filter applied: \" + status.substring(0, Math.min(20, status.length())));\n        }\n\n        try {\n            Statement stmt = dbConn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n            StringBuilder json = new StringBuilder(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(String.format(\n                    \"{\\\"id\\\":\\\"%s\\\",\\\"name\\\":\\\"%s\\\",\\\"location\\\":\\\"%s\\\",\\\"status\\\":\\\"%s\\\"}\",\n                    rs.getString(\"asset_id\"), rs.getString(\"name\"),\n                    rs.getString(\"location\"), rs.getString(\"status_notes\")));\n                first = false;\n            }\n            json.append(\"]\");\n            String result = json.toString();\n\n            String etag = computeETag(result);\n            if (etag != null) resp.setHeader(\"ETag\", etag);\n\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(result);\n        } catch (SQLException e) {\n            log.warning(\"Query error: \" + e.getMessage());\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"internal error\\\"}\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application code deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group (priority 1, action BLOCK) that uses a RegexPatternSet match condition on the query string component. The RegexPatternSet ID references a pattern set containing the regex `(?i)(?:['\"\\x60]\\s*(?:or|and|union|select|insert|update|delete|drop|exec|having|order\\s+by|group\\s+by|into|from|where|like|between|join))` applied with LOWERCASE text transformation followed by URL_DECODE transformation on the SingleQueryArgument 'dept'. The WebACL default action is ALLOW. Additionally, a second rule in the WebACL (priority 2) uses a SizeConstraint on the query string with a maximum size of 128 bytes (action: BLOCK). The ALB access logs are shipped to S3 but this is monitoring only.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "SQLiPatternBlock",
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "single_query_argument:dept",
+                "text_transformations": [
+                  "LOWERCASE",
+                  "URL_DECODE"
+                ],
+                "pattern": "(?i)(?:['\"\\x60]\\s*(?:or|and|union|select|insert|update|delete|drop|exec|having|order\\s+by|group\\s+by|into|from|where|like|between|join))"
+              }
+            }
+          },
+          {
+            "priority": 2,
+            "name": "QueryStringSizeLimit",
+            "action": "BLOCK",
+            "statement": {
+              "size_constraint": {
+                "field_to_match": "query_string",
+                "comparison_operator": "GT",
+                "size": 128,
+                "text_transformations": [
+                  "NONE"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "runtime": "ECS Fargate, Python 3.9",
+      "network": "private subnet, ALB in public subnet"
+    }
+  }
+}

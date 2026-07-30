@@ -1,0 +1,43 @@
+{
+  "id": "9bdcd6de",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nvar searchTemplate = template.Must(template.New(\"search\").Parse(`\n<html><body>\n<h1>Product Search</h1>\n<form method=\"POST\" action=\"/search\">\n  <input name=\"q\" value=\"{{.Query}}\" size=\"40\">\n  <select name=\"category\">\n    <option value=\"all\">All</option>\n    <option value=\"electronics\">Electronics</option>\n    <option value=\"books\">Books</option>\n  </select>\n  <button type=\"submit\">Search</button>\n</form>\n<table border=\"1\">\n<tr><th>Name</th><th>Price</th><th>Category</th></tr>\n{{range .Results}}\n<tr><td>{{.Name}}</td><td>{{.Price}}</td><td>{{.Category}}</td></tr>\n{{end}}\n</table>\n</body></html>\n`))\n\ntype Product struct {\n\tName     string\n\tPrice    string\n\tCategory string\n}\n\ntype SearchPage struct {\n\tQuery   string\n\tResults []Product\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\tsearchTemplate.Execute(w, SearchPage{})\n\t\treturn\n\t}\n\n\tquery := r.FormValue(\"q\")\n\tcategory := r.FormValue(\"category\")\n\n\t// Validate category against whitelist\n\tvalidCategories := map[string]bool{\"all\": true, \"electronics\": true, \"books\": true}\n\tif !validCategories[category] {\n\t\tcategory = \"all\"\n\t}\n\n\tvar sqlQuery string\n\tif category == \"all\" {\n\t\tsqlQuery = fmt.Sprintf(\"SELECT name, price, category FROM products WHERE name ILIKE '%%%s%%'\", query)\n\t} else {\n\t\tsqlQuery = fmt.Sprintf(\"SELECT name, price, category FROM products WHERE name ILIKE '%%%s%%' AND category = '%s'\", query, category)\n\t}\n\n\trows, err := db.Query(sqlQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.Name, &p.Price, &p.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, p)\n\t}\n\n\tsearchTemplate.Execute(w, SearchPage{Query: query, Results: results})\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tif connStr == \"\" {\n\t\tconnStr = \"postgres://app:app@localhost:5432/products?sslmode=disable\"\n\t}\n\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdefer db.Close()\n\n\t// Connection pool settings\n\tdb.SetMaxOpenConns(10)\n\tdb.SetMaxIdleConns(5)\n\n\t// Restrict search length at application level\n\thttp.HandleFunc(\"/search\", func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Method == \"POST\" {\n\t\t\tq := r.FormValue(\"q\")\n\t\t\tif len(q) > 100 {\n\t\t\t\thttp.Error(w, \"Query too long\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}\n\t\t\t// Basic sanitization - remove obvious comment sequences\n\t\t\tq = strings.ReplaceAll(q, \"/*\", \"\")\n\t\t\tq = strings.ReplaceAll(q, \"*/\", \"\")\n\t\t}\n\t\tsearchHandler(w, r)\n\t})\n\thttp.HandleFunc(\"/health\", healthHandler)\n\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) a custom rule with priority 5 using a RegexPatternSet that matches request query strings against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with BLOCK action. The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress except to the RDS instance on port 5432 (note: the app uses local SQLite, but the network policy is inherited from the base task definition template). CloudWatch Logs captures all WAF BLOCK decisions with full request headers and query parameters.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "wafv2_web_acl_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none"
+        },
+        {
+          "priority": 5,
+          "name": "custom-sqli-regex-block",
+          "statement": {
+            "regex_pattern_set": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()",
+            "field_to_match": "query_string"
+          },
+          "action": "block"
+        }
+      ],
+      "web_acl_default_action": "ALLOW",
+      "network": "private subnet, ALB in public subnet",
+      "ecs_task_network_mode": "awsvpc",
+      "security_group_egress": "only port 5432 to RDS subnet CIDR",
+      "logging": "WAF logs to CloudWatch with full request capture"
+    }
+  }
+}

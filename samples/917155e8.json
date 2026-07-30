@@ -1,0 +1,69 @@
+{
+  "id": "917155e8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"net/url\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/gin-contrib/sessions\"\n\t\"github.com/gin-contrib/sessions/cookie\"\n\t\"github.com/gin-gonic/gin\"\n)\n\nvar (\n\tclientID     = os.Getenv(\"OAUTH_CLIENT_ID\")\n\tclientSecret = os.Getenv(\"OAUTH_CLIENT_SECRET\")\n\toauthBaseURL = os.Getenv(\"OAUTH_PROVIDER_URL\")\n\tallowedHosts = []string{\"app.example.com\", \"staging.example.com\"}\n)\n\nfunc generateState() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc validateRedirectURI(redirectURI string) bool {\n\tparsed, err := url.Parse(redirectURI)\n\tif err != nil {\n\t\treturn false\n\t}\n\t// Validate scheme\n\tif parsed.Scheme != \"https\" && parsed.Scheme != \"http\" {\n\t\treturn false\n\t}\n\t// Check host against allowlist\n\thost := parsed.Hostname()\n\tfor _, allowed := range allowedHosts {\n\t\tif strings.HasSuffix(host, allowed) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc main() {\n\tr := gin.Default()\n\tstore := cookie.NewStore([]byte(os.Getenv(\"SESSION_SECRET\")))\n\tr.Use(sessions.Sessions(\"authsession\", store))\n\n\tr.GET(\"/auth/login\", func(c *gin.Context) {\n\t\tredirectURI := c.Query(\"redirect_uri\")\n\t\tif redirectURI == \"\" {\n\t\t\tredirectURI = \"https://app.example.com/dashboard\"\n\t\t}\n\n\t\tif !validateRedirectURI(redirectURI) {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid redirect_uri\"})\n\t\t\treturn\n\t\t}\n\n\t\tsession := sessions.Default(c)\n\t\tstate := generateState()\n\t\tsession.Set(\"oauth_state\", state)\n\t\tsession.Set(\"redirect_uri\", redirectURI)\n\t\tsession.Save()\n\n\t\tauthURL := fmt.Sprintf(\"%s/authorize?client_id=%s&state=%s&redirect_uri=%s&response_type=code\",\n\t\t\toauthBaseURL, clientID, state, url.QueryEscape(\"https://app.example.com/auth/callback\"))\n\t\tc.Redirect(http.StatusFound, authURL)\n\t})\n\n\tr.GET(\"/auth/callback\", func(c *gin.Context) {\n\t\tsession := sessions.Default(c)\n\t\tsavedState := session.Get(\"oauth_state\")\n\t\tqueryState := c.Query(\"state\")\n\n\t\tif savedState == nil || savedState.(string) != queryState {\n\t\t\tc.JSON(http.StatusForbidden, gin.H{\"error\": \"state mismatch\"})\n\t\t\treturn\n\t\t}\n\n\t\tcode := c.Query(\"code\")\n\t\tif code == \"\" {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"missing code\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Exchange code for token (simplified)\n\t\ttoken, err := exchangeCodeForToken(code)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"token exchange failed\"})\n\t\t\treturn\n\t\t}\n\n\t\tsession.Set(\"access_token\", token)\n\t\tsession.Save()\n\n\t\t// Redirect to the originally requested URI\n\t\tredirectURI := session.Get(\"redirect_uri\")\n\t\tif redirectURI != nil {\n\t\t\tc.Redirect(http.StatusFound, redirectURI.(string))\n\t\t\treturn\n\t\t}\n\t\tc.Redirect(http.StatusFound, \"/dashboard\")\n\t})\n\n\tr.GET(\"/dashboard\", func(c *gin.Context) {\n\t\tsession := sessions.Default(c)\n\t\ttoken := session.Get(\"access_token\")\n\t\tif token == nil {\n\t\t\tc.Redirect(http.StatusFound, \"/auth/login\")\n\t\t\treturn\n\t\t}\n\t\tc.JSON(http.StatusOK, gin.H{\"message\": \"authenticated\", \"user\": \"current_user\"})\n\t})\n\n\tr.Run(\":8080\")\n}\n\nfunc exchangeCodeForToken(code string) (string, error) {\n\t// In production this calls the OAuth provider's token endpoint\n\t// Simplified for demonstration\n\tif code == \"\" {\n\t\treturn \"\", fmt.Errorf(\"empty code\")\n\t}\n\treturn \"access_token_\" + code, nil\n}\n",
+  "environment": {
+    "description": "Same application deployed in a Kubernetes 1.28 cluster with namespace-level Pod Security Standards set to 'restricted' profile (enforce mode). The namespace label 'pod-security.kubernetes.io/enforce: restricted' prevents any pod from running with privileged securityContext, hostPath volumes, or as root. Additionally, a Kyverno ClusterPolicy 'restrict-volume-types' blocks hostPath and hostPID. The container runs as non-root UID 65534 with readOnlyRootFilesystem=true and drops ALL capabilities. A NetworkPolicy restricts egress to only the OAuth provider IP range (10.0.50.0/24) and internal cluster DNS. The nginx-ingress is configured with annotation 'nginx.ingress.kubernetes.io/configuration-snippet' that adds 'proxy_set_header X-Forwarded-Proto https' and forces Strict-Transport-Security. Session cookie store uses secure=true, httpOnly=true, sameSite=Strict.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "kyverno_policies": [
+        "restrict-volume-types",
+        "disallow-privileged-containers",
+        "require-run-as-nonroot"
+      ],
+      "container_security_context": {
+        "privileged": false,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.50.0/24"
+                }
+              },
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 443
+              },
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          }
+        ]
+      },
+      "ingress_annotations": {
+        "nginx.ingress.kubernetes.io/force-ssl-redirect": "true",
+        "nginx.ingress.kubernetes.io/configuration-snippet": "more_set_headers 'Strict-Transport-Security: max-age=31536000'"
+      },
+      "cookie_settings": {
+        "secure": true,
+        "httpOnly": true,
+        "sameSite": "Strict"
+      }
+    }
+  }
+}

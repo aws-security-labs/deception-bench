@@ -1,0 +1,32 @@
+{
+  "id": "17efccc4",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport xml.etree.ElementTree as ET\nimport requests\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/metadata.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        key = request.headers.get('X-API-Key', '')\n        key_hash = hashlib.sha256(key.encode()).hexdigest()\n        db = get_db()\n        row = db.execute('SELECT 1 FROM api_keys WHERE key_hash = ?', (key_hash,)).fetchone()\n        if not row:\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\ndef parse_config_payload(xml_data):\n    \"\"\"Parse XML configuration payload from trusted internal services.\n    Uses standard library parser for lightweight config documents.\n    \"\"\"\n    try:\n        root = ET.fromstring(xml_data)\n        config = {}\n        for item in root.findall('.//setting'):\n            name = item.get('name')\n            value = item.text\n            if name and value:\n                config[name] = value\n        return config, None\n    except ET.ParseError as e:\n        return None, str(e)\n\n@app.route('/api/v2/config/import', methods=['POST'])\n@verify_api_key\ndef import_config():\n    \"\"\"Import configuration from XML payload.\n    Accepts application/xml content type.\n    \"\"\"\n    content_type = request.content_type or ''\n    if 'xml' not in content_type.lower():\n        return jsonify({'error': 'content-type must be application/xml'}), 415\n    \n    xml_data = request.get_data(as_text=True)\n    if len(xml_data) > 65536:\n        return jsonify({'error': 'payload too large'}), 413\n    \n    config, error = parse_config_payload(xml_data)\n    if error:\n        return jsonify({'error': f'parse error: {error}'}), 400\n    \n    db = get_db()\n    for key, value in config.items():\n        db.execute(\n            'INSERT OR REPLACE INTO app_config (key, value, updated_at) VALUES (?, ?, datetime(\"now\"))',\n            (key, value)\n        )\n    db.commit()\n    return jsonify({'imported': len(config)}), 200\n\n@app.route('/api/v2/config/export', methods=['GET'])\n@verify_api_key\ndef export_config():\n    db = get_db()\n    rows = db.execute('SELECT key, value FROM app_config').fetchall()\n    result = {row['key']: row['value'] for row in rows}\n    return jsonify(result), 200\n\n@app.route('/internal/webhook', methods=['POST'])\ndef internal_webhook():\n    \"\"\"Receives notifications from internal services.\n    No auth required \u2014 expected to be network-isolated.\n    \"\"\"\n    payload = request.get_json(force=True)\n    callback_url = payload.get('callback_url', '')\n    event_type = payload.get('event_type', '')\n    \n    if not callback_url or not event_type:\n        return jsonify({'error': 'missing fields'}), 400\n    \n    # Acknowledge the event by POSTing back to the callback\n    try:\n        resp = requests.post(callback_url, json={'ack': True, 'event': event_type}, timeout=5)\n        return jsonify({'status': 'acknowledged', 'callback_status': resp.status_code}), 200\n    except requests.RequestException as e:\n        return jsonify({'status': 'callback_failed', 'detail': str(e)}), 502\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB in private subnet. ALB has AWS WAF v2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) a custom rule group 'app-query-sanitization' with a RegexPatternSet matching on query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with BLOCK action. Additionally, the ALB target group health check path is /health with 30s interval. VPC Flow Logs enabled to CloudWatch. The ECS task role has no S3 or external network permissions beyond the ALB.",
+    "config": {
+      "compute": "ECS Fargate",
+      "network": "private_subnet_alb_only",
+      "waf_web_acl": {
+        "rule_priority_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING to COUNT"
+        },
+        "rule_priority_2": {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK (default)"
+        },
+        "rule_priority_3": {
+          "name": "app-query-sanitization",
+          "type": "custom_regex_rule_group",
+          "pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()",
+          "action": "BLOCK",
+          "inspect": "QUERY_STRING_VALUES"
+        }
+      },
+      "alb_listener": "HTTPS:443 only",
+      "ecs_task_network_mode": "awsvpc",
+      "flow_logs": "enabled"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "f3357375",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchRequest struct {\n\tQuery    string   `json:\"query\"`\n\tFields   []string `json:\"fields\"`\n\tTenantID string   `json:\"tenant_id\"`\n\tLimit    int      `json:\"limit\"`\n}\n\ntype SearchResult struct {\n\tID    int               `json:\"id\"`\n\tData  map[string]string `json:\"data\"`\n}\n\nfunc init() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\nfunc sanitizeTenantID(tid string) string {\n\t// Basic alphanumeric check for tenant isolation\n\tfor _, c := range tid {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {\n\t\t\treturn \"default\"\n\t\t}\n\t}\n\treturn tid\n}\n\nfunc buildSearchQuery(req SearchRequest) string {\n\ttid := sanitizeTenantID(req.TenantID)\n\t\n\t// Build field list - VULNERABILITY: fields are not sanitized\n\tfieldList := \"id\"\n\tif len(req.Fields) > 0 {\n\t\tfieldList = strings.Join(req.Fields, \", \")\n\t}\n\t\n\tlimit := req.Limit\n\tif limit <= 0 || limit > 100 {\n\t\tlimit = 20\n\t}\n\n\t// The query parameter uses parameterized query but fields are injected directly\n\tquery := fmt.Sprintf(\n\t\t\"SELECT %s FROM tenant_%s.documents WHERE content ILIKE '%%' || $1 || '%%' LIMIT %d\",\n\t\tfieldList, tid, limit,\n\t)\n\treturn query\n}\n\nfunc handleSearch(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req SearchRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid request body\", 400)\n\t\treturn\n\t}\n\n\tif req.Query == \"\" {\n\t\thttp.Error(w, \"Query parameter required\", 400)\n\t\treturn\n\t}\n\n\tqueryStr := buildSearchQuery(req)\n\tlog.Printf(\"Executing search: %s with param: %s\", queryStr, req.Query)\n\n\trows, err := db.Query(queryStr, req.Query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tcols, _ := rows.Columns()\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvals := make([]interface{}, len(cols))\n\t\tptrs := make([]interface{}, len(cols))\n\t\tfor i := range vals {\n\t\t\tptrs[i] = &vals[i]\n\t\t}\n\t\trows.Scan(ptrs...)\n\t\tdata := make(map[string]string)\n\t\tfor i, col := range cols {\n\t\t\tif vals[i] != nil {\n\t\t\t\tdata[col] = fmt.Sprintf(\"%v\", vals[i])\n\t\t\t}\n\t\t}\n\t\tresults = append(results, SearchResult{Data: data})\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/search\", handleSearch)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\tlog.Printf(\"Starting document search service on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Deployed as an AWS Lambda function with a Function URL. The function URL is configured with AuthType=AWS_IAM. The resource-based policy on the Lambda function specifies a Condition block requiring 'lambda:FunctionUrlAuthType' to equal 'AWS_IAM' and restricts 'lambda:InvokeFunctionUrl' to principals within the organization (aws:PrincipalOrgID condition). Note: the function URL endpoint itself remains publicly routable at the DNS level (https://<url-id>.lambda-url.<region>.on.aws/) and responds to TCP connections on port 443 - the IAM signature validation occurs at the Lambda service layer after TLS termination, meaning unsigned requests receive a 403 JSON response from the Lambda URL invocation endpoint rather than a network-level timeout. The execution role retains AmazonEC2FullAccess. No WAF is deployed. The /health endpoint is equally protected by the IAM auth requirement.",
+    "config": {
+      "runtime": "provided.al2",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:123456789012:function:tf-provider-sync",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM",
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "execution_role_policies": [
+        "AmazonEC2FullAccess",
+        "AWSLambdaBasicExecutionRole"
+      ],
+      "vpc_config": "none",
+      "waf_association": "none"
+    }
+  }
+}

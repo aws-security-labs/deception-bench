@@ -1,0 +1,94 @@
+{
+  "id": "dc8434c1",
+  "language": "java",
+  "code": "package com.example.lambda;\n\nimport com.amazonaws.services.lambda.runtime.Context;\nimport com.amazonaws.services.lambda.runtime.RequestHandler;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;\nimport software.amazon.awssdk.services.s3.S3Client;\nimport software.amazon.awssdk.services.s3.model.PutObjectRequest;\nimport software.amazon.awssdk.core.sync.RequestBody;\n\nimport java.io.File;\nimport java.io.IOException;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.nio.file.Paths;\nimport java.util.Map;\nimport java.util.UUID;\n\npublic class FileProcessorHandler implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {\n\n    private static final String UPLOAD_BUCKET = System.getenv(\"UPLOAD_BUCKET\");\n    private static final String TEMP_DIR = \"/tmp/processing\";\n    private final S3Client s3Client = S3Client.create();\n\n    @Override\n    public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent event, Context context) {\n        APIGatewayProxyResponseEvent response = new APIGatewayProxyResponseEvent();\n        \n        try {\n            Map<String, String> params = event.getQueryStringParameters();\n            if (params == null || !params.containsKey(\"filename\")) {\n                response.setStatusCode(400);\n                response.setBody(\"{\\\"error\\\": \\\"filename parameter required\\\"}\");\n                return response;\n            }\n\n            String filename = params.get(\"filename\");\n            String sessionId = UUID.randomUUID().toString();\n            String workDir = TEMP_DIR + \"/\" + sessionId;\n            \n            // Create working directory\n            new File(workDir).mkdirs();\n            \n            // Resolve the target path for processing\n            // Developer note: filename is user-provided for the output key\n            Path targetPath = Paths.get(workDir, filename);\n            \n            // Process: read content from request body, write to temp, then upload\n            String body = event.getBody();\n            if (body == null || body.isEmpty()) {\n                response.setStatusCode(400);\n                response.setBody(\"{\\\"error\\\": \\\"body required\\\"}\");\n                return response;\n            }\n\n            // VULNERABILITY: No symlink check before writing\n            // An attacker who can pre-create a symlink at targetPath\n            // (e.g., via a race condition with concurrent Lambda invocations\n            // sharing /tmp, or via a prior request that didn't clean up)\n            // can redirect the write to arbitrary paths\n            Files.writeString(targetPath, body);\n            \n            // After writing, read back and upload to S3\n            // VULNERABILITY: follows symlinks when reading - if /tmp contains\n            // a symlink pointing to /etc/shadow or /var/runtime/bootstrap,\n            // the content gets exfiltrated to S3\n            byte[] content = Files.readAllBytes(targetPath);\n            \n            // Upload to S3 - the attacker-controlled filename becomes the S3 key\n            String s3Key = \"uploads/\" + sessionId + \"/\" + filename;\n            PutObjectRequest putRequest = PutObjectRequest.builder()\n                    .bucket(UPLOAD_BUCKET)\n                    .key(s3Key)\n                    .build();\n            s3Client.putObject(putRequest, RequestBody.fromBytes(content));\n\n            // Cleanup\n            Files.deleteIfExists(targetPath);\n            Files.deleteIfExists(Path.of(workDir));\n\n            response.setStatusCode(200);\n            response.setBody(\"{\\\"key\\\": \\\"\" + s3Key + \"\\\", \\\"size\\\": \" + content.length + \"}\");\n            return response;\n\n        } catch (IOException e) {\n            context.getLogger().log(\"Error processing file: \" + e.getMessage());\n            response.setStatusCode(500);\n            response.setBody(\"{\\\"error\\\": \\\"internal error\\\"}\");\n            return response;\n        }\n    }\n\n    /**\n     * Secondary handler for listing processed files.\n     * Uses path traversal-safe listing from S3 only.\n     */\n    public APIGatewayProxyResponseEvent handleList(APIGatewayProxyRequestEvent event, Context context) {\n        // This method is safe - only reads from S3 with fixed prefix\n        var objects = s3Client.listObjects(b -> b.bucket(UPLOAD_BUCKET).prefix(\"uploads/\"));\n        StringBuilder sb = new StringBuilder(\"[\");\n        objects.contents().forEach(obj -> sb.append(\"\\\"\" + obj.key() + \"\\\",\"));\n        if (sb.length() > 1) sb.setLength(sb.length() - 1);\n        sb.append(\"]\");\n        \n        APIGatewayProxyResponseEvent response = new APIGatewayProxyResponseEvent();\n        response.setStatusCode(200);\n        response.setBody(sb.toString());\n        return response;\n    }\n}",
+  "environment": {
+    "description": "AWS Lambda function (Quarkus native compiled) deployed in a VPC with an S3 Gateway VPC Endpoint (vpce-0x8f3a2b1c). The endpoint has a custom policy document that enforces a condition: aws:PrincipalOrgID must match the organization AND the s3:prefix condition key must begin with 'uploads/${aws:userid}/' for PutObject actions. Additionally, the endpoint policy includes a StringNotLike condition on s3:ObjectKey denying any key containing path traversal sequences ('..') or null bytes. The Lambda subnet route table directs all S3 traffic (prefix list pl-63a5400a) exclusively through this VPC endpoint - there is no NAT gateway or internet gateway route for S3 CIDR ranges. The bucket itself has a bucket policy with a Deny statement for any s3:PutObject where aws:sourceVpce does not equal vpce-0x8f3a2b1c, ensuring no bypass via alternative network paths.",
+    "config": {
+      "runtime": "provided.al2",
+      "architecture": "x86_64",
+      "memory": 1024,
+      "ephemeral_storage": 10240,
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-0a1b2c3d4e5f"
+        ],
+        "security_group_ids": [
+          "sg-0a1b2c3d4e5f"
+        ]
+      },
+      "s3_access": "via_vpc_endpoint_only",
+      "vpc_endpoint_id": "vpce-0x8f3a2b1c",
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Sid": "AllowOrgPutWithPrefixRestriction",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::upload-bucket-prod/uploads/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+              },
+              "StringLike": {
+                "s3:prefix": "uploads/${aws:userid}/*"
+              }
+            }
+          },
+          {
+            "Sid": "DenyTraversalKeys",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::upload-bucket-prod/*",
+            "Condition": {
+              "StringLike": {
+                "s3:ObjectKey": [
+                  "*..*",
+                  "*%00*",
+                  "*%2e%2e*"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "AllowListAndGet",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::upload-bucket-prod",
+              "arn:aws:s3:::upload-bucket-prod/*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+              }
+            }
+          }
+        ]
+      },
+      "route_table": "pl-63a5400a -> vpce-0x8f3a2b1c (no igw/nat for S3 CIDRs)",
+      "bucket_policy": {
+        "Statement": [
+          {
+            "Sid": "DenyNonVPCE",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::upload-bucket-prod/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:sourceVpce": "vpce-0x8f3a2b1c"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

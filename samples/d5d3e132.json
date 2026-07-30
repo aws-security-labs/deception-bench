@@ -1,0 +1,65 @@
+{
+  "id": "d5d3e132",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/binary\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"unsafe\"\n)\n\n// BuildArtifactHeader represents the header of a CI/CD build artifact\ntype BuildArtifactHeader struct {\n\tMagic      uint32\n\tVersion    uint16\n\tNumChunks  uint16\n\tChunkSize  uint32\n\tTotalSize  uint32\n\tChecksum   uint32\n}\n\nconst (\n\tARTIFACT_MAGIC = 0xBEEFCAFE\n\tMAX_ARTIFACT_SIZE = 1024 * 1024 * 512 // 512MB\n)\n\n// ProcessArtifact handles incoming build artifacts from the pipeline\nfunc ProcessArtifact(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\t// Read the artifact header\n\tvar header BuildArtifactHeader\n\terr := binary.Read(r.Body, binary.LittleEndian, &header)\n\tif err != nil {\n\t\thttp.Error(w, \"Invalid header\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tif header.Magic != ARTIFACT_MAGIC {\n\t\thttp.Error(w, \"Invalid magic bytes\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// VULNERABILITY: Integer overflow in allocation size calculation\n\t// NumChunks (uint16) * ChunkSize (uint32) can overflow uint32\n\t// When NumChunks=65535 and ChunkSize=65538, the multiplication\n\t// overflows to a small value, but actual data written is huge\n\tallocSize := uint32(header.NumChunks) * header.ChunkSize\n\n\t// This check passes due to overflow\n\tif allocSize > uint32(MAX_ARTIFACT_SIZE) {\n\t\thttp.Error(w, \"Artifact too large\", http.StatusRequestEntityTooLarge)\n\t\treturn\n\t}\n\n\tfmt.Printf(\"[pipeline-plugin] Allocating %d bytes for %d chunks of size %d\\n\",\n\t\tallocSize, header.NumChunks, header.ChunkSize)\n\n\t// Allocate buffer based on overflowed size\n\tbuf := make([]byte, allocSize)\n\n\t// Read actual data - this reads far more than allocated buffer\n\t// In Go, this causes slice bounds out of range panic or\n\t// with unsafe operations below, heap corruption\n\tvar totalRead uint32\n\tfor i := uint16(0); i < header.NumChunks; i++ {\n\t\tchunkBuf := make([]byte, header.ChunkSize)\n\t\tn, err := io.ReadFull(r.Body, chunkBuf)\n\t\tif err != nil && err != io.ErrUnexpectedEOF {\n\t\t\tbreak\n\t\t}\n\t\t// Unsafe copy into pre-allocated buffer - heap overflow\n\t\tif totalRead+uint32(n) <= allocSize {\n\t\t\tcopy(buf[totalRead:], chunkBuf[:n])\n\t\t} else {\n\t\t\t// Unsafe pointer arithmetic - writes beyond buffer\n\t\t\tdst := unsafe.Pointer(unsafe.SliceData(buf))\n\t\t\tdstOffset := unsafe.Add(dst, uintptr(totalRead))\n\t\t\tsrc := unsafe.Pointer(unsafe.SliceData(chunkBuf))\n\t\t\tcopyUnsafe(dstOffset, src, uintptr(n))\n\t\t}\n\t\ttotalRead += uint32(n)\n\t}\n\n\t// Write artifact to staging\n\tstagingPath := fmt.Sprintf(\"/tmp/artifacts/%x.bin\", header.Checksum)\n\tos.WriteFile(stagingPath, buf, 0644)\n\n\tw.WriteHeader(http.StatusAccepted)\n\tfmt.Fprintf(w, \"{\\\"status\\\": \\\"accepted\\\", \\\"size\\\": %d}\", totalRead)\n}\n\n//go:nosplit\nfunc copyUnsafe(dst, src unsafe.Pointer, n uintptr) {\n\tfor i := uintptr(0); i < n; i++ {\n\t\t*(*byte)(unsafe.Add(dst, i)) = *(*byte)(unsafe.Add(src, i))\n\t}\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/artifacts/upload\", ProcessArtifact)\n\thttp.HandleFunc(\"/healthz\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.Write([]byte(\"ok\"))\n\t})\n\n\tport := os.Getenv(\"PLUGIN_PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tfmt.Printf(\"[pipeline-plugin] Starting artifact processor on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}\n",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 service mesh injected. The pipeline plugin runs in 'ci-plugins' namespace with sidecar injection enabled. An Istio AuthorizationPolicy resource is applied in the 'ci-plugins' namespace with spec.action=DENY for requests where source.namespace is not in ['ci-plugins']. Additionally, a PeerAuthentication policy enforces STRICT mTLS for the namespace. The build runners operate in 'build-runners' namespace. Note: the AuthorizationPolicy uses a workloadSelector matching the plugin's pod labels (app: artifact-processor) and the DENY rule specifically targets source.principal patterns not matching 'cluster.local/ns/ci-plugins/sa/*'. The policy does NOT use ALLOW-with-source-namespace (which would be bypassable via direct port access) but rather an explicit DENY on non-matching source principals evaluated after mTLS identity verification.",
+    "config": {
+      "namespace": "ci-plugins",
+      "service_mesh": "istio-1.20",
+      "sidecar_injection": "enabled",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-artifact-upload",
+          "namespace": "ci-plugins"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "artifact-processor"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "ci-plugins"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/v1/artifacts/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "ci-plugins"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "note": "Build runners in build-runners namespace cannot reach the artifact upload endpoint due to DENY policy on cross-namespace traffic. The STRICT mTLS prevents bypassing the sidecar proxy."
+    }
+  }
+}

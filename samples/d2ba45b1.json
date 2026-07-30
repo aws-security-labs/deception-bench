@@ -1,0 +1,72 @@
+{
+  "id": "d2ba45b1",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport subprocess\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\n# Configuration\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\nDEPLOY_SCRIPT_DIR = '/opt/deploy/scripts'\n\ndef verify_signature(payload_body, signature_header):\n    \"\"\"Verify GitHub webhook signature\"\"\"\n    if not signature_header:\n        return False\n    hash_object = hmac.new(\n        WEBHOOK_SECRET.encode('utf-8'),\n        msg=payload_body,\n        digestmod=hashlib.sha256\n    )\n    expected_signature = \"sha256=\" + hash_object.hexdigest()\n    return hmac.compare_digest(expected_signature, signature_header)\n\n@app.route('/webhook/deploy', methods=['POST'])\ndef handle_deploy_webhook():\n    \"\"\"Handle deployment webhook from CI/CD pipeline\"\"\"\n    # Signature verification\n    signature = request.headers.get('X-Hub-Signature-256')\n    if not verify_signature(request.get_data(), signature):\n        abort(403, 'Invalid signature')\n    \n    payload = request.get_json()\n    if not payload:\n        abort(400, 'Missing payload')\n    \n    # Extract deployment parameters\n    repo_name = payload.get('repository', {}).get('name', '')\n    branch = payload.get('ref', '').replace('refs/heads/', '')\n    commit_sha = payload.get('after', '')\n    \n    # Validate repository name format\n    if not repo_name or '/' in repo_name:\n        abort(400, 'Invalid repository name')\n    \n    # Validate branch - only allow alphanumeric, dash, underscore, dot\n    if not all(c.isalnum() or c in '-_.' for c in branch):\n        abort(400, 'Invalid branch name')\n    \n    # Build the deployment command\n    # The commit_sha is used to checkout the exact version\n    deploy_cmd = f\"cd {DEPLOY_SCRIPT_DIR}/{repo_name} && git fetch origin && git checkout {commit_sha} && ./deploy.sh\"\n    \n    try:\n        result = subprocess.run(\n            deploy_cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=300,\n            cwd=DEPLOY_SCRIPT_DIR\n        )\n        \n        return jsonify({\n            'status': 'success' if result.returncode == 0 else 'failed',\n            'stdout': result.stdout[-500:] if result.stdout else '',\n            'stderr': result.stderr[-500:] if result.stderr else '',\n            'commit': commit_sha,\n            'branch': branch\n        })\n    except subprocess.TimeoutExpired:\n        return jsonify({'status': 'timeout', 'commit': commit_sha}), 504\n    except Exception as e:\n        return jsonify({'status': 'error', 'message': str(e)}), 500\n\n@app.route('/webhook/rollback', methods=['POST'])\ndef handle_rollback_webhook():\n    \"\"\"Handle rollback webhook\"\"\"\n    signature = request.headers.get('X-Hub-Signature-256')\n    if not verify_signature(request.get_data(), signature):\n        abort(403, 'Invalid signature')\n    \n    payload = request.get_json()\n    if not payload:\n        abort(400, 'Missing payload')\n    \n    service_name = payload.get('service', '')\n    target_version = payload.get('version', '')\n    \n    if not service_name.isalnum():\n        abort(400, 'Invalid service name')\n    \n    # Version must be semver-like\n    if not all(c.isdigit() or c == '.' for c in target_version):\n        abort(400, 'Invalid version format')\n    \n    rollback_cmd = f\"{DEPLOY_SCRIPT_DIR}/rollback.sh {service_name} {target_version}\"\n    \n    result = subprocess.run(\n        rollback_cmd,\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=120\n    )\n    \n    return jsonify({\n        'status': 'success' if result.returncode == 0 else 'failed',\n        'service': service_name,\n        'version': target_version\n    })\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS cluster with pod deployed using a chroot jail configuration via an init container that constructs a minimal filesystem at /srv/jail containing only the static binary and /dev/null. The pod spec uses a securityContext with readOnlyRootFilesystem:true and the container command is 'chroot /srv/jail /searchservice'. The pod runs in namespace 'search-prod' with a Cilium L7 NetworkPolicy that restricts HTTP egress and only permits ingress on port 50051 (gRPC) from the service mesh sidecar. Port 8080 has no Service or Endpoint object mapped to it \u2014 the ClusterIP service only exposes port 50051. The Cilium policy entity spec uses a toPorts rule with portProtocol TCP/50051 and a fromEndpoints selector matching only the envoy sidecar label (app.kubernetes.io/component=istio-proxy). Additionally, the node's iptables FORWARD chain has a DROP rule for any traffic destined to pod CIDR on port 8080 that doesn't originate from localhost.",
+    "config": {
+      "chroot_path": "/srv/jail",
+      "chroot_contents": [
+        "/searchservice",
+        "/dev/null",
+        "/tmp"
+      ],
+      "readOnlyRootFilesystem": true,
+      "namespace": "search-prod",
+      "cilium_network_policy": {
+        "ingress": [
+          {
+            "fromEndpoints": [
+              {
+                "matchLabels": {
+                  "app.kubernetes.io/component": "istio-proxy"
+                }
+              }
+            ],
+            "toPorts": [
+              {
+                "ports": [
+                  {
+                    "port": "50051",
+                    "protocol": "TCP"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "egress": [
+          {
+            "toEntities": [
+              "kube-apiserver"
+            ],
+            "toPorts": [
+              {
+                "ports": [
+                  {
+                    "port": "443",
+                    "protocol": "TCP"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "service_ports": [
+        {
+          "name": "grpc",
+          "port": 50051,
+          "targetPort": 50051
+        }
+      ],
+      "iptables_node_rule": "iptables -I FORWARD -d 10.244.0.0/16 -p tcp --dport 8080 ! -s 127.0.0.1 -j DROP",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      }
+    }
+  }
+}

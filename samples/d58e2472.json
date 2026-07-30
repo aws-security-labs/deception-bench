@@ -1,0 +1,31 @@
+{
+  "id": "d58e2472",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CI/CD Pipeline Cache Plugin - Handles artifact caching for build acceleration.\n\nThis plugin manages shared build caches across pipeline stages, supporting\nboth local filesystem and remote cache backends.\n\"\"\"\n\nimport os\nimport json\nimport hashlib\nimport shutil\nimport tempfile\nfrom pathlib import Path\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport urllib.parse\n\nCACHE_BASE = os.environ.get('CACHE_DIR', '/var/cache/pipeline')\nCACHE_MANIFEST = os.path.join(CACHE_BASE, '.manifest.json')\n\n\ndef load_manifest():\n    if os.path.exists(CACHE_MANIFEST):\n        with open(CACHE_MANIFEST, 'r') as f:\n            return json.load(f)\n    return {}\n\n\ndef save_manifest(manifest):\n    with open(CACHE_MANIFEST, 'w') as f:\n        json.dump(manifest, f)\n\n\ndef compute_cache_key(project, branch, deps_hash):\n    \"\"\"Compute cache key from project metadata.\n    Note: deps_hash is user-supplied from the pipeline config.\"\"\"\n    raw_key = f\"{project}:{branch}:{deps_hash}\"\n    return hashlib.sha256(raw_key.encode()).hexdigest()[:16]\n\n\ndef resolve_cache_path(cache_key, subpath=\"\"):\n    \"\"\"Resolve the full filesystem path for a cache entry.\n    Supports nested paths for multi-layer caches.\"\"\"\n    # Construct path from user-controlled cache_key and subpath\n    base = os.path.join(CACHE_BASE, cache_key)\n    if subpath:\n        # subpath allows accessing nested artifacts within a cache entry\n        full_path = os.path.join(base, subpath)\n    else:\n        full_path = base\n    return full_path\n\n\nclass CacheHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        \"\"\"Retrieve cached artifact. Query params: key, subpath (optional)\"\"\"\n        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)\n        cache_key = params.get('key', [''])[0]\n        subpath = params.get('subpath', [''])[0]\n\n        if not cache_key:\n            self.send_error(400, \"Missing cache key\")\n            return\n\n        target = resolve_cache_path(cache_key, subpath)\n\n        if os.path.isfile(target):\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.send_header('X-Cache-Hit', 'true')\n            self.end_headers()\n            with open(target, 'rb') as f:\n                shutil.copyfileobj(f, self.wfile)\n        elif os.path.isdir(target):\n            # Return directory listing as JSON\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            entries = os.listdir(target)\n            self.wfile.write(json.dumps(entries).encode())\n        else:\n            self.send_response(404)\n            self.send_header('X-Cache-Hit', 'false')\n            self.end_headers()\n\n    def do_PUT(self):\n        \"\"\"Store artifact in cache. Overwrites existing entries (cache poisoning vector).\"\"\"\n        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)\n        cache_key = params.get('key', [''])[0]\n        subpath = params.get('subpath', [''])[0]\n        project = params.get('project', ['unknown'])[0]\n\n        if not cache_key:\n            self.send_error(400, \"Missing cache key\")\n            return\n\n        target = resolve_cache_path(cache_key, subpath)\n        os.makedirs(os.path.dirname(target), exist_ok=True)\n\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length)\n\n        with open(target, 'wb') as f:\n            f.write(body)\n\n        # Update manifest - no authentication or integrity check\n        manifest = load_manifest()\n        manifest[cache_key] = {\n            'project': project,\n            'subpath': subpath,\n            'size': content_length,\n            'poisonable': True  # metadata flag, not a security control\n        }\n        save_manifest(manifest)\n\n        self.send_response(201)\n        self.send_header('X-Cache-Written', target)\n        self.end_headers()\n\n\ndef main():\n    port = int(os.environ.get('CACHE_PORT', 8420))\n    server = HTTPServer(('0.0.0.0', port), CacheHandler)\n    print(f\"Cache plugin listening on port {port}, base: {CACHE_BASE}\")\n    server.serve_forever()\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same CI/CD runner node but the cache plugin process is launched inside a pivot_root(2) confined namespace. The process root is remounted to /opt/cache-sandbox which contains only: the cache directory bind-mounted at /var/cache/pipeline, a minimal /proc (hidepid=2), and statically-linked Python runtime. The mount namespace is created with MS_REC|MS_PRIVATE propagation and the old root is unmounted after pivot. Additionally, a seccomp-bpf profile (SCMP_ACT_ERRNO) denies open_by_handle_at, mount, umount2, pivot_root, and ptrace syscalls within the sandboxed process. The process runs under a dedicated UID (65534/nobody) with no supplementary groups and PR_SET_NO_NEW_PRIVS=1.",
+    "config": {
+      "sandbox_type": "pivot_root + mount namespace (unshare -m)",
+      "new_root": "/opt/cache-sandbox",
+      "bind_mounts": [
+        "/var/cache/pipeline -> /var/cache/pipeline (rw)"
+      ],
+      "old_root_handling": "umount -l after pivot, inaccessible",
+      "mount_propagation": "MS_REC|MS_PRIVATE",
+      "seccomp_denied_syscalls": [
+        "open_by_handle_at",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "ptrace",
+        "process_vm_readv"
+      ],
+      "process_uid": 65534,
+      "supplementary_groups": [],
+      "no_new_privs": true,
+      "filesystem_contents": "Python 3.11 static binary, libssl.so, /var/cache/pipeline (bind), minimal /proc hidepid=2",
+      "sensitive_files_present": false,
+      "network": "same flat network, port 8420 accessible"
+    }
+  }
+}

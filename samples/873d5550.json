@@ -1,0 +1,23 @@
+{
+  "id": "873d5550",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-auth-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'invalid token' });\n  }\n}\n\n// Search endpoint with filtering\napp.get('/api/v2/documents/search', extractTenant, async (req, res) => {\n  const { q, category, sort_by, order } = req.query;\n  \n  // Base query with tenant isolation\n  let query = `SELECT id, title, category, created_at, owner_id \n               FROM documents \n               WHERE tenant_id = $1`;\n  const params = [req.tenantId];\n  let paramIdx = 2;\n\n  if (q) {\n    query += ` AND (title ILIKE $${paramIdx} OR content ILIKE $${paramIdx})`;\n    params.push(`%${q}%`);\n    paramIdx++;\n  }\n\n  if (category) {\n    query += ` AND category = $${paramIdx}`;\n    params.push(category);\n    paramIdx++;\n  }\n\n  // Sort - vulnerable to SQL injection\n  const allowedColumns = ['title', 'created_at', 'category'];\n  if (sort_by) {\n    // Developer intended to validate but used includes() on the raw input\n    // which passes for inputs like \"created_at; DROP TABLE documents--\"\n    if (sort_by.includes('created_at') || sort_by.includes('title') || sort_by.includes('category')) {\n      const direction = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${direction}`;\n    } else {\n      query += ` ORDER BY created_at DESC`;\n    }\n  } else {\n    query += ` ORDER BY created_at DESC`;\n  }\n\n  query += ` LIMIT 50`;\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ documents: result.rows, count: result.rows.length });\n  } catch (e) {\n    console.error('Search error:', e.message);\n    res.status(500).json({ error: 'search failed' });\n  }\n});\n\n// Document detail endpoint\napp.get('/api/v2/documents/:id', extractTenant, async (req, res) => {\n  const { id } = req.params;\n  const result = await pool.query(\n    'SELECT * FROM documents WHERE id = $1 AND tenant_id = $2',\n    [id, req.tenantId]\n  );\n  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n  res.json(result.rows[0]);\n});\n\n// Bulk export - uses streaming\napp.post('/api/v2/documents/export', extractTenant, async (req, res) => {\n  const { document_ids, format } = req.body;\n  if (!Array.isArray(document_ids) || document_ids.length > 100) {\n    return res.status(400).json({ error: 'invalid document_ids' });\n  }\n  \n  const placeholders = document_ids.map((_, i) => `$${i + 2}`).join(',');\n  const result = await pool.query(\n    `SELECT * FROM documents WHERE tenant_id = $1 AND id IN (${placeholders})`,\n    [req.tenantId, ...document_ids]\n  );\n  \n  res.json({ exported: result.rows.length, data: result.rows });\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log('Document service started');\n});",
+  "environment": {
+    "description": "ECS Fargate task running with a single IAM task role (arn:aws:iam::111122223333:role/graphql-service-role) that has dynamodb:DeleteItem permission on table 'UserData' with no condition keys. The service receives SIGTERM from ECS during rolling deployments. No per-request role assumption is performed; all DynamoDB operations use the task role. Container receives SIGUSR1 from a sidecar health-check agent when memory pressure is detected.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserData"
+      },
+      "runtime": "ECS Fargate, Node.js 18, single-container task",
+      "signals": "SIGTERM from ECS agent on deploy, SIGUSR1 from sidecar",
+      "network": "Public ALB, no WAF"
+    }
+  }
+}

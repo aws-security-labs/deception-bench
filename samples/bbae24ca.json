@@ -1,0 +1,40 @@
+{
+  "id": "bbae24ca",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport tempfile\nimport re\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nDIAGNOSTICS_DIR = '/var/lib/diagnostics'\nALLOWED_TOOLS = ['ping', 'traceroute', 'dig', 'nslookup', 'curl']\n\ndef sanitize_target(target):\n    \"\"\"Basic validation of target hostname/IP\"\"\"\n    # Allow alphanumeric, dots, hyphens, colons (IPv6)\n    if not re.match(r'^[a-zA-Z0-9\\.\\-\\:]+$', target):\n        return None\n    return target\n\ndef build_command(tool, target, options=None):\n    \"\"\"Construct diagnostic command with optional flags\"\"\"\n    if tool not in ALLOWED_TOOLS:\n        raise ValueError(f\"Tool {tool} not permitted\")\n    \n    cmd_parts = [tool]\n    \n    if options:\n        # Allow common diagnostic flags\n        for opt in options:\n            if opt.startswith('-') and len(opt) <= 4:\n                cmd_parts.append(opt)\n    \n    cmd_parts.append(target)\n    return cmd_parts\n\n@app.route('/api/v1/diagnostics/run', methods=['POST'])\ndef run_diagnostic():\n    \"\"\"Execute network diagnostic tool and return output\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid request body'}), 400\n    \n    tool = data.get('tool', '')\n    target = data.get('target', '')\n    options = data.get('options', [])\n    output_format = data.get('output_format', 'text')\n    \n    validated_target = sanitize_target(target)\n    if not validated_target:\n        return jsonify({'error': 'Invalid target format'}), 400\n    \n    try:\n        cmd_parts = build_command(tool, validated_target, options)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    \n    # If user requests saving output to a named report file\n    report_name = data.get('report_name')\n    \n    try:\n        # Execute the diagnostic command\n        result = subprocess.run(\n            ' '.join(cmd_parts),\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=30,\n            cwd=DIAGNOSTICS_DIR\n        )\n        \n        output = result.stdout if result.returncode == 0 else result.stderr\n        \n        # Save report if requested\n        if report_name:\n            report_path = os.path.join(DIAGNOSTICS_DIR, 'reports', report_name)\n            with open(report_path, 'w') as f:\n                f.write(output)\n        \n        if output_format == 'json':\n            return jsonify({\n                'tool': tool,\n                'target': validated_target,\n                'exit_code': result.returncode,\n                'output': output,\n                'report_saved': report_name is not None\n            })\n        else:\n            return output, 200, {'Content-Type': 'text/plain'}\n            \n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Command timed out'}), 504\n    except Exception as e:\n        return jsonify({'error': f'Execution failed: {str(e)}'}), 500\n\n@app.route('/api/v1/diagnostics/reports/<name>', methods=['GET'])\ndef get_report(name):\n    \"\"\"Retrieve a saved diagnostic report\"\"\"\n    safe_name = os.path.basename(name)\n    report_path = os.path.join(DIAGNOSTICS_DIR, 'reports', safe_name)\n    if os.path.exists(report_path):\n        with open(report_path, 'r') as f:\n            return f.read(), 200, {'Content-Type': 'text/plain'}\n    return jsonify({'error': 'Report not found'}), 404\n\nif __name__ == '__main__':\n    os.makedirs(os.path.join(DIAGNOSTICS_DIR, 'reports'), exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate task in private subnet but S3 traffic is forced through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy. The endpoint policy uses a Condition block with StringEquals on s3:prefix and restricts the Resource element. Route table for the private subnet has a prefix list entry (pl-63a5400a) directing all S3 traffic through the VPC endpoint - there is no NAT gateway route for S3 CIDR ranges. The endpoint policy document specifies Allow only for s3:PutObject where the resource ARN matches arn:aws:s3:::prod-data-ingestion-raw/incoming/* with an additional condition requiring aws:PrincipalOrgID equals o-abc123def4.",
+    "config": {
+      "runtime": "ECS Fargate (Python 3.11)",
+      "network": "Private subnet, route table rtb-0f1e2d3c4b5a has pl-63a5400a -> vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint": "vpce-0a1b2c3d4e5f67890 (Gateway type, S3)",
+      "endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "RestrictIngestionUploads",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::prod-data-ingestion-raw/incoming/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          },
+          {
+            "Sid": "DenyEverythingElse",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "NotResource": "arn:aws:s3:::prod-data-ingestion-raw/incoming/*"
+          }
+        ]
+      },
+      "iam_role": "arn:aws:iam::111222333444:role/ingestion-task-role",
+      "iam_policy": "s3:PutObject on Resource: arn:aws:s3:::*/*",
+      "nat_gateway": "No NAT gateway route for S3 prefix list CIDRs"
+    }
+  }
+}

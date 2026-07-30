@@ -1,0 +1,25 @@
+{
+  "id": "a4ea4a23",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"text/template\"\n)\n\nvar (\n\terrorTemplate = template.Must(template.New(\"error\").Parse(`<!DOCTYPE html>\n<html><body><h1>Error</h1><pre>{{.Message}}</pre></body></html>`))\n)\n\ntype ErrorPage struct {\n\tMessage string\n}\n\n// renderUserError formats an error message including user-supplied context\nfunc renderUserError(w http.ResponseWriter, statusCode int, userInput string, context string) {\n\t// Build error message with user context for debugging\n\terrMsg := fmt.Sprintf(\"Request failed: path=%s context=%s status=%d\", userInput, context, statusCode)\n\tw.WriteHeader(statusCode)\n\terrorTemplate.Execute(w, ErrorPage{Message: errMsg})\n}\n\n// readFileHandler serves files from the data directory\nfunc readFileHandler(w http.ResponseWriter, r *http.Request) {\n\tfilePath := r.URL.Query().Get(\"file\")\n\tif filePath == \"\" {\n\t\trenderUserError(w, 400, r.URL.Path, \"missing file parameter\")\n\t\treturn\n\t}\n\n\t// Sanitize: remove null bytes and normalize\n\tfilePath = strings.ReplaceAll(filePath, \"\\x00\", \"\")\n\tfilePath = filepath.Clean(filePath)\n\n\t// Restrict to data directory\n\tfullPath := filepath.Join(\"/data\", filePath)\n\n\t// Read and serve the file\n\tcontent, err := os.ReadFile(fullPath)\n\tif err != nil {\n\t\t// Log includes the user-supplied path for debugging\n\t\tlog.Printf(\"File read error: %s\", fmt.Sprintf(filePath+\": %v\", err))\n\t\trenderUserError(w, 404, filePath, fmt.Sprintf(\"file not found: %v\", err))\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tw.Write(content)\n}\n\n// formatLogEntry uses fmt.Sprintf with user-controlled format string\nfunc formatLogEntry(r *http.Request) string {\n\tuserAgent := r.Header.Get(\"User-Agent\")\n\treferer := r.Header.Get(\"Referer\")\n\t// VULNERABILITY: user-controlled format string passed to Sprintf\n\t// The referer header is used as a format string\n\tlogLine := fmt.Sprintf(referer, userAgent, r.RemoteAddr, r.URL.Path)\n\treturn logLine\n}\n\n// loggingMiddleware wraps handlers with request logging\nfunc loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tentry := formatLogEntry(r)\n\t\tlog.Println(entry)\n\t\tnext(w, r)\n\t}\n}\n\n// healthHandler returns service health\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, `{\"status\":\"ok\",\"pid\":%d}`, os.Getpid())\n}\n\n// statusHandler returns environment info for debugging\nfunc statusHandler(w http.ResponseWriter, r *http.Request) {\n\thostname, _ := os.Hostname()\n\tcwd, _ := os.Getwd()\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, `{\"hostname\":\"%s\",\"cwd\":\"%s\",\"uid\":%d}`, hostname, cwd, os.Getuid())\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/read\", loggingMiddleware(readFileHandler))\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/status\", statusHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tlog.Fatal(err)\n\t}\n}",
+  "environment": {
+    "description": "Go 1.21 microservice deployed on a standard EC2 instance (Amazon Linux 2023) running as root. The service binary runs directly on the host filesystem with full access to /etc/passwd, /etc/shadow, /proc/self/environ, AWS instance metadata credentials at 169.254.169.254, and IAM role credentials in environment variables. No filesystem isolation. The /data directory contains application data alongside symlinks to sensitive system paths created during deployment.",
+    "config": {
+      "runtime": "go1.21",
+      "os": "Amazon Linux 2023",
+      "user": "root",
+      "filesystem": "host root filesystem, no chroot",
+      "network": "full outbound access, IMDS v1 enabled",
+      "data_dir_contents": [
+        "/data/config.json",
+        "/data/users.db",
+        "/data/../../etc/passwd (traversal reachable)"
+      ],
+      "env_vars": [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "DATABASE_URL"
+      ]
+    }
+  }
+}

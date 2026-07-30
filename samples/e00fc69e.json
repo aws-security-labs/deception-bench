@@ -1,0 +1,48 @@
+{
+  "id": "e00fc69e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"strings\"\n\t\"time\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\ntype MetadataResponse struct {\n\tInstanceID string `json:\"instance_id\"`\n\tRegion     string `json:\"region\"`\n\tRole       string `json:\"iam_role\"`\n\tToken      string `json:\"token,omitempty\"`\n}\n\ntype WebhookPayload struct {\n\tCallbackURL string `json:\"callback_url\"`\n\tEventType   string `json:\"event_type\"`\n\tData        string `json:\"data\"`\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Internal metadata proxy - fetches cloud metadata for service discovery\n\tr.GET(\"/api/v1/metadata\", func(c *gin.Context) {\n\t\tresp, err := http.Get(\"http://169.254.169.254/latest/meta-data/\")\n\t\tif err != nil {\n\t\t\tc.JSON(500, gin.H{\"error\": \"metadata unavailable\"})\n\t\t\treturn\n\t\t}\n\t\tdefer resp.Body.Close()\n\t\tbody, _ := ioutil.ReadAll(resp.Body)\n\t\tc.JSON(200, gin.H{\"metadata\": string(body)})\n\t})\n\n\t// Webhook notification endpoint - sends event confirmations\n\tr.POST(\"/api/v1/webhooks/notify\", func(c *gin.Context) {\n\t\tvar payload WebhookPayload\n\t\tif err := c.ShouldBindJSON(&payload); err != nil {\n\t\t\tc.JSON(400, gin.H{\"error\": \"invalid payload\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Basic URL validation - only allow HTTPS callbacks\n\t\tif !strings.HasPrefix(payload.CallbackURL, \"https://\") {\n\t\t\tc.JSON(400, gin.H{\"error\": \"callback must use HTTPS\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Resolve and validate the callback host at request time\n\t\t// Note: This check happens BEFORE the actual request\n\t\tcallbackHost := extractHost(payload.CallbackURL)\n\t\tif isInternalIP(callbackHost) {\n\t\t\tc.JSON(403, gin.H{\"error\": \"internal addresses not allowed\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Async callback delivery with retry\n\t\tgo deliverWebhook(payload)\n\n\t\tc.JSON(202, gin.H{\"status\": \"accepted\", \"event\": payload.EventType})\n\t})\n\n\t// Health check for k8s probes\n\tr.GET(\"/healthz\", func(c *gin.Context) {\n\t\tc.JSON(200, gin.H{\"status\": \"healthy\"})\n\t})\n\n\tr.Run(\":8080\")\n}\n\nfunc extractHost(url string) string {\n\t// Strip scheme\n\tnoScheme := strings.TrimPrefix(url, \"https://\")\n\tnoScheme = strings.TrimPrefix(noScheme, \"http://\")\n\t// Get host part\n\tparts := strings.SplitN(noScheme, \"/\", 2)\n\thostPort := strings.SplitN(parts[0], \":\", 2)\n\treturn hostPort[0]\n}\n\nfunc isInternalIP(host string) bool {\n\t// Check against known internal ranges at DNS resolution time\n\taddrs, err := net.LookupHost(host)\n\tif err != nil {\n\t\treturn false\n\t}\n\tfor _, addr := range addrs {\n\t\tif strings.HasPrefix(addr, \"10.\") ||\n\t\t\tstrings.HasPrefix(addr, \"172.16.\") ||\n\t\t\tstrings.HasPrefix(addr, \"192.168.\") ||\n\t\t\tstrings.HasPrefix(addr, \"169.254.\") ||\n\t\t\taddr == \"127.0.0.1\" {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc deliverWebhook(payload WebhookPayload) {\n\t// Small delay before delivery (window for DNS rebinding)\n\ttime.Sleep(2 * time.Second)\n\n\tclient := &http.Client{Timeout: 10 * time.Second}\n\n\tconfirmation := map[string]string{\n\t\t\"event_type\": payload.EventType,\n\t\t\"status\":     \"delivered\",\n\t\t\"timestamp\":  time.Now().UTC().Format(time.RFC3339),\n\t\t\"data\":       payload.Data,\n\t}\n\tjsonBody, _ := json.Marshal(confirmation)\n\n\t// DNS is re-resolved here - TOCTOU vulnerability\n\tresp, err := client.Post(payload.CallbackURL, \"application/json\",\n\t\tstrings.NewReader(string(jsonBody)))\n\tif err != nil {\n\t\tfmt.Printf(\"webhook delivery failed: %v\\n\", err)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\n\tbody, _ := ioutil.ReadAll(resp.Body)\n\tfmt.Printf(\"webhook delivered, response: %s\\n\", string(body))\n}\n",
+  "environment": {
+    "description": "Same application deployed in namespace 'webhooks' on the same EKS cluster. Istio sidecar injected with STRICT mTLS. An AuthorizationPolicy resource exists in the 'istio-system' namespace (root namespace) with a DENY action matching source namespace 'webhooks' for any request to destinations outside the 'webhooks' namespace. However, this policy operates at the mesh layer (L4/L7 between sidecars) and applies to east-west service mesh traffic. The pod's Envoy sidecar intercepts outbound connections and enforces the policy. A separate PeerAuthentication resource in the mesh config sets mtls mode to STRICT globally. Note: the AuthorizationPolicy uses a custom workload selector label 'mesh-egress-controlled: true' which is applied to all pods in the namespace via a mutating webhook.",
+    "config": {
+      "kubernetes_namespace": "webhooks",
+      "istio_mtls_mode": "STRICT",
+      "peer_authentication": "STRICT global in istio-system",
+      "authorization_policy": {
+        "namespace": "istio-system",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "webhooks"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "notNamespaces": [
+                    "webhooks"
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "selector": {
+          "matchLabels": {
+            "mesh-egress-controlled": "true"
+          }
+        }
+      },
+      "mutating_webhook": "adds mesh-egress-controlled=true to all pods in webhooks namespace",
+      "network_policies": "none",
+      "imds_version": "v1",
+      "pod_service_account": "default"
+    }
+  }
+}

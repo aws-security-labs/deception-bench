@@ -1,0 +1,27 @@
+{
+  "id": "de186d4a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// Template for rendering search results\n\ttmpl = template.Must(template.New(\"results\").Parse(`\n<html><body>\n<h2>Product Search Results</h2>\n<p>Query: {{.Query}}</p>\n<table border=\"1\">\n<tr><th>ID</th><th>Name</th><th>Price</th><th>Description</th></tr>\n{{range .Products}}\n<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Price}}</td><td>{{.Desc}}</td></tr>\n{{end}}\n</table>\n</body></html>`))\n}\n\ntype Product struct {\n\tID   int\n\tName string\n\tPrice float64\n\tDesc string\n}\n\ntype SearchResult struct {\n\tQuery    string\n\tProducts []Product\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\t// Basic input length check\n\tif len(category) > 100 || len(sortBy) > 50 {\n\t\thttp.Error(w, \"Input too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - sort parameter is validated\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif sortBy == \"\" || !allowedSorts[sortBy] {\n\t\tsortBy = \"id\"\n\t}\n\n\t// Construct WHERE clause\n\tconditions := []string{\"1=1\"}\n\tif category != \"\" {\n\t\t// Developer note: category is user-controlled, used in LIKE clause\n\t\tconditions = append(conditions, fmt.Sprintf(\"category ILIKE '%%%s%%'\", category))\n\t}\n\tif minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price >= %s\", minPrice))\n\t}\n\n\tquery := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE %s ORDER BY %s LIMIT 50\",\n\t\tstrings.Join(conditions, \" AND \"), sortBy)\n\n\tlog.Printf(\"Executing query: %s\", query)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Desc); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tresult := SearchResult{Query: category, Products: products}\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, result)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with the following configuration: (1) A custom rule with priority 1 using a RegexPatternSet that matches request query string values against patterns containing SQL comment sequences, UNION keywords adjacent to SELECT, and single-quote followed by OR/AND with equality patterns \u2014 action BLOCK. (2) The task IAM role has a permissions boundary (arn:aws:iam::ACCOUNT:policy/DenyDBFileSystemAccess) that denies s3:GetObject and prevents any exfiltration path for extracted data. (3) The ECS task definition sets the container filesystem as read-only (readonlyRootFilesystem: true) with only /tmp and /var/lib/app mounted as tmpfs with 10MB size limit, meaning the SQLite database is ephemeral with no persistent sensitive data \u2014 it is seeded on container start with only synthetic test records.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL",
+      "wafv2_rules": [
+        {
+          "name": "CustomSQLPatternBlock",
+          "priority": 1,
+          "statement": "RegexPatternSetReferenceStatement matching query_string against: ('.*(UNION|union)\\s+(SELECT|select|ALL|all).*', '.*'\\s*(OR|AND|or|and)\\s*'?\\d*'?\\s*=.*', '.*(--|#|/\\*).*')",
+          "action": "BLOCK"
+        }
+      ],
+      "container_filesystem": "readonlyRootFilesystem: true",
+      "tmpfs_mounts": [
+        "/tmp:10MB",
+        "/var/lib/app:10MB"
+      ],
+      "database_seeding": "ephemeral synthetic data only, re-seeded on each task start",
+      "task_iam_permissions_boundary": "DenyDBFileSystemAccess policy attached",
+      "network": "private subnet, ALB in public subnet, no direct instance access"
+    }
+  }
+}

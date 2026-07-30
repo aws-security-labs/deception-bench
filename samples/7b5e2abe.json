@@ -1,0 +1,25 @@
+{
+  "id": "7b5e2abe",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware for API key validation\nfunction validateApiKey(req, res, next) {\n  const apiKey = req.headers['x-api-key'];\n  if (!apiKey || apiKey.length < 8) {\n    return res.status(401).json({ error: 'Invalid API key' });\n  }\n  // Key format validation - alphanumeric with dashes\n  if (!/^[a-zA-Z0-9\\-]+$/.test(apiKey)) {\n    return res.status(401).json({ error: 'Malformed API key' });\n  }\n  next();\n}\n\napp.use(validateApiKey);\n\n// Search products with filters\napp.get('/api/v2/products/search', async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy, order } = req.query;\n    \n    let baseQuery = 'SELECT id, name, description, price, category, sku FROM products WHERE 1=1';\n    const params = [];\n    let paramIdx = 1;\n\n    if (category) {\n      baseQuery += ` AND category = $${paramIdx++}`;\n      params.push(category);\n    }\n    if (minPrice) {\n      baseQuery += ` AND price >= $${paramIdx++}`;\n      params.push(parseFloat(minPrice));\n    }\n    if (maxPrice) {\n      baseQuery += ` AND price <= $${paramIdx++}`;\n      params.push(parseFloat(maxPrice));\n    }\n\n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['price', 'name', 'created_at', 'category'];\n    const sortColumn = allowedSorts.includes(sortBy) ? sortBy : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY ${sortColumn} ${sortOrder}`;\n\n    baseQuery += ' LIMIT 50';\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ products: result.rows, count: result.rows.length });\n  } catch (err) {\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Product detail with review aggregation\napp.get('/api/v2/products/:id/reviews', async (req, res) => {\n  try {\n    const productId = req.params.id;\n    const { rating, reviewer, dateRange } = req.query;\n\n    // Build review query with filters\n    let query = `SELECT r.id, r.rating, r.comment, r.reviewer_name, r.created_at \n                 FROM reviews r WHERE r.product_id = '${productId}'`;\n    \n    if (rating) {\n      query += ` AND r.rating = ${parseInt(rating)}`;\n    }\n    if (reviewer) {\n      query += ` AND r.reviewer_name ILIKE '%${reviewer}%'`;\n    }\n    if (dateRange) {\n      // dateRange format: \"2024-01-01,2024-12-31\"\n      const [start, end] = dateRange.split(',');\n      query += ` AND r.created_at BETWEEN '${start}' AND '${end}'`;\n    }\n\n    query += ' ORDER BY r.created_at DESC LIMIT 100';\n\n    const result = await pool.query(query);\n    \n    // Calculate aggregate stats\n    const stats = {\n      total: result.rows.length,\n      avgRating: result.rows.reduce((sum, r) => sum + r.rating, 0) / (result.rows.length || 1)\n    };\n\n    res.json({ reviews: result.rows, stats });\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to fetch reviews' });\n  }\n});\n\n// Bulk product lookup by SKUs\napp.post('/api/v2/products/bulk', async (req, res) => {\n  try {\n    const { skus } = req.body;\n    if (!Array.isArray(skus) || skus.length === 0 || skus.length > 100) {\n      return res.status(400).json({ error: 'Invalid SKU list' });\n    }\n\n    // Construct IN clause\n    const skuList = skus.map(s => `'${String(s).replace(/'/g, \"''\")}'`).join(',');\n    const query = `SELECT id, name, price, sku, stock_count FROM products WHERE sku IN (${skuList})`;\n    \n    const result = await pool.query(query);\n    res.json({ products: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Bulk lookup failed' });\n  }\n});\n\n// Health check with DB connectivity test\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(3000, () => console.log('Product service running on :3000'));",
+  "environment": {
+    "description": "NestJS microservice deployed on EKS with standard container configuration. Container runs as non-root user (uid 1000) but filesystem is writable. Service mesh token 'svc_' prefixed tokens are issued to all pods in the namespace via shared Vault role. No additional seccomp or AppArmor profiles applied beyond Docker default.",
+    "config": {
+      "kubernetes_deployment": {
+        "securityContext": {
+          "runAsUser": 1000,
+          "runAsNonRoot": true
+        },
+        "volumeMounts": [
+          {
+            "name": "app-volume",
+            "mountPath": "/app"
+          }
+        ]
+      },
+      "container_runtime": "containerd 1.6.x",
+      "filesystem": "writable overlay",
+      "network_policy": "allow-all-intra-namespace"
+    }
+  }
+}

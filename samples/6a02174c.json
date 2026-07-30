@@ -1,0 +1,87 @@
+{
+  "id": "6a02174c",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final Pattern SAFE_IDENTIFIER = Pattern.compile(\"^[a-zA-Z_][a-zA-Z0-9_]*$\");\n    \n    // Developer note: sortColumn is validated by frontend React component\n    // before submission. Backend validation TODO for Q3 sprint.\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortColumn = req.getParameter(\"sort\");\n        String direction = req.getParameter(\"dir\");\n        String userId = req.getParameter(\"uid\");\n        \n        // Validate date parameters using prepared statement params\n        if (startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing date range\");\n            return;\n        }\n        \n        // Validate direction\n        if (direction == null || (!direction.equals(\"ASC\") && !direction.equals(\"DESC\"))) {\n            direction = \"ASC\";\n        }\n        \n        // Validate reportType\n        if (reportType == null || !SAFE_IDENTIFIER.matcher(reportType).matches()) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // sortColumn is used in ORDER BY - cannot be parameterized in JDBC\n        // Frontend validates against allowed list, backend trusts frontend\n        if (sortColumn == null) {\n            sortColumn = \"created_at\";\n        }\n        \n        Connection conn = null;\n        PreparedStatement stmt = null;\n        ResultSet rs = null;\n        \n        try {\n            conn = getConnection();\n            \n            // Build query - note sortColumn is concatenated (ORDER BY can't use ?)\n            String query = \"SELECT id, title, amount, created_at, status FROM reports_\" \n                + reportType + \" WHERE user_id = ? AND created_at BETWEEN ? AND ? ORDER BY \" \n                + sortColumn + \" \" + direction;\n            \n            log.info(\"Executing report query for user: \" + userId);\n            \n            stmt = conn.prepareStatement(query);\n            stmt.setString(1, userId);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n            \n            rs = stmt.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"{\\\"id\\\":%d,\\\"title\\\":\\\"%s\\\",\\\"amount\\\":\\\"%.2f\\\",\\\"date\\\":\\\"%s\\\",\\\"status\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"title\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getDouble(\"amount\"),\n                    rs.getString(\"created_at\"),\n                    rs.getString(\"status\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n            \n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            closeQuietly(rs, stmt, conn);\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\"));\n    }\n    \n    private void closeQuietly(ResultSet rs, Statement stmt, Connection conn) {\n        try { if (rs != null) rs.close(); } catch (Exception e) {}\n        try { if (stmt != null) stmt.close(); } catch (Exception e) {}\n        try { if (conn != null) conn.close(); } catch (Exception e) {}\n    }\n}",
+  "environment": {
+    "description": "EKS cluster v1.28 with Cilium CNI (v1.14.3) in strict mode. Namespace 'platform-services' has a CiliumNetworkPolicy (not standard Kubernetes NetworkPolicy) with entity-based egress rules. The policy uses toEntities with 'world' denied and toCIDRSet with explicit allowances only for internal service mesh endpoints (10.0.0.0/8). The metadata endpoint 169.254.169.254/32 is not in any allowlist. Additionally, a CiliumClusterwideNetworkPolicy applies a baseline deny-all egress with exceptions only for kube-dns (UDP/53 to kube-system/coredns). The pod's egress to 169.254.169.254 is blocked at the eBPF datapath level before TCP SYN leaves the pod network namespace. Note: standard Kubernetes NetworkPolicy objects are NOT used - this relies on Cilium's native policy enforcement which operates at L3/L4 in the kernel via eBPF programs attached to the pod's veth interface.",
+    "config": {
+      "cluster": "EKS 1.28, Cilium CNI v1.14.3 (kube-proxy replacement mode)",
+      "namespace": "platform-services",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "config-svc-egress",
+          "namespace": "platform-services"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "config-service"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "platform-services"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "50051",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cilium_clusterwide_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumClusterwideNetworkPolicy",
+        "metadata": {
+          "name": "default-deny-egress"
+        },
+        "spec": {
+          "endpointSelector": {},
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            }
+          ]
+        }
+      },
+      "imds": "IMDSv1 enabled on node (HttpTokens: optional) - but unreachable from pod",
+      "service_account": "default (no IRSA)"
+    }
+  }
+}

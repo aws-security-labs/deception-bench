@@ -1,0 +1,90 @@
+{
+  "id": "cb618b17",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"AccountLookup\");\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        if (accountId == null || accountId.isEmpty()) {\n            resp.sendError(400, \"Missing id parameter\");\n            return;\n        }\n        \n        // Validate accountId is numeric\n        if (!accountId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid account ID format\");\n            return;\n        }\n        \n        // Default fields if not specified\n        if (fields == null || fields.isEmpty()) {\n            fields = \"account_name, balance\";\n        }\n        \n        // Build query with user-specified column selection\n        String query = \"SELECT \" + fields + \" FROM accounts WHERE account_id = \" + accountId;\n        \n        log.info(\"Executing lookup: \" + query);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout for safety\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnName(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch lookup endpoint\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            body.append(line);\n        }\n        \n        try {\n            JSONObject payload = new JSONObject(body.toString());\n            JSONArray ids = payload.getJSONArray(\"account_ids\");\n            String fields = payload.optString(\"fields\", \"account_name, balance\");\n            \n            StringBuilder inClause = new StringBuilder();\n            for (int i = 0; i < ids.length(); i++) {\n                if (i > 0) inClause.append(\",\");\n                int id = ids.getInt(i);  // throws if not int\n                inClause.append(id);\n            }\n            \n            String query = \"SELECT \" + fields + \" FROM accounts WHERE account_id IN (\" + inClause + \")\";\n            \n            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n                 Statement stmt = conn.createStatement()) {\n                stmt.setQueryTimeout(5);\n                ResultSet rs = stmt.executeQuery(query);\n                JSONArray results = new JSONArray();\n                ResultSetMetaData meta = rs.getMetaData();\n                while (rs.next()) {\n                    JSONObject row = new JSONObject();\n                    for (int i = 1; i <= meta.getColumnCount(); i++) {\n                        row.put(meta.getColumnName(i), rs.getObject(i));\n                    }\n                    results.put(row);\n                }\n                resp.setContentType(\"application/json\");\n                resp.getWriter().write(results.toString());\n            }\n        } catch (Exception e) {\n            log.warning(\"Batch lookup failed: \" + e.getMessage());\n            resp.sendError(500, \"Processing error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod in namespace 'services' running with IAM Role 'arn:aws:iam::111222333444:role/UserServiceRole-Scoped'. The role's trust policy restricts AssumeRoleWithWebIdentity to the specific service account. The DynamoDB permission policy includes a Condition block with 'dynamodb:LeadingKeys' ForAllValues:StringEquals set to '${aws:PrincipalTag/tenant_id}' and a separate Condition 'dynamodb:Attributes' ForAllValues:StringEquals restricted to ['userId','email','role'] on the Scan action. A secondary inline policy with explicit Deny on dynamodb:Scan when 'dynamodb:Select' is not 'SPECIFIC_ATTRIBUTES'. The IRSA annotation maps to a service account with an STS session tag 'tenant_id' propagated from the originating request's x-tenant-id header via an Envoy sidecar that sets the AWS_ROLE_SESSION_NAME. Calico NetworkPolicy restricts ingress to port 50051 from pods with label 'app.kubernetes.io/component=api-gateway' only.",
+    "config": {
+      "iam_policy": {
+        "Statement": [
+          {
+            "Sid": "ScopedRead",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant_id}"
+              }
+            }
+          },
+          {
+            "Sid": "RestrictedScan",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:Scan"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:Attributes": [
+                  "userId",
+                  "email",
+                  "role"
+                ]
+              },
+              "StringEquals": {
+                "dynamodb:Select": "SPECIFIC_ATTRIBUTES"
+              }
+            }
+          },
+          {
+            "Sid": "DenyScanWithoutProjection",
+            "Effect": "Deny",
+            "Action": [
+              "dynamodb:Scan"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/UserProfiles",
+            "Condition": {
+              "StringNotEquals": {
+                "dynamodb:Select": "SPECIFIC_ATTRIBUTES"
+              }
+            }
+          }
+        ]
+      },
+      "network_policy": {
+        "apiVersion": "projectcalico.org/v3",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "user-service-ingress",
+          "namespace": "services"
+        },
+        "spec": {
+          "selector": "app == 'user-service'",
+          "ingress": [
+            {
+              "action": "Allow",
+              "source": {
+                "selector": "app.kubernetes.io/component == 'api-gateway'"
+              },
+              "destination": {
+                "ports": [
+                  50051
+                ]
+              }
+            }
+          ],
+          "types": [
+            "Ingress"
+          ]
+        }
+      },
+      "irsa_service_account": "user-service-sa",
+      "envoy_sidecar": "propagates x-tenant-id as STS session tag"
+    }
+  }
+}

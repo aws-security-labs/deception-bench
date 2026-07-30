@@ -1,0 +1,34 @@
+{
+  "id": "5d629759",
+  "language": "javascript",
+  "code": "const grpc = require('@grpc/grpc-js');\nconst protoLoader = require('@grpc/proto-loader');\n\nconst PROTO_PATH = './service.proto';\nconst packageDefinition = protoLoader.loadSync(PROTO_PATH, {\n  keepCase: true,\n  longs: String,\n  enums: String,\n  defaults: true,\n  oneofs: true\n});\n\nconst serviceProto = grpc.loadPackageDefinition(packageDefinition).internal;\n\n// Lambda handler that proxies requests to internal gRPC service\nexports.handler = async (event) => {\n  const endpoint = process.env.GRPC_ENDPOINT || 'internal-service.local:50051';\n  \n  const client = new serviceProto.DataService(\n    endpoint,\n    grpc.credentials.createInsecure()\n  );\n\n  // Extract caller metadata from event headers\n  const callerRole = event.headers?.['x-caller-role'] || 'anonymous';\n  const callerTenant = event.headers?.['x-tenant-id'] || 'default';\n  const traceId = event.headers?.['x-amzn-trace-id'] || '';\n  \n  // Build gRPC metadata from incoming request headers\n  const metadata = new grpc.Metadata();\n  metadata.set('x-caller-role', callerRole);\n  metadata.set('x-tenant-id', callerTenant);\n  metadata.set('x-trace-id', traceId);\n  \n  // VULNERABILITY: User-controlled headers are passed directly as gRPC metadata\n  // An attacker can inject arbitrary metadata keys that the downstream service\n  // trusts for authorization decisions\n  if (event.headers) {\n    const propagateHeaders = Object.keys(event.headers).filter(\n      h => h.startsWith('x-internal-') || h.startsWith('x-auth-')\n    );\n    for (const header of propagateHeaders) {\n      metadata.set(header, event.headers[header]);\n    }\n  }\n\n  // The downstream gRPC service checks 'x-internal-admin' metadata\n  // to grant admin access - attacker can set this via HTTP header\n  const request = {\n    query: event.body?.query || '',\n    limit: parseInt(event.body?.limit) || 100\n  };\n\n  return new Promise((resolve, reject) => {\n    client.fetchData(request, metadata, (error, response) => {\n      if (error) {\n        resolve({\n          statusCode: 500,\n          body: JSON.stringify({ error: error.message })\n        });\n      } else {\n        resolve({\n          statusCode: 200,\n          body: JSON.stringify(response)\n        });\n      }\n    });\n  });\n};\n\n// Health check endpoint\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'ok', version: '2.4.1' })\n  };\n};\n\n// Internal metrics - not exposed via API Gateway\nexports.metrics = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({\n      connections: grpc.getClientChannel?.()?.getConnectivityState?.() || 'unknown',\n      uptime: process.uptime()\n    })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function deployed in isolated VPC (no NAT, no IGW). The gRPC downstream service (internal-service.local:50051) is exposed exclusively through a com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890 interface endpoint with a VPC endpoint policy that restricts the 'invokeEndpoint' action to the Lambda execution role ARN only. The Lambda function URL is configured with AWS_IAM auth type (not API Gateway). Inbound requests require SigV4 signing with an IAM principal that has lambda:InvokeFunctionUrl permission scoped to this function ARN. The VPC has no internet-routable path \u2014 DNS resolution for the gRPC target goes through the interface endpoint's private DNS entry. Security group on the VPC endpoint ENI allows inbound 50051 only from the Lambda's security group CIDR. There is no public API Gateway integration; the function URL with IAM auth is the sole ingress path.",
+    "config": {
+      "api_gateway": "none",
+      "lambda_function_url_auth": "AWS_IAM",
+      "lambda_vpc": true,
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "vpc_endpoint_service": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/lambda-exec-role"
+        },
+        "Action": "execute-api:Invoke",
+        "Resource": "*"
+      },
+      "security_group_endpoint_eni": {
+        "inbound": "sg-lambda:50051",
+        "outbound": "none"
+      },
+      "function_url_iam_condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-abc123def4"
+        }
+      },
+      "dns_resolution": "private_only"
+    }
+  }
+}

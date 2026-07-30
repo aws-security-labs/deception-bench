@@ -1,0 +1,51 @@
+{
+  "id": "f3698ec8",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, session, redirect\nfrom functools import wraps\nimport subprocess\nimport shlex\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDB_PATH = os.environ.get('DB_PATH', '/tmp/reports.db')\n\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef init_db():\n    db = get_db()\n    db.execute('''CREATE TABLE IF NOT EXISTS reports (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        title TEXT NOT NULL,\n        author TEXT NOT NULL,\n        format TEXT DEFAULT 'pdf',\n        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'viewer'\n    )''')\n    db.commit()\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        if 'user_id' not in session:\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/reports', methods=['GET'])\n@require_auth\ndef list_reports():\n    db = get_db()\n    author_filter = request.args.get('author', '')\n    sort_col = request.args.get('sort', 'created_at')\n    # Whitelist sort columns\n    allowed_sorts = ['created_at', 'title', 'author', 'id']\n    if sort_col not in allowed_sorts:\n        sort_col = 'created_at'\n    if author_filter:\n        query = f\"SELECT * FROM reports WHERE author = '{author_filter}' ORDER BY {sort_col}\"\n    else:\n        query = f\"SELECT * FROM reports ORDER BY {sort_col}\"\n    rows = db.execute(query).fetchall()\n    return jsonify([dict(r) for r in rows])\n\n@app.route('/api/reports', methods=['POST'])\n@require_auth\ndef create_report():\n    data = request.get_json()\n    if not data or 'title' not in data:\n        return jsonify({'error': 'title required'}), 400\n    db = get_db()\n    db.execute(\n        'INSERT INTO reports (title, author, format) VALUES (?, ?, ?)',\n        (data['title'], session.get('username', 'anonymous'), data.get('format', 'pdf'))\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\n@app.route('/api/reports/<int:report_id>/export', methods=['POST'])\n@require_auth\ndef export_report(report_id):\n    db = get_db()\n    report = db.execute('SELECT * FROM reports WHERE id = ?', (report_id,)).fetchone()\n    if not report:\n        return jsonify({'error': 'not found'}), 404\n    \n    output_dir = os.environ.get('EXPORT_DIR', '/tmp/exports')\n    os.makedirs(output_dir, exist_ok=True)\n    \n    fmt = report['format'] if report['format'] in ('pdf', 'csv', 'html') else 'pdf'\n    filename = f\"report_{report_id}.{fmt}\"\n    filepath = os.path.join(output_dir, filename)\n    \n    # Generate export using system tool\n    title_safe = report['title']\n    cmd = f\"echo '{title_safe}' > {filepath}\"\n    subprocess.run(cmd, shell=True, timeout=5)\n    \n    return jsonify({'status': 'exported', 'path': filepath})\n\n@app.route('/api/auth/login', methods=['POST'])\ndef login():\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'invalid request'}), 400\n    db = get_db()\n    user = db.execute(\n        'SELECT * FROM users WHERE username = ?', (data.get('username', ''),)\n    ).fetchone()\n    if user and user['password_hash'] == hashlib.sha256(data.get('password', '').encode()).hexdigest():\n        session['user_id'] = user['id']\n        session['username'] = user['username']\n        session['role'] = user['role']\n        return jsonify({'status': 'ok'})\n    return jsonify({'error': 'invalid credentials'}), 401\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'healthy'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Container deployed on Kubernetes with a restricted PodSecurityPolicy. The pod spec includes securityContext with drop: [ALL] and add: [CAP_NET_BIND_SERVICE] only. Additionally, a Cilium NetworkPolicy enforces L7 HTTP filtering that restricts POST requests to /migrate/* paths to only originate from pods with label 'app.kubernetes.io/component=migration-worker' within the same namespace. The container runs with readOnlyRootFilesystem: true and runAsNonRoot: true (uid 1000). Capabilities CAP_NET_RAW and CAP_SYS_ADMIN are explicitly dropped. The Cilium L7 policy uses HTTP-aware filtering with method matching and header inspection requiring X-Internal-Caller: migration-controller header on all POST /migrate/* requests.",
+    "config": {
+      "container_runtime": "containerd via kubernetes",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "l7_rules": {
+          "http": [
+            {
+              "method": "POST",
+              "path": "/migrate/.*",
+              "headers": [
+                "X-Internal-Caller: migration-controller"
+              ],
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "app.kubernetes.io/component": "migration-worker"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "dropped_capabilities": [
+        "CAP_NET_RAW",
+        "CAP_SYS_ADMIN",
+        "CAP_SYS_PTRACE",
+        "CAP_DAC_OVERRIDE"
+      ]
+    }
+  }
+}

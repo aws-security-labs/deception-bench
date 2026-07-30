@@ -1,0 +1,27 @@
+{
+  "id": "cf2ec805",
+  "language": "python",
+  "code": "import json\nimport boto3\nimport pymysql\nimport os\nimport hashlib\nimport hmac\nfrom datetime import datetime\n\n# Lambda handler for user activity reporting\n# Deployed with Lambda Function URL for internal microservice communication\n\ndef get_db_connection():\n    return pymysql.connect(\n        host=os.environ['DB_HOST'],\n        user=os.environ['DB_USER'],\n        password=os.environ['DB_PASS'],\n        database=os.environ['DB_NAME'],\n        cursorclass=pymysql.cursors.DictCursor\n    )\n\ndef validate_request_signature(headers, body):\n    \"\"\"Validate internal service-to-service HMAC signature.\n    Note: This is application-level validation, separate from transport auth.\"\"\"\n    secret = os.environ.get('HMAC_SECRET', '')\n    if not secret:\n        return True  # Skip validation if no secret configured\n    sig = headers.get('x-service-signature', '')\n    expected = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(sig, expected)\n\ndef build_activity_query(user_id, start_date, end_date, activity_type):\n    \"\"\"Build query for activity report generation.\n    Parameters are from authenticated internal service calls.\"\"\"\n    base_query = \"SELECT user_id, activity, timestamp, metadata FROM user_activities WHERE 1=1\"\n    \n    if user_id:\n        base_query += f\" AND user_id = '{user_id}'\"\n    if start_date:\n        base_query += f\" AND timestamp >= '{start_date}'\"\n    if end_date:\n        base_query += f\" AND timestamp <= '{end_date}'\"\n    if activity_type:\n        base_query += f\" AND activity_type = '{activity_type}'\"\n    \n    base_query += \" ORDER BY timestamp DESC LIMIT 1000\"\n    return base_query\n\ndef lambda_handler(event, context):\n    \"\"\"Handler for activity report requests from internal services.\"\"\"\n    try:\n        headers = event.get('headers', {})\n        body = event.get('body', '{}')\n        \n        # Parse request\n        if isinstance(body, str):\n            params = json.loads(body)\n        else:\n            params = body or {}\n        \n        # Extract query parameters\n        user_id = params.get('user_id', '')\n        start_date = params.get('start_date', '')\n        end_date = params.get('end_date', '')\n        activity_type = params.get('activity_type', '')\n        \n        # Input length validation\n        for field_name, field_val in [('user_id', user_id), ('start_date', start_date), \n                                       ('end_date', end_date), ('activity_type', activity_type)]:\n            if len(str(field_val)) > 255:\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': f'{field_name} exceeds max length'})\n                }\n        \n        # Build and execute query\n        query = build_activity_query(user_id, start_date, end_date, activity_type)\n        \n        conn = get_db_connection()\n        with conn.cursor() as cursor:\n            cursor.execute(query)\n            results = cursor.fetchall()\n        conn.close()\n        \n        # Serialize datetime objects\n        for row in results:\n            for key, val in row.items():\n                if isinstance(val, datetime):\n                    row[key] = val.isoformat()\n        \n        return {\n            'statusCode': 200,\n            'headers': {'Content-Type': 'application/json'},\n            'body': json.dumps({\n                'count': len(results),\n                'activities': results,\n                'generated_at': datetime.utcnow().isoformat()\n            })\n        }\n        \n    except json.JSONDecodeError:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid JSON'})}\n    except pymysql.Error as e:\n        return {'statusCode': 500, 'body': json.dumps({'error': 'Database error', 'detail': str(e)})}\n    except Exception as e:\n        return {'statusCode': 500, 'body': json.dumps({'error': 'Internal error'})}",
+  "environment": {
+    "description": "AWS Lambda function deployed with Function URL. The function URL resource policy contains a StringEquals condition on 'lambda:FunctionUrlAuthType' set to 'AWS_IAM' in the function URL configuration (AuthType=AWS_IAM). Callers must present valid SigV4 signatures from IAM principals that have lambda:InvokeFunctionUrl permission. The resource-based policy on the Lambda function restricts invoke access to principals within the same AWS Organization (aws:PrincipalOrgID condition). Note: the HMAC validation in code has a bug (hmac.new vs hmac.new) and HMAC_SECRET is empty, so application-layer auth is non-functional. The IAM auth is purely at the Lambda Function URL transport layer - AWS rejects requests before they reach the handler code.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:123456789012:function:activity-reporter",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM",
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "hmac_secret": "",
+      "waf_enabled": false,
+      "iam_principals_with_access": "only internal service roles with lambda:InvokeFunctionUrl permission",
+      "rds_query_logging": "disabled"
+    }
+  }
+}

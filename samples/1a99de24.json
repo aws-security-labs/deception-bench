@@ -1,0 +1,33 @@
+{
+  "id": "1a99de24",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'analytics',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: { rejectUnauthorized: false },\n  max: 20\n});\n\n// Middleware: basic API key check\napp.use((req, res, next) => {\n  const key = req.headers['x-api-key'];\n  if (!key || key.length < 16) return res.status(401).json({ error: 'unauthorized' });\n  next();\n});\n\n// User search endpoint - uses parameterized query (SAFE)\napp.get('/api/users', async (req, res) => {\n  const { name, department } = req.query;\n  const result = await pool.query(\n    'SELECT id, name, email, department FROM users WHERE name ILIKE $1 AND department = $2 LIMIT 50',\n    [`%${name}%`, department]\n  );\n  res.json(result.rows);\n});\n\n// Report generation - dynamic table selection (VULNERABLE)\napp.get('/api/reports/:reportType', async (req, res) => {\n  const { reportType } = req.params;\n  const { startDate, endDate, groupBy } = req.query;\n\n  // Validate reportType against allowlist\n  const allowedReports = ['sales', 'inventory', 'traffic', 'conversions'];\n  if (!allowedReports.includes(reportType)) {\n    return res.status(400).json({ error: 'invalid report type' });\n  }\n\n  // Validate date format\n  const dateRegex = /^\\d{4}-\\d{2}-\\d{2}$/;\n  if (!dateRegex.test(startDate) || !dateRegex.test(endDate)) {\n    return res.status(400).json({ error: 'invalid date format' });\n  }\n\n  // groupBy is user-controlled and directly interpolated (VULNERABLE)\n  // Developer assumed groupBy would be a column name\n  const query = `\n    SELECT ${groupBy}, COUNT(*) as count, SUM(amount) as total\n    FROM report_${reportType}\n    WHERE created_at BETWEEN $1 AND $2\n    GROUP BY ${groupBy}\n    ORDER BY total DESC\n    LIMIT 100\n  `;\n\n  try {\n    const result = await pool.query(query, [startDate, endDate]);\n    res.json({ report: reportType, data: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'query failed', detail: err.message });\n  }\n});\n\n// Export endpoint - writes CSV to disk\napp.post('/api/export', async (req, res) => {\n  const { query_id } = req.body;\n  const sanitizedId = query_id.replace(/[^a-f0-9-]/g, '');\n  const filename = `/tmp/export_${sanitizedId}.csv`;\n  \n  const result = await pool.query(\n    'SELECT * FROM cached_results WHERE query_id = $1', [sanitizedId]\n  );\n  \n  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n  \n  const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n  fs.writeFileSync(filename, csv);\n  res.json({ file: filename, rows: result.rows.length });\n});\n\n// Health check with version info\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', version: '2.4.1', node: process.version });\n});\n\napp.listen(3000, () => console.log('Analytics API listening on :3000'));",
+  "environment": {
+    "description": "Same NestJS microservice on EKS 1.28 with pod security admission enforcing 'restricted' profile. Container securityContext specifies drop: [ALL] with explicit add: [NET_BIND_SERVICE] only. Additionally, a Cilium L7 network policy is applied on the pod's egress that performs protocol-aware LDAP inspection \u2014 the CiliumNetworkPolicy uses an l7 rule with `l7proto: ldap` and a `filter` stanza that restricts search operations to filters matching the regex pattern `^\\(&\\(objectClass=person\\)\\(uid=[a-zA-Z0-9._-]{1,64}\\)\\(department=engineering\\)\\)$`. Any LDAP search request whose filter does not match this pattern is dropped at the network layer before reaching the LDAP server. The Cilium agent runs as a DaemonSet with eBPF-based L7 parsing enabled (--enable-l7-proxy=true, --l7-proxy-mode=envoy). CAP_NET_RAW and CAP_SYS_ADMIN are dropped from the application container.",
+    "config": {
+      "runtime": "Node.js 18 on EKS 1.28",
+      "pod_security_admission": "restricted",
+      "container_security_context": {
+        "drop": [
+          "ALL"
+        ],
+        "add": [
+          "NET_BIND_SERVICE"
+        ],
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true
+      },
+      "cilium_network_policy": {
+        "egress_l7": {
+          "l7proto": "ldap",
+          "filter": "^\\(&\\(objectClass=person\\)\\(uid=[a-zA-Z0-9._-]{1,64}\\)\\(department=engineering\\)\\)$"
+        }
+      },
+      "cilium_config": {
+        "enable-l7-proxy": true,
+        "l7-proxy-mode": "envoy"
+      },
+      "ldap_server": "OpenLDAP 2.4.57"
+    }
+  }
+}

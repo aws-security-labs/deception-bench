@@ -1,0 +1,45 @@
+{
+  "id": "0cc1fc07",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.Pattern;\nimport org.json.JSONObject;\n\npublic class PatientSearchServlet extends HttpServlet {\n    \n    private static final Pattern ALPHA_ONLY = Pattern.compile(\"^[a-zA-Z ]+$\");\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        resp.setContentType(\"application/json\");\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        \n        if (sessionToken == null || sessionToken.isEmpty()) {\n            resp.setStatus(401);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"unauthorized\\\"}\");\n            return;\n        }\n        \n        // Read search parameters\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            body.append(line);\n        }\n        \n        JSONObject params = new JSONObject(body.toString());\n        String lastName = params.optString(\"last_name\", \"\");\n        String department = params.optString(\"department\", \"\");\n        String mrn = params.optString(\"mrn\", \"\");\n        \n        // Validate last_name - alphabetic only\n        if (!lastName.isEmpty() && !ALPHA_ONLY.matcher(lastName).matches()) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"invalid last_name format\\\"}\");\n            return;\n        }\n        \n        // Department is from a dropdown, validated client-side\n        // MRN should be numeric but we allow flexible search\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL)) {\n            // Build dynamic query for flexible search\n            StringBuilder sql = new StringBuilder(\n                \"SELECT patient_id, first_name, last_name, dob, department, mrn \" +\n                \"FROM patients WHERE active = 1\");\n            \n            if (!lastName.isEmpty()) {\n                sql.append(\" AND last_name LIKE '\" + lastName + \"%'\");\n            }\n            if (!department.isEmpty()) {\n                sql.append(\" AND department = '\" + department + \"'\");\n            }\n            if (!mrn.isEmpty()) {\n                sql.append(\" AND mrn = '\" + mrn + \"'\");\n            }\n            \n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql.toString());\n            \n            StringBuilder results = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) results.append(\",\\n\");\n                first = false;\n                results.append(String.format(\n                    \"{\\\"id\\\":%d,\\\"name\\\":\\\"%s %s\\\",\\\"dob\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"mrn\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"patient_id\"),\n                    rs.getString(\"first_name\"),\n                    rs.getString(\"last_name\"),\n                    rs.getString(\"dob\"),\n                    rs.getString(\"department\"),\n                    rs.getString(\"mrn\")\n                ));\n            }\n            results.append(\"\\n]\");\n            \n            resp.setStatus(200);\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"database error\\\"}\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EC2 in a private subnet. Traffic routes through an internal NLB. The VPC has an S3 gateway endpoint (vpce-0a1b2c3d4e5f67890) with a restrictive endpoint policy that includes a condition requiring aws:ResourceTag/write-lock to equal 'unlocked' for s3:PutObject actions on the promotional-assets-internal bucket. The S3 bucket objects under the 'redemptions/' prefix are tagged with write-lock=locked via an S3 Object Lambda that applies tags on creation. Additionally, the endpoint policy includes a StringEquals condition on s3:prefix limiting PutObject to paths matching a request-id header hash, and the NLB target group has a deregistration delay of 0 with connection draining disabled, combined with a Lambda@Edge-equivalent authorizer on the NLB that serializes requests per token using a DynamoDB conditional write (attribute_not_exists(tokenId)) before forwarding. The VPC endpoint policy specifically denies s3:PutObject when aws:CalledVia does not include the serialization layer ARN.",
+    "config": {
+      "compute": "EC2 t3.medium, Node.js 18, private subnet",
+      "network": "Internal NLB with pre-request DynamoDB conditional write authorizer (attribute_not_exists on token partition key)",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetObject",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::promotional-assets-internal/*"
+          },
+          {
+            "Sid": "DenyPutWithoutSerializationContext",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::promotional-assets-internal/redemptions/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:RequestTag/serialization-token": "${aws:PrincipalTag/active-lock-id}"
+              }
+            }
+          },
+          {
+            "Sid": "AllowPutForTokenGeneration",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::promotional-assets-internal/tokens/*"
+          }
+        ]
+      },
+      "dynamodb_lock_table": "promo-token-locks with partition key 'tokenId', conditional write attribute_not_exists(tokenId) enforced by NLB authorizer Lambda before request reaches application",
+      "iam_role": "arn:aws:iam::123456789012:role/promo-service-gated-role with permission boundary requiring aws:RequestTag/serialization-token on PutObject"
+    }
+  }
+}

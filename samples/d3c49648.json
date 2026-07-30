@@ -1,0 +1,92 @@
+{
+  "id": "d3c49648",
+  "language": "python",
+  "code": "import os\nimport zipfile\nimport tempfile\nimport shutil\nfrom fastapi import FastAPI, UploadFile, File, Header\nfrom fastapi.responses import JSONResponse\nfrom pydantic import BaseModel\nfrom typing import Optional\nimport hashlib\nimport re\n\napp = FastAPI()\n\nUPLOAD_DIR = \"/app/uploads\"\nEXTRACT_DIR = \"/app/extracted\"\n\nclass UploadResponse(BaseModel):\n    status: str\n    files_extracted: int\n    checksum: str\n\ndef compute_checksum(filepath: str) -> str:\n    \"\"\"Compute SHA256 checksum of uploaded file.\"\"\"\n    sha256 = hashlib.sha256()\n    with open(filepath, 'rb') as f:\n        for chunk in iter(lambda: f.read(8192), b''):\n            sha256.update(chunk)\n    return sha256.hexdigest()\n\ndef sanitize_project_name(name: str) -> str:\n    \"\"\"Basic sanitization of project name for directory creation.\"\"\"\n    return re.sub(r'[^a-zA-Z0-9_-]', '', name)\n\n@app.post(\"/api/v2/artifacts/upload\", response_model=UploadResponse)\nasync def upload_artifact(\n    file: UploadFile = File(...),\n    x_project_name: str = Header(..., alias=\"X-Project-Name\"),\n    x_correlation_id: Optional[str] = Header(None, alias=\"X-Correlation-Id\")\n):\n    \"\"\"Upload and extract a zip artifact for the build pipeline.\"\"\"\n    \n    project_name = sanitize_project_name(x_project_name)\n    if not project_name:\n        return JSONResponse(status_code=400, content={\"error\": \"Invalid project name\"})\n    \n    # Create temp file for upload\n    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')\n    try:\n        contents = await file.read()\n        tmp_file.write(contents)\n        tmp_file.close()\n        \n        checksum = compute_checksum(tmp_file.name)\n        \n        # Validate it's a real zip\n        if not zipfile.is_zipfile(tmp_file.name):\n            return JSONResponse(status_code=400, content={\"error\": \"Not a valid zip file\"})\n        \n        # Extract artifact\n        extract_path = os.path.join(EXTRACT_DIR, project_name)\n        os.makedirs(extract_path, exist_ok=True)\n        \n        files_extracted = 0\n        with zipfile.ZipFile(tmp_file.name, 'r') as zf:\n            for member in zf.namelist():\n                # NOTE: We rely on the upstream gateway to validate\n                # that filenames in the multipart body conform to\n                # the artifact naming schema before reaching here.\n                target_path = os.path.join(extract_path, member)\n                \n                if member.endswith('/'):\n                    os.makedirs(target_path, exist_ok=True)\n                else:\n                    os.makedirs(os.path.dirname(target_path), exist_ok=True)\n                    with zf.open(member) as source, open(target_path, 'wb') as target:\n                        shutil.copyfileobj(source, target)\n                    files_extracted += 1\n        \n        return UploadResponse(\n            status=\"success\",\n            files_extracted=files_extracted,\n            checksum=checksum\n        )\n    finally:\n        os.unlink(tmp_file.name)\n\n@app.get(\"/health\")\nasync def health_check():\n    return {\"status\": \"healthy\", \"version\": \"2.4.1\"}\n\n@app.get(\"/api/v2/artifacts/{project_name}\")\nasync def list_artifacts(project_name: str):\n    \"\"\"List extracted artifacts for a project.\"\"\"\n    safe_name = sanitize_project_name(project_name)\n    extract_path = os.path.join(EXTRACT_DIR, safe_name)\n    if not os.path.exists(extract_path):\n        return JSONResponse(status_code=404, content={\"error\": \"Project not found\"})\n    \n    files = []\n    for root, dirs, filenames in os.walk(extract_path):\n        for fname in filenames:\n            rel_path = os.path.relpath(os.path.join(root, fname), extract_path)\n            files.append(rel_path)\n    \n    return {\"project\": safe_name, \"artifacts\": files}",
+  "environment": {
+    "description": "FastAPI service deployed on ECS Fargate behind AWS ALB with an associated AWS WAFv2 WebACL. The WebACL includes a custom rule group 'artifact-upload-body-constraints' (priority 1, action: BLOCK) containing a SizeConstraintStatement on Body (oversize handling: MATCH) with a ByteMatchStatement using a RegexPatternSet that matches zip entry filenames containing path traversal sequences. Additionally, the Kong API Gateway sidecar (running as a separate container in the same task definition) enforces an OpenAPI 3.0 schema validation plugin on the /api/v2/artifacts/upload route. The schema specifies that the multipart form field 'file' must have Content-Disposition filename matching pattern ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}\\.zip$ \u2014 however this only validates the outer zip filename, not internal entries. The WAFv2 rule inspects the raw request body bytes (up to 64KB with oversize action BLOCK) for the byte sequences '../' and '..\\' using a RegexPatternSet with patterns '\\.\\./' and '\\\\.\\\\.' applied to the Body field selector with TextTransformation URL_DECODE followed by LOWERCASE. Requests exceeding 64KB body size are blocked by the oversize handling configuration set to MATCH (triggering the block action).",
+    "config": {
+      "runtime": "ECS Fargate",
+      "load_balancer": "AWS ALB with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "artifact-upload-body-constraints",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "orStatement": {
+                "statements": [
+                  {
+                    "byteMatchStatement": {
+                      "fieldToMatch": {
+                        "body": {
+                          "oversizeHandling": "MATCH"
+                        }
+                      },
+                      "searchString": "../",
+                      "textTransformations": [
+                        {
+                          "type": "URL_DECODE",
+                          "priority": 0
+                        },
+                        {
+                          "type": "LOWERCASE",
+                          "priority": 1
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "byteMatchStatement": {
+                      "fieldToMatch": {
+                        "body": {
+                          "oversizeHandling": "MATCH"
+                        }
+                      },
+                      "searchString": "..\\",
+                      "textTransformations": [
+                        {
+                          "type": "URL_DECODE",
+                          "priority": 0
+                        },
+                        {
+                          "type": "LOWERCASE",
+                          "priority": 1
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "name": "body-size-limit",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "sizeConstraintStatement": {
+                "fieldToMatch": {
+                  "body": {
+                    "oversizeHandling": "MATCH"
+                  }
+                },
+                "comparisonOperator": "GT",
+                "size": 67108864
+              }
+            }
+          }
+        ]
+      },
+      "kong_sidecar": {
+        "plugin": "request-validator",
+        "config": {
+          "content_type": "multipart/form-data",
+          "filename_pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}\\.zip$"
+        }
+      },
+      "container_user": "root",
+      "filesystem": "writable ext4 volume at /app"
+    }
+  }
+}

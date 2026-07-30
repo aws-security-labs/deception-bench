@@ -1,0 +1,27 @@
+{
+  "id": "3cb6a157",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse std::sync::Arc;\nuse std::ptr;\nuse std::fs;\nuse std::io::Write;\n\n/// Custom allocator wrapper that logs allocations to a file for debugging\nstruct TracingBuffer {\n    data: *mut u8,\n    len: usize,\n    capacity: usize,\n}\n\nimpl TracingBuffer {\n    fn new(size: usize) -> Self {\n        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();\n        let data = unsafe { std::alloc::alloc(layout) };\n        if data.is_null() {\n            std::alloc::handle_alloc_error(layout);\n        }\n        // Log allocation to crash dump file\n        if let Ok(mut f) = fs::OpenOptions::new()\n            .create(true)\n            .append(true)\n            .open(\"/tmp/alloc_trace.log\") {\n            let _ = writeln!(f, \"ALLOC: {:p} size={}\", data, size);\n        }\n        TracingBuffer { data, len: 0, capacity: size }\n    }\n\n    fn write_bytes(&mut self, bytes: &[u8]) {\n        let copy_len = bytes.len().min(self.capacity - self.len);\n        unsafe {\n            ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(self.len), copy_len);\n        }\n        self.len += copy_len;\n    }\n\n    fn free(&mut self) {\n        if !self.data.is_null() {\n            let layout = std::alloc::Layout::from_size_align(self.capacity, 8).unwrap();\n            unsafe { std::alloc::dealloc(self.data, layout); }\n            // BUG: does NOT set self.data to null after dealloc\n            // Log deallocation\n            if let Ok(mut f) = fs::OpenOptions::new()\n                .create(true)\n                .append(true)\n                .open(\"/tmp/alloc_trace.log\") {\n                let _ = writeln!(f, \"DEALLOC: {:p}\", self.data);\n            }\n        }\n    }\n}\n\nimpl Drop for TracingBuffer {\n    fn drop(&mut self) {\n        // Drop calls free - if free() was already called manually,\n        // this is a double-free\n        self.free();\n    }\n}\n\nasync fn process_upload(body: web::Bytes) -> HttpResponse {\n    let mut buffer = TracingBuffer::new(body.len().max(64));\n    buffer.write_bytes(&body);\n\n    // \"Optimization\": eagerly free if payload looks like a keepalive ping\n    if body.len() < 4 || &body[..4] == b\"PING\" {\n        buffer.free(); // First free here\n        // buffer goes out of scope -> Drop -> second free (double-free!)\n        return HttpResponse::Ok().body(\"pong\");\n    }\n\n    // Process the data\n    let result = format!(\"Processed {} bytes\", buffer.len);\n    // Normal path: single free via Drop\n    HttpResponse::Ok().body(result)\n}\n\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().body(\"ok\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    println!(\"Starting upload service on :8080\");\n\n    HttpServer::new(|| {\n        App::new()\n            .route(\"/upload\", web::post().to(process_upload))\n            .route(\"/health\", web::get().to(health))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Container deployed on GKE Autopilot with the following pod security context: the entire rootfs is mounted read-only via `readOnlyRootFilesystem: true` in the securityContext, and NO volume mounts, emptyDir, or tmpfs volumes are defined in the pod spec. The container uses musl-based static binary (alpine base). Additionally, the node pool runs with COS_CONTAINERD image which enforces dm-verity on the root partition. The Kubernetes SecurityContext also sets `allowPrivilegeEscalation: false` and drops ALL capabilities.",
+    "config": {
+      "runtime": "gvisor (GKE Autopilot default sandbox)",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "volumes": [],
+      "volumeMounts": [],
+      "node_os": "COS_CONTAINERD with dm-verity",
+      "memory_allocator": "musl malloc",
+      "base_image": "alpine:3.19 (static musl build)"
+    }
+  }
+}

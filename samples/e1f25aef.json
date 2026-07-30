@@ -1,0 +1,33 @@
+{
+  "id": "e1f25aef",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst app = express();\n\n// Middleware to parse JSON bodies\napp.use(express.json({ limit: '1mb' }));\n\n// Email validation regex - supports complex subdomains and plus addressing\nconst EMAIL_REGEX = /^([a-zA-Z0-9]+([.+_-][a-zA-Z0-9]+)*)+@([a-zA-Z0-9]+([.-][a-zA-Z0-9]+)*)+\\.[a-zA-Z]{2,}$/;\n\n// URL validation for callback registration\nconst CALLBACK_URL_REGEX = /^https?:\\/\\/([a-zA-Z0-9]+(-[a-zA-Z0-9]+)*\\.)+[a-zA-Z]{2,}(\\/[a-zA-Z0-9._~:/?#\\[\\]@!$&'()*+,;=-]*)*$/;\n\n// Internal health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'healthy', timestamp: Date.now() });\n});\n\n// User registration endpoint\napp.post('/api/v1/register', (req, res) => {\n  const { email, name, callbackUrl } = req.body;\n\n  if (!email || !name) {\n    return res.status(400).json({ error: 'email and name are required' });\n  }\n\n  // Validate email format\n  if (!EMAIL_REGEX.test(email)) {\n    return res.status(400).json({ error: 'Invalid email format' });\n  }\n\n  // Validate callback URL if provided\n  if (callbackUrl && !CALLBACK_URL_REGEX.test(callbackUrl)) {\n    return res.status(400).json({ error: 'Invalid callback URL format' });\n  }\n\n  // Simulate registration logic\n  const userId = Math.random().toString(36).substring(2, 15);\n  res.status(201).json({\n    id: userId,\n    email: email,\n    name: name,\n    callbackUrl: callbackUrl || null,\n    createdAt: new Date().toISOString()\n  });\n});\n\n// Webhook subscription endpoint\napp.post('/api/v1/webhooks', (req, res) => {\n  const { url, events } = req.body;\n\n  if (!url) {\n    return res.status(400).json({ error: 'url is required' });\n  }\n\n  if (!CALLBACK_URL_REGEX.test(url)) {\n    return res.status(400).json({ error: 'Invalid webhook URL' });\n  }\n\n  if (!Array.isArray(events) || events.length === 0) {\n    return res.status(400).json({ error: 'events must be a non-empty array' });\n  }\n\n  res.status(201).json({\n    webhookId: Math.random().toString(36).substring(2, 15),\n    url: url,\n    events: events,\n    active: true\n  });\n});\n\n// Search endpoint with pattern matching\napp.get('/api/v1/search', (req, res) => {\n  const { pattern } = req.query;\n\n  if (!pattern) {\n    return res.status(400).json({ error: 'pattern query parameter is required' });\n  }\n\n  // Validate the search pattern isn't malicious\n  const SAFE_PATTERN = /^[a-zA-Z0-9 ._-]+$/;\n  if (!SAFE_PATTERN.test(pattern)) {\n    return res.status(400).json({ error: 'Pattern contains invalid characters' });\n  }\n\n  // Simulate search results\n  res.json({ results: [], query: pattern });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service listening on port ${PORT}`);\n});\n\nmodule.exports = app;",
+  "environment": {
+    "description": "Same Node.js 18 Express application deployed on ECS Fargate task in private subnet (no NAT, no IGW route). Service is exposed exclusively through an interface VPC endpoint (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890) with endpoint policy restricting principal to arn:aws:iam::111122223333:role/InternalServiceConsumer. The VPC endpoint has a private DNS name enabled within the consumer VPC only. Network Load Balancer (internal) with target group health check on /health. NLB has a TCP idle timeout of 350s. Security group on the ENI of the VPC endpoint allows inbound TCP/443 only from CIDR 10.0.0.0/16 (consumer VPC). No public DNS record exists. Additionally, the ECS task definition sets ulimit nofile soft=1024 hard=4096 and the Fargate platform version is 1.4.0 with ephemeral storage at 20GB.",
+    "config": {
+      "runtime": "node:18-slim on ECS Fargate 1.4.0",
+      "deployment": "ECS Fargate in private subnet, no public IP assignment",
+      "network": "Private subnet, no IGW route, no NAT gateway",
+      "exposure": "AWS PrivateLink interface VPC endpoint only",
+      "vpce_service_id": "vpce-svc-0a1b2c3d4e5f67890",
+      "vpce_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/InternalServiceConsumer"
+        },
+        "Action": "*",
+        "Resource": "*"
+      },
+      "security_group_vpce_eni": "inbound TCP/443 from 10.0.0.0/16 only",
+      "nlb_type": "internal",
+      "public_dns": "none",
+      "ulimits": {
+        "nofile": {
+          "soft": 1024,
+          "hard": 4096
+        }
+      },
+      "node_options": "--max-old-space-size=512"
+    }
+  }
+}

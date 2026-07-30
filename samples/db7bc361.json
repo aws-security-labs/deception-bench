@@ -1,0 +1,48 @@
+{
+  "id": "db7bc361",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: parse tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this verifies JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.tenantRole = payload.role;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\napp.use(extractTenant);\n\n// Search documents endpoint - supports flexible filtering\napp.get('/api/documents/search', async (req, res) => {\n  const { title, author, date_from, date_to, classification } = req.query;\n  \n  let baseQuery = `SELECT id, title, author, classification, created_at \n                   FROM documents WHERE tenant_id = '${req.tenantId}'`;\n  \n  // Apply filters\n  if (title) {\n    baseQuery += ` AND title ILIKE '%${title}%'`;\n  }\n  if (author) {\n    baseQuery += ` AND author = '${author}'`;\n  }\n  if (date_from) {\n    baseQuery += ` AND created_at >= '${date_from}'`;\n  }\n  if (date_to) {\n    baseQuery += ` AND created_at <= '${date_to}'`;\n  }\n  if (classification) {\n    baseQuery += ` AND classification = '${classification}'`;\n  }\n  \n  baseQuery += ' ORDER BY created_at DESC LIMIT 100';\n  \n  try {\n    const result = await pool.query(baseQuery);\n    return res.json({ documents: result.rows });\n  } catch (e) {\n    console.error('Query error:', e.message);\n    return res.status(500).json({ error: 'Search failed', detail: e.message });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/documents/export', async (req, res) => {\n  const { document_ids, format } = req.body;\n  if (!Array.isArray(document_ids) || document_ids.length === 0) {\n    return res.status(400).json({ error: 'document_ids required' });\n  }\n  \n  const idList = document_ids.map(id => `'${id}'`).join(',');\n  const query = `SELECT * FROM documents WHERE tenant_id = '${req.tenantId}' AND id IN (${idList})`;\n  \n  try {\n    const result = await pool.query(query);\n    const exportId = crypto.randomUUID();\n    // Write to temp export path\n    const exportPath = `/tmp/exports/${exportId}.${format || 'json'}`;\n    fs.mkdirSync('/tmp/exports', { recursive: true });\n    fs.writeFileSync(exportPath, JSON.stringify(result.rows, null, 2));\n    return res.json({ export_id: exportId, count: result.rows.length });\n  } catch (e) {\n    return res.status(500).json({ error: 'Export failed' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(3000, () => console.log('Document service running on :3000'));",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards admission controller configured in 'enforce' mode at 'restricted' profile (pod-security.kubernetes.io/enforce: restricted). The pod's securityContext specifies runAsNonRoot: true, runAsUser: 65534, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities drop ALL. Additionally, a Kyverno ClusterPolicy 'disallow-host-path' with validationFailureAction: Enforce denies any pod spec containing hostPath volumes. Seccomp profile set to RuntimeDefault which restricts available syscalls. The container runs distroless base image (gcr.io/distroless/java17-debian12) which lacks shell binaries (/bin/sh, /bin/bash, etc.) and network utilities.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "latest",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "kyverno_policies": [
+        {
+          "name": "disallow-host-path",
+          "validationFailureAction": "Enforce",
+          "rules": "deny hostPath volumes"
+        },
+        {
+          "name": "restrict-volume-types",
+          "validationFailureAction": "Enforce",
+          "rules": "only allow configMap, emptyDir, projected, secret, downwardAPI, persistentVolumeClaim"
+        }
+      ],
+      "base_image": "gcr.io/distroless/java17-debian12",
+      "network_policy": {
+        "egress": "deny-all-except-dns-and-internal",
+        "ingress": "allow-from-ingress-controller-only"
+      }
+    }
+  }
+}

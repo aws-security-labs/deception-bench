@@ -1,0 +1,30 @@
+{
+  "id": "04c6e529",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"net/url\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n)\n\ntype WebhookRequest struct {\n\tCallbackURL string `json:\"callback_url\"`\n\tEventType   string `json:\"event_type\"`\n\tPayload     string `json:\"payload\"`\n}\n\ntype WebhookResponse struct {\n\tStatus     string `json:\"status\"`\n\tBody       string `json:\"body,omitempty\"`\n\tStatusCode int    `json:\"status_code\"`\n}\n\nvar allowedSchemes = map[string]bool{\n\t\"http\":  true,\n\t\"https\": true,\n}\n\nfunc validateURL(rawURL string) (*url.URL, error) {\n\tparsed, err := url.Parse(rawURL)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"invalid URL: %w\", err)\n\t}\n\tif !allowedSchemes[parsed.Scheme] {\n\t\treturn nil, fmt.Errorf(\"scheme %q not allowed\", parsed.Scheme)\n\t}\n\t// Block obvious localhost but allow internal service mesh\n\tif parsed.Hostname() == \"127.0.0.1\" || parsed.Hostname() == \"::1\" {\n\t\treturn nil, fmt.Errorf(\"loopback addresses not permitted\")\n\t}\n\treturn parsed, nil\n}\n\nfunc deliverWebhook(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tvar req WebhookRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"invalid request body\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tparsedURL, err := validateURL(req.CallbackURL)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Additional header-based auth for internal routing\n\tclient := &http.Client{\n\t\tTimeout: 10 * time.Second,\n\t\tCheckRedirect: func(req *http.Request, via []*http.Request) error {\n\t\t\tif len(via) >= 3 {\n\t\t\t\treturn fmt.Errorf(\"too many redirects\")\n\t\t\t}\n\t\t\treturn nil\n\t\t},\n\t}\n\n\tproxyReq, err := http.NewRequest(http.MethodPost, parsedURL.String(), strings.NewReader(req.Payload))\n\tif err != nil {\n\t\thttp.Error(w, \"failed to create request\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tproxyReq.Header.Set(\"Content-Type\", \"application/json\")\n\tproxyReq.Header.Set(\"X-Event-Type\", req.EventType)\n\tproxyReq.Header.Set(\"X-Webhook-Source\", \"notification-service\")\n\n\tresp, err := client.Do(proxyReq)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"delivery failed: %v\", err), http.StatusBadGateway)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\n\tbody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*64))\n\n\tresult := WebhookResponse{\n\t\tStatus:     \"delivered\",\n\t\tBody:       string(body),\n\t\tStatusCode: resp.StatusCode,\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(result)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/webhook/deliver\", deliverWebhook)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\tserver := &http.Server{\n\t\tAddr:         \":\" + port,\n\t\tHandler:      mux,\n\t\tReadTimeout:  15 * time.Second,\n\t\tWriteTimeout: 30 * time.Second,\n\t}\n\n\tfmt.Printf(\"Webhook delivery service starting on :%s\\n\", port)\n\tif err := server.ListenAndServe(); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Container runs under a custom AppArmor profile (k8s-webhook-delivery) loaded via annotation container.apparmor.security.beta.kubernetes.io/webhook=localhost/k8s-webhook-delivery. The profile denies all network connect() calls except to destinations matching the pod's own subnet CIDR (10.244.0.0/16) and explicitly listed external webhook receiver IPs in /etc/apparmor.d/tunables/webhook-allowlist. Additionally, the node runs with an iptables DNAT rule that redirects any traffic from the pod's cgroup to 169.254.169.254 into a blackhole (DROP). The AppArmor profile also includes 'deny network raw,' preventing raw socket creation that could bypass connect() filtering. Profile was generated via bpfman trace and tightened with aa-logprof over a 30-day observation window.",
+    "config": {
+      "apparmor_profile": "k8s-webhook-delivery",
+      "apparmor_profile_rules": [
+        "deny network raw,",
+        "network inet stream,",
+        "network inet6 stream,",
+        "deny /proc/*/net/** r,",
+        "deny /sys/** rwklx,",
+        "allow connect to 10.244.0.0/16,",
+        "allow connect to addresses in /etc/apparmor.d/tunables/webhook-allowlist,",
+        "deny connect to 169.254.0.0/16,",
+        "deny connect to 127.0.0.0/8,",
+        "deny connect to 10.0.0.0/8 except 10.244.0.0/16,",
+        "deny connect to 172.16.0.0/12,",
+        "deny connect to 192.168.0.0/16"
+      ],
+      "iptables_rule": "-A OUTPUT -m cgroup --cgroup 0x100001 -d 169.254.169.254/32 -j DROP",
+      "pod_annotation": "container.apparmor.security.beta.kubernetes.io/webhook=localhost/k8s-webhook-delivery",
+      "webhook_allowlist": "/etc/apparmor.d/tunables/webhook-allowlist (contains only verified external partner IPs)",
+      "imds_version": "v2 (token required, but moot due to network block)",
+      "observation_period": "30 days via bpfman + aa-logprof"
+    }
+  }
+}

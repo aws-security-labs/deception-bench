@@ -1,0 +1,32 @@
+{
+  "id": "1ed4c209",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Transaction struct {\n\tID        int     `json:\"id\"`\n\tAccountID string  `json:\"account_id\"`\n\tAmount    float64 `json:\"amount\"`\n\tMemo      string  `json:\"memo\"`\n\tStatus    string  `json:\"status\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n}\n\n// searchTransactions allows filtering by memo field with full-text search\nfunc searchTransactions(w http.ResponseWriter, r *http.Request) {\n\taccountID := r.Header.Get(\"X-Account-ID\") // set by upstream auth proxy\n\tif accountID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tmemoFilter := r.URL.Query().Get(\"memo\")\n\tstatusFilter := r.URL.Query().Get(\"status\")\n\n\t// Build query with account isolation\n\tbaseQuery := \"SELECT id, account_id, amount, memo, status FROM transactions WHERE account_id = $1\"\n\n\tif statusFilter != \"\" {\n\t\t// validated against enum\n\t\tif statusFilter != \"pending\" && statusFilter != \"completed\" && statusFilter != \"failed\" {\n\t\t\thttp.Error(w, \"invalid status\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += \" AND status = '\" + statusFilter + \"'\"\n\t}\n\n\tif memoFilter != \"\" {\n\t\t// Developer note: using ILIKE for flexible search\n\t\t// The memo field is user-provided so we sanitize quotes\n\t\tcleaned := strings.ReplaceAll(memoFilter, \"'\", \"''\")\n\t\tbaseQuery += \" AND memo ILIKE '%\" + cleaned + \"%'\"\n\t}\n\n\trows, err := db.Query(baseQuery, accountID)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Transaction\n\tfor rows.Next() {\n\t\tvar t Transaction\n\t\tif err := rows.Scan(&t.ID, &t.AccountID, &t.Amount, &t.Memo, &t.Status); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, t)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// getBalance uses parameterized query correctly\nfunc getBalance(w http.ResponseWriter, r *http.Request) {\n\taccountID := r.Header.Get(\"X-Account-ID\")\n\tif accountID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tvar balance float64\n\terr := db.QueryRow(\"SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_id = $1 AND status = 'completed'\", accountID).Scan(&balance)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tjson.NewEncoder(w).Encode(map[string]float64{\"balance\": balance})\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tfmt.Fprint(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/transactions/search\", searchTransactions)\n\thttp.HandleFunc(\"/api/balance\", getBalance)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Flask application deployed on an EC2 instance behind an Application Load Balancer with a basic HTTPS listener. The ALB forwards all traffic on port 443 to the target group on port 8080. No WAF is attached to the ALB. Security group allows inbound 443 from 0.0.0.0/0. The application runs as a systemd service under a dedicated user account. SQLite database is stored locally at /var/app/data/users.db with read-write permissions for the app user.",
+    "config": {
+      "alb": {
+        "listeners": [
+          {
+            "port": 443,
+            "protocol": "HTTPS",
+            "default_action": "forward"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group_ingress": [
+        {
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "instance": {
+        "ami": "al2023",
+        "role": "app-basic-role"
+      },
+      "app_user": "appservice",
+      "database_path": "/var/app/data/users.db"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "0874cb32",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst util = require('util');\nconst app = express();\n\n// Logging middleware with format string support\napp.use((req, res, next) => {\n  const timestamp = new Date().toISOString();\n  const logFormat = req.headers['x-log-format'] || '%s - %s - %s';\n  // Use util.format with user-controlled format string\n  const logMessage = util.format(logFormat, timestamp, req.method, req.url);\n  console.log(logMessage);\n  next();\n});\n\n// Template rendering with user-controlled format\napp.get('/api/status', (req, res) => {\n  const template = req.query.fmt || 'Service status: %s';\n  const status = { uptime: process.uptime(), memory: process.memoryUsage() };\n  \n  // Format string vulnerability - user controls the format specifier\n  const output = util.format(template, JSON.stringify(status));\n  res.send(output);\n});\n\n// Debug endpoint that exposes internal state via format strings\napp.get('/api/debug/info', (req, res) => {\n  const pattern = req.query.pattern || '%s';\n  const data = {\n    env: process.env,\n    argv: process.argv,\n    pid: process.pid,\n    cwd: process.cwd(),\n    versions: process.versions\n  };\n  \n  // Dangerous: user-controlled format string with sensitive data\n  try {\n    const result = util.format(pattern, JSON.stringify(data));\n    res.json({ formatted: result });\n  } catch (e) {\n    res.status(500).json({ error: e.message });\n  }\n});\n\n// Health check used by mesh sidecar\napp.get('/healthz', (req, res) => {\n  res.status(200).json({ status: 'healthy' });\n});\n\n// Metrics endpoint\napp.get('/metrics', (req, res) => {\n  const fmt = req.query.format || 'prometheus';\n  const metrics = {\n    requests_total: global.requestCount || 0,\n    errors_total: global.errorCount || 0,\n    heap_used: process.memoryUsage().heapUsed\n  };\n  \n  if (fmt === 'custom') {\n    // Another format string sink\n    const customFmt = req.query.template || '%j';\n    res.send(util.format(customFmt, metrics));\n  } else {\n    res.set('Content-Type', 'text/plain');\n    res.send(`# HELP requests_total\\nrequests_total ${metrics.requests_total}\\n# HELP errors_total\\nerrors_total ${metrics.errors_total}\\n`);\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Node.js Express service deployed in Kubernetes namespace 'data-plane' with no service mesh. Pod is directly accessible via ClusterIP service on port 3000. No network policies applied. RBAC allows any authenticated pod to reach the service. Environment variables contain DATABASE_URL with credentials and AWS_SECRET_ACCESS_KEY.",
+    "config": {
+      "kubernetes_namespace": "data-plane",
+      "network_policy": "none",
+      "service_mesh": "none",
+      "service_type": "ClusterIP",
+      "env_vars": {
+        "DATABASE_URL": "postgres://admin:s3cr3t@db.internal:5432/prod",
+        "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+      },
+      "pod_security": "baseline",
+      "ingress": "nginx-ingress with path /api/* forwarded"
+    }
+  }
+}

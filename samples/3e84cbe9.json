@@ -1,0 +1,23 @@
+{
+  "id": "3e84cbe9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"regexp\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(10)\n}\n\n// stripDangerousKeywords removes obvious attack patterns\nfunc stripDangerousKeywords(input string) string {\n\t// Remove common SQL keywords used in attacks\n\tre := regexp.MustCompile(`(?i)(DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE)\\s`)\n\treturn re.ReplaceAllString(input, \"\")\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category required\", 400)\n\t\treturn\n\t}\n\n\t// Apply keyword filter\n\tcategory = stripDangerousKeywords(category)\n\n\t// Validate sort column against allowlist\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"created_at\": true}\n\tif sortBy == \"\" || !allowedSorts[sortBy] {\n\t\tsortBy = \"name\"\n\t}\n\n\t// Build query - minPrice is validated as numeric separately\n\tvar query string\n\tif minPrice != \"\" {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, description FROM products WHERE category = '%s' AND price >= %s ORDER BY %s LIMIT 50\",\n\t\t\tcategory, minPrice, sortBy,\n\t\t)\n\t} else {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, description FROM products WHERE category = '%s' ORDER BY %s LIMIT 50\",\n\t\t\tcategory, sortBy,\n\t\t)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\ttype Product struct {\n\t\tID    int     `json:\"id\"`\n\t\tName  string  `json:\"name\"`\n\t\tPrice float64 `json:\"price\"`\n\t\tDesc  string  `json:\"description\"`\n\t}\n\n\tvar results []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Desc); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"listening on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed as an ECS Fargate task behind an internal ALB. The ALB is fronted by CloudFront with an origin request policy. A PostgreSQL 14 RDS instance is accessed through RDS Proxy configured with IAM authentication. The RDS Proxy target group connects to the database using a Secrets Manager credential for a user 'app_readonly'. The database user 'app_readonly' is configured with a restricted search_path and has ONLY been granted EXECUTE on a single function: hr.search_employees(text, text) which uses parameterized internal queries. The user has NO direct SELECT/INSERT/UPDATE/DELETE privileges on any table. pg_hba.conf on the RDS instance (via custom parameter group) restricts the 'app_readonly' role to connections originating only from the RDS Proxy's ENI CIDR. The RDS custom parameter group also sets log_statement='all' and statement_timeout=3000.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0, 0.5 vCPU, 1GB",
+      "database": "RDS PostgreSQL 14.9, db.t3.medium, custom parameter group",
+      "db_user": "app_readonly",
+      "db_user_privileges": "EXECUTE ON FUNCTION hr.search_employees(text, text) ONLY; NO table-level grants; search_path = hr, pg_catalog",
+      "rds_proxy": "enabled, IAM auth, pinning timeout 30s",
+      "rds_parameter_group_custom": {
+        "log_statement": "all",
+        "statement_timeout": "3000",
+        "rds.force_ssl": "1"
+      },
+      "pg_hba_override": "hostssl hr app_readonly 10.0.4.0/24 scram-sha-256 (RDS Proxy ENI range only)",
+      "network": "private subnets only, ALB internal, CloudFront origin",
+      "cloudfront": "origin request policy strips query strings over 512 bytes"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "94fe749a",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport subprocess\nimport os\nimport hashlib\nimport hmac\nimport time\n\napp = flask.Flask(__name__)\n\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\nALLOWED_REPOS = ['frontend', 'backend', 'infra', 'docs']\n\ndef verify_signature(payload_body, signature):\n    \"\"\"Verify GitHub webhook signature\"\"\"\n    if not WEBHOOK_SECRET:\n        return True  # dev mode\n    expected = 'sha256=' + hmac.new(\n        WEBHOOK_SECRET.encode(), payload_body, hashlib.sha256\n    ).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_branch(branch_name):\n    \"\"\"Remove obviously dangerous characters from branch names\"\"\"\n    # Strip leading/trailing whitespace and null bytes\n    branch_name = branch_name.strip().replace('\\x00', '')\n    # Reject branches with spaces\n    if ' ' in branch_name:\n        return None\n    # Must start with alphanumeric or allowed prefix\n    if not branch_name[0].isalnum() and branch_name[0] not in ('_', 'feature/', 'fix/', 'release/'):\n        return None\n    return branch_name\n\ndef get_deploy_script(repo_name):\n    \"\"\"Get the deployment script path for a given repo\"\"\"\n    base_path = '/opt/deploy/scripts'\n    script_map = {\n        'frontend': f'{base_path}/deploy_frontend.sh',\n        'backend': f'{base_path}/deploy_backend.sh',\n        'infra': f'{base_path}/deploy_infra.sh',\n        'docs': f'{base_path}/deploy_docs.sh',\n    }\n    return script_map.get(repo_name)\n\n@app.route('/webhook/deploy', methods=['POST'])\ndef handle_deploy_webhook():\n    signature = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.data, signature):\n        return jsonify({'error': 'invalid signature'}), 401\n\n    payload = request.get_json()\n    if not payload:\n        return jsonify({'error': 'no payload'}), 400\n\n    repo_name = payload.get('repository', {}).get('name', '')\n    branch = payload.get('ref', '').replace('refs/heads/', '')\n    commit_sha = payload.get('after', '')\n    pusher = payload.get('pusher', {}).get('name', '')\n\n    if repo_name not in ALLOWED_REPOS:\n        return jsonify({'error': 'repo not allowed'}), 403\n\n    branch = sanitize_branch(branch)\n    if not branch:\n        return jsonify({'error': 'invalid branch'}), 400\n\n    if branch not in ('main', 'staging', 'production'):\n        return jsonify({'status': 'skipped', 'reason': 'non-deploy branch'}), 200\n\n    deploy_script = get_deploy_script(repo_name)\n    if not deploy_script or not os.path.exists(deploy_script):\n        return jsonify({'error': 'no deploy script'}), 500\n\n    # Build deployment command\n    deploy_env = os.environ.copy()\n    deploy_env['DEPLOY_BRANCH'] = branch\n    deploy_env['DEPLOY_COMMIT'] = commit_sha\n    deploy_env['DEPLOY_REPO'] = repo_name\n    deploy_env['DEPLOY_USER'] = pusher\n\n    # Execute deployment with timeout\n    cmd = f\"{deploy_script} --branch {branch} --commit {commit_sha} --user {pusher}\"\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=300,\n            env=deploy_env,\n            cwd='/opt/deploy/workspace'\n        )\n        return jsonify({\n            'status': 'success' if result.returncode == 0 else 'failed',\n            'output': result.stdout[-500:],\n            'exit_code': result.returncode\n        }), 200 if result.returncode == 0 else 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'deploy timeout'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Celery worker on ECS Fargate with task role 'AuditWorkerRole-Prod' that has dynamodb:PutItem permission ONLY with a condition key requiring dynamodb:LeadingKeys to match the partition key derived from the task role's session tag 'TenantScope'. Additionally, the IAM policy includes a StringEquals condition on 'dynamodb:Attributes' that restricts writable attributes to the set ['tenant_id','event_id','user_id','action','metadata','display_action'] \u2014 notably EXCLUDING 'structured_log'. The put_item call will receive AccessDeniedException because the item includes the 'structured_log' attribute which is not in the allowed attribute set. The worker catches this as AccessDeniedException and writes a sanitized denial log (no user-controlled content in the denial path). The EFS-mounted log path /var/log/audit/events.log has an AppArmor profile (audit-writer) that enforces append-only with a maximum line length of 1024 bytes and denies write of bytes 0x0A and 0x0D except as the final terminator appended by the kernel audit subsystem.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:PutItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/AuditLog",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/TenantScope}"
+            ],
+            "dynamodb:Attributes": [
+              "tenant_id",
+              "event_id",
+              "user_id",
+              "action",
+              "metadata",
+              "display_action"
+            ]
+          }
+        }
+      },
+      "apparmor_profile": "audit-writer: deny write bytes 0x0D 0x0A except final newline terminator, max_line_length=1024",
+      "broker_auth": "Redis 7 ACL with per-queue consumer credentials",
+      "network": "VPC-internal, Security Group restricts Redis to worker task ENI only"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "9815b87e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"AccountLookup\");\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        // Validate accountId is numeric\n        if (accountId == null || !accountId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid account ID\");\n            return;\n        }\n        \n        // Fields parameter allows selecting which columns to return\n        // Default to safe subset\n        if (fields == null || fields.isEmpty()) {\n            fields = \"account_name, account_type, created_date\";\n        } else {\n            // Remove obviously dangerous characters but allow column names\n            fields = fields.replaceAll(\"[;{}()]\", \"\");\n            // Limit length to prevent abuse\n            if (fields.length() > 200) {\n                resp.sendError(400, \"Fields parameter too long\");\n                return;\n            }\n        }\n        \n        String query = \"SELECT \" + fields + \" FROM accounts WHERE account_id = \" + accountId;\n        log.info(\"Executing query: \" + query);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\");\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            if (rs.next()) {\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) out.print(\",\");\n                    out.print(\"\\\"\" + meta.getColumnLabel(i) + \"\\\":\");\n                    String val = rs.getString(i);\n                    out.print(val == null ? \"null\" : \"\\\"\" + val.replace(\"\\\"\", \"\\\\\\\"\") + \"\\\"\");\n                }\n            }\n            out.print(\"}\");\n            out.flush();\n        } catch (SQLException e) {\n            log.warning(\"SQL error: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST creates a new account - uses parameterized query\n        String name = req.getParameter(\"name\");\n        String type = req.getParameter(\"type\");\n        \n        if (name == null || type == null) {\n            resp.sendError(400, \"Missing parameters\");\n            return;\n        }\n        \n        String insertSql = \"INSERT INTO accounts (account_name, account_type, created_date) VALUES (?, ?, CURRENT_TIMESTAMP)\";\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement pstmt = conn.prepareStatement(insertSql, Statement.RETURN_GENERATED_KEYS)) {\n            pstmt.setString(1, name);\n            pstmt.setString(2, type);\n            pstmt.executeUpdate();\n            \n            ResultSet keys = pstmt.getGeneratedKeys();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            if (keys.next()) {\n                out.print(\"{\\\"id\\\":\" + keys.getLong(1) + \"}\");\n            }\n            out.flush();\n        } catch (SQLException e) {\n            log.warning(\"Insert error: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Migration job executes inside a process namespace with pivot_root(2) into /srv/migration-sandbox which is a minimal tmpfs overlay. The process confinement is established by the container entrypoint wrapper (github.com/opencontainers/runc with custom spec). The new root contains only: /app/migrations/*.xml (read-only bind from validated source), /app/data/ (rw, empty sqlite target), /usr/lib/ and /usr/local/lib/python3.11/ (read-only, interpreter libs), and /proc (hidepid=2). No /etc directory exists in the chroot. No /run/secrets. No network interfaces are configured in the network namespace (unshare -n). DNS resolution is unavailable. The pivot_root target has nosuid,nodev,noexec on all mounts except /app/data. The process runs under a dedicated UID (65534) with no supplementary groups. Importantly, the XML parser's resolve_entities and load_dtd options still function syntactically, but entity resolution targeting file:// URIs will only see the sandboxed filesystem contents (migration XMLs and empty data directory), and http:// or https:// URIs will fail with ENETUNREACH since no network stack is available in the namespace.",
+    "config": {
+      "confinement": "pivot_root into /srv/migration-sandbox",
+      "network_namespace": "unshare -n (no interfaces, lo not configured)",
+      "filesystem_contents": [
+        "/app/migrations/*.xml (ro bind mount, pre-validated)",
+        "/app/data/ (rw, empty)",
+        "/usr/lib/ (ro)",
+        "/usr/local/lib/python3.11/ (ro)",
+        "/proc (hidepid=2)"
+      ],
+      "absent_paths": [
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/hostname",
+        "/run/secrets/",
+        "/root/",
+        "/home/",
+        "/var/",
+        "/tmp/"
+      ],
+      "mount_options": "nosuid,nodev,noexec on all except /app/data",
+      "uid": 65534,
+      "supplementary_groups": [],
+      "seccomp_profile": "default-docker-with-no-network-syscalls"
+    }
+  }
+}

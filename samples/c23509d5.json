@@ -1,0 +1,19 @@
+{
+  "id": "c23509d5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"sync\"\n)\n\nvar (\n\ttempDir    = \"/var/lib/converter/workspace\"\n\tsessionMu  sync.Mutex\n\tsessions   = make(map[string]string)\n)\n\nfunc generateToken() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc uploadHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tfile, header, err := r.FormFile(\"document\")\n\tif err != nil {\n\t\thttp.Error(w, \"Missing file\", 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Validate extension\n\text := strings.ToLower(filepath.Ext(header.Filename))\n\tif ext != \".docx\" && ext != \".odt\" && ext != \".rtf\" {\n\t\thttp.Error(w, \"Unsupported format\", 400)\n\t\treturn\n\t}\n\n\ttoken := generateToken()\n\tworkspace := filepath.Join(tempDir, token)\n\tos.MkdirAll(workspace, 0750)\n\n\t// Save uploaded file - filename is user-controlled\n\tdstPath := filepath.Join(workspace, header.Filename)\n\tdst, err := os.Create(dstPath)\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tio.Copy(dst, file)\n\tdst.Close()\n\n\tsessionMu.Lock()\n\tsessions[token] = dstPath\n\tsessionMu.Unlock()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, `{\"token\":\"%s\"}`, token)\n}\n\nfunc convertHandler(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.URL.Query().Get(\"token\")\n\tformat := r.URL.Query().Get(\"format\")\n\n\tif token == \"\" || format == \"\" {\n\t\thttp.Error(w, \"Missing parameters\", 400)\n\t\treturn\n\t}\n\n\tsessionMu.Lock()\n\tsrcPath, ok := sessions[token]\n\tsessionMu.Unlock()\n\n\tif !ok {\n\t\thttp.Error(w, \"Invalid token\", 404)\n\t\treturn\n\t}\n\n\t// format parameter is injected directly into shell command\n\toutputDir := filepath.Dir(srcPath)\n\tcmdStr := fmt.Sprintf(\"libreoffice --headless --convert-to %s --outdir %s %s\",\n\t\tformat, outputDir, srcPath)\n\n\tcmd := exec.Command(\"bash\", \"-c\", cmdStr)\n\tcmd.Env = append(os.Environ(), \"HOME=/tmp\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Conversion failed: %s\", string(output)), 500)\n\t\treturn\n\t}\n\n\t// Find output file\n\tbaseName := strings.TrimSuffix(filepath.Base(srcPath), filepath.Ext(srcPath))\n\toutFile := filepath.Join(outputDir, baseName+\".\"+strings.Split(format, \" \")[0])\n\n\tw.Header().Set(\"Content-Disposition\", \"attachment; filename=\"+filepath.Base(outFile))\n\thttp.ServeFile(w, r, outFile)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc main() {\n\tos.MkdirAll(tempDir, 0750)\n\thttp.HandleFunc(\"/upload\", uploadHandler)\n\thttp.HandleFunc(\"/convert\", convertHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tfmt.Println(\"Document converter listening on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "CI/CD runner (GitLab Runner 15.x, shell executor) on Ubuntu 22.04 with default kernel configuration. Runner process executes as 'gitlab-runner' user with write access to /var/lib/ci-runner/ and home directories. No MAC framework loaded. ASLR enabled but heap layout is deterministic due to single-threaded artifact processing. glibc 2.35 tcache allows reliable exploitation of double-free.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "kernel": "5.15.0-generic",
+      "glibc": "2.35",
+      "selinux": "disabled",
+      "apparmor": "disabled (profile not loaded)",
+      "runner_user": "gitlab-runner",
+      "executor": "shell",
+      "aslr": "enabled but heap deterministic for single-thread",
+      "seccomp": "disabled"
+    }
+  }
+}

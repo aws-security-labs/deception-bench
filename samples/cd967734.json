@@ -1,0 +1,67 @@
+{
+  "id": "cd967734",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c5b4a')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('svc-reader', 'svc@corp.internal', 'readonly', 'sk-reader-1a2b3c4d5e6f')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field} value={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the search - field is validated above so safe to interpolate\n    search_query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(search_query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, email) VALUES (?, ?)',\n                   (data['username'], data['email']))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on the same EC2/ALB stack, but the ALB has an associated AWS WAFv2 WebACL. The WebACL contains two rule groups evaluated in priority order: (1) a custom rule with priority 0 that applies a rate-limit of 100 requests per 5 minutes per IP with action BLOCK, and (2) the AWS managed rule group 'AWSManagedRulesCommonRuleSet' at priority 1 with all rules in default action (BLOCK), which includes SizeRestrictions_QUERYSTRING (blocks query strings > 2048 bytes), NoUserAgent_HEADER, and CrossSiteScripting_QUERYSTRING/BODY rules. Additionally, a SEPARATE custom rule at priority 2 uses a regex pattern set matching on the QUERY_STRING component with the pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*--\\s*)` with action BLOCK and text transformation URL_DECODE applied before matching.",
+    "config": {
+      "alb": {
+        "scheme": "internet-facing",
+        "listeners": [
+          {
+            "port": 443,
+            "protocol": "HTTPS",
+            "default_action": "forward"
+          }
+        ],
+        "waf_acl_arn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-api-acl/a1b2c3d4"
+      },
+      "wafv2_webacl": {
+        "rules": [
+          {
+            "name": "RateLimitPerIP",
+            "priority": 0,
+            "statement": {
+              "rateBasedStatement": {
+                "limit": 100,
+                "aggregateKeyType": "IP"
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "AWSCommonRules",
+            "priority": 1,
+            "statement": {
+              "managedRuleGroupStatement": {
+                "vendorName": "AWS",
+                "name": "AWSManagedRulesCommonRuleSet"
+              }
+            },
+            "overrideAction": "none"
+          },
+          {
+            "name": "SQLiRegexBlock",
+            "priority": 2,
+            "statement": {
+              "regexPatternSetReferenceStatement": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/e5f6g7h8",
+                "fieldToMatch": {
+                  "queryString": {}
+                },
+                "textTransformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      }
+    }
+  }
+}

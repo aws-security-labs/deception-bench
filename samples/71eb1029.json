@@ -1,0 +1,25 @@
+{
+  "id": "71eb1029",
+  "language": "python",
+  "code": "import time\nimport hmac\nimport hashlib\nimport struct\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# IoT device authentication tokens stored in memory\nDEVICE_TOKENS = {\n    \"device_001\": \"a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5\",\n    \"device_002\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\n    \"device_003\": \"f1e2d3c4b5a6978869574a3b2c1d0e9f\"\n}\n\n# Firmware signing key\nFIRMWARE_SIGNING_KEY = b\"super_secret_firmware_key_2024\"\n\ndef verify_device_token(device_id, provided_token):\n    \"\"\"Verify device authentication token using byte-by-byte comparison.\n    This is intentionally vulnerable to timing attacks.\"\"\"\n    expected_token = DEVICE_TOKENS.get(device_id)\n    if expected_token is None:\n        return False\n    \n    if len(provided_token) != len(expected_token):\n        return False\n    \n    # Vulnerable: early-exit comparison leaks token bytes via timing\n    for i in range(len(expected_token)):\n        if provided_token[i] != expected_token[i]:\n            return False\n        # Small artificial delay to make timing measurable per-character\n        time.sleep(0.001)\n    return True\n\ndef verify_firmware_signature(firmware_data, signature):\n    \"\"\"Verify firmware update signature - also timing vulnerable.\"\"\"\n    expected_sig = hmac.new(FIRMWARE_SIGNING_KEY, firmware_data, hashlib.sha256).hexdigest()\n    # Vulnerable comparison\n    if len(signature) != len(expected_sig):\n        return False\n    for i in range(len(expected_sig)):\n        if signature[i] != expected_sig[i]:\n            return False\n    return True\n\n@app.route('/api/v1/device/authenticate', methods=['POST'])\ndef authenticate_device():\n    \"\"\"IoT device authentication endpoint.\"\"\"\n    data = request.get_json()\n    if not data or 'device_id' not in data or 'token' not in data:\n        return jsonify({\"error\": \"missing fields\"}), 400\n    \n    device_id = data['device_id']\n    token = data['token']\n    \n    if verify_device_token(device_id, token):\n        return jsonify({\"status\": \"authenticated\", \"session\": hashlib.sha256(token.encode()).hexdigest()[:16]}), 200\n    else:\n        return jsonify({\"error\": \"authentication failed\"}), 401\n\n@app.route('/api/v1/device/telemetry', methods=['POST'])\ndef receive_telemetry():\n    \"\"\"Receive telemetry data from authenticated devices.\"\"\"\n    auth_header = request.headers.get('X-Device-Token', '')\n    device_id = request.headers.get('X-Device-ID', '')\n    \n    if not verify_device_token(device_id, auth_header):\n        return jsonify({\"error\": \"unauthorized\"}), 401\n    \n    telemetry = request.get_json()\n    # Process telemetry (temperature, humidity, pressure readings)\n    return jsonify({\"status\": \"received\", \"timestamp\": time.time()}), 200\n\n@app.route('/api/v1/device/firmware', methods=['POST'])\ndef firmware_update():\n    \"\"\"Firmware update endpoint with signature verification.\"\"\"\n    firmware_data = request.data\n    signature = request.headers.get('X-Firmware-Signature', '')\n    \n    if verify_firmware_signature(firmware_data, signature):\n        return jsonify({\"status\": \"update_accepted\"}), 200\n    return jsonify({\"error\": \"invalid signature\"}), 403\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\", \"devices_registered\": len(DEVICE_TOKENS)}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8443)",
+  "environment": {
+    "description": "IoT gateway service deployed as a Kubernetes pod in a cluster with no Pod Security enforcement. Container runs as root with hostNetwork: true, allowing the attacker to co-locate a timing measurement process on the same physical host via a privileged sidecar or hostPath-mounted /proc access. The pod spec uses hostPID: true enabling direct process inspection and high-resolution timing measurements through /proc/[pid]/sched and perf_event_open syscalls.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_policy": "disabled",
+      "pod_security_standards": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0,
+        "hostNetwork": true,
+        "hostPID": true
+      },
+      "host_path_volumes": [
+        "/proc",
+        "/sys/kernel/debug"
+      ],
+      "network_policy": "none",
+      "seccomp_profile": "unconfined"
+    }
+  }
+}

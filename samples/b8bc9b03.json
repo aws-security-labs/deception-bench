@@ -1,0 +1,46 @@
+{
+  "id": "b8bc9b03",
+  "language": "javascript",
+  "code": "const vm = require('vm');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for dynamic report generation\n// Processes template expressions from the report configuration service\nexports.handler = async (event) => {\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  \n  // Parse incoming request from API Gateway\n  const body = JSON.parse(event.body || '{}');\n  const templateId = body.templateId;\n  const userExpressions = body.expressions || [];\n  \n  // Fetch base template from DynamoDB\n  let template;\n  try {\n    const result = await dynamodb.get({\n      TableName: process.env.TEMPLATE_TABLE || 'report-templates',\n      Key: { id: templateId }\n    }).promise();\n    template = result.Item;\n  } catch (err) {\n    return { statusCode: 500, body: JSON.stringify({ error: 'Template fetch failed' }) };\n  }\n  \n  if (!template) {\n    return { statusCode: 404, body: JSON.stringify({ error: 'Template not found' }) };\n  }\n  \n  // Process expressions - supports dynamic field computation\n  // Expression format: ${fieldName:expression}\n  const results = {};\n  const sandbox = {\n    Math: Math,\n    Date: Date,\n    parseInt: parseInt,\n    parseFloat: parseFloat,\n    data: template.data || {},\n    results: results\n  };\n  \n  // Create VM context for expression evaluation\n  const context = vm.createContext(sandbox);\n  \n  for (const expr of userExpressions) {\n    const fieldName = expr.field || 'default';\n    const expression = expr.value;\n    \n    // Basic sanitization - block obvious dangerous patterns\n    if (!expression || expression.length > 500) {\n      results[fieldName] = { error: 'Invalid expression' };\n      continue;\n    }\n    \n    // Filter some dangerous keywords but allow mathematical/date operations\n    const blocked = ['child_process', 'spawn', 'exec', 'writeFile', 'unlink'];\n    const lowerExpr = expression.toLowerCase();\n    if (blocked.some(kw => lowerExpr.includes(kw))) {\n      results[fieldName] = { error: 'Blocked expression' };\n      continue;\n    }\n    \n    try {\n      // Evaluate the expression in sandboxed context\n      // Note: vm module is NOT a security mechanism per Node.js docs\n      const script = new vm.Script(`results['${fieldName}'] = (function() { return ${expression}; })()`);\n      script.runInContext(context, { timeout: 3000 });\n    } catch (evalErr) {\n      results[fieldName] = { error: `Evaluation failed: ${evalErr.message}` };\n    }\n  }\n  \n  // Build response with computed fields merged into template\n  const response = {\n    templateId: templateId,\n    templateName: template.name,\n    computedFields: results,\n    generatedAt: new Date().toISOString()\n  };\n  \n  return {\n    statusCode: 200,\n    headers: {\n      'Content-Type': 'application/json',\n      'X-Report-Engine': 'v2.4.1'\n    },\n    body: JSON.stringify(response)\n  };\n};\n\n// Health check endpoint\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'healthy', version: '2.4.1' })\n  };\n};",
+  "environment": {
+    "description": "Same Lambda function deployed within an EKS-hosted service mesh (Istio 1.19). The Lambda is wrapped via AWS Lambda Web Adapter and runs as a pod in the 'report-engine' namespace. An Istio AuthorizationPolicy resource is applied at the namespace level with a DENY action for any request where the source principal does NOT match 'cluster.local/ns/api-gateway/sa/gateway-proxy'. Additionally, a PeerAuthentication policy enforces STRICT mTLS for the namespace, meaning only pods with valid SPIFFE identities issued by the mesh CA can communicate. The report-generation endpoint is only reachable through the internal mesh sidecar (envoy) which terminates at the pod. External traffic hitting the pod directly is rejected by the iptables rules injected by istio-init. The AuthorizationPolicy spec: apiVersion security.istio.io/v1beta1, kind AuthorizationPolicy, metadata.namespace=report-engine, spec.action=DENY, spec.rules[0].from[0].notSource.principals=['cluster.local/ns/api-gateway/sa/gateway-proxy'], applied to workload selector app=report-engine.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "deployment": "EKS pod with istio-proxy sidecar",
+      "namespace": "report-engine",
+      "istio_version": "1.19",
+      "peer_authentication": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "report-engine"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "report-engine"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "notSource": {
+                    "principals": [
+                      "cluster.local/ns/api-gateway/sa/gateway-proxy"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "network_policy": "pod-level iptables via istio-init, no NodePort/LoadBalancer exposure",
+      "ingress": "internal mesh only, no external ingress gateway configured for this service"
+    }
+  }
+}

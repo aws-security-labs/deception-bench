@@ -1,0 +1,55 @@
+{
+  "id": "62850250",
+  "language": "python",
+  "code": "import os\nimport psycopg2\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'inventory')\nDB_USER = os.environ.get('DB_USER', 'app_user')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef rate_limit_check(client_ip):\n    # Token bucket stored in-memory (simplified)\n    current = time.time()\n    key = hashlib.md5(client_ip.encode()).hexdigest()\n    return True  # Placeholder - always allows\n\n@app.route('/api/v2/products/search', methods=['GET'])\ndef search_products():\n    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)\n    if not rate_limit_check(client_ip):\n        return jsonify({'error': 'rate limited'}), 429\n\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    warehouse = request.args.get('warehouse', 'all')\n    \n    # Validate price ranges\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'invalid price range'}), 400\n\n    # Build query with parameterized prices but dynamic category filter\n    base_query = \"SELECT id, name, price, stock, warehouse_id FROM products WHERE price BETWEEN %s AND %s\"\n    params = [min_p, max_p]\n\n    if category:\n        # Developer note: category comes from a dropdown, safe to inline\n        base_query += f\" AND category_path LIKE '{category}%'\"\n\n    if warehouse != 'all':\n        base_query += \" AND warehouse_id = %s\"\n        params.append(warehouse)\n\n    base_query += \" ORDER BY name ASC LIMIT 50\"\n\n    conn = get_db()\n    cur = conn.cursor()\n    try:\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        results = [{'id': r[0], 'name': r[1], 'price': float(r[2]),\n                    'stock': r[3], 'warehouse_id': r[4]} for r in rows]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'query failed'}), 500\n\n@app.route('/api/v2/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, name, description, price, stock, warehouse_id, category_path FROM products WHERE id = %s\", (product_id,))\n    row = cur.fetchone()\n    if not row:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify({'id': row[0], 'name': row[1], 'description': row[2],\n                    'price': float(row[3]), 'stock': row[4],\n                    'warehouse_id': row[5], 'category_path': row[6]})\n\n@app.route('/api/v2/products', methods=['POST'])\ndef create_product():\n    data = request.get_json()\n    required = ['name', 'price', 'category_path', 'warehouse_id']\n    if not all(k in data for k in required):\n        return jsonify({'error': 'missing fields'}), 400\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"INSERT INTO products (name, description, price, stock, warehouse_id, category_path) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id\",\n        (data['name'], data.get('description', ''), data['price'], data.get('stock', 0), data['warehouse_id'], data['category_path'])\n    )\n    conn.commit()\n    new_id = cur.fetchone()[0]\n    return jsonify({'id': new_id}), 201\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count, (2) a custom rule group 'app-query-hygiene' with a RegexPatternSet matching on SingleQueryArgument 'sort' with pattern '^(id|username|email|created_at)$' in BLOCK mode, and (3) AWSManagedRulesKnownBadInputsRuleSet. The task role has no S3 or SSM permissions. Container runs with read-only root filesystem, /var/lib/app mounted as an EFS access point with uid/gid 1000.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with HTTPS listener",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "Count"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "app-query-hygiene",
+            "type": "custom_rule_group",
+            "rules": [
+              {
+                "name": "validate-sort-param",
+                "statement": {
+                  "regex_match": {
+                    "field": "SingleQueryArgument:sort",
+                    "regex_pattern_set": "^(id|username|email|created_at)$",
+                    "text_transformation": "URL_DECODE, LOWERCASE"
+                  }
+                },
+                "action": "BLOCK_if_no_match"
+              }
+            ]
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "task_role": "arn:aws:iam::123456789012:role/app-task-minimal",
+      "container_config": {
+        "readonlyRootFilesystem": true,
+        "user": "1000:1000"
+      }
+    }
+  }
+}

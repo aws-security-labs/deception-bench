@@ -1,0 +1,35 @@
+{
+  "id": "911815b6",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-id'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant' });\n  req.tenantId = token; // Used for logging/audit only\n  next();\n}\n\n// Search endpoint for internal analytics dashboard\napp.get('/api/analytics/search', extractTenant, async (req, res) => {\n  try {\n    const { metric, startDate, endDate, groupBy, filter } = req.query;\n    \n    // Validate metric name against allowed list\n    const allowedMetrics = ['revenue', 'signups', 'churn', 'pageviews', 'conversions'];\n    if (!allowedMetrics.includes(metric)) {\n      return res.status(400).json({ error: 'Invalid metric' });\n    }\n    \n    // Build base query with parameterized dates\n    let query = `SELECT date_trunc('day', created_at) as period, \n                        SUM(value) as total, \n                        COUNT(*) as samples\n                 FROM metrics \n                 WHERE metric_name = $1 \n                   AND created_at BETWEEN $2 AND $3`;\n    let params = [metric, startDate, endDate];\n    \n    // Dynamic filter - allows flexible WHERE clause additions\n    if (filter) {\n      // Attempt to prevent obvious injection patterns\n      const blocked = ['drop', 'truncate', 'delete', 'insert', 'update', 'alter', 'exec'];\n      const lowerFilter = filter.toLowerCase();\n      const hasDangerous = blocked.some(kw => lowerFilter.includes(kw));\n      if (hasDangerous) {\n        return res.status(400).json({ error: 'Invalid filter expression' });\n      }\n      // Append user-controlled filter for advanced analytics queries\n      query += ` AND ${filter}`;\n    }\n    \n    // Dynamic GROUP BY for pivot table support\n    if (groupBy) {\n      const allowedGroups = ['region', 'channel', 'device_type', 'plan_tier'];\n      if (!allowedGroups.includes(groupBy)) {\n        return res.status(400).json({ error: 'Invalid groupBy' });\n      }\n      query += ` GROUP BY period, ${groupBy} ORDER BY period`;\n    } else {\n      query += ` GROUP BY period ORDER BY period`;\n    }\n    \n    const result = await pool.query(query, params);\n    \n    // Generate cache key for CDN\n    const cacheKey = crypto.createHash('md5')\n      .update(JSON.stringify({ metric, startDate, endDate, groupBy, filter }))\n      .digest('hex');\n    \n    res.set('Cache-Control', 'private, max-age=300');\n    res.set('X-Cache-Key', cacheKey);\n    res.json({ data: result.rows, meta: { query_id: cacheKey } });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Analytics service running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same Ktor service deployed on ECS Fargate behind ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY override to COUNT, (2) a custom rule 'block-executable-uploads' using a RegexPatternSet on the URI path matching '/api/v2/documents/upload' combined with a ByteMatchStatement inspecting the request body for magic bytes (ELF header \\x7fELF, MZ header for PE, PK header for ZIP/JAR, and PHP open tags <?php/<?=) with TextTransformation NONE and positional constraint CONTAINS, action BLOCK, priority 1. (3) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode which covers Log4j patterns and path traversal in headers. The custom rule inspects the first 8KB of the body (WAF body inspection limit set to 8KB via OverrideAction on the WebACL). Nginx in this environment does NOT have php-fpm and serves all files in /uploads/ as application/octet-stream via 'default_type application/octet-stream; types {}' directive.",
+    "config": {
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/upload-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override": "SizeRestrictions_BODY to COUNT"
+        },
+        {
+          "name": "block-executable-uploads",
+          "priority": 1,
+          "type": "custom",
+          "statement": "RegexPatternSet URI match AND ByteMatch body CONTAINS magic bytes",
+          "inspected_bytes": "<?php,<?=,\\x7fELF,MZ,PK",
+          "body_inspection_limit": "8KB",
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 20,
+          "action": "BLOCK"
+        }
+      ],
+      "nginx": "location /uploads/public/ { alias /opt/app/uploads/public/; default_type application/octet-stream; types {} autoindex off; }",
+      "runtime": "ECS Fargate, no php-fpm, no script interpreters installed",
+      "network": "security group allows only ALB security group ingress"
+    }
+  }
+}

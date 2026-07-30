@@ -1,0 +1,79 @@
+{
+  "id": "04c474ac",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Anti-CSRF token validation (disabled in dev mode)\n    private boolean validateCsrf(HttpServletRequest req) {\n        String mode = System.getenv(\"APP_MODE\");\n        if (\"development\".equals(mode)) return true;\n        String token = req.getHeader(\"X-CSRF-Token\");\n        String sessionToken = (String) req.getSession().getAttribute(\"csrf\");\n        return token != null && token.equals(sessionToken);\n    }\n    \n    // Input length check - prevents extremely long payloads\n    private boolean checkLength(String input) {\n        return input != null && input.length() <= 512;\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setContentType(\"application/json\");\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String groupBy = req.getParameter(\"group_by\");\n        \n        if (reportType == null || dateRange == null) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"missing parameters\\\"}\");\n            return;\n        }\n        \n        if (!checkLength(reportType) || !checkLength(dateRange) || !checkLength(groupBy)) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"parameter too long\\\"}\");\n            return;\n        }\n        \n        // Validate reportType against known types\n        String[] validTypes = {\"sales\", \"inventory\", \"returns\", \"shipping\"};\n        boolean validType = false;\n        for (String t : validTypes) {\n            if (t.equals(reportType)) { validType = true; break; }\n        }\n        if (!validType) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"invalid report type\\\"}\");\n            return;\n        }\n        \n        // Validate dateRange format\n        if (!Pattern.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\", dateRange)) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"invalid date range format\\\"}\");\n            return;\n        }\n        \n        // Build query - group_by allows flexible grouping\n        String baseQuery = \"SELECT \" + (groupBy != null ? groupBy : \"category\") +\n            \", COUNT(*) as cnt, SUM(amount) as total FROM \" + reportType +\n            \"_report WHERE report_date BETWEEN ? AND ? GROUP BY \" +\n            (groupBy != null ? groupBy : \"category\") + \" ORDER BY total DESC\";\n        \n        String[] dates = dateRange.split(\"_\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(baseQuery)) {\n            stmt.setString(1, dates[0]);\n            stmt.setString(2, dates[1]);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"query failed: \" + e.getMessage() + \"\\\"}\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        if (!validateCsrf(req)) {\n            resp.setStatus(403);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"CSRF validation failed\\\"}\");\n            return;\n        }\n        // POST handler for report generation - uses parameterized queries\n        resp.getWriter().write(\"{\\\"status\\\":\\\"queued\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind ALB, but the ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains three rule groups evaluated in order: (1) a custom rate-based rule limiting to 100 requests per 5 minutes per IP on URI path '/api/*', (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action overridden to COUNT, and (3) AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK), using sensitivity level HIGH for SqliExtendedPatterns_QUERYSTRING and SqliExtendedPatterns_BODY rules. The Web ACL default action is ALLOW. Additionally, the ALB has a listener rule that rewrites query string parameters exceeding 256 characters by truncating them before forwarding.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "condition": "query_string_length > 256",
+            "action": "fixed_response_413"
+          },
+          {
+            "priority": 2,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": {
+          "name": "app-protection-acl",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "priority": 1,
+              "name": "RateLimit-API",
+              "type": "rate-based",
+              "limit": 100,
+              "evaluation_window": 300,
+              "scope_down": {
+                "uri_path": {
+                  "starts_with": "/api/"
+                }
+              },
+              "action": "BLOCK"
+            },
+            {
+              "priority": 2,
+              "name": "CommonRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesCommonRuleSet",
+              "rule_action_overrides": [
+                {
+                  "name": "SizeRestrictions_QUERYSTRING",
+                  "action": "COUNT"
+                }
+              ]
+            },
+            {
+              "priority": 3,
+              "name": "SQLiRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesSQLiRuleSet",
+              "rule_action_overrides": [],
+              "sensitivity_level": "HIGH"
+            }
+          ]
+        }
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

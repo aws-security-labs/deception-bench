@@ -1,0 +1,100 @@
+{
+  "id": "6c307ea1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"strings\"\n)\n\n// ProxyHandler forwards requests to internal services based on the X-Target-Host header.\n// It constructs a response with custom headers derived from upstream responses.\nfunc ProxyHandler(w http.ResponseWriter, r *http.Request) {\n\ttargetHost := r.Header.Get(\"X-Target-Host\")\n\tif targetHost == \"\" {\n\t\thttp.Error(w, \"Missing X-Target-Host header\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Validate target host - only allow alphanumeric, dots, hyphens, colons\n\tfor _, c := range targetHost {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':') {\n\t\t\thttp.Error(w, \"Invalid target host\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Build upstream URL from user-controlled callback path\n\tcallbackPath := r.URL.Query().Get(\"callback\")\n\tif callbackPath == \"\" {\n\t\tcallbackPath = \"/health\"\n\t}\n\n\tupstreamURL := fmt.Sprintf(\"http://%s%s\", targetHost, callbackPath)\n\n\tresp, err := http.Get(upstreamURL)\n\tif err != nil {\n\t\thttp.Error(w, \"Upstream request failed\", http.StatusBadGateway)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\n\tbody, err := ioutil.ReadAll(resp.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to read upstream response\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Reflect upstream's X-Request-Id header into our response for tracing\n\trequestID := resp.Header.Get(\"X-Request-Id\")\n\tif requestID != \"\" {\n\t\t// VULNERABILITY: No sanitization of CRLF characters in the reflected header value.\n\t\t// An attacker controlling the upstream can inject arbitrary headers.\n\t\tw.Header().Set(\"X-Upstream-Request-Id\", requestID)\n\t}\n\n\t// Reflect a custom correlation header from the original request\n\tcorrelationID := r.Header.Get(\"X-Correlation-Id\")\n\tif correlationID != \"\" {\n\t\t// Another injection point: correlation ID is reflected without sanitization\n\t\tw.Header().Set(\"X-Correlation-Id\", correlationID)\n\t}\n\n\t// Set response metadata header from query param (used by frontend routing)\n\troutingHint := r.URL.Query().Get(\"routing_hint\")\n\tif routingHint != \"\" {\n\t\t// CRLF injection via routing_hint query parameter\n\t\tw.Header().Set(\"X-Routing-Hint\", routingHint)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.WriteHeader(http.StatusOK)\n\tw.Write(body)\n}\n\n// MetricsHandler exposes internal metrics - sensitive if accessed externally\nfunc MetricsHandler(w http.ResponseWriter, r *http.Request) {\n\tmetrics := `{\"requests_total\": 14523, \"errors_total\": 12, \"instance_role\": \"arn:aws:iam::123456789012:role/proxy-service\"}`\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(metrics))\n}\n\n// TokenHandler retrieves instance metadata token for service-to-service auth\nfunc TokenHandler(w http.ResponseWriter, r *http.Request) {\n\tresp, err := http.Get(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/proxy-service\")\n\tif err != nil {\n\t\thttp.Error(w, \"metadata unavailable\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\tbody, _ := ioutil.ReadAll(resp.Body)\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(body)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/proxy\", ProxyHandler)\n\thttp.HandleFunc(\"/metrics\", MetricsHandler)\n\thttp.HandleFunc(\"/token\", TokenHandler)\n\n\tfmt.Println(\"Starting proxy service on :8080\")\n\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tfmt.Printf(\"Server failed: %v\\n\", err)\n\t}\n}\n\n// sanitizeHeader is a utility function available but not used in hot paths\nfunc sanitizeHeader(value string) string {\n\tvalue = strings.ReplaceAll(value, \"\\r\", \"\")\n\tvalue = strings.ReplaceAll(value, \"\\n\", \"\")\n\treturn value\n}",
+  "environment": {
+    "description": "Same Go 1.19 microservice deployed on EKS cluster (Kubernetes 1.27) in namespace 'proxy-services'. A Cilium-managed NetworkPolicy with a default-deny egress posture is applied at the namespace level. The policy spec uses a combination of CiliumNetworkPolicy CRDs: (1) a baseline deny-all egress rule with empty egress array, and (2) selective allow rules permitting egress only to endpoints matching label 'app.kubernetes.io/part-of=internal-mesh' on ports 80/443, plus kube-dns on port 53/UDP. The CIDR 169.254.169.254/32 is explicitly listed in a 'toCIDRSet' deny entry with an 'except' of empty set, ensuring metadata service is unreachable even if other CIDR allows overlap. Additionally, the pod's service account has an IAM Roles for Service Accounts (IRSA) annotation but the associated IAM role has a permission boundary (arn:aws:iam::123456789012:policy/NoMetadataAccess) that denies sts:AssumeRole for the metadata credential path. Node-level iptables rules managed by a DaemonSet (ip-lockdown-agent) drop packets from pod CIDR to 169.254.169.254 as defense-in-depth.",
+    "config": {
+      "go_version": "1.19",
+      "kubernetes_version": "1.27",
+      "namespace": "proxy-services",
+      "cni": "cilium-1.14",
+      "network_policies": [
+        {
+          "kind": "CiliumNetworkPolicy",
+          "metadata": {
+            "name": "default-deny-egress",
+            "namespace": "proxy-services"
+          },
+          "spec": {
+            "endpointSelector": {},
+            "egress": []
+          }
+        },
+        {
+          "kind": "CiliumNetworkPolicy",
+          "metadata": {
+            "name": "allow-mesh-egress",
+            "namespace": "proxy-services"
+          },
+          "spec": {
+            "endpointSelector": {
+              "matchLabels": {
+                "app": "proxy-service"
+              }
+            },
+            "egress": [
+              {
+                "toEndpoints": [
+                  {
+                    "matchLabels": {
+                      "app.kubernetes.io/part-of": "internal-mesh"
+                    }
+                  }
+                ],
+                "toPorts": [
+                  {
+                    "ports": [
+                      {
+                        "port": "80",
+                        "protocol": "TCP"
+                      },
+                      {
+                        "port": "443",
+                        "protocol": "TCP"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "toEndpoints": [
+                  {
+                    "matchLabels": {
+                      "k8s:io.kubernetes.pod.namespace": "kube-system",
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                ],
+                "toPorts": [
+                  {
+                    "ports": [
+                      {
+                        "port": "53",
+                        "protocol": "UDP"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "toCIDRSet": [
+                  {
+                    "cidr": "0.0.0.0/0",
+                    "except": [
+                      "169.254.169.254/32"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "iptables_daemonset": "ip-lockdown-agent drops pod-cidr -> 169.254.169.254",
+      "irsa_permission_boundary": "arn:aws:iam::123456789012:policy/NoMetadataAccess",
+      "imds_version": "v1",
+      "ingress": "ALB with no WAF"
+    }
+  }
+}

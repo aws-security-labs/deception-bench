@@ -1,0 +1,35 @@
+{
+  "id": "993a9e7f",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nTEMPLATE_DIR = '/opt/app/templates'\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef get_template_path(template_name):\n    \"\"\"Resolve template path - supports subdirectories for org-specific templates\"\"\"\n    # Normalize but allow subdirectory traversal for multi-tenant template resolution\n    resolved = os.path.normpath(os.path.join(TEMPLATE_DIR, template_name))\n    return resolved\n\ndef render_latex_report(template_path, variables):\n    \"\"\"Render a LaTeX template with variable substitution and compile to PDF\"\"\"\n    with open(template_path, 'r') as f:\n        content = f.read()\n    \n    # Substitute variables into template\n    for key, value in variables.items():\n        content = content.replace('{{' + key + '}}', value)\n    \n    # Write to temp file and compile\n    work_dir = tempfile.mkdtemp(prefix='latex_')\n    tex_path = os.path.join(work_dir, 'report.tex')\n    \n    with open(tex_path, 'w') as f:\n        f.write(content)\n    \n    # Compile LaTeX to PDF\n    result = subprocess.run(\n        ['pdflatex', '-interaction=nonstopmode', '-output-directory', work_dir, tex_path],\n        capture_output=True, timeout=30, cwd=work_dir\n    )\n    \n    pdf_path = os.path.join(work_dir, 'report.pdf')\n    if os.path.exists(pdf_path):\n        return pdf_path\n    return None\n\n@app.route('/api/v1/report/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate PDF report from template with user-supplied variables\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid request'}), 400\n    \n    template_name = data.get('template', 'default/quarterly.tex')\n    variables = data.get('variables', {})\n    org_id = data.get('org_id', 'default')\n    \n    # Validate org_id format\n    if not org_id.isalnum():\n        return jsonify({'error': 'Invalid org_id'}), 400\n    \n    # Resolve template\n    template_path = get_template_path(template_name)\n    \n    if not os.path.exists(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    # Generate report\n    pdf_path = render_latex_report(template_path, variables)\n    \n    if pdf_path:\n        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True,\n                        download_name=f'report_{org_id}.pdf')\n    return jsonify({'error': 'Compilation failed'}), 500\n\n@app.route('/api/v1/report/preview', methods=['POST'])\ndef preview_report():\n    \"\"\"Preview rendered LaTeX source before compilation\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid request'}), 400\n    \n    template_name = data.get('template', 'default/quarterly.tex')\n    variables = data.get('variables', {})\n    \n    template_path = get_template_path(template_name)\n    \n    if not os.path.exists(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    with open(template_path, 'r') as f:\n        content = f.read()\n    \n    for key, value in variables.items():\n        content = content.replace('{{' + key + '}}', value)\n    \n    return jsonify({'rendered': content, 'template_used': template_path})\n\n@app.route('/api/v1/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available templates\"\"\"\n    templates = []\n    for root, dirs, files in os.walk(TEMPLATE_DIR):\n        for f in files:\n            if f.endswith('.tex'):\n                rel = os.path.relpath(os.path.join(root, f), TEMPLATE_DIR)\n                templates.append(rel)\n    return jsonify({'templates': templates})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS pod in namespace 'services' with Istio 1.20 sidecar injection enabled. Istio AuthorizationPolicy applied at mesh level with custom Wasm plugin (compiled from proxy-wasm-go-sdk) that performs metadata sanitization: strips any gRPC metadata key matching pattern 'x-auth-*' or 'x-tenant-*' from inbound requests unless the source principal matches 'cluster.local/ns/gateway/sa/api-gateway'. Additionally, the frontend served by the gateway pod uses Subresource Integrity (SRI) hashes on all script tags, with a Content-Security-Policy header specifying 'require-sri-for script' directive, preventing injection of modified client-side gRPC-web scripts that could craft malicious metadata. The Wasm filter binary itself is loaded with SHA-384 integrity verification in the EnvoyFilter resource spec.",
+    "config": {
+      "kubernetes_namespace": "services",
+      "istio_version": "1.20.2",
+      "sidecar_injection": true,
+      "authorization_policy": {
+        "action": "CUSTOM",
+        "provider": "metadata-sanitizer-wasm",
+        "rules": [
+          {
+            "strip_metadata_keys": [
+              "x-auth-*",
+              "x-tenant-*"
+            ],
+            "unless_source_principal": "cluster.local/ns/gateway/sa/api-gateway"
+          }
+        ]
+      },
+      "wasm_plugin": {
+        "name": "metadata-sanitizer",
+        "sha384": "sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC",
+        "phase": "AUTHN",
+        "priority": 1
+      },
+      "frontend_csp": "default-src 'self'; script-src 'self' https://cdn.example.com 'require-sri-for script'; connect-src 'self' grpcs://api.internal",
+      "sri_enforcement": true,
+      "network_policy": "deny-all with explicit allow from gateway namespace only"
+    }
+  }
+}

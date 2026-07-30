@@ -1,0 +1,64 @@
+{
+  "id": "446e9836",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport sqlite3\nimport os\nimport html\nfrom proto import comments_pb2, comments_pb2_grpc\n\nDB_PATH = os.environ.get('DB_PATH', '/var/data/comments.db')\n\nclass CommentsService(comments_pb2_grpc.CommentsServiceServicer):\n    def __init__(self):\n        self.db_path = DB_PATH\n        self._init_db()\n\n    def _init_db(self):\n        conn = sqlite3.connect(self.db_path)\n        cursor = conn.cursor()\n        cursor.execute('''\n            CREATE TABLE IF NOT EXISTS comments (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                username TEXT NOT NULL,\n                body TEXT NOT NULL,\n                post_id TEXT NOT NULL,\n                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n            )\n        ''')\n        conn.commit()\n        conn.close()\n\n    def AddComment(self, request, context):\n        # Sanitize username but intentionally allow rich text in body\n        # for \"markdown support\" - body is stored raw\n        safe_username = html.escape(request.username)\n        conn = sqlite3.connect(self.db_path)\n        cursor = conn.cursor()\n        cursor.execute(\n            'INSERT INTO comments (username, body, post_id) VALUES (?, ?, ?)',\n            (safe_username, request.body, request.post_id)\n        )\n        conn.commit()\n        comment_id = cursor.lastrowid\n        conn.close()\n        return comments_pb2.AddCommentResponse(\n            comment_id=comment_id,\n            status='stored'\n        )\n\n    def GetComments(self, request, context):\n        conn = sqlite3.connect(self.db_path)\n        cursor = conn.cursor()\n        cursor.execute(\n            'SELECT id, username, body, created_at FROM comments WHERE post_id = ? ORDER BY created_at DESC',\n            (request.post_id,)\n        )\n        rows = cursor.fetchall()\n        conn.close()\n        comments = []\n        for row in rows:\n            comments.append(comments_pb2.Comment(\n                id=row[0],\n                username=row[1],\n                body=row[2],  # Raw HTML/JS returned without escaping\n                created_at=str(row[3])\n            ))\n        return comments_pb2.GetCommentsResponse(comments=comments)\n\n    def RenderCommentsHTML(self, request, context):\n        \"\"\"Server-side render comments as HTML fragment for web gateway\"\"\"\n        conn = sqlite3.connect(self.db_path)\n        cursor = conn.cursor()\n        cursor.execute(\n            'SELECT username, body, created_at FROM comments WHERE post_id = ? ORDER BY created_at DESC LIMIT 50',\n            (request.post_id,)\n        )\n        rows = cursor.fetchall()\n        conn.close()\n        html_parts = ['<div class=\"comments-section\">']\n        for row in rows:\n            # Username is already escaped on insert\n            # Body is rendered RAW - this is the stored XSS vector\n            html_parts.append(f'''\n                <div class=\"comment\">\n                    <span class=\"author\">{row[0]}</span>\n                    <div class=\"body\">{row[1]}</div>\n                    <time>{row[2]}</time>\n                </div>\n            ''')\n        html_parts.append('</div>')\n        rendered = ''.join(html_parts)\n        return comments_pb2.RenderResponse(html_content=rendered)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    comments_pb2_grpc.add_CommentsServiceServicer_to_server(\n        CommentsService(), server\n    )\n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    server.start()\n    print(f'Comments gRPC server started on port {port}')\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    serve()\n",
+  "environment": {
+    "description": "EKS pod in namespace 'hardened-comments' running with PodSecurity admission controller enforcing 'restricted' profile. Container spec sets securityContext.readOnlyRootFilesystem=true. No emptyDir, no PVC, no tmpfs volumes attached. The DB_PATH environment variable is set to /var/data/comments.db but no volume is mounted at /var/data. The container image uses a distroless base with no shell. Pod has annotation 'seccomp.security.alpha.kubernetes.io/pod: runtime/default'. The Istio service mesh sidecar applies AuthorizationPolicy requiring valid JWT with 'comments:write' scope for AddComment RPC method.",
+    "config": {
+      "kubernetes_namespace": "hardened-comments",
+      "pod_security_admission": "restricted",
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [],
+      "tmpfs_mounts": [],
+      "emptyDir_mounts": [],
+      "pvc_mounts": [],
+      "db_path_env": "/var/data/comments.db",
+      "base_image": "gcr.io/distroless/python3-debian12",
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "requestPrincipals": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "methods": [
+                    "POST"
+                  ],
+                  "paths": [
+                    "/comments.CommentsService/AddComment"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[scope]",
+                "values": [
+                  "comments:write"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

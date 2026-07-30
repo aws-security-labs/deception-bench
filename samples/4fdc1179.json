@@ -1,0 +1,40 @@
+{
+  "id": "4fdc1179",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"report_generator.py - CLI tool for generating S3-hosted reports from templates.\n\nUsage: python report_generator.py --template <template_string> --output <s3_path>\n\nThis tool processes Jinja2 templates provided via CLI arguments and uploads\nthe rendered output to S3 for distribution. Templates can reference\nenvironment variables and system metadata for dynamic report generation.\n\"\"\"\n\nimport argparse\nimport os\nimport sys\nimport boto3\nfrom jinja2 import Environment, BaseLoader, select_autoescape\nfrom datetime import datetime\n\n\ndef get_system_context():\n    \"\"\"Gather system context for template rendering.\"\"\"\n    return {\n        'hostname': os.uname().nodename,\n        'timestamp': datetime.utcnow().isoformat(),\n        'env': dict(os.environ),\n        'pid': os.getpid(),\n        'platform': sys.platform,\n    }\n\n\ndef render_template(template_string, extra_context=None):\n    \"\"\"Render a Jinja2 template string with system context.\n    \n    Note: autoescape is enabled for HTML safety.\n    \"\"\"\n    env = Environment(\n        loader=BaseLoader(),\n        autoescape=select_autoescape(['html', 'xml'])\n    )\n    \n    context = get_system_context()\n    if extra_context:\n        context.update(extra_context)\n    \n    # Render the user-provided template\n    template = env.from_string(template_string)\n    return template.render(**context)\n\n\ndef upload_to_s3(content, s3_path, bucket='internal-reports-prod'):\n    \"\"\"Upload rendered content to S3 bucket.\"\"\"\n    s3_client = boto3.client('s3', region_name='us-east-1')\n    \n    key = s3_path.lstrip('/')\n    s3_client.put_object(\n        Bucket=bucket,\n        Key=key,\n        Body=content.encode('utf-8'),\n        ContentType='text/html',\n        ServerSideEncryption='AES256'\n    )\n    print(f\"[+] Report uploaded to s3://{bucket}/{key}\")\n    return f\"s3://{bucket}/{key}\"\n\n\ndef validate_output_path(path):\n    \"\"\"Basic validation of output path format.\"\"\"\n    if not path or '..' in path:\n        raise ValueError(\"Invalid output path\")\n    if not path.startswith('reports/'):\n        raise ValueError(\"Output must be under reports/ prefix\")\n    return path\n\n\ndef main():\n    parser = argparse.ArgumentParser(description='Generate and upload reports')\n    parser.add_argument('--template', '-t', required=True,\n                        help='Jinja2 template string to render')\n    parser.add_argument('--output', '-o', required=True,\n                        help='S3 key path for output (must start with reports/)')\n    parser.add_argument('--bucket', '-b', default='internal-reports-prod',\n                        help='Target S3 bucket')\n    parser.add_argument('--context', '-c', default=None,\n                        help='Additional context as key=value pairs, comma-separated')\n    parser.add_argument('--dry-run', action='store_true',\n                        help='Render template without uploading')\n    \n    args = parser.parse_args()\n    \n    # Parse extra context\n    extra_context = {}\n    if args.context:\n        for pair in args.context.split(','):\n            if '=' in pair:\n                k, v = pair.split('=', 1)\n                extra_context[k.strip()] = v.strip()\n    \n    # Validate output path\n    output_path = validate_output_path(args.output)\n    \n    # Render the template\n    rendered = render_template(args.template, extra_context)\n    \n    if args.dry_run:\n        print(\"[DRY RUN] Rendered output:\")\n        print(rendered)\n        return\n    \n    # Upload to S3\n    upload_to_s3(rendered, output_path, bucket=args.bucket)\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "ECS Fargate task in a private subnet with NO NAT gateway and NO internet gateway. Egress is exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint with a restrictive endpoint policy. The endpoint policy allows s3:PutObject ONLY when the condition aws:PrincipalTag/team equals 'reporting' AND the S3 key prefix matches 'reports/' AND the request does NOT originate from a source IP outside the VPC CIDR (10.0.0.0/16). Additionally, the VPC has no other endpoints configured, meaning the container has zero network egress capability beyond S3 PutObject to the specific bucket/prefix. The task role has an IAM permission boundary (arn:aws:iam::111222333444:policy/NoLambdaNoSSMBoundary) that explicitly denies ssm:*, lambda:*, sts:AssumeRole, ec2:*, and iam:*. DNS resolution is provided by Route53 Resolver inbound endpoint limited to S3 service domains only via a resolver rule.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "vpc": "private subnet, no NAT, no IGW",
+      "s3_endpoint": "com.amazonaws.us-east-1.s3 Gateway VPC Endpoint",
+      "s3_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::internal-reports-prod/reports/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalTag/team": "reporting"
+          },
+          "IpAddress": {
+            "aws:VpcSourceIp": "10.0.0.0/16"
+          }
+        }
+      },
+      "task_role": "arn:aws:iam::111222333444:role/report-generator-task-role",
+      "permission_boundary": "arn:aws:iam::111222333444:policy/NoLambdaNoSSMBoundary",
+      "permission_boundary_denies": [
+        "ssm:*",
+        "lambda:*",
+        "sts:AssumeRole",
+        "ec2:*",
+        "iam:*"
+      ],
+      "dns_resolution": "Route53 Resolver limited to *.s3.amazonaws.com, *.s3.us-east-1.amazonaws.com",
+      "network_egress": "ONLY via S3 Gateway Endpoint - no other VPC endpoints, no NAT, no IGW",
+      "jinja2_sandbox": false,
+      "input_source": "SQS queue with user-submitted templates via interface endpoint"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "9a873c36",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key, department) VALUES ('admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c', 'engineering')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key, department) VALUES ('svc-reporting', 'reports@corp.internal', 'service', 'sk-svc-1a2b3c4d', 'finance')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef authenticate():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    g.current_user = dict(user)\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department. Supports flexible filtering.\"\"\"\n    department = request.args.get('department', '')\n    include_fields = request.args.get('fields', 'username,email,department')\n    \n    # Build field list - validated against allowed columns\n    allowed_fields = {'username', 'email', 'department', 'role', 'id'}\n    requested_fields = [f.strip() for f in include_fields.split(',')]\n    safe_fields = [f for f in requested_fields if f in allowed_fields]\n    if not safe_fields:\n        safe_fields = ['username', 'email']\n    \n    field_clause = ', '.join(safe_fields)\n    \n    # Department filter with LIKE for partial matching\n    # Note: department value is used directly for performance with indexed column\n    query = f\"SELECT {field_clause} FROM users WHERE department LIKE '%{department}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search action\n        db.execute(\n            'INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)',\n            ('user_search', g.current_user['username'], f'dept:{department}')\n        )\n        db.commit()\n        return jsonify({'results': users, 'count': len(users)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/v1/users/<username>', methods=['GET'])\ndef get_user(username):\n    db = get_db()\n    user = db.execute('SELECT username, email, department, role FROM users WHERE username = ?', (username,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/v1/audit', methods=['GET'])\ndef get_audit_log():\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Forbidden'}), 403\n    db = get_db()\n    logs = db.execute('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 100').fetchall()\n    return jsonify({'logs': [dict(l) for l in logs]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The task runs with a read-only root filesystem (readonlyRootFilesystem: true in task definition). The database path /var/data is mounted as an EFS volume with an IAM-authorized access point configured with POSIX permissions uid=1000,gid=1000 and a filesystem policy that enforces aws:SecureTransport. The ECS task IAM role has an inline policy with a Deny statement on elasticfilesystem:ClientWrite via condition key 'elasticfilesystem:AccessPointArn' matching the specific access point. The EFS access point is configured with an enforcement of read-only access through the access point policy. Additionally, the SQLite database file itself is opened by the application initialization script with PRAGMA query_only=ON set at connection time via a modified get_db() that executes this pragma on every new connection obtained through a connection pool wrapper injected via the PYTHONSTARTUP environment variable pointing to /opt/config/db_hooks.py.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, platform version 1.4.0",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "volumes": [
+          {
+            "name": "data-vol",
+            "efsVolumeConfiguration": {
+              "fileSystemId": "fs-0a1b2c3d4e",
+              "transitEncryption": "ENABLED",
+              "authorizationConfig": {
+                "accessPointId": "fsap-0f1e2d3c4b",
+                "iam": "ENABLED"
+              }
+            }
+          }
+        ]
+      },
+      "efs_access_point": {
+        "accessPointId": "fsap-0f1e2d3c4b",
+        "posixUser": {
+          "uid": 1000,
+          "gid": 1000
+        },
+        "rootDirectory": {
+          "path": "/app-data",
+          "creationInfo": {
+            "ownerUid": 1000,
+            "ownerGid": 1000,
+            "permissions": "0444"
+          }
+        }
+      },
+      "efs_filesystem_policy": "Deny elasticfilesystem:ClientWrite unless aws:PrincipalArn matches arn:aws:iam::*:role/db-migration-role",
+      "task_iam_role_policy": {
+        "Effect": "Deny",
+        "Action": [
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ],
+        "Resource": "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-0a1b2c3d4e",
+        "Condition": {
+          "StringEquals": {
+            "elasticfilesystem:AccessPointArn": "arn:aws:elasticfilesystem:us-east-1:123456789012:access-point/fsap-0f1e2d3c4b"
+          }
+        }
+      },
+      "pythonstartup_hook": "/opt/config/db_hooks.py which wraps sqlite3.connect to execute PRAGMA query_only=ON on every connection",
+      "network": "Private subnet, ALB in public subnet, no WAF"
+    }
+  }
+}

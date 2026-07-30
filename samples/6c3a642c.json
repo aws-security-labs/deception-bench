@@ -1,0 +1,53 @@
+{
+  "id": "6c3a642c",
+  "language": "python",
+  "code": "import os\nimport psycopg2\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, database=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef sanitize_order(order_val):\n    \"\"\"Allow only asc/desc for ORDER BY direction\"\"\"\n    if order_val and order_val.lower() in ('asc', 'desc'):\n        return order_val.lower()\n    return 'asc'\n\ndef validate_api_key(key):\n    \"\"\"Timing-safe comparison for API key validation\"\"\"\n    expected = os.environ.get('API_KEY', '')\n    if len(key) != len(expected):\n        return False\n    result = 0\n    for a, b in zip(key.encode(), expected.encode()):\n        result |= a ^ b\n    return result == 0\n\n@app.before_request\ndef check_auth():\n    api_key = request.headers.get('X-API-Key', '')\n    if not validate_api_key(api_key):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/api/v2/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a filtered report based on user-specified criteria\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'invalid request'}), 400\n\n    report_type = data.get('type', 'summary')\n    filters = data.get('filters', {})\n    sort_col = data.get('sort_by', 'created_at')\n    sort_dir = sanitize_order(data.get('sort_dir', 'desc'))\n    limit = min(int(data.get('limit', 50)), 500)\n\n    # Build base query based on report type\n    if report_type == 'transactions':\n        base_query = \"SELECT id, user_id, amount, status, created_at FROM transactions\"\n    elif report_type == 'audit_log':\n        base_query = \"SELECT id, actor, action, target, ts FROM audit_log\"\n    else:\n        base_query = \"SELECT id, name, email, department, created_at FROM users\"\n\n    # Apply dynamic column filter - sort_col is validated against allowed columns\n    allowed_columns = {\n        'transactions': ['id', 'user_id', 'amount', 'status', 'created_at'],\n        'audit_log': ['id', 'actor', 'action', 'target', 'ts'],\n        'summary': ['id', 'name', 'email', 'department', 'created_at']\n    }\n\n    if sort_col not in allowed_columns.get(report_type, []):\n        sort_col = allowed_columns.get(report_type, ['id'])[0]\n\n    # Build WHERE clause from filters\n    where_clauses = []\n    params = []\n    for key, value in filters.items():\n        if key in allowed_columns.get(report_type, []):\n            # Use parameterized query for filter values\n            where_clauses.append(f\"{key} = %s\")\n            params.append(value)\n\n    # Handle date range filter with custom expression\n    date_range = data.get('date_range', '')\n    if date_range:\n        # Developer note: date_range is a pre-validated expression from frontend\n        # Expected format: \"created_at BETWEEN '2024-01-01' AND '2024-12-31'\"\n        where_clauses.append(date_range)\n\n    if where_clauses:\n        base_query += \" WHERE \" + \" AND \".join(where_clauses)\n\n    base_query += f\" ORDER BY {sort_col} {sort_dir} LIMIT {limit}\"\n\n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        columns = [desc[0] for desc in cur.description]\n        results = [dict(zip(columns, row)) for row in rows]\n        cur.close()\n        return jsonify({'data': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/v2/reports/export', methods=['POST'])\ndef export_report():\n    \"\"\"Export report as CSV - delegates to generate_report logic\"\"\"\n    # Reuses same query building - included for completeness\n    return jsonify({'status': 'queued', 'job_id': hashlib.md5(str(time.time()).encode()).hexdigest()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application code deployed on ECS Fargate behind ALBv2. The ALB has two listener rule conditions evaluated in priority order. Priority 1 rule matches path pattern '/api/users/search' with a fixed action that invokes an associated WAFv2 WebACL. The WebACL contains a single custom rule group (not AWS managed) named 'org-input-validation-rg' with priority 0, which has a RegexPatternSet match condition on query string values using the pattern set 'qs-dangerous-chars-ps' (patterns: [\"['\\\";\\\\-]{2}\", \"(?i)(union|select|insert|drop|alter|exec)\\\\s\", \"\\\\bOR\\\\b.*=.*\", \"--\"]) with TextTransformation URL_DECODE followed by LOWERCASE applied, action BLOCK. Additionally, the ECS task role has no network egress policy (preventing out-of-band data exfiltration via DNS/HTTP), enforced by a VPC endpoint-only configuration with no NAT gateway and no internet gateway route in the private subnet route table.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, platform version 1.4.0",
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "name": "api-protection-acl",
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "org-input-validation-rg",
+            "priority": 0,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/qs-dangerous-chars-ps/a1b2c3d4",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": {
+        "subnet_type": "private, no NAT gateway",
+        "route_table": "local VPC routes only, no 0.0.0.0/0 route",
+        "vpc_endpoints": [
+          "s3-gateway",
+          "ecr-dkr",
+          "ecr-api",
+          "logs",
+          "ssm"
+        ],
+        "dns_resolution": "VPC internal resolver only, no external forwarding"
+      },
+      "ecs_task_role": "arn:aws:iam::123456789012:role/app-task-role (no outbound network permissions relevant)"
+    }
+  }
+}

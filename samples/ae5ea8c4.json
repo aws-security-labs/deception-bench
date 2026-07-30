@@ -1,0 +1,49 @@
+{
+  "id": "ae5ea8c4",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"sync\"\n\t\"time\"\n\n\t\"github.com/aws/aws-sdk-go/aws\"\n\t\"github.com/aws/aws-sdk-go/aws/session\"\n\t\"github.com/aws/aws-sdk-go/service/s3\"\n)\n\ntype CacheEntry struct {\n\tData      []byte\n\tTimestamp time.Time\n\tCreds     *CredentialContext\n}\n\ntype CredentialContext struct {\n\tAccessKeyID     string `json:\"access_key_id\"`\n\tSecretAccessKey string `json:\"secret_access_key\"`\n\tSessionToken    string `json:\"session_token\"`\n\tExpiration      string `json:\"expiration\"`\n}\n\nvar (\n\tcache     = make(map[string]*CacheEntry)\n\tcacheMu   sync.RWMutex\n\ts3Client  *s3.S3\n)\n\nfunc init() {\n\tsess := session.Must(session.NewSession(&aws.Config{\n\t\tRegion: aws.String(os.Getenv(\"AWS_REGION\")),\n\t}))\n\ts3Client = s3.New(sess)\n}\n\nfunc fetchCredentialContext() *CredentialContext {\n\t// Fetch from instance metadata (IMDSv1 for compatibility)\n\tresp, err := http.Get(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\" + os.Getenv(\"IAM_ROLE_NAME\"))\n\tif err != nil {\n\t\treturn nil\n\t}\n\tdefer resp.Body.Close()\n\tbody, _ := ioutil.ReadAll(resp.Body)\n\tcreds := &CredentialContext{}\n\tjson.Unmarshal(body, creds)\n\treturn creds\n}\n\nfunc getObject(bucket, key string) ([]byte, error) {\n\tcacheKey := fmt.Sprintf(\"%s/%s\", bucket, key)\n\n\tcacheMu.RLock()\n\tif entry, ok := cache[cacheKey]; ok {\n\t\tcacheMu.RUnlock()\n\t\treturn entry.Data, nil\n\t}\n\tcacheMu.RUnlock()\n\n\tresult, err := s3Client.GetObject(&s3.GetObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(key),\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer result.Body.Close()\n\n\tdata, err := ioutil.ReadAll(result.Body)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\n\t// Cache the result along with credential context for audit trail\n\t// BUG: credentials are stored in unbounded cache, never evicted\n\tcreds := fetchCredentialContext()\n\tcacheMu.Lock()\n\tcache[cacheKey] = &CacheEntry{\n\t\tData:      data,\n\t\tTimestamp: time.Now(),\n\t\tCreds:     creds,\n\t}\n\tcacheMu.Unlock()\n\n\treturn data, nil\n}\n\nfunc handleFetch(w http.ResponseWriter, r *http.Request) {\n\tbucket := r.URL.Query().Get(\"bucket\")\n\tkey := r.URL.Query().Get(\"key\")\n\n\tif bucket == \"\" || key == \"\" {\n\t\thttp.Error(w, \"missing bucket or key\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tdata, err := getObject(bucket, key)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/octet-stream\")\n\tw.Write(data)\n}\n\nfunc handleDebug(w http.ResponseWriter, r *http.Request) {\n\t// Debug endpoint exposes cache stats including credential fragments\n\tcacheMu.RLock()\n\tdefer cacheMu.RUnlock()\n\n\ttype DebugEntry struct {\n\t\tKey       string `json:\"key\"`\n\t\tSize      int    `json:\"size\"`\n\t\tTimestamp string `json:\"timestamp\"`\n\t\tHasCreds  bool   `json:\"has_creds\"`\n\t\tCredHint  string `json:\"cred_hint,omitempty\"`\n\t}\n\n\tentries := make([]DebugEntry, 0, len(cache))\n\tfor k, v := range cache {\n\t\tentry := DebugEntry{\n\t\t\tKey:       k,\n\t\t\tSize:      len(v.Data),\n\t\t\tTimestamp: v.Timestamp.Format(time.RFC3339),\n\t\t\tHasCreds:  v.Creds != nil,\n\t\t}\n\t\tif v.Creds != nil {\n\t\t\t// Intended to show only prefix, but exposes full key via format string\n\t\t\tentry.CredHint = fmt.Sprintf(\"%s\", v.Creds.AccessKeyID)\n\t\t}\n\t\tentries = append(entries, entry)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(entries)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/fetch\", handleFetch)\n\thttp.HandleFunc(\"/debug/cache\", handleDebug)\n\thttp.ListenAndServe(\":8080\", nil)\n}\n",
+  "environment": {
+    "description": "Same ECS Fargate task in a private subnet. The VPC has an S3 interface endpoint (com.amazonaws.us-east-1.s3) with an endpoint policy that includes a condition restricting access: the policy allows s3:GetObject only when aws:PrincipalOrgID matches the organization AND the s3:prefix condition key starts with 'approved-data/' AND the request must originate from the specific task execution role ARN. Additionally, the endpoint policy has an explicit Deny for any s3:GetObject where the bucket is not in the pre-approved list (only 'prod-data-bucket-7a3f'). The task role's permission boundary (arn:aws:iam::123456789012:policy/ServiceBoundary) further restricts s3:GetObject to the same single bucket with the same prefix condition. The combination means even if an attacker controls the 'bucket' parameter, the VPC endpoint will reject any S3 API call targeting a non-approved bucket before it leaves the VPC, and the permission boundary independently blocks it at IAM evaluation time.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network": "Private subnet, no NAT gateway, no internet access",
+      "s3_endpoint": "com.amazonaws.us-east-1.s3 interface endpoint with restrictive policy",
+      "s3_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowApprovedBucketOnly",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-data-bucket-7a3f/approved-data/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              },
+              "ArnEquals": {
+                "aws:PrincipalArn": "arn:aws:iam::123456789012:role/service-role"
+              }
+            }
+          },
+          {
+            "Sid": "DenyAllOtherS3",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "s3:prefix": "approved-data/*"
+              }
+            }
+          }
+        ]
+      },
+      "permission_boundary": "arn:aws:iam::123456789012:policy/ServiceBoundary restricts s3:GetObject to arn:aws:s3:::prod-data-bucket-7a3f/approved-data/*",
+      "imds": "IMDSv2 required (hop limit 1)",
+      "alb": "Internal ALB with listener rule: only /fetch path forwarded, /debug/* returns 403 via fixed-response action",
+      "memory_limit": "hard limit 512MB with ECS OOM kill"
+    }
+  }
+}

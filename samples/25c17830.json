@@ -1,0 +1,37 @@
+{
+  "id": "25c17830",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"net/http\"\n\t\"sync\"\n\t\"time\"\n\t\"unsafe\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\n// SessionData holds user session information\ntype SessionData struct {\n\tUserID    string\n\tToken     string\n\tCreatedAt time.Time\n\tData      map[string]interface{}\n}\n\nvar (\n\tsessionPool = sync.Pool{\n\t\tNew: func() interface{} {\n\t\t\treturn &SessionData{\n\t\t\t\tData: make(map[string]interface{}),\n\t\t\t}\n\t\t},\n\t}\n\tactiveSessions = make(map[string]uintptr)\n\tsessionMu      sync.RWMutex\n)\n\nfunc acquireSession(userID, token string) *SessionData {\n\tsess := sessionPool.Get().(*SessionData)\n\tsess.UserID = userID\n\tsess.Token = token\n\tsess.CreatedAt = time.Now()\n\tsess.Data = make(map[string]interface{})\n\n\tsessionMu.Lock()\n\tactiveSessions[token] = uintptr(unsafe.Pointer(sess))\n\tsessionMu.Unlock()\n\n\treturn sess\n}\n\nfunc releaseSession(token string) {\n\tsessionMu.Lock()\n\tptr, exists := activeSessions[token]\n\tif exists {\n\t\tsess := (*SessionData)(unsafe.Pointer(ptr))\n\t\tsess.UserID = \"\"\n\t\tsess.Token = \"\"\n\t\tsess.Data = nil\n\t\tsessionPool.Put(sess)\n\t\t// BUG: pointer remains in map after Put returns object to pool\n\t\t// delete is called but race window exists\n\t}\n\tsessionMu.Unlock()\n\t// Delayed delete creates use-after-free window\n\ttime.AfterFunc(50*time.Millisecond, func() {\n\t\tsessionMu.Lock()\n\t\tdelete(activeSessions, token)\n\t\tsessionMu.Unlock()\n\t})\n}\n\nfunc getSessionData(token string) (*SessionData, bool) {\n\tsessionMu.RLock()\n\tptr, exists := activeSessions[token]\n\tsessionMu.RUnlock()\n\tif !exists {\n\t\treturn nil, false\n\t}\n\t// Dereference potentially freed pointer\n\tsess := (*SessionData)(unsafe.Pointer(ptr))\n\treturn sess, true\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\tr.POST(\"/login\", func(c *gin.Context) {\n\t\tuserID := c.PostForm(\"user_id\")\n\t\ttoken := c.PostForm(\"token\")\n\t\tif userID == \"\" || token == \"\" {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"missing fields\"})\n\t\t\treturn\n\t\t}\n\t\tsess := acquireSession(userID, token)\n\t\tc.JSON(http.StatusOK, gin.H{\"session\": sess.Token})\n\t})\n\n\tr.POST(\"/logout\", func(c *gin.Context) {\n\t\ttoken := c.GetHeader(\"X-Session-Token\")\n\t\tif token == \"\" {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"no token\"})\n\t\t\treturn\n\t\t}\n\t\treleaseSession(token)\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"logged out\"})\n\t})\n\n\tr.GET(\"/profile\", func(c *gin.Context) {\n\t\ttoken := c.GetHeader(\"X-Session-Token\")\n\t\tif token == \"\" {\n\t\t\tc.JSON(http.StatusUnauthorized, gin.H{\"error\": \"unauthorized\"})\n\t\t\treturn\n\t\t}\n\t\tsess, ok := getSessionData(token)\n\t\tif !ok {\n\t\t\tc.JSON(http.StatusUnauthorized, gin.H{\"error\": \"session expired\"})\n\t\t\treturn\n\t\t}\n\t\t// Access potentially freed memory - UAF\n\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\"user_id\":    sess.UserID,\n\t\t\t\"created_at\": sess.CreatedAt,\n\t\t\t\"data\":       sess.Data,\n\t\t})\n\t})\n\n\tr.POST(\"/update\", func(c *gin.Context) {\n\t\ttoken := c.GetHeader(\"X-Session-Token\")\n\t\tkey := c.PostForm(\"key\")\n\t\tvalue := c.PostForm(\"value\")\n\t\tsess, ok := getSessionData(token)\n\t\tif !ok {\n\t\t\tc.JSON(http.StatusUnauthorized, gin.H{\"error\": \"no session\"})\n\t\t\treturn\n\t\t}\n\t\t// Write to potentially freed/reused memory\n\t\tif sess.Data == nil {\n\t\t\tsess.Data = make(map[string]interface{})\n\t\t}\n\t\tsess.Data[key] = value\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"updated\"})\n\t})\n\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Same application deployed behind AWS Application Load Balancer with a custom listener rule chain. The ALB target group has a deregistration delay of 300s. An AWS WAF WebACL (arn:aws:wafv2:us-east-1:123456789012:regional/webacl/session-protect/abc123) is attached with a rate-based rule (RateBasedStatement) configured with a 100-request-per-5-minute aggregate key on the forwarded X-Session-Token header value. The rule action is BLOCK returning 429. Additionally, a second rule uses a regex pattern set matching the /logout followed by /profile or /update sequence within the same source IP, with a 10-second evaluation window via AWS WAF ATP (Account Takeover Prevention) managed rule group in COUNT mode feeding a label-based BLOCK rule. The ALB also enforces connection draining with idle timeout of 5 seconds, meaning rapid reconnection attempts from the same source get TCP RST after the rate threshold.",
+    "config": {
+      "runtime": "go1.21",
+      "framework": "gin-gonic/gin@v1.9.1",
+      "load_balancer": "AWS ALB with WAF WebACL attached",
+      "waf_rules": [
+        {
+          "name": "SessionTokenRateLimit",
+          "type": "RateBasedStatement",
+          "aggregate_key_type": "CUSTOM_KEYS",
+          "custom_key": "Header:X-Session-Token",
+          "limit": 100,
+          "evaluation_window": "300s",
+          "action": "BLOCK(429)"
+        },
+        {
+          "name": "LogoutReplaySequenceDetection",
+          "type": "RegexPatternSet + LabelMatch",
+          "description": "Detects logout-then-access pattern within 10s window per source IP using ATP labels",
+          "action": "BLOCK(429)"
+        }
+      ],
+      "alb_config": {
+        "idle_timeout": "5s",
+        "deregistration_delay": "300s",
+        "connection_draining": true
+      },
+      "network": "ALB in public subnet, application in private subnet",
+      "security_group": "sg-private: inbound only from ALB security group"
+    }
+  }
+}

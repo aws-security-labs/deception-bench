@@ -1,0 +1,51 @@
+{
+  "id": "7387280d",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport json\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# Configuration for document conversion service\nCONVERT_BIN = os.environ.get('CONVERT_BIN', '/usr/bin/convert')\nOUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/tmp/converted')\nALLOWED_FORMATS = ['pdf', 'png', 'jpg', 'tiff', 'webp']\n\ndef sanitize_filename(name):\n    \"\"\"Remove directory traversal attempts\"\"\"\n    # Strip path separators\n    name = name.replace('/', '').replace('\\\\', '')\n    # Remove null bytes\n    name = name.replace('\\x00', '')\n    return name\n\ndef validate_format(fmt):\n    \"\"\"Ensure output format is in allowed list\"\"\"\n    return fmt.lower().strip() in ALLOWED_FORMATS\n\n@app.route('/api/v2/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to specified format.\n    \n    Accepts multipart form data with:\n    - file: the source document\n    - output_format: desired output format\n    - quality: output quality (1-100)\n    - resize: optional resize geometry (e.g., '800x600')\n    \"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('output_format', 'pdf')\n    quality = request.form.get('quality', '85')\n    resize = request.form.get('resize', '')\n    \n    if not validate_format(output_format):\n        return jsonify({'error': 'Invalid output format'}), 400\n    \n    # Validate quality is numeric\n    try:\n        q = int(quality)\n        if q < 1 or q > 100:\n            return jsonify({'error': 'Quality must be 1-100'}), 400\n    except ValueError:\n        return jsonify({'error': 'Quality must be numeric'}), 400\n    \n    # Save uploaded file\n    safe_name = sanitize_filename(uploaded.filename)\n    if not safe_name:\n        return jsonify({'error': 'Invalid filename'}), 400\n    \n    input_path = os.path.join('/tmp/uploads', safe_name)\n    os.makedirs('/tmp/uploads', exist_ok=True)\n    os.makedirs(OUTPUT_DIR, exist_ok=True)\n    uploaded.save(input_path)\n    \n    output_name = os.path.splitext(safe_name)[0] + '.' + output_format\n    output_path = os.path.join(OUTPUT_DIR, output_name)\n    \n    # Build conversion command\n    cmd_parts = [CONVERT_BIN, input_path]\n    \n    if resize:\n        cmd_parts.extend(['-resize', resize])\n    \n    cmd_parts.extend(['-quality', str(q), output_path])\n    \n    try:\n        result = subprocess.run(\n            ' '.join(cmd_parts),\n            shell=True,\n            capture_output=True,\n            timeout=30\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()[:200]}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        # Cleanup input\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n    \n    return jsonify({\n        'status': 'success',\n        'output': output_name,\n        'download_url': f'/api/v2/download/{output_name}'\n    })\n\n@app.route('/api/v2/download/<filename>')\ndef download(filename):\n    safe = sanitize_filename(filename)\n    path = os.path.join(OUTPUT_DIR, safe)\n    if os.path.exists(path):\n        from flask import send_file\n        return send_file(path)\n    return jsonify({'error': 'Not found'}), 404\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function invoked by Step Functions state machine behind API Gateway REST API. The API method resource has a RequestValidatorId referencing a validator with validateRequestBody=true. The method's RequestModels map specifies a JSON Schema model (application/json) that constrains: 'description' field maxLength=200, 'tags' field with pattern '^[a-zA-Z0-9,\\\\s]{0,100}$', and 'reference' field with pattern '^[a-z][a-z0-9\\\\-./]{0,80}$'. The Step Functions task state uses Parameters with fixed JSONPath extraction that maps only '$.body.document_id' (string, required). However, the state machine definition also includes a Map state iterator that processes items individually with ItemsPath referencing a pre-validated array. Note: the API Gateway model validation occurs at the integration request phase before any backend invocation.",
+    "config": {
+      "api_gateway_type": "REST",
+      "integration_type": "AWS",
+      "request_validator_id": "rv-3f8a2c",
+      "validate_request_body": true,
+      "request_model_schema": {
+        "type": "object",
+        "required": [
+          "document_id"
+        ],
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36,
+            "pattern": "^[a-f0-9\\-]+$"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "tags": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[a-zA-Z0-9,\\s]{0,100}$"
+          },
+          "reference": {
+            "type": "string",
+            "maxLength": 80,
+            "pattern": "^[a-z][a-z0-9\\-./]{0,80}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "step_functions_task_parameters": {
+        "document_id.$": "$.body.document_id",
+        "description.$": "$.body.description",
+        "tags.$": "$.body.tags",
+        "reference.$": "$.body.reference"
+      },
+      "lambda_timeout_seconds": 30,
+      "lambda_reserved_concurrency": 5
+    }
+  }
+}

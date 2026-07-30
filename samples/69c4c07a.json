@@ -1,0 +1,46 @@
+{
+  "id": "69c4c07a",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nimport json\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\nHMAC_SECRET = os.environ.get('HMAC_SECRET', 'changeme-in-production')\nADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', 'supersecretadmintoken')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DB_PATH)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DB_PATH)\n    db.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        owner TEXT NOT NULL,\n        title TEXT NOT NULL,\n        content TEXT,\n        classification TEXT DEFAULT 'internal',\n        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        key_hash TEXT NOT NULL,\n        owner TEXT NOT NULL,\n        scope TEXT DEFAULT 'read',\n        revoked INTEGER DEFAULT 0\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO documents (id, owner, title, content, classification) VALUES (1, 'admin', 'Secret Strategy', 'Acquisition target: CompanyX at $4.2B', 'top-secret')\")\n    db.execute(\"INSERT OR IGNORE INTO documents (id, owner, title, content, classification) VALUES (2, 'admin', 'Board Minutes', 'CEO compensation: $12M + equity', 'confidential')\")\n    db.execute(\"INSERT OR IGNORE INTO documents (id, owner, title, content, classification) VALUES (3, 'jsmith', 'Project Plan', 'Q4 deliverables overview', 'internal')\")\n    db.commit()\n    db.close()\n\ndef verify_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    if not key:\n        return None, None\n    key_hash = hashlib.sha256(key.encode()).hexdigest()\n    db = get_db()\n    row = db.execute('SELECT owner, scope FROM api_keys WHERE key_hash = ? AND revoked = 0', (key_hash,)).fetchone()\n    if row:\n        return row['owner'], row['scope']\n    return None, None\n\n@app.route('/api/documents/search', methods=['GET'])\ndef search_documents():\n    owner, scope = verify_api_key(request)\n    if not owner:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    query = request.args.get('q', '')\n    classification = request.args.get('classification', 'internal')\n    sort_by = request.args.get('sort', 'created_at')\n    \n    # Build query with parameterized owner filter\n    sql = f\"SELECT id, title, classification, created_at FROM documents WHERE owner = ? AND classification = '{classification}'\"\n    \n    if query:\n        sql += f\" AND (title LIKE '%{query}%' OR content LIKE '%{query}%')\"\n    \n    sql += f\" ORDER BY {sort_by}\"\n    \n    try:\n        results = get_db().execute(sql, (owner,)).fetchall()\n        return jsonify({'documents': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/documents/<int:doc_id>', methods=['GET'])\ndef get_document(doc_id):\n    owner, scope = verify_api_key(request)\n    if not owner:\n        return jsonify({'error': 'unauthorized'}), 401\n    row = get_db().execute('SELECT * FROM documents WHERE id = ? AND owner = ?', (doc_id, owner)).fetchone()\n    if not row:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(row))\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'db': DB_PATH, 'version': '2.3.1'})\n\n@app.route('/api/admin/keys', methods=['POST'])\ndef create_api_key():\n    token = request.headers.get('Authorization', '').replace('Bearer ', '')\n    if not hmac.compare_digest(token, ADMIN_TOKEN):\n        return jsonify({'error': 'forbidden'}), 403\n    data = request.get_json()\n    raw_key = os.urandom(24).hex()\n    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()\n    db = get_db()\n    db.execute('INSERT INTO api_keys (key_hash, owner, scope) VALUES (?, ?, ?)',\n               (key_hash, data['owner'], data.get('scope', 'read')))\n    db.commit()\n    return jsonify({'key': raw_key, 'owner': data['owner']})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "FastAPI service deployed behind Kong Gateway (OSS 3.6) with a custom request-validator plugin configured via declarative YAML. The plugin enforces OpenAPI 3.0 schema on POST /api/v2/sessions requiring 'user_id' as string (minLength: 1, maxLength: 64, pattern: ^[a-zA-Z0-9_-]+$) and 'permissions' field is stripped from inbound requests via a pre-function plugin (kong.service.request.clear_header and body rewrite removing any 'permissions' key before proxying). The schema also rejects requests where Content-Type is not exactly 'application/json'. Additionally, a rate-limit plugin caps /api/v2/sessions to 5 requests per minute per source IP. The X-Session-Token header on admin endpoints is validated by a separate plugin that checks token format against base64 pattern with max length 512 bytes.",
+    "config": {
+      "api_gateway": "Kong Gateway OSS 3.6.1",
+      "plugins": [
+        {
+          "name": "request-validator",
+          "config": {
+            "body_schema": "{\"type\":\"object\",\"properties\":{\"user_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[a-zA-Z0-9_-]+$\"}},\"required\":[\"user_id\"],\"additionalProperties\":false}",
+            "allowed_content_types": [
+              "application/json"
+            ],
+            "routes": [
+              "POST /api/v2/sessions"
+            ]
+          }
+        },
+        {
+          "name": "pre-function",
+          "config": {
+            "phase": "access",
+            "functions": [
+              "local body = kong.request.get_body(); if body then body.permissions = nil; kong.service.request.set_body(body) end"
+            ]
+          }
+        },
+        {
+          "name": "rate-limiting",
+          "config": {
+            "minute": 5,
+            "policy": "local",
+            "routes": [
+              "POST /api/v2/sessions"
+            ]
+          }
+        }
+      ],
+      "network": "Private subnet, Kong in public subnet",
+      "container": "ECS Fargate, Python 3.11, uvicorn"
+    }
+  }
+}

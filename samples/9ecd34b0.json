@@ -1,0 +1,47 @@
+{
+  "id": "9ecd34b0",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n\n        // Validate report type against allowed values\n        if (reportType == null || !reportType.matches(\"(summary|detail|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date format validation\n        if (startDate == null || !startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid start date format\");\n            return;\n        }\n        if (endDate == null || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid end date format\");\n            return;\n        }\n\n        // Department parameter is optional but used in query construction\n        String query = buildQuery(reportType, startDate, endDate, department);\n        log.info(\"Executing report query for type=\" + reportType + \" dept=\" + department);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.print(\", \");\n                    out.print(\"\\\"\" + meta.getColumnName(i) + \"\\\": \");\n                    out.print(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                out.print(\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildQuery(String type, String start, String end, String dept) {\n        StringBuilder sb = new StringBuilder();\n        switch (type) {\n            case \"summary\":\n                sb.append(\"SELECT department, COUNT(*) as cnt, SUM(amount) as total \");\n                sb.append(\"FROM transactions WHERE tx_date BETWEEN '\");\n                sb.append(start).append(\"' AND '\").append(end).append(\"'\");\n                break;\n            case \"detail\":\n                sb.append(\"SELECT id, department, amount, description, tx_date \");\n                sb.append(\"FROM transactions WHERE tx_date BETWEEN '\");\n                sb.append(start).append(\"' AND '\").append(end).append(\"'\");\n                break;\n            case \"audit\":\n                sb.append(\"SELECT id, user_id, action, timestamp \");\n                sb.append(\"FROM audit_log WHERE timestamp BETWEEN '\");\n                sb.append(start).append(\"' AND '\").append(end).append(\"'\");\n                break;\n        }\n        if (dept != null && !dept.isEmpty()) {\n            sb.append(\" AND department = '\").append(dept).append(\"'\");\n        }\n        if (\"summary\".equals(type)) {\n            sb.append(\" GROUP BY department\");\n        }\n        sb.append(\" LIMIT 1000\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Go binary deployed behind AWS API Gateway (HTTP API type) with a WebSocket route $default. The API Gateway integration uses a request validation model (JSON Schema) attached to the $connect and $default routes. The model schema enforces: (1) 'filename' field must match regex pattern '^[a-zA-Z0-9_-]{1,64}\\\\.[a-z]{2,4}$' which rejects any filename containing path separators, dots beyond the extension separator, or encoded characters; (2) 'content' field must be a string with maxLength 1048576; (3) 'action' must be enum ['upload','list']. The validator is configured with validateRequestBody=true on the route. Additionally, the API Gateway has a usage plan with throttling (100 req/s burst, 50 req/s sustained) and the integration timeout is 29 seconds. The backend ECS task runs with a read-only root filesystem except /var/uploads which is an ephemeral tmpfs mount with noexec,nosuid flags and 100MB size limit. The task IAM role has no S3 or filesystem-related permissions beyond the container boundary.",
+    "config": {
+      "api_gateway": "AWS API Gateway HTTP API, WebSocket protocol",
+      "request_validation": {
+        "model_name": "UploadRequestModel",
+        "validate_request_body": true,
+        "schema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "upload",
+                "list"
+              ]
+            },
+            "filename": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,64}\\.[a-z]{2,4}$"
+            },
+            "content": {
+              "type": "string",
+              "maxLength": 1048576
+            },
+            "mime_type": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "runtime": "ECS Fargate, Amazon Linux 2 container",
+      "filesystem": "read-only root filesystem, /var/uploads is tmpfs (100MB, noexec, nosuid)",
+      "process_user": "appuser (uid 1000)",
+      "network": "private subnet, no direct internet access"
+    }
+  }
+}

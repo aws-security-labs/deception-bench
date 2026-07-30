@@ -1,0 +1,31 @@
+{
+  "id": "e751abc0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with category filtering\n// NOTE: prepared statements were removed in v2.3 due to connection pool\n// exhaustion under high concurrency. See JIRA-4421.\n// TODO: re-enable prepared statements after pgbouncer migration\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category is required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic input length check (anti-abuse, not security)\n\tif len(category) > 100 {\n\t\thttp.Error(w, \"category too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query dynamically for flexible filtering\n\tvar conditions []string\n\tconditions = append(conditions, fmt.Sprintf(\"category = '%s'\", category))\n\n\tif minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price >= %s\", minPrice))\n\t}\n\tif maxPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price <= %s\", maxPrice))\n\t}\n\n\tquery := \"SELECT id, name, price, category FROM products WHERE \" + strings.Join(conditions, \" AND \")\n\n\t// Sort validation - only allow known columns\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif sortBy != \"\" && allowedSorts[sortBy] {\n\t\tquery += \" ORDER BY \" + sortBy\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, cat string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &cat); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"%d|%s|%.2f|%s\", id, name, price, cat))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfmt.Fprintf(w, \"Results:\\n%s\", strings.Join(results, \"\\n\"))\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting product-search service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Staging Rails 7.1 API on ECS Fargate. Split.io SDK initialized with workspace API key for the 'staging-hardened' environment. In this Split environment, the 'user_profile_update_mode' split has been configured with a kill switch (the split is in 'killed' state). When a split is killed in Split.io, the SDK returns the designated default treatment regardless of any targeting rules or user attributes. The killed default treatment for this split is set to 'strict'. Note: the application code's fallback logic (the else branch defaulting to :flexible) only triggers when the SDK returns the literal string 'control' (which happens on SDK errors/timeouts). A killed split does NOT return 'control' \u2014 it returns the killed default treatment value ('strict') through normal SDK operation. The Split workspace has an organization-level policy preventing un-killing of splits without approval from two workspace admins, enforced via Split's RBAC with SSO-gated admin accounts.",
+    "config": {
+      "rails_version": "7.1.3",
+      "ruby_version": "3.2.2",
+      "split_environment": "staging-hardened",
+      "split_definition": {
+        "name": "user_profile_update_mode",
+        "treatments": [
+          "flexible",
+          "strict"
+        ],
+        "status": "killed",
+        "killed_default_treatment": "strict",
+        "kill_reason": "SEC-2024-0891: Mass assignment vector in flexible path",
+        "kill_date": "2024-08-15T14:30:00Z"
+      },
+      "split_workspace_policy": {
+        "unkill_requires": "two_admin_approval",
+        "admin_auth": "Okta SSO with hardware MFA",
+        "audit_log": "enabled"
+      },
+      "network_config": "Internal ALB, VPC-only access",
+      "iam_config": "ECS task role with standard RDS access"
+    }
+  }
+}

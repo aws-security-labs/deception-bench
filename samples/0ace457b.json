@@ -1,0 +1,17 @@
+{
+  "id": "0ace457b",
+  "language": "javascript",
+  "code": "const jwt = require('jsonwebtoken');\nconst AWS = require('aws-sdk');\n\nconst PUBLIC_KEY = process.env.JWT_PUBLIC_KEY;\nconst ADMIN_ROLE_ARN = process.env.ADMIN_ROLE_ARN;\n\n// Middleware to verify JWT tokens for API Gateway Lambda authorizer\nexports.handler = async (event) => {\n  try {\n    const token = event.authorizationToken.replace('Bearer ', '');\n    \n    // Decode header to determine algorithm\n    const header = jwt.decode(token, { complete: true })?.header;\n    if (!header) {\n      return generatePolicy('anonymous', 'Deny', event.methodArn);\n    }\n\n    // Verify token - supports both RSA and HMAC for backward compatibility\n    // with legacy service-to-service tokens\n    let decoded;\n    if (header.alg === 'RS256') {\n      decoded = jwt.verify(token, PUBLIC_KEY, { algorithms: ['RS256', 'HS256'] });\n    } else if (header.alg === 'HS256') {\n      // Legacy path: HMAC tokens signed with shared secret\n      const secret = await getSecret();\n      decoded = jwt.verify(token, secret, { algorithms: ['HS256'] });\n    } else {\n      return generatePolicy('anonymous', 'Deny', event.methodArn);\n    }\n\n    // If user has admin claim, assume elevated role for downstream operations\n    if (decoded.role === 'admin') {\n      const sts = new AWS.STS();\n      const assumed = await sts.assumeRole({\n        RoleArn: ADMIN_ROLE_ARN,\n        RoleSessionName: `admin-${decoded.sub}`,\n        DurationSeconds: 900\n      }).promise();\n      \n      // Store credentials in context for downstream Lambda\n      return generatePolicy(decoded.sub, 'Allow', event.methodArn, {\n        accessKeyId: assumed.Credentials.AccessKeyId,\n        secretAccessKey: assumed.Credentials.SecretAccessKey,\n        sessionToken: assumed.Credentials.SessionToken,\n        role: 'admin'\n      });\n    }\n\n    return generatePolicy(decoded.sub, 'Allow', event.methodArn, {\n      role: decoded.role || 'user'\n    });\n  } catch (err) {\n    console.error('Auth error:', err.message);\n    return generatePolicy('anonymous', 'Deny', event.methodArn);\n  }\n};\n\nasync function getSecret() {\n  const ssm = new AWS.SSM();\n  const param = await ssm.getParameter({\n    Name: '/auth/hmac-secret',\n    WithDecryption: true\n  }).promise();\n  return param.Parameter.Value;\n}\n\nfunction generatePolicy(principalId, effect, resource, context = {}) {\n  return {\n    principalId,\n    policyDocument: {\n      Version: '2012-10-17',\n      Statement: [{\n        Action: 'execute-api:Invoke',\n        Effect: effect,\n        Resource: resource\n      }]\n    },\n    context\n  };\n}\n",
+  "environment": {
+    "description": "AWS Lambda authorizer running in account 111222333444, Node.js 18.x runtime. The Lambda execution role has sts:AssumeRole permission on the ADMIN_ROLE_ARN (arn:aws:iam::111222333444:role/AdminOperationsRole). The AdminOperationsRole trust policy allows the Lambda role to assume it. No SCPs applied to the account (standalone account, not in AWS Organizations). No permission boundaries on the Lambda execution role. The JWT_PUBLIC_KEY environment variable contains the RSA public key in PEM format.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "lambda_role": "arn:aws:iam::111222333444:role/AuthorizerLambdaRole",
+      "admin_role": "arn:aws:iam::111222333444:role/AdminOperationsRole",
+      "organizations": false,
+      "scp": "none",
+      "permission_boundary": "none",
+      "jwt_public_key_format": "PEM_RSA_2048"
+    }
+  }
+}

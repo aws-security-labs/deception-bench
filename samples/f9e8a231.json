@@ -1,0 +1,34 @@
+{
+  "id": "f9e8a231",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.*;\nimport org.w3c.dom.*;\n\npublic class ConfigImportServlet extends javax.servlet.http.HttpServlet {\n\n    private static final Set<String> ALLOWED_TAGS = Set.of(\n        \"config\", \"setting\", \"name\", \"value\", \"metadata\", \"version\"\n    );\n\n    @Override\n    protected void doPost(javax.servlet.http.HttpServletRequest req,\n                          javax.servlet.http.HttpServletResponse resp)\n            throws javax.servlet.ServletException, IOException {\n\n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"xml\")) {\n            resp.sendError(400, \"Content-Type must be application/xml\");\n            return;\n        }\n\n        String apiKey = req.getHeader(\"X-API-Key\");\n        if (!validateApiKey(apiKey)) {\n            resp.sendError(401, \"Invalid API key\");\n            return;\n        }\n\n        String body = new String(req.getInputStream().readAllBytes(), \"UTF-8\");\n\n        // Tag whitelist check - defense in depth\n        if (!validateTagWhitelist(body)) {\n            resp.sendError(400, \"Disallowed XML tags detected\");\n            return;\n        }\n\n        try {\n            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();\n            // Note: we intentionally allow DTDs for backward compat with\n            // legacy config files that use internal entity shortcuts\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", true);\n            dbf.setExpandEntityReferences(true);\n\n            DocumentBuilder db = dbf.newDocumentBuilder();\n            InputSource is = new InputSource(new StringReader(body));\n            Document doc = db.parse(is);\n\n            NodeList settings = doc.getElementsByTagName(\"setting\");\n            Map<String, String> configMap = new HashMap<>();\n\n            for (int i = 0; i < settings.getLength(); i++) {\n                Element el = (Element) settings.item(i);\n                String name = el.getElementsByTagName(\"name\").item(0).getTextContent();\n                String value = el.getElementsByTagName(\"value\").item(0).getTextContent();\n\n                if (name.length() > 64 || value.length() > 512) {\n                    resp.sendError(400, \"Field length exceeded\");\n                    return;\n                }\n                configMap.put(name, value);\n            }\n\n            applyConfiguration(configMap);\n            resp.setStatus(200);\n            resp.getWriter().write(\"{\\\"status\\\":\\\"imported\\\",\\\"count\\\":\" + configMap.size() + \"}\");\n\n        } catch (ParserConfigurationException | SAXException e) {\n            resp.sendError(400, \"XML parse error: \" + e.getMessage());\n        }\n    }\n\n    private boolean validateApiKey(String key) {\n        if (key == null) return false;\n        // Constant-time comparison against stored keys\n        String[] validKeys = System.getenv(\"VALID_API_KEYS\").split(\",\");\n        for (String valid : validKeys) {\n            if (MessageDigest.isEqual(key.getBytes(), valid.trim().getBytes())) {\n                return true;\n            }\n        }\n        return false;\n    }\n\n    private boolean validateTagWhitelist(String xml) {\n        // Regex-based tag extraction - checks opening tags only\n        java.util.regex.Matcher m = java.util.regex.Pattern\n            .compile(\"<([a-zA-Z][a-zA-Z0-9]*)[ >/]\")\n            .matcher(xml);\n        while (m.find()) {\n            if (!ALLOWED_TAGS.contains(m.group(1).toLowerCase())) {\n                return false;\n            }\n        }\n        return true;\n    }\n\n    private void applyConfiguration(Map<String, String> config) {\n        // Persist to application config store\n        config.forEach((k, v) -> {\n            System.setProperty(\"app.config.\" + k, v);\n        });\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application on AWS Lambda via Bref runtime. The Lambda function URL is configured with AuthType=AWS_IAM. The function's resource-based policy specifies a principal condition requiring requests be signed with SigV4 by an IAM role from a specific account (arn:aws:iam::111122223333:role/ReportServiceCaller). The invoke permission uses lambda:InvokeFunctionUrl action with lambda:FunctionUrlAuthType condition key set to AWS_IAM. No public access is possible - unsigned requests receive HTTP 403 from the Lambda service layer before reaching application code. CloudWatch metrics confirm zero successful invocations from non-authenticated sources. Additionally, the function runs with a concurrency reservation of 5 to limit blast radius.",
+    "config": {
+      "runtime": "provided.al2",
+      "handler": "Bref\\LaravelBridge\\Http\\OctaneHandler",
+      "function_url_auth_type": "AWS_IAM",
+      "memory": 512,
+      "timeout": 30,
+      "reserved_concurrency": 5,
+      "environment": {
+        "APP_DEBUG": "false",
+        "APP_ENV": "production",
+        "LOG_LEVEL": "warning"
+      },
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/ReportServiceCaller"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "invoke_permission": "restricted-to-specific-role"
+    }
+  }
+}

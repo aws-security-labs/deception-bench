@@ -1,0 +1,57 @@
+{
+  "id": "3a3aba28",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.regex.Pattern;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final Pattern SAFE_ID = Pattern.compile(\"^[0-9]{1,10}$\");\n    \n    // Note: prepared statements used for INSERT/UPDATE operations elsewhere\n    // This endpoint uses string concat for legacy compatibility with Oracle PIVOT syntax\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, java.io.IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String department = req.getParameter(\"dept\");\n        String fiscal_year = req.getParameter(\"fy\");\n        \n        // Validate report type against allowed list\n        if (reportType == null || !isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate fiscal year is numeric\n        if (fiscal_year != null && !SAFE_ID.matcher(fiscal_year).matches()) {\n            resp.sendError(400, \"Invalid fiscal year\");\n            return;\n        }\n        \n        // Department parameter used for dynamic column filtering\n        // Legacy requirement: dept names contain spaces and special chars like \"R&D\", \"VP's Office\"\n        // so we cannot restrict to alphanumeric only\n        if (department == null || department.length() > 64) {\n            resp.sendError(400, \"Invalid department\");\n            return;\n        }\n        \n        // Basic blocklist check for obvious attacks\n        String deptLower = department.toLowerCase();\n        if (deptLower.contains(\"--\") || deptLower.contains(\"/*\") || \n            deptLower.contains(\"xp_\") || deptLower.contains(\"exec\")) {\n            log.warning(\"Blocked suspicious dept parameter: \" + department);\n            resp.sendError(400, \"Invalid characters in department\");\n            return;\n        }\n        \n        Connection conn = null;\n        Statement stmt = null;\n        ResultSet rs = null;\n        \n        try {\n            conn = getConnection();\n            \n            // Build dynamic query for pivot report\n            // fiscal_year is validated numeric, reportType is from allowlist\n            String sql = \"SELECT e.employee_name, e.title, r.amount, r.quarter \" +\n                        \"FROM expense_reports r \" +\n                        \"JOIN employees e ON r.employee_id = e.id \" +\n                        \"WHERE r.report_type = '\" + reportType + \"' \" +\n                        \"AND r.fiscal_year = \" + fiscal_year + \" \" +\n                        \"AND e.department = '\" + department + \"' \" +\n                        \"ORDER BY r.quarter\";\n            \n            log.info(\"Executing report query for type=\" + reportType + \", fy=\" + fiscal_year);\n            \n            stmt = conn.createStatement();\n            rs = stmt.executeQuery(sql);\n            \n            resp.setContentType(\"application/json\");\n            var writer = resp.getWriter();\n            writer.write(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) writer.write(\",\");\n                writer.write(\"{\\\"name\\\":\\\"\" + escapeJson(rs.getString(1)) + \"\\\",\");\n                writer.write(\"\\\"title\\\":\\\"\" + escapeJson(rs.getString(2)) + \"\\\",\");\n                writer.write(\"\\\"amount\\\":\" + rs.getDouble(3) + \",\");\n                writer.write(\"\\\"quarter\\\":\" + rs.getInt(4) + \"}\");\n                first = false;\n            }\n            writer.write(\"]}\");\n            \n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        } finally {\n            closeQuietly(rs, stmt, conn);\n        }\n    }\n    \n    private boolean isValidReportType(String type) {\n        return type.equals(\"travel\") || type.equals(\"supplies\") || \n               type.equals(\"equipment\") || type.equals(\"training\");\n    }\n    \n    private String escapeJson(String s) {\n        if (s == null) return \"\";\n        return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getProperty(\"db.url\"),\n            System.getProperty(\"db.user\"), \n            System.getProperty(\"db.pass\"));\n    }\n    \n    private void closeQuietly(ResultSet rs, Statement stmt, Connection conn) {\n        try { if (rs != null) rs.close(); } catch (Exception e) {}\n        try { if (stmt != null) stmt.close(); } catch (Exception e) {}\n        try { if (conn != null) conn.close(); } catch (Exception e) {}\n    }\n}",
+  "environment": {
+    "description": "Same Lambda@Edge function deployed on CloudFront distribution with restricted viewer access. Distribution configured with a trusted key group (key-group-id: kg-29f8a1c3) using RSA-2048 key pair for URL signing. Default cache behavior requires signed URLs (TrustedKeyGroups set). Additionally, the S3 bucket has a resource policy that only allows GetObject when aws:Referer matches an internal token AND the request originates from the specific CloudFront distribution's OAI. CloudFront also has a custom origin request policy that strips and re-encodes URI components using percent-encoding normalization (Origin Request Policy ID: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf with 'URI path normalization' enabled in the distribution's edge configuration, which resolves Unicode escape sequences to their percent-encoded byte representations before the Lambda@Edge trigger fires).",
+    "config": {
+      "cloudfront_distribution": {
+        "origins": [
+          {
+            "id": "s3-uploads",
+            "domain": "uploads-bucket.s3.amazonaws.com",
+            "oai": "enabled",
+            "origin_shield": true
+          }
+        ],
+        "default_cache_behavior": {
+          "viewer_protocol_policy": "redirect-to-https",
+          "lambda_function_associations": [
+            {
+              "event_type": "origin-request",
+              "lambda_arn": "arn:aws:lambda:us-east-1:123456789:function:file-handler:3"
+            }
+          ],
+          "trusted_key_groups": [
+            "kg-29f8a1c3"
+          ],
+          "require_signed_urls": true
+        },
+        "uri_normalization": "enabled",
+        "edge_config": {
+          "normalize_uri_path": true,
+          "normalize_unicode_sequences": true,
+          "double_decode_prevention": true
+        }
+      },
+      "s3_bucket_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity E2K5EXAMPLE"
+        },
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::uploads-bucket/uploads/*",
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": "uploads/*/"
+          },
+          "StringEquals": {
+            "aws:Referer": "x-internal-cf-token-8f2a9b1c"
+          }
+        }
+      },
+      "waf_web_acl": "none",
+      "notes": "Signed URL policy restricts to specific path prefix matching /files/{username}/* pattern. Key pair rotation every 72h via Secrets Manager."
+    }
+  }
+}

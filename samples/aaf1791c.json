@@ -1,0 +1,57 @@
+{
+  "id": "aaf1791c",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\nSECRET_SALT = os.environ.get('SECRET_SALT', 'defaultsalt')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        details TEXT,\n        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef hash_password(password):\n    return hashlib.sha256((SECRET_SALT + password).encode()).hexdigest()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria for admin dashboard.\"\"\"\n    api_key = request.headers.get('X-API-Key', '')\n    db = get_db()\n    # Verify API key belongs to an admin\n    admin = db.execute('SELECT * FROM users WHERE api_key = ? AND role = ?',\n                       (api_key, 'admin')).fetchone()\n    if not admin:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    # Log the search action\n    search_field = request.args.get('field', 'username')\n    search_value = request.args.get('value', '')\n    sort_by = request.args.get('sort', 'id')\n    \n    db.execute(\"INSERT INTO audit_log (action, username, details) VALUES (?, ?, ?)\",\n               ('search', admin['username'], f'field={search_field} value={search_value}'))\n    db.commit()\n\n    # Build query - field is validated against whitelist\n    allowed_fields = ['username', 'role', 'id']\n    if search_field not in allowed_fields:\n        return jsonify({'error': 'invalid search field'}), 400\n\n    # Sort parameter used directly for flexible ordering\n    query = f\"SELECT id, username, role FROM users WHERE {search_field} LIKE ? ORDER BY {sort_by}\"\n    try:\n        results = db.execute(query, (f'%{search_value}%',)).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    \n    username = data['username']\n    password = data['password']\n    api_key = hashlib.md5((username + SECRET_SALT).encode()).hexdigest()\n    \n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)',\n                   (username, hash_password(password), api_key))\n        db.commit()\n        return jsonify({'username': username, 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'username exists'}), 409\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has two listener rules applied in priority order: (1) A custom rule with condition path-pattern '/api/users/search*' that invokes an associated WAFv2 WebACL. The WebACL contains a single custom rule with priority 1: a RegexPatternSet match on query string parameters inspecting all query arguments with a regex pattern that matches any value containing characters from the set [;()\\-\\-/\\*] (semicolons, parentheses, comment sequences, slashes followed by asterisks) \u2014 action BLOCK. (2) Additionally, the ECS task role IAM policy has an explicit Deny on 'ssm:GetParameter' and 'secretsmanager:GetSecretValue' preventing any runtime credential exfiltration even if code execution were achieved through other means. The task runs with a read-only root filesystem and the SQLite database is mounted from an EFS access point with uid/gid enforcement.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, ALBv2",
+      "wafv2_web_acl": {
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "block-sqli-sort-param",
+            "priority": 1,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-chars/abc123",
+                "field_to_match": "all_query_arguments",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "regex_patterns": [
+          "[;()\\-]{2}[/][*]"
+        ]
+      },
+      "alb_listener_rule": {
+        "priority": 1,
+        "condition": "path-pattern: /api/users/search*",
+        "action": "forward with WAFv2 WebACL association"
+      },
+      "ecs_task_config": {
+        "readonly_root_filesystem": true,
+        "task_role_policy_deny": [
+          "ssm:GetParameter",
+          "secretsmanager:GetSecretValue"
+        ]
+      },
+      "efs_access_point": {
+        "uid": 1000,
+        "gid": 1000,
+        "permissions": "0755"
+      }
+    }
+  }
+}

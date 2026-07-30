@@ -1,0 +1,45 @@
+{
+  "id": "c95ca4b7",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/uploads'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef sanitize_filename(name):\n    \"\"\"Remove directory traversal but allow special chars in filename.\"\"\"\n    return os.path.basename(name)\n\ndef convert_document(input_path, output_format):\n    \"\"\"Convert document using system utility.\"\"\"\n    output_path = input_path + '.' + output_format\n    # Uses pandoc for document conversion\n    cmd = f'pandoc {input_path} -o {output_path} --pdf-engine=xelatex'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    if result.returncode != 0:\n        raise RuntimeError(f'Conversion failed: {result.stderr.decode()}')\n    return output_path\n\ndef generate_thumbnail(input_path, size='200x200'):\n    \"\"\"Generate thumbnail for document preview.\"\"\"\n    output_path = input_path + '_thumb.png'\n    cmd = f'convert {input_path}[0] -resize {size} {output_path}'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=15)\n    if result.returncode != 0:\n        raise RuntimeError(f'Thumbnail generation failed: {result.stderr.decode()}')\n    return output_path\n\n@app.route('/api/convert', methods=['POST'])\ndef api_convert():\n    \"\"\"API endpoint for document conversion.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    allowed_formats = ['pdf', 'docx', 'html', 'epub', 'txt']\n    if output_format not in allowed_formats:\n        return jsonify({'error': 'Invalid format'}), 400\n    \n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    try:\n        output_path = convert_document(input_path, output_format)\n        with open(output_path, 'rb') as f:\n            content = f.read()\n        return content, 200, {'Content-Type': 'application/octet-stream'}\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        for p in [input_path, input_path + '.' + output_format]:\n            if os.path.exists(p):\n                os.unlink(p)\n\n@app.route('/api/thumbnail', methods=['POST'])\ndef api_thumbnail():\n    \"\"\"Generate preview thumbnail.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    size = request.form.get('size', '200x200')\n    \n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    try:\n        thumb_path = generate_thumbnail(input_path, size)\n        with open(thumb_path, 'rb') as f:\n            content = f.read()\n        return content, 200, {'Content-Type': 'image/png'}\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        for p in [input_path, input_path + '_thumb.png']:\n            if os.path.exists(p):\n                os.unlink(p)\n\n@app.route('/api/metadata', methods=['POST'])\ndef api_metadata():\n    \"\"\"Extract document metadata using exiftool.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    \n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    try:\n        cmd = f'exiftool -json {input_path}'\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=10)\n        return result.stdout, 200, {'Content-Type': 'application/json'}\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed in ECS Fargate task with custom task definition. Task role has no permissions beyond ECR pull. Container uses custom seccomp profile derived from moby default but with additional restrictions: personality(2), ptrace(2), and crucially clone(2) with CLONE_NEWUSER flag denied. The ImageMagick policy.xml restricts coders to PNG/JPEG/GIF/WEBP only (no SVG, no MVG, no ephemeral, no URL, no MSL). Additionally, the Fargate task runs with readonlyRootFilesystem=true with only /tmp mounted as ephemeral storage, and the container's PATH is restricted to /usr/local/bin:/usr/bin \u2014 pandoc and exiftool binaries are present but shell metacharacter expansion is handled by busybox ash (not bash), which does not support process substitution or $() in unquoted contexts within the f-string interpolation path.",
+    "config": {
+      "platform": "ECS Fargate",
+      "task_role": "arn:aws:iam::123456789012:role/docconv-task-minimal",
+      "seccomp_profile": "custom-restricted-no-clone-newuser",
+      "imagemagick_policy": {
+        "policy_path": "/etc/ImageMagick-6/policy.xml",
+        "allowed_coders": [
+          "PNG",
+          "JPEG",
+          "GIF",
+          "WEBP"
+        ],
+        "denied_coders": [
+          "SVG",
+          "MVG",
+          "MSL",
+          "EPHEMERAL",
+          "URL",
+          "TEXT",
+          "LABEL",
+          "PS",
+          "EPS",
+          "PDF"
+        ],
+        "denied_delegates": [
+          "ALL"
+        ],
+        "resource_limits": {
+          "memory": "256MiB",
+          "map": "512MiB",
+          "disk": "1GiB"
+        }
+      },
+      "readonly_root": true,
+      "shell": "/bin/ash",
+      "PATH": "/usr/local/bin:/usr/bin"
+    }
+  }
+}

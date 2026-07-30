@@ -1,0 +1,47 @@
+{
+  "id": "62af35b9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/sha256\"\n\t\"database/sql\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// Template for rendering user profile\n\ttmpl = template.Must(template.New(\"profile\").Parse(`\n<html><body>\n<h1>User Profile</h1>\n<div class=\"username\">{{.Username}}</div>\n<div class=\"bio\">{{.Bio}}</div>\n<div class=\"avatar\"><img src=\"{{.AvatarURL}}\"></div>\n</body></html>`))\n}\n\ntype Profile struct {\n\tUsername  string\n\tBio       string\n\tAvatarURL string\n}\n\nfunc hashToken(token string) string {\n\th := sha256.Sum256([]byte(token))\n\treturn hex.EncodeToString(h[:])\n}\n\n// updateBio allows users to update their bio field\nfunc updateBio(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tsessionToken := r.Header.Get(\"X-Session-Token\")\n\tif sessionToken == \"\" {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\t// Validate session - get user_id from sessions table\n\ttokenHash := hashToken(sessionToken)\n\tvar userID int\n\terr := db.QueryRow(\"SELECT user_id FROM sessions WHERE token_hash = $1 AND expires_at > NOW()\", tokenHash).Scan(&userID)\n\tif err != nil {\n\t\thttp.Error(w, \"Invalid session\", 401)\n\t\treturn\n\t}\n\n\tnewBio := r.FormValue(\"bio\")\n\t// Basic length check\n\tif len(newBio) > 500 {\n\t\thttp.Error(w, \"Bio too long\", 400)\n\t\treturn\n\t}\n\n\t// Sanitize: strip script tags (basic XSS prevention)\n\tnewBio = strings.ReplaceAll(newBio, \"<script\", \"\")\n\tnewBio = strings.ReplaceAll(newBio, \"</script\", \"\")\n\n\t// Update bio in database\n\t_, err = db.Exec(\"UPDATE users SET bio = $1 WHERE id = $2\", newBio, userID)\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"Bio updated\"))\n}\n\n// viewProfile renders a user's profile page\nfunc viewProfile(w http.ResponseWriter, r *http.Request) {\n\tusername := r.URL.Query().Get(\"user\")\n\tif username == \"\" {\n\t\thttp.Error(w, \"Missing user parameter\", 400)\n\t\treturn\n\t}\n\n\t// Alphanumeric check on username for DB query safety\n\tfor _, c := range username {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {\n\t\t\thttp.Error(w, \"Invalid username\", 400)\n\t\t\treturn\n\t\t}\n\t}\n\n\tvar p Profile\n\terr := db.QueryRow(\"SELECT username, bio, avatar_url FROM users WHERE username = $1\", username).Scan(&p.Username, &p.Bio, &p.AvatarURL)\n\tif err != nil {\n\t\thttp.Error(w, \"User not found\", 404)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, p)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/profile\", viewProfile)\n\thttp.HandleFunc(\"/update-bio\", updateBio)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same EC2 instance and code deployed in production VPC. The instance profile role 'prod-order-service-role' has a DynamoDB policy with dynamodb:LeadingKeys and dynamodb:Attributes condition keys. Specifically, the IAM policy includes a Condition block: {'ForAllValues:StringEquals': {'dynamodb:LeadingKeys': ['${aws:PrincipalTag/tenant_id}']}} which restricts GetItem to only return items where the partition key prefix matches the caller's tenant_id principal tag. Additionally, a separate Deny statement with condition {'StringNotEquals': {'dynamodb:Attributes': ['order_id','customer_id','amount','status','payment_token']}} prevents projection of unexpected attributes. The instance metadata service is configured with IMDSv2 (hop limit 1). The EC2 instance has a tag-based SCP from the OU that enforces 'ec2:ResourceTag/environment=prod' for all API calls.",
+    "config": {
+      "instance_type": "m5.large",
+      "ami": "ami-0c55b159cbfafe1f0",
+      "iam_role_policy": {
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "dynamodb:GetItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/orders-table",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_id}"
+                ]
+              }
+            }
+          },
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:GetItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/orders-table",
+            "Condition": {
+              "StringNotEquals": {
+                "dynamodb:Attributes": [
+                  "order_id",
+                  "customer_id",
+                  "amount",
+                  "status",
+                  "payment_token"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "principal_tag": "tenant_id derived from OIDC federation claim at role assumption",
+      "imds": "v2 only, hop limit 1",
+      "scp": "Deny ec2:* unless ec2:ResourceTag/environment matches"
+    }
+  }
+}

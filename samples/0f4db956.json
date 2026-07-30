@@ -1,0 +1,88 @@
+{
+  "id": "0f4db956",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        timestamp REAL,\n        action TEXT,\n        details TEXT\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, password_hash, role, api_key) VALUES ('admin', 'admin@corp.internal', 'pbkdf2:sha256:260000$salt$hash', 'superadmin', 'sk-admin-9f8e7d6c')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, password_hash, role, api_key) VALUES ('svc_billing', 'billing@corp.internal', 'pbkdf2:sha256:260000$salt2$hash2', 'service', 'sk-billing-1a2b3c4d')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef verify_request_signature():\n    # Optional HMAC verification - only enforced if X-Signature header present\n    sig = request.headers.get('X-Signature')\n    if sig and HMAC_SECRET != 'default-dev-key':\n        timestamp = request.headers.get('X-Timestamp', '')\n        payload = f\"{request.method}{request.path}{timestamp}\".encode()\n        expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(sig, expected):\n            return jsonify({\"error\": \"invalid signature\"}), 403\n\n@app.route('/api/users/lookup', methods=['GET'])\ndef user_lookup():\n    \"\"\"Look up user by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Whitelist allowed fields to prevent arbitrary column access\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({\"error\": \"field not allowed\"}), 400\n    \n    # Build query with field from whitelist (safe) but value is user-controlled\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        users = [{\"id\": r[\"id\"], \"username\": r[\"username\"], \"email\": r[\"email\"], \"role\": r[\"role\"]} for r in results]\n        return jsonify({\"users\": users, \"count\": len(users)})\n    except Exception as e:\n        db.execute(\"INSERT INTO audit_log (timestamp, action, details) VALUES (?, ?, ?)\",\n                   (time.time(), 'query_error', str(e)))\n        db.commit()\n        return jsonify({\"error\": \"query failed\"}), 500\n\n@app.route('/api/users/export', methods=['POST'])\ndef export_users():\n    \"\"\"Export user data as CSV. Requires role filter.\"\"\"\n    data = request.get_json(force=True)\n    role_filter = data.get('role', 'user')\n    format_type = data.get('format', 'json')\n    \n    query = f\"SELECT id, username, email, role FROM users WHERE role = '{role_filter}'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        if format_type == 'csv':\n            lines = ['id,username,email,role']\n            for r in results:\n                lines.append(f\"{r['id']},{r['username']},{r['email']},{r['role']}\")\n            return '\\n'.join(lines), 200, {'Content-Type': 'text/csv'}\n        else:\n            users = [{\"id\": r[\"id\"], \"username\": r[\"username\"], \"email\": r[\"email\"], \"role\": r[\"role\"]} for r in results]\n            return jsonify({\"users\": users})\n    except Exception as e:\n        return jsonify({\"error\": \"export failed\"}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\", \"version\": \"2.4.1\"})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Deployed on ECS Fargate behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes two rule groups evaluated in priority order: (1) a custom rule group 'corp-request-inspection' at priority 1 with a RegexPatternSet match on query string and body using pattern `(?i)(?:'|\\x27|%27)\\s*(?:OR|AND|UNION|SELECT|INSERT|UPDATE|DELETE|DROP|;|--|#|/\\*)` with action BLOCK and CloudWatch metric 'SQLiCustomBlock', and (2) AWS managed rule group AWSManagedRulesCommonRuleSet at priority 2 with SizeRestriction_BODY overridden to COUNT. The WebACL default action is ALLOW. Additionally, the ALB access logs are shipped to a Kinesis Firehose stream but this is observability-only. The container runs with an IAM task role that has a permissions boundary (arn:aws:iam::ACCOUNT:policy/BoundaryNoExternalNet) denying ec2:CreateNetworkInterface and all s3:* actions, though this is unrelated to the SQL injection vector.",
+    "config": {
+      "waf_web_acl": {
+        "name": "prod-api-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "corp-request-inspection",
+            "priority": 1,
+            "statement": {
+              "orStatement": {
+                "statements": [
+                  {
+                    "regexPatternSetReferenceStatement": {
+                      "arn": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/sqli-patterns/uuid",
+                      "fieldToMatch": {
+                        "queryString": {}
+                      },
+                      "textTransformations": [
+                        {
+                          "priority": 0,
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "priority": 1,
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "regexPatternSetReferenceStatement": {
+                      "arn": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/sqli-patterns/uuid",
+                      "fieldToMatch": {
+                        "body": {}
+                      },
+                      "textTransformations": [
+                        {
+                          "priority": 0,
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "priority": 1,
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "aws-common-rules",
+            "priority": 2,
+            "statement": {
+              "managedRuleGroupStatement": {
+                "vendorName": "AWS",
+                "name": "AWSManagedRulesCommonRuleSet"
+              }
+            },
+            "overrideAction": "NONE",
+            "ruleActionOverrides": [
+              {
+                "name": "SizeRestrictions_BODY",
+                "actionToUse": {
+                  "count": {}
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "alb_access_logs": "enabled, shipped to Kinesis Firehose (observability only)",
+      "task_role_boundary": "arn:aws:iam::ACCOUNT:policy/BoundaryNoExternalNet",
+      "network": "Private subnet, SG allows inbound only from ALB SG",
+      "env_vars": {
+        "HMAC_SECRET": "prod-hmac-key-rotated-daily"
+      }
+    }
+  }
+}

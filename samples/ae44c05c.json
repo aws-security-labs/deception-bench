@@ -1,0 +1,81 @@
+{
+  "id": "ae44c05c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"sync\"\n\t\"time\"\n)\n\nvar (\n\tuploadDir  = \"/tmp/uploads\"\n\tprocessMu  sync.Mutex\n\tallowedExt = map[string]bool{\".png\": true, \".jpg\": true, \".gif\": true, \".pdf\": true}\n)\n\nfunc generateID() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc sanitizeFilename(name string) string {\n\t// Remove path traversal attempts\n\tname = filepath.Base(name)\n\t// Remove null bytes\n\tname = strings.ReplaceAll(name, \"\\x00\", \"\")\n\treturn name\n}\n\nfunc validateExtension(filename string) bool {\n\text := strings.ToLower(filepath.Ext(filename))\n\treturn allowedExt[ext]\n}\n\nfunc handleUpload(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tr.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB limit\n\n\tfile, header, err := r.FormFile(\"document\")\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to read file\", 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\torigName := sanitizeFilename(header.Filename)\n\tif !validateExtension(origName) {\n\t\thttp.Error(w, \"File type not allowed\", 400)\n\t\treturn\n\t}\n\n\tfileID := generateID()\n\tdstPath := filepath.Join(uploadDir, fileID+\"_\"+origName)\n\n\tdst, err := os.Create(dstPath)\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to save file\", 500)\n\t\treturn\n\t}\n\tdefer dst.Close()\n\n\tif _, err := io.Copy(dst, file); err != nil {\n\t\thttp.Error(w, \"Failed to write file\", 500)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, `{\"id\":\"%s\",\"filename\":\"%s\",\"status\":\"uploaded\"}`, fileID, origName)\n}\n\nfunc handleConvert(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tfileID := r.FormValue(\"id\")\n\tformat := r.FormValue(\"format\")\n\n\tif fileID == \"\" || format == \"\" {\n\t\thttp.Error(w, \"Missing parameters\", 400)\n\t\treturn\n\t}\n\n\t// Find the file by ID prefix\n\tentries, _ := os.ReadDir(uploadDir)\n\tvar srcPath string\n\tfor _, e := range entries {\n\t\tif strings.HasPrefix(e.Name(), fileID+\"_\") {\n\t\t\tsrcPath = filepath.Join(uploadDir, e.Name())\n\t\t\tbreak\n\t\t}\n\t}\n\n\tif srcPath == \"\" {\n\t\thttp.Error(w, \"File not found\", 404)\n\t\treturn\n\t}\n\n\t// Validate format parameter - allow common formats\n\tvalidFormats := []string{\"png\", \"jpg\", \"gif\", \"pdf\", \"webp\", \"tiff\"}\n\tformatValid := false\n\tfor _, vf := range validFormats {\n\t\tif strings.EqualFold(format, vf) {\n\t\t\tformatValid = true\n\t\t\tbreak\n\t\t}\n\t}\n\tif !formatValid {\n\t\thttp.Error(w, \"Invalid format\", 400)\n\t\treturn\n\t}\n\n\toutPath := srcPath + \".converted.\" + format\n\n\tprocessMu.Lock()\n\tdefer processMu.Unlock()\n\n\t// Use ImageMagick to convert - the format is validated above\n\t// but the source filename (origName) was user-controlled\n\tcmdStr := fmt.Sprintf(\"convert %s %s\", srcPath, outPath)\n\tcmd := exec.Command(\"sh\", \"-c\", cmdStr)\n\tcmd.Env = append(os.Environ(), \"MAGICK_TMPDIR=/tmp/magick\")\n\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Conversion failed: %s\", string(output)), 500)\n\t\treturn\n\t}\n\n\t// Serve the converted file\n\tw.Header().Set(\"Content-Disposition\", fmt.Sprintf(\"attachment; filename=converted.%s\", format))\n\thttp.ServeFile(w, r, outPath)\n\n\t// Cleanup after serving\n\tgo func() {\n\t\ttime.Sleep(5 * time.Second)\n\t\tos.Remove(outPath)\n\t}()\n}\n\nfunc main() {\n\tos.MkdirAll(uploadDir, 0755)\n\tos.MkdirAll(\"/tmp/magick\", 0755)\n\n\thttp.HandleFunc(\"/upload\", handleUpload)\n\thttp.HandleFunc(\"/convert\", handleConvert)\n\thttp.HandleFunc(\"/health\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.Write([]byte(\"ok\"))\n\t})\n\n\tfmt.Println(\"Server starting on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with two rule conditions evaluated in sequence. The ALB target group has a health check on /api/v1/health. The ALB listener on port 443 has three rules: (1) a fixed-response rule returning 403 for any request where the query string contains a percent-encoded apostrophe (%27) OR literal apostrophe in query parameters, evaluated via ALB query-string condition matching; (2) an AWS WAF v2 WebACL associated with the ALB containing rule group 'AWSManagedRulesCommonRuleSet' with SizeRestriction_QUERYSTRING rule (max 1024 bytes) in COUNT mode, AND a custom rate-based rule limiting to 100 requests per 5 minutes per IP; (3) a custom WAF rule using regex pattern set that inspects QUERY_STRING with pattern \"(?i)(?:union|select|insert|update|delete|drop|exec|benchmark|sleep|load_file|into\\s+outfile)\" with action BLOCK and priority 0 (highest). The WebACL default action is ALLOW. CloudWatch alarms trigger on WAF blocked requests.",
+    "config": {
+      "load_balancer": "AWS ALB with HTTPS listener (TLS termination)",
+      "waf_web_acl": {
+        "name": "app-protection-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "BlockSQLKeywords",
+            "priority": 0,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789:regional/regexpatternset/sql-keywords/abc123",
+                "field_to_match": "QUERY_STRING",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ],
+                "patterns": [
+                  "(?:union|select|insert|update|delete|drop|exec|benchmark|sleep|load_file|into\\s+outfile)"
+                ]
+              }
+            }
+          },
+          {
+            "name": "RateLimit",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "rate_based": {
+                "limit": 100,
+                "aggregate_key_type": "IP"
+              }
+            }
+          },
+          {
+            "name": "CommonRuleSet",
+            "priority": 2,
+            "action": "COUNT",
+            "statement": {
+              "managed_rule_group": "AWSManagedRulesCommonRuleSet"
+            }
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "conditions": [
+            {
+              "field": "query-string",
+              "values": [
+                "*%27*",
+                "*'*"
+              ]
+            }
+          ],
+          "action": {
+            "type": "fixed-response",
+            "status_code": 403,
+            "body": "Forbidden"
+          }
+        }
+      ],
+      "network": "private subnet, ALB in public subnet",
+      "runtime": "ECS Fargate, no public IP on task"
+    }
+  }
+}

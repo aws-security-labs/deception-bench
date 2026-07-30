@@ -1,0 +1,62 @@
+{
+  "id": "438e087e",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport tempfile\nfrom flask import Flask, request, jsonify\nimport shlex\n\napp = Flask(__name__)\n\nALLOWED_FORMATS = ['png', 'jpg', 'gif', 'webp']\nMAX_WIDTH = 4096\nMAX_HEIGHT = 4096\n\ndef sanitize_dimension(value):\n    \"\"\"Ensure dimension is a positive integer within bounds.\"\"\"\n    try:\n        dim = int(value)\n        if dim < 1 or dim > MAX_WIDTH:\n            return None\n        return dim\n    except (ValueError, TypeError):\n        return None\n\ndef get_image_info(filepath):\n    \"\"\"Get image dimensions using ImageMagick identify.\"\"\"\n    cmd = f\"identify -format '%w %h' {filepath}\"\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)\n    if result.returncode != 0:\n        return None\n    parts = result.stdout.strip().split()\n    return {'width': int(parts[0]), 'height': int(parts[1])}\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_image():\n    \"\"\"Convert uploaded image to specified format and dimensions.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    target_format = request.form.get('format', 'png').lower()\n    if target_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'Format must be one of: {ALLOWED_FORMATS}'}), 400\n    \n    width = sanitize_dimension(request.form.get('width', '256'))\n    height = sanitize_dimension(request.form.get('height', '256'))\n    if not width or not height:\n        return jsonify({'error': 'Invalid dimensions'}), 400\n    \n    # Optional annotation text overlay\n    annotation = request.form.get('annotation', '')\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    # Save upload to temp file\n    suffix = os.path.splitext(uploaded.filename)[1]\n    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir='/tmp/uploads') as tmp:\n        uploaded.save(tmp)\n        input_path = tmp.name\n    \n    output_path = input_path + f'_out.{target_format}'\n    \n    try:\n        # Build ImageMagick convert command\n        cmd = f\"convert {input_path} -resize {width}x{height}\"\n        \n        # Add annotation if provided\n        if annotation:\n            # Basic length check\n            if len(annotation) > 200:\n                return jsonify({'error': 'Annotation too long'}), 400\n            cmd += f\" -annotate +0+20 '{annotation}'\"\n        \n        cmd += f\" {output_path}\"\n        \n        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'detail': result.stderr[:200]}), 500\n        \n        # Read and return converted file\n        with open(output_path, 'rb') as f:\n            data = f.read()\n        \n        return data, 200, {'Content-Type': f'image/{target_format}'}\n    \n    finally:\n        # Cleanup\n        for p in [input_path, output_path]:\n            try:\n                os.unlink(p)\n            except OSError:\n                pass\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    # Verify ImageMagick is available\n    result = subprocess.run(['convert', '--version'], capture_output=True, text=True)\n    if result.returncode == 0:\n        return jsonify({'status': 'healthy', 'imagemagick': result.stdout.split('\\n')[0]})\n    return jsonify({'status': 'degraded'}), 503\n\nif __name__ == '__main__':\n    os.makedirs('/tmp/uploads', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Celery worker on ECS Fargate in private subnet. The upload API is fronted by an ALB associated with an AWS WAFv2 WebACL. The WebACL includes the AWS managed rule group 'AWSManagedRulesKnownBadInputsRuleSet' with all rules in default action (BLOCK), which includes the rule 'ExploitablePaths_URIPATH' and critically the rule 'Host_localhost_HEADER' and general bad-input signatures. Additionally, a custom WAFv2 rule with priority 1 uses a RegexPatternSet matching '<!ENTITY|<!DOCTYPE.*\\[|SYSTEM\\s+[\"\\']' on the request body field (with body size limit set to 64KB via oversized handling 'MATCH'), action BLOCK. The WebACL body inspection is configured with 'SizeInspectionLimit' of 64KB. The Fargate task's security group restricts all egress to only the DynamoDB VPC endpoint and the Redis endpoint (no NAT gateway route, no internet egress). The task execution role has an explicit deny on ec2:CreateNetworkInterface to prevent attachment of additional ENIs.",
+    "config": {
+      "waf_webacl": {
+        "managed_rule_groups": [
+          {
+            "name": "AWSManagedRulesKnownBadInputsRuleSet",
+            "vendor": "AWS",
+            "override_action": "none",
+            "priority": 2
+          }
+        ],
+        "custom_rules": [
+          {
+            "name": "BlockXXEPatterns",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/xxe-patterns/abc123",
+                "field_to_match": "Body",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "HTML_ENTITY_DECODE"
+                  }
+                ]
+              }
+            },
+            "body_size_limit": "64KB",
+            "oversize_handling": "MATCH"
+          }
+        ]
+      },
+      "network": {
+        "security_group_egress": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "vpce-dynamodb-prefix-list"
+          },
+          {
+            "protocol": "tcp",
+            "port": 6379,
+            "destination": "sg-redis-cluster"
+          }
+        ],
+        "nat_gateway": "none",
+        "internet_access": false
+      },
+      "task_role_boundary": "deny ec2:CreateNetworkInterface"
+    }
+  }
+}

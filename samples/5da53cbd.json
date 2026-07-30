@@ -1,0 +1,34 @@
+{
+  "id": "5da53cbd",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst crypto = require('crypto');\nconst { Pool } = require('pg');\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: process.env.DB_PORT || 5432,\n  database: 'appdb',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  max: 20\n});\n\nconst ALGORITHM = 'aes-256-cbc';\nconst KEY = Buffer.from(process.env.ENC_KEY || 'a'.repeat(64), 'hex');\n\nfunction decrypt(encryptedHex) {\n  const data = Buffer.from(encryptedHex, 'hex');\n  const iv = data.slice(0, 16);\n  const ciphertext = data.slice(16);\n  const decipher = crypto.createDecipheriv(ALGORITHM, KEY, iv);\n  let decrypted = decipher.update(ciphertext);\n  decrypted = Buffer.concat([decrypted, decipher.final()]);\n  return decrypted.toString('utf8');\n}\n\nfunction encrypt(plaintext) {\n  const iv = crypto.randomBytes(16);\n  const cipher = crypto.createCipheriv(ALGORITHM, KEY, iv);\n  let encrypted = cipher.update(plaintext, 'utf8');\n  encrypted = Buffer.concat([encrypted, cipher.final()]);\n  return Buffer.concat([iv, encrypted]).toString('hex');\n}\n\n// Token-based session lookup\napp.post('/api/session/validate', async (req, res) => {\n  const { token } = req.body;\n  if (!token || typeof token !== 'string') {\n    return res.status(400).json({ error: 'Missing token' });\n  }\n\n  try {\n    const sessionData = decrypt(token);\n    const parsed = JSON.parse(sessionData);\n    \n    // Parameterized query - safe from SQLi\n    const result = await pool.query(\n      'SELECT user_id, role, email FROM users WHERE user_id = $1 AND active = true',\n      [parsed.userId]\n    );\n\n    if (result.rows.length === 0) {\n      return res.status(401).json({ error: 'Invalid session' });\n    }\n\n    return res.status(200).json({\n      valid: true,\n      user: result.rows[0],\n      expires: parsed.exp\n    });\n  } catch (err) {\n    // Padding oracle: different error messages for different failure modes\n    if (err.message.includes('bad decrypt') || err.message.includes('wrong final block')) {\n      return res.status(400).json({ error: 'Decryption failed: invalid padding' });\n    }\n    if (err instanceof SyntaxError) {\n      return res.status(400).json({ error: 'Malformed session payload' });\n    }\n    return res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Issue encrypted session token\napp.post('/api/session/create', async (req, res) => {\n  const { username, password } = req.body;\n  \n  const result = await pool.query(\n    'SELECT user_id, password_hash FROM users WHERE email = $1',\n    [username]\n  );\n\n  if (result.rows.length === 0) {\n    return res.status(401).json({ error: 'Invalid credentials' });\n  }\n\n  const user = result.rows[0];\n  const hash = crypto.createHash('sha256').update(password).digest('hex');\n  \n  if (hash !== user.password_hash) {\n    return res.status(401).json({ error: 'Invalid credentials' });\n  }\n\n  const sessionPayload = JSON.stringify({\n    userId: user.user_id,\n    exp: Date.now() + 3600000,\n    nonce: crypto.randomBytes(8).toString('hex')\n  });\n\n  const token = encrypt(sessionPayload);\n  return res.status(200).json({ token });\n});\n\n// Admin endpoint\napp.get('/api/admin/users', async (req, res) => {\n  const authToken = req.headers['x-session-token'];\n  if (!authToken) return res.status(401).json({ error: 'No token' });\n\n  try {\n    const sessionData = decrypt(authToken);\n    const parsed = JSON.parse(sessionData);\n    \n    const result = await pool.query(\n      'SELECT user_id, role FROM users WHERE user_id = $1',\n      [parsed.userId]\n    );\n\n    if (result.rows.length === 0 || result.rows[0].role !== 'admin') {\n      return res.status(403).json({ error: 'Forbidden' });\n    }\n\n    const users = await pool.query('SELECT user_id, email, role FROM users');\n    return res.status(200).json({ users: users.rows });\n  } catch (err) {\n    if (err.message.includes('bad decrypt') || err.message.includes('wrong final block')) {\n      return res.status(400).json({ error: 'Decryption failed: invalid padding' });\n    }\n    return res.status(500).json({ error: 'Internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('Server running on port 3000'));",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind ALB with AWS WAF WebACL. PgBouncer 1.21 in session pooling mode with prepared statement support (protocol-level named statements). The WAF WebACL includes a custom rate-based rule (threshold: 100 requests per 5 minutes per IP on URI path /api/session/validate) combined with a custom rule group containing a regex pattern rule that inspects response bodies for the string 'invalid padding' and when matched, activates a CAPTCHA action on subsequent requests from that IP for 300 seconds. CloudFront distribution with origin failover disabled. The ALB access logs feed into a Kinesis stream processed by a Lambda that updates a DynamoDB-backed IP reputation table, but this is async and not in the blocking path.",
+    "config": {
+      "load_balancer": "AWS ALB with WAF WebACL",
+      "waf_rules": [
+        {
+          "name": "PaddingOracleRateLimit",
+          "type": "rate-based",
+          "threshold": 100,
+          "evaluation_window": 300,
+          "scope_down": "URI path matches /api/session/validate",
+          "action": "BLOCK"
+        },
+        {
+          "name": "PaddingOracleResponseInspection",
+          "type": "custom-rule-group",
+          "description": "Regex match on response body for padding error indicators, triggers CAPTCHA challenge on source IP",
+          "pattern": "(?i)(invalid padding|bad decrypt|wrong final block)",
+          "action": "CAPTCHA",
+          "immunity_time": 300
+        }
+      ],
+      "pgbouncer_mode": "session",
+      "pgbouncer_version": "1.21",
+      "pgbouncer_prepared_statements": "enabled (session mode supports named prepared statements)",
+      "network": "private subnet, ALB in public subnet",
+      "cloudfront": "enabled, origin protocol HTTPS only"
+    }
+  }
+}

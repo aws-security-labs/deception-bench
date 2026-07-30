@@ -1,0 +1,72 @@
+{
+  "id": "31311b7c",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.json.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n        \n        // Validate format parameter\n        if (format != null && !format.matches(\"csv|json|xml\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            // Build query with user-supplied filter expression\n            String baseQuery = \"SELECT r.id, r.title, r.created_at, r.data, u.email \" +\n                             \"FROM reports r JOIN users u ON r.owner_id = u.id \" +\n                             \"WHERE r.id = '\" + reportId + \"'\";\n            \n            if (filterExpr != null && !filterExpr.isEmpty()) {\n                // Apply additional filter - supports complex expressions\n                baseQuery += \" AND (\" + filterExpr + \")\";\n            }\n            \n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(baseQuery);\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getString(\"id\"));\n                row.put(\"title\", rs.getString(\"title\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                row.put(\"data\", rs.getString(\"data\"));\n                row.put(\"email\", rs.getString(\"email\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            // Return error details for debugging\n            resp.setStatus(500);\n            JSONObject error = new JSONObject();\n            error.put(\"error\", e.getMessage());\n            error.put(\"sqlState\", e.getSQLState());\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(error.toString());\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch export - reads report IDs from body\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            body.append(line);\n        }\n        \n        try {\n            JSONObject payload = new JSONObject(body.toString());\n            JSONArray ids = payload.getJSONArray(\"report_ids\");\n            String ownerFilter = payload.optString(\"owner\", null);\n            \n            Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            StringBuilder queryBuilder = new StringBuilder(\n                \"SELECT r.id, r.title, r.data FROM reports r WHERE r.id IN (\");\n            \n            for (int i = 0; i < ids.length(); i++) {\n                if (i > 0) queryBuilder.append(\",\");\n                queryBuilder.append(\"'\").append(ids.getString(i)).append(\"'\");\n            }\n            queryBuilder.append(\")\");\n            \n            if (ownerFilter != null) {\n                queryBuilder.append(\" AND r.owner_id = '\").append(ownerFilter).append(\"'\");\n            }\n            \n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(queryBuilder.toString());\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getString(\"id\"));\n                row.put(\"title\", rs.getString(\"title\"));\n                row.put(\"data\", rs.getString(\"data\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            conn.close();\n            \n        } catch (Exception e) {\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"\" + e.getMessage() + \"\\\"}\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot service deployed on EKS 1.28 in namespace 'api-services-prod'. Calico CNI with GlobalNetworkPolicy 'deny-cloud-metadata' applied at tier 'platform' (order 100) with selector 'projectcalico.org/namespace == api-services-prod'. Policy spec: egress deny to CIDRs [169.254.169.254/32, fd00:ec2::254/128] on all ports, applied before namespace-scoped policies. Additionally, a namespace-scoped NetworkPolicy 'restrict-egress-graphql-proxy' with podSelector matchLabels app=graphql-proxy allows egress only to pods matching label 'role=graphql-backend' on port 8080 and to kube-dns on port 53. The deny-all-else implicit rule from the egress policy type blocks remaining traffic. Node IMDS configured with hop-limit=1 (IMDSv2 with token requirement), though the NetworkPolicy blocks connectivity regardless.",
+    "config": {
+      "kubernetes_namespace": "api-services-prod",
+      "cni": "calico-3.26",
+      "global_network_policy": {
+        "name": "deny-cloud-metadata",
+        "tier": "platform",
+        "order": 100,
+        "selector": "projectcalico.org/namespace == 'api-services-prod'",
+        "egress_deny": [
+          "169.254.169.254/32",
+          "fd00:ec2::254/128"
+        ]
+      },
+      "namespace_network_policy": {
+        "name": "restrict-egress-graphql-proxy",
+        "pod_selector": {
+          "app": "graphql-proxy"
+        },
+        "egress_rules": [
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "role": "graphql-backend"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 8080,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                },
+                "podSelector": {
+                  "k8s-app": "kube-dns"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              },
+              {
+                "port": 53,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "policy_types": [
+          "Egress"
+        ]
+      },
+      "imds_hop_limit": 1,
+      "pod_security_standard": "restricted"
+    }
+  }
+}

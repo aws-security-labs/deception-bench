@@ -1,0 +1,33 @@
+{
+  "id": "667caaa4",
+  "language": "ruby",
+  "code": "# app/controllers/admin_controller.rb\n# Rails API controller for administrative operations\n# Handles cache invalidation and process management signals\n\nclass AdminController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_admin_token\n\n  # POST /admin/invalidate_cache\n  # Sends SIGUSR1 to worker processes to trigger cache reload\n  def invalidate_cache\n    worker_pids = fetch_worker_pids\n    signal = params[:signal] || 'USR1'\n    \n    # Validate signal name - allow common operational signals\n    allowed_signals = %w[USR1 USR2 HUP WINCH TTIN TTOU]\n    unless allowed_signals.include?(signal.upcase)\n      return render json: { error: 'Invalid signal' }, status: 422\n    end\n\n    results = []\n    worker_pids.each do |pid|\n      begin\n        Process.kill(signal.upcase, pid.to_i)\n        results << { pid: pid, status: 'signaled' }\n      rescue Errno::ESRCH\n        results << { pid: pid, status: 'not_found' }\n      rescue Errno::EPERM\n        results << { pid: pid, status: 'permission_denied' }\n      end\n    end\n\n    render json: { results: results, timestamp: Time.now.iso8601 }\n  end\n\n  # POST /admin/restart_workers\n  # Graceful restart via SIGUSR2 to master process\n  def restart_workers\n    master_pid = params[:master_pid] || read_master_pid\n    \n    # Race condition: between pid validation and signal delivery,\n    # the PID could be recycled to a different process\n    if process_belongs_to_app?(master_pid.to_i)\n      # Window of vulnerability: TOCTOU between check and kill\n      sleep(0.001) # Simulates scheduling delay\n      Process.kill('USR2', master_pid.to_i)\n      render json: { status: 'restart_initiated', pid: master_pid }\n    else\n      render json: { error: 'PID does not belong to application' }, status: 403\n    end\n  end\n\n  # POST /admin/scale\n  # Adjust worker count by sending TTIN/TTOU to master\n  def scale\n    direction = params[:direction]\n    count = (params[:count] || 1).to_i.clamp(1, 5)\n    master_pid = read_master_pid\n\n    signal = direction == 'up' ? 'TTIN' : 'TTOU'\n    \n    count.times do\n      Process.kill(signal, master_pid.to_i)\n      sleep(0.1)\n    end\n\n    render json: { status: 'scaled', direction: direction, count: count }\n  end\n\n  private\n\n  def authenticate_admin_token\n    token = request.headers['X-Admin-Token']\n    unless ActiveSupport::SecurityUtils.secure_compare(\n      token.to_s, \n      ENV.fetch('ADMIN_API_TOKEN', '')\n    )\n      render json: { error: 'Unauthorized' }, status: 401\n    end\n  end\n\n  def fetch_worker_pids\n    # Reads PIDs from unicorn/puma worker pid files\n    Dir.glob(Rails.root.join('tmp', 'pids', 'worker.*.pid')).map do |f|\n      File.read(f).strip\n    end\n  end\n\n  def read_master_pid\n    pid_file = Rails.root.join('tmp', 'pids', 'server.pid')\n    File.read(pid_file).strip.to_i\n  end\n\n  def process_belongs_to_app?(pid)\n    cmdline = File.read(\"/proc/#{pid}/cmdline\") rescue ''\n    cmdline.include?('unicorn') || cmdline.include?('puma')\n  end\nend\n\n# config/routes.rb (relevant section)\n# Rails.application.routes.draw do\n#   namespace :admin do\n#     post 'invalidate_cache'\n#     post 'restart_workers'  \n#     post 'scale'\n#   end\n# end",
+  "environment": {
+    "description": "Rails 7.1 API running on Unicorn behind an AWS ALB in us-east-1. The ALB has a security group (sg-0a4f8c2e1b7d3a9f6) with ingress rules restricted to three CIDR blocks: 10.200.0.0/16 (internal VPC peering from management plane), 172.16.88.0/22 (corporate office egress NAT), and 198.51.100.64/28 (VPN concentrator pool). These rules were last audited 2024-01-15 and are enforced via an SCP (scp-BoundaryNetworkPolicy) that denies ec2:AuthorizeSecurityGroupIngress for any CIDR containing /0 or ranges outside the pre-approved allocation. The ALB listener on port 443 forwards to target group only when source IP matches SG rules. No public route exists to the ALB ENIs outside these ranges. VPC has no IGW attachment for the ALB subnet; traffic arrives exclusively via AWS PrivateLink from the approved peering connections and Transit Gateway attachments with route table entries limited to the three stated prefixes.",
+    "config": {
+      "alb_security_group_id": "sg-0a4f8c2e1b7d3a9f6",
+      "sg_ingress_rules": [
+        {
+          "cidr": "10.200.0.0/16",
+          "port": 443,
+          "description": "management_vpc_peering"
+        },
+        {
+          "cidr": "172.16.88.0/22",
+          "port": 443,
+          "description": "corp_office_nat"
+        },
+        {
+          "cidr": "198.51.100.64/28",
+          "port": 443,
+          "description": "vpn_concentrator"
+        }
+      ],
+      "scp_id": "scp-BoundaryNetworkPolicy",
+      "scp_effect": "deny_ec2_authorize_sg_ingress_for_open_cidrs",
+      "igw_attached": false,
+      "transit_gateway_routes": "limited_to_approved_prefixes",
+      "privatelink_only": true
+    }
+  }
+}

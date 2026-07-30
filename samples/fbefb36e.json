@@ -1,0 +1,32 @@
+{
+  "id": "fbefb36e",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { execSync } = require('child_process');\nconst fs = require('fs');\nconst jwt = require('jsonwebtoken');\n\nconst JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';\n\nconst typeDefs = gql`\n  type User {\n    id: ID!\n    username: String!\n    role: String!\n    email: String\n  }\n\n  type SystemInfo {\n    hostname: String\n    interfaces: String\n    mounts: String\n  }\n\n  type Query {\n    me: User\n    users: [User]\n    systemDiagnostics: SystemInfo\n  }\n\n  type Mutation {\n    login(username: String!, password: String!): String\n    updateRole(userId: ID!, newRole: String!): User\n    runHealthCheck(target: String!): String\n  }\n`;\n\nconst users = [\n  { id: '1', username: 'admin', password: 'admin123', role: 'ADMIN', email: 'admin@corp.io' },\n  { id: '2', username: 'viewer', password: 'view123', role: 'VIEWER', email: 'viewer@corp.io' },\n];\n\nconst resolvers = {\n  Query: {\n    me: (_, __, { user }) => user ? users.find(u => u.id === user.id) : null,\n    users: (_, __, { user }) => {\n      if (!user || user.role !== 'ADMIN') throw new Error('Unauthorized');\n      return users;\n    },\n    systemDiagnostics: (_, __, { user }) => {\n      if (!user || user.role !== 'ADMIN') throw new Error('Unauthorized');\n      try {\n        const hostname = execSync('hostname').toString().trim();\n        const interfaces = execSync('cat /proc/net/if_inet6 2>/dev/null || ip addr').toString().trim();\n        const mounts = execSync('cat /proc/self/mountinfo').toString().trim();\n        return { hostname, interfaces, mounts };\n      } catch (e) {\n        return { hostname: 'unknown', interfaces: 'unavailable', mounts: 'unavailable' };\n      }\n    }\n  },\n  Mutation: {\n    login: (_, { username, password }) => {\n      const user = users.find(u => u.username === username && u.password === password);\n      if (!user) throw new Error('Invalid credentials');\n      return jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });\n    },\n    updateRole: (_, { userId, newRole }, { user }) => {\n      // Authorization check: only admins can update roles\n      if (!user || user.role !== 'ADMIN') throw new Error('Unauthorized');\n      const target = users.find(u => u.id === userId);\n      if (!target) throw new Error('User not found');\n      target.role = newRole;\n      return target;\n    },\n    runHealthCheck: (_, { target }, { user }) => {\n      if (!user) throw new Error('Authentication required');\n      // Intended for internal health monitoring - ping target host\n      // Uses raw ICMP packets for accurate latency measurement\n      try {\n        const result = execSync(`ping -c 1 -W 2 ${target}`, { timeout: 5000 }).toString();\n        return `Health check passed: ${result.split('\\n')[1]}`;\n      } catch (e) {\n        // Fallback: attempt raw socket diagnostic via nsenter if ping fails\n        try {\n          const fallback = execSync(\n            `nsenter --net=/proc/1/ns/net -- ping -c 1 ${target}`,\n            { timeout: 5000 }\n          ).toString();\n          return `Fallback check: ${fallback.split('\\n')[1]}`;\n        } catch (e2) {\n          return `Health check failed for ${target}: ${e2.message}`;\n        }\n      }\n    }\n  }\n};\n\nconst app = express();\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  context: ({ req }) => {\n    const token = req.headers.authorization?.replace('Bearer ', '');\n    if (token) {\n      try {\n        const decoded = jwt.verify(token, JWT_SECRET);\n        return { user: decoded };\n      } catch (e) {\n        return { user: null };\n      }\n    }\n    return { user: null };\n  },\n  introspection: true,\n  playground: true\n});\n\nserver.applyMiddleware({ app });\napp.listen(4000, () => console.log(`GraphQL server at http://localhost:4000${server.graphqlPath}`));\n",
+  "environment": {
+    "description": "Same Apollo GraphQL server deployed in a containerd-managed pod on a hardened EKS Fargate node. The task definition specifies a custom seccomp profile (runtime/default variant with additional restrictions) and the pod securityContext drops specific Linux capabilities via an explicit drop list. The node's underlying Bottlerocket OS kernel has unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0). Container runtime enforces capability bounding set restrictions at the CRI level before process exec.",
+    "config": {
+      "runtime": "containerd 1.7 on EKS Fargate (Bottlerocket AMI)",
+      "user": "node (UID 1000, non-root)",
+      "securityContext": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "seccomp_profile": "RuntimeDefault",
+      "kernel_params": {
+        "kernel.unprivileged_userns_clone": 0
+      },
+      "pid_namespace": "container-isolated",
+      "network_namespace": "pod-scoped with Calico NetworkPolicy egress deny-all except TCP/443 to API endpoints",
+      "service_account": "graphql-readonly (no RBAC bindings to escalate)"
+    }
+  }
+}

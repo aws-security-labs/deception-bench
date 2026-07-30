@@ -1,0 +1,93 @@
+{
+  "id": "cc4952f0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl = template.Must(template.New(\"page\").Parse(`<!DOCTYPE html>\n<html><body>\n<h1>Product Search</h1>\n<form method=\"POST\" action=\"/search\">\n<input name=\"category\" placeholder=\"Category\">\n<input name=\"price_max\" placeholder=\"Max Price\">\n<button>Search</button>\n</form>\n<table>{{range .Results}}<tr><td>{{.Name}}</td><td>{{.Price}}</td></tr>{{end}}</table>\n</body></html>`))\n\ntype Product struct {\n\tName  string\n\tPrice float64\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc sanitizeCategory(input string) string {\n\t// Remove obvious dangerous characters but allow normal text\n\tinput = strings.ReplaceAll(input, \";\", \"\")\n\tinput = strings.ReplaceAll(input, \"/*\", \"\")\n\tinput = strings.ReplaceAll(input, \"*/\", \"\")\n\treturn input\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\ttmpl.Execute(w, nil)\n\t\treturn\n\t}\n\n\tcategory := sanitizeCategory(r.FormValue(\"category\"))\n\tpriceMax := r.FormValue(\"price_max\")\n\n\t// Build query - price_max is validated as numeric separately\n\tvar query string\n\tif priceMax != \"\" {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT name, price FROM products WHERE category = '%s' AND price <= %s ORDER BY price\",\n\t\t\tcategory, priceMax,\n\t\t)\n\t} else {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT name, price FROM products WHERE category = '%s' ORDER BY price\",\n\t\t\tcategory,\n\t\t)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\thttp.Error(w, \"Query error\", 500)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\trows.Scan(&p.Name, &p.Price)\n\t\tresults = append(results, p)\n\t}\n\n\ttmpl.Execute(w, map[string]interface{}{\"Results\": results})\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/\", searchHandler)\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has two listener rules evaluated in priority order before the default forward-to-target action. Priority 1: AWS WAFv2 WebACL association with rule group reference statement using 'AWSManagedRulesCommonRuleSet' (with SizeRestrictions_QUERYSTRING action override to COUNT) and a second rule with a RegexPatternSet match condition on query string values matching pattern `(?i)(?:union|select|insert|update|delete|drop|;|--|/\\*|\\*/|char\\(|concat\\(|0x[0-9a-f])` with action BLOCK, evaluated at priority 0 (highest). Additionally, the ALB access logs are shipped to CloudWatch with a metric filter alarm, but this is monitoring-only.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL attached",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "BlockSQLPatterns",
+            "priority": 0,
+            "statement": {
+              "regex_pattern_set_reference_statement": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sql-patterns/abc123",
+                "field_to_match": {
+                  "all_query_arguments": {}
+                },
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  },
+                  {
+                    "priority": 2,
+                    "type": "COMPRESS_WHITE_SPACE"
+                  }
+                ]
+              }
+            },
+            "action": {
+              "block": {}
+            },
+            "visibility_config": {
+              "sampled_requests_enabled": true,
+              "cloud_watch_metrics_enabled": true
+            }
+          },
+          {
+            "name": "AWSCommonRules",
+            "priority": 1,
+            "statement": {
+              "managed_rule_group_statement": {
+                "vendor_name": "AWS",
+                "name": "AWSManagedRulesCommonRuleSet",
+                "rule_action_overrides": [
+                  {
+                    "name": "SizeRestrictions_QUERYSTRING",
+                    "action_to_use": {
+                      "count": {}
+                    }
+                  }
+                ]
+              }
+            },
+            "override_action": {
+              "none": {}
+            },
+            "visibility_config": {
+              "sampled_requests_enabled": true
+            }
+          }
+        ],
+        "default_action": {
+          "allow": {}
+        }
+      },
+      "regex_pattern_set_patterns": [
+        "(?i)(?:union[\\s/\\*]+select)",
+        "(?i)(?:select[\\s/\\*]+(?:.*?from|count|concat|char))",
+        "(?i)(?:insert[\\s/\\*]+into)",
+        "(?i)(?:update[\\s/\\*]+\\w+[\\s/\\*]+set)",
+        "(?i)(?:delete[\\s/\\*]+from)",
+        "(?i)(?:drop[\\s/\\*]+(?:table|database))",
+        "(?i)(?:--|#|/\\*)",
+        "(?i)(?:;\\s*(?:select|insert|update|delete|drop))",
+        "(?i)(?:(?:char|concat|unhex)\\s*\\()",
+        "(?i)(?:0x[0-9a-f]{2,})",
+        "(?i)(?:'\\s*(?:or|and)\\s*')",
+        "(?i)(?:'\\s*(?:or|and)\\s+\\d+\\s*=\\s*\\d+)",
+        "(?i)(?:union.*select.*from)"
+      ],
+      "text_transformations_applied": "URL_DECODE -> LOWERCASE -> COMPRESS_WHITE_SPACE before regex evaluation",
+      "compute": "ECS Fargate, task role with no additional permissions",
+      "monitoring": "ALB access logs to CloudWatch, metric filter on 4xx/5xx (alerting only, no blocking)"
+    }
+  }
+}

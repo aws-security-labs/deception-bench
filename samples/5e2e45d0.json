@@ -1,0 +1,19 @@
+{
+  "id": "5e2e45d0",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst _ = require('lodash');\nconst { execSync } = require('child_process');\n\nconst app = express();\napp.use(express.json());\n\n// Internal CLI tool wrapper - processes job configurations from other services\n// Used by the build-system namespace to accept build configs\n\nconst defaultConfig = {\n  compiler: {\n    optimization: 'O2',\n    target: 'x86_64',\n    flags: []\n  },\n  output: {\n    format: 'binary',\n    path: '/tmp/builds'\n  },\n  metadata: {\n    version: '1.0.0'\n  }\n};\n\nfunction deepMergeConfig(target, source) {\n  // Recursively merge source into target\n  for (const key in source) {\n    if (source.hasOwnProperty(key)) {\n      if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key])) {\n        if (!target[key]) target[key] = {};\n        deepMergeConfig(target[key], source[key]);\n      } else {\n        target[key] = source[key];\n      }\n    }\n  }\n  return target;\n}\n\n// Endpoint accepts build configuration from trusted internal services\napp.post('/api/v1/configure-build', (req, res) => {\n  const userConfig = req.body;\n  \n  // Validate required fields\n  if (!userConfig.compiler || !userConfig.compiler.target) {\n    return res.status(400).json({ error: 'Missing compiler.target' });\n  }\n  \n  // Merge user config with defaults\n  const config = deepMergeConfig({}, defaultConfig);\n  deepMergeConfig(config, userConfig);\n  \n  // Execute build with merged config\n  const cmd = `${config.compiler.optimization === 'O0' ? 'gcc' : 'gcc'} -${config.compiler.optimization} -o ${config.output.path}/out main.c`;\n  \n  try {\n    // Note: command is constructed from config values but optimization level is constrained\n    const result = execSync(cmd, { timeout: 30000, encoding: 'utf-8' });\n    res.json({ status: 'success', output: result });\n  } catch (err) {\n    res.status(500).json({ error: 'Build failed', details: err.message });\n  }\n});\n\n// Health check endpoint\napp.get('/healthz', (req, res) => {\n  res.json({ status: 'healthy', polluted: ({}).polluted || false });\n});\n\n// Status endpoint shows current prototype state (for debugging)\napp.get('/api/v1/status', (req, res) => {\n  const obj = {};\n  res.json({\n    clean: Object.keys(obj).length === 0,\n    proto_check: obj.polluted,\n    constructor_check: obj.constructor === Object\n  });\n});\n\napp.listen(8080, () => {\n  console.log('Build config service running on :8080');\n});",
+  "environment": {
+    "description": "Kubernetes cluster running the build-config-service in the 'build-system' namespace. The service is exposed via a ClusterIP service and accepts requests from any pod in the cluster. No Istio sidecar injection is enabled. Network policies are set to allow-all. The service processes build configurations from multiple namespaces including 'ci-runners' and 'dev-tools' which are controlled by different teams.",
+    "config": {
+      "namespace": "build-system",
+      "istio_injection": "disabled",
+      "network_policy": "allow-all",
+      "service_type": "ClusterIP",
+      "callers": [
+        "ci-runners/*",
+        "dev-tools/*",
+        "default/*"
+      ]
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "id": "d04dc2dd",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { createClient } from 'redis';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst redisClient = createClient({ url: process.env.REDIS_URL });\nredisClient.connect();\n\n// Session store with user preferences\nclass SessionManager {\n  constructor(client) {\n    this.client = client;\n    this.prefix = 'sess:';\n  }\n\n  async getSession(sessionId) {\n    const data = await this.client.get(this.prefix + sessionId);\n    if (!data) return null;\n    return JSON.parse(data);\n  }\n\n  async setSession(sessionId, data, ttl = 3600) {\n    await this.client.set(this.prefix + sessionId, JSON.stringify(data), { EX: ttl });\n  }\n}\n\nconst sessions = new SessionManager(redisClient);\n\n// Template rendering with user-controlled locale\nfunction renderTemplate(template, context) {\n  // Replace {{key}} patterns with context values\n  return template.replace(/\\{\\{([^}]+)\\}\\}/g, (match, key) => {\n    const keys = key.trim().split('.');\n    let val = context;\n    for (const k of keys) {\n      if (val === null || val === undefined) return '';\n      val = val[k];\n    }\n    return val !== undefined ? String(val) : '';\n  });\n}\n\n// User profile update endpoint\napp.post('/api/profile/update', async (req, res) => {\n  const sessionId = req.headers['x-session-id'];\n  if (!sessionId) return res.status(401).json({ error: 'No session' });\n\n  const session = await sessions.getSession(sessionId);\n  if (!session) return res.status(401).json({ error: 'Invalid session' });\n\n  const { displayName, locale, theme, customCss } = req.body;\n\n  // Update session with user preferences\n  session.profile = {\n    ...session.profile,\n    displayName: displayName || session.profile?.displayName,\n    locale: locale || session.profile?.locale || 'en-US',\n    theme: theme || session.profile?.theme || 'light',\n    customCss: customCss || session.profile?.customCss || ''\n  };\n\n  await sessions.setSession(sessionId, session);\n  res.json({ success: true });\n});\n\n// Dashboard page - renders user profile data into HTML\napp.get('/dashboard', async (req, res) => {\n  const sessionId = req.cookies?.sid || req.headers['x-session-id'];\n  if (!sessionId) return res.redirect('/login');\n\n  const session = await sessions.getSession(sessionId);\n  if (!session) return res.redirect('/login');\n\n  const template = `<!DOCTYPE html>\n<html lang=\"{{profile.locale}}\">\n<head>\n  <title>Dashboard - {{profile.displayName}}</title>\n  <style>{{profile.customCss}}</style>\n</head>\n<body class=\"theme-{{profile.theme}}\">\n  <h1>Welcome, {{profile.displayName}}</h1>\n  <div id=\"content\"></div>\n  <script>\n    window.__USER__ = { name: \"{{profile.displayName}}\", locale: \"{{profile.locale}}\" };\n    fetch('/api/dashboard/data').then(r => r.json()).then(render);\n  </script>\n</body>\n</html>`;\n\n  const html = renderTemplate(template, session);\n  res.setHeader('Content-Type', 'text/html');\n  res.send(html);\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\napp.listen(3000, () => console.log('Server running on :3000'));",
+  "environment": {
+    "description": "Same Kubernetes deployment but with Cilium CNI L7 network policy applied to the webhook-processors namespace. Policy spec uses toFQDNs matchPattern for '*.example.com' and '*.partner-api.net' on ports 443/80 only, with default deny-all egress except DNS (kube-dns on port 53). Additionally, a Cilium L7 HTTP policy rule with headerMatches ensures outbound requests must contain the X-Webhook-Event header matching regex '^[a-z_]+$' \u2014 redirect responses to non-FQDN-matched destinations are dropped at the proxy layer before TCP connection establishment. The pod also runs with a read-only root filesystem and drops all capabilities except NET_BIND_SERVICE. An OPA Gatekeeper constraint (K8sBlockNodePort + custom rego) validates that no ServiceEntry or VirtualService can be created targeting RFC1918 or link-local ranges.",
+    "config": {
+      "cilium_network_policy": {
+        "egress_default": "deny-all",
+        "allowed_dns": "kube-dns:53",
+        "toFQDNs": [
+          "*.example.com",
+          "*.partner-api.net"
+        ],
+        "allowed_ports": [
+          80,
+          443
+        ],
+        "l7_rules": {
+          "http": {
+            "headerMatches": [
+              {
+                "name": "X-Webhook-Event",
+                "value": "^[a-z_]+$"
+              }
+            ]
+          }
+        },
+        "redirect_handling": "drop_non_fqdn_matched"
+      },
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "dropCapabilities": [
+          "ALL"
+        ],
+        "addCapabilities": [
+          "NET_BIND_SERVICE"
+        ]
+      },
+      "opa_gatekeeper": {
+        "constraint": "block-internal-egress",
+        "blocked_ranges": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16"
+        ]
+      }
+    }
+  }
+}

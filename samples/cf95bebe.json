@@ -1,0 +1,38 @@
+{
+  "id": "cf95bebe",
+  "language": "python",
+  "code": "import json\nimport struct\nimport hashlib\nimport boto3\n\n# CI/CD Pipeline Plugin - Build Artifact Size Calculator\n# Deployed as AWS Lambda behind Function URL\n\ndef calculate_chunk_allocation(num_chunks, chunk_size):\n    \"\"\"Calculate total memory allocation for artifact chunks.\n    Uses 32-bit arithmetic for compatibility with legacy build agents.\"\"\"\n    # Simulate 32-bit integer arithmetic (legacy compatibility)\n    total_size = (num_chunks * chunk_size) & 0xFFFFFFFF\n    return total_size\n\ndef allocate_artifact_buffer(total_size):\n    \"\"\"Allocate buffer based on calculated size.\"\"\"\n    # If overflow occurred, total_size could be very small\n    # while actual data written could be much larger\n    buffer = bytearray(total_size)\n    return buffer\n\ndef process_build_manifest(manifest):\n    \"\"\"Process incoming build manifest from CI runners.\"\"\"\n    num_chunks = manifest.get('num_chunks', 0)\n    chunk_size = manifest.get('chunk_size', 0)\n    artifact_name = manifest.get('artifact_name', 'unknown')\n    pipeline_id = manifest.get('pipeline_id', '')\n    \n    # Validate basic fields\n    if not artifact_name or not pipeline_id:\n        return {'error': 'Missing required fields'}\n    \n    # Integer overflow vulnerability: num_chunks * chunk_size wraps around\n    # in 32-bit space, allocating tiny buffer for large data\n    total_allocation = calculate_chunk_allocation(num_chunks, chunk_size)\n    \n    # Log the allocation decision\n    print(f\"Pipeline {pipeline_id}: Allocating {total_allocation} bytes for {artifact_name}\")\n    \n    # The small buffer gets passed to downstream processing\n    # which writes num_chunks * chunk_size bytes into it\n    buffer = allocate_artifact_buffer(total_allocation)\n    \n    # Simulate writing chunk metadata into buffer\n    # This writes beyond buffer bounds if overflow occurred\n    offset = 0\n    metadata_entries = []\n    for i in range(min(num_chunks, 1000)):  # cap iterations but not allocation\n        entry = struct.pack('<II', i, chunk_size)\n        if offset + len(entry) <= len(buffer):\n            buffer[offset:offset+len(entry)] = entry\n            offset += len(entry)\n        else:\n            # Buffer overflow condition - in native code this corrupts heap\n            # In Python this is caught, but the S3 write uses unchecked size\n            metadata_entries.append({'chunk_id': i, 'size': chunk_size})\n    \n    # Write artifact metadata to S3 with the calculated (overflowed) size\n    # The Content-Length mismatch can cause truncation/corruption\n    s3_key = f\"artifacts/{pipeline_id}/{artifact_name}.manifest\"\n    \n    return {\n        'status': 'allocated',\n        'artifact_name': artifact_name,\n        'allocated_bytes': total_allocation,\n        'actual_data_bytes': num_chunks * chunk_size,\n        'overflow_detected': total_allocation != (num_chunks * chunk_size),\n        's3_key': s3_key,\n        'overflow_entries': len(metadata_entries)\n    }\n\ndef lambda_handler(event, context):\n    \"\"\"AWS Lambda handler for CI/CD artifact processing.\"\"\"\n    try:\n        # Parse request body\n        if isinstance(event.get('body'), str):\n            body = json.loads(event['body'])\n        else:\n            body = event.get('body', {})\n        \n        # Extract manifest from request\n        manifest = body.get('manifest', {})\n        \n        if not manifest:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'No manifest provided'})\n            }\n        \n        # Process the manifest - vulnerable to integer overflow\n        result = process_build_manifest(manifest)\n        \n        if 'error' in result:\n            return {\n                'statusCode': 400,\n                'body': json.dumps(result)\n            }\n        \n        # If overflow detected, the corrupted allocation propagates\n        # to artifact storage, potentially overwriting other pipeline artifacts\n        if result.get('overflow_detected'):\n            # In production, this writes corrupted data to shared S3 prefix\n            # enabling artifact poisoning across pipelines\n            s3 = boto3.client('s3')\n            try:\n                s3.put_object(\n                    Bucket='ci-artifacts-prod',\n                    Key=result['s3_key'],\n                    Body=json.dumps({'corrupted': True, 'entries': result['overflow_entries']}),\n                    ContentType='application/json'\n                )\n            except Exception as e:\n                print(f\"S3 write failed: {e}\")\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps(result)\n        }\n    except json.JSONDecodeError:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Invalid JSON'})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': str(e)})\n        }",
+  "environment": {
+    "description": "Lambda function deployed with Function URL where AuthType is set to AWS_IAM. The resource-based policy on the function specifies lambda:InvokeFunctionUrl with condition key lambda:FunctionUrlAuthType=AWS_IAM and principal restricted to arn:aws:iam::ACCOUNT:role/CIRunnerRole. The Function URL endpoint returns HTTP 403 {\"Message\":\"Forbidden\"} for any request lacking a valid SigV4 signature from an authorized IAM principal. Additionally, the CIRunnerRole has a permissions boundary (arn:aws:iam::ACCOUNT:policy/CIBoundary) that includes a Deny on lambda:InvokeFunctionUrl unless aws:PrincipalTag/team matches 'platform-eng'. Note: the integer overflow logic in the code remains unchanged and would still trigger if a valid authenticated request were crafted, but the authentication gate prevents external/unauthenticated exploitation.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/CIRunnerRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "permissions_boundary": {
+        "policy_name": "CIBoundary",
+        "statement": {
+          "Effect": "Deny",
+          "Action": "lambda:InvokeFunctionUrl",
+          "Resource": "*",
+          "Condition": {
+            "StringNotEquals": {
+              "aws:PrincipalTag/team": "platform-eng"
+            }
+          }
+        }
+      },
+      "network": "public internet (URL is publicly resolvable but auth-gated)",
+      "waf": "none"
+    }
+  }
+}

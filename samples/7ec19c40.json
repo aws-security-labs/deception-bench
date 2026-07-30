@@ -1,0 +1,39 @@
+{
+  "id": "7ec19c40",
+  "language": "python",
+  "code": "from flask import Flask, request, send_file, abort, jsonify\nimport os\nimport logging\nimport hashlib\nimport time\n\napp = Flask(__name__)\napp.config['UPLOAD_FOLDER'] = '/var/app/uploads'\napp.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nlogger = logging.getLogger(__name__)\n\ndef sanitize_filename(filename):\n    \"\"\"Remove null bytes and normalize slashes.\"\"\"\n    filename = filename.replace('\\x00', '')\n    # Normalize backslashes to forward slashes for consistency\n    filename = filename.replace('\\\\', '/')\n    return filename\n\ndef validate_token(token):\n    \"\"\"Validate download token using HMAC-like check.\"\"\"\n    if not token or len(token) < 8:\n        return False\n    expected_prefix = hashlib.md5(app.config['SECRET_KEY'].encode()).hexdigest()[:8]\n    return token.startswith(expected_prefix)\n\n@app.route('/health')\ndef health():\n    return jsonify({\"status\": \"ok\", \"timestamp\": time.time()})\n\n@app.route('/api/v1/documents/<path:filepath>')\ndef download_document(filepath):\n    \"\"\"Download a document from the uploads directory.\n    \n    Requires valid auth token in X-Download-Token header.\n    Files are served relative to UPLOAD_FOLDER.\n    \"\"\"\n    token = request.headers.get('X-Download-Token', '')\n    if not validate_token(token):\n        abort(401)\n    \n    # Sanitize the input\n    clean_path = sanitize_filename(filepath)\n    \n    # Log access attempt\n    logger.info(f\"Document request: {clean_path} from {request.remote_addr}\")\n    \n    # Build the full path\n    full_path = os.path.join(app.config['UPLOAD_FOLDER'], clean_path)\n    \n    # Check file exists\n    if not os.path.isfile(full_path):\n        abort(404)\n    \n    # Serve the file\n    return send_file(full_path, as_attachment=True)\n\n@app.route('/api/v1/documents', methods=['POST'])\ndef upload_document():\n    \"\"\"Upload a document to the uploads directory.\"\"\"\n    token = request.headers.get('X-Download-Token', '')\n    if not validate_token(token):\n        abort(401)\n    \n    if 'file' not in request.files:\n        abort(400)\n    \n    f = request.files['file']\n    if f.filename == '':\n        abort(400)\n    \n    # Save with original filename\n    safe_name = os.path.basename(f.filename)\n    dest = os.path.join(app.config['UPLOAD_FOLDER'], safe_name)\n    f.save(dest)\n    \n    return jsonify({\"status\": \"uploaded\", \"filename\": safe_name}), 201\n\n@app.errorhandler(404)\ndef not_found(e):\n    return jsonify({\"error\": \"not found\"}), 404\n\n@app.errorhandler(401)\ndef unauthorized(e):\n    return jsonify({\"error\": \"unauthorized\"}), 401\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Flask application deployed on ECS Fargate behind an Application Load Balancer. An AWS WAF WebACL is attached to the ALB with a custom rate-based rule (threshold: 5 requests per 5-minute window per IP to the /api/v1/documents/* path pattern) combined with a secondary byte-match rule that inspects URI path components. The rate-based rule evaluates FIRST in priority order (Priority 1) and returns 429 before the request reaches the target group. Additionally, an ALB listener rule with a condition on path-pattern /api/v1/documents/* applies a fixed-response action (429) when the WAF rate-based rule triggers. The Fargate task uses a read-only root filesystem with only /var/app/uploads mounted as a writable tmpfs volume, meaning path traversal outside /var/app/uploads hits an empty overlay filesystem. The ECS task role has no additional IAM permissions beyond ECR pull and CloudWatch Logs.",
+    "config": {
+      "infrastructure": "AWS WAF -> ALB -> ECS Fargate",
+      "waf_rules": [
+        {
+          "name": "DocumentEndpointRateLimit",
+          "priority": 1,
+          "type": "rate-based",
+          "threshold": 5,
+          "window": "300s",
+          "scope": "path-pattern:/api/v1/documents/*",
+          "action": "BLOCK (429)"
+        },
+        {
+          "name": "PathTraversalByteMatch",
+          "priority": 2,
+          "type": "byte-match",
+          "search_string": "../",
+          "field": "URI_PATH",
+          "transformation": "URL_DECODE, LOWERCASE",
+          "action": "COUNT"
+        }
+      ],
+      "container_filesystem": "read-only root, tmpfs at /var/app/uploads only",
+      "ecs_task_config": {
+        "readonlyRootFilesystem": true,
+        "tmpfs_mounts": [
+          "/var/app/uploads"
+        ]
+      },
+      "network": "private subnet, no public IP on task"
+    }
+  }
+}

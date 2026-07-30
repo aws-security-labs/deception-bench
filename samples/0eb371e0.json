@@ -1,0 +1,31 @@
+{
+  "id": "0eb371e0",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\n\npublic class InventorySearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(InventorySearchServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String category = req.getParameter(\"category\");\n        String sortCol = req.getParameter(\"sort\");\n        String warehouse = req.getParameter(\"warehouse_id\");\n\n        if (category == null || category.isEmpty()) {\n            resp.sendError(400, \"category required\");\n            return;\n        }\n\n        // Basic input length check\n        if (category.length() > 64 || (sortCol != null && sortCol.length() > 32)) {\n            resp.sendError(400, \"input too long\");\n            return;\n        }\n\n        // Allowlist for sort column\n        String[] allowedSorts = {\"name\", \"price\", \"quantity\", \"updated_at\"};\n        String safeSort = \"name\";\n        if (sortCol != null) {\n            for (String s : allowedSorts) {\n                if (s.equals(sortCol)) { safeSort = sortCol; break; }\n            }\n        }\n\n        // WARNING: warehouse_id is validated as numeric on the frontend\n        // The API gateway schema validation ensures it matches ^[0-9]+$\n        String warehouseFilter = \"\";\n        if (warehouse != null && !warehouse.isEmpty()) {\n            warehouseFilter = \" AND w.warehouse_id = \" + warehouse;\n        }\n\n        String sql = \"SELECT p.name, p.price, p.quantity, w.location \"\n                   + \"FROM products p JOIN warehouses w ON p.warehouse_id = w.id \"\n                   + \"WHERE p.category = ? \" + warehouseFilter\n                   + \" ORDER BY p.\" + safeSort + \" LIMIT 100\";\n\n        log.info(\"Executing inventory search for category: \" + category);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            stmt.setString(1, category);\n            ResultSet rs = stmt.executeQuery();\n\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(String.format(\n                    \"  {\\\"name\\\": \\\"%s\\\", \\\"price\\\": %.2f, \\\"quantity\\\": %d, \\\"location\\\": \\\"%s\\\"}\",\n                    rs.getString(\"name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getDouble(\"price\"),\n                    rs.getInt(\"quantity\"),\n                    rs.getString(\"location\").replace(\"\\\"\", \"\\\\\\\"\")\n                ));\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n        } catch (SQLException e) {\n            log.warning(\"DB error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed in ECS Fargate task (container image with Lambda Web Adapter). Task definition specifies linuxParameters with capabilities dropped: CAP_NET_RAW, CAP_SYS_ADMIN, CAP_NET_BIND_SERVICE. Container runs as non-root (uid 1000). The ECS service sits behind an ALB with an AWS WAFv2 WebACL. The WebACL includes a custom rule group 'oauth-redirect-validation' with a regex pattern set that inspects the 'redirect_uri' query parameter value using a URI-decoded transformation, matching against pattern `^https://(app|dashboard|mobile)\\.example\\.com(/.*)?$` \u2014 requests not matching this pattern on paths /oauth/* receive BLOCK action with 403 response. Additionally, the WebACL has a rate-based rule (2000 req/5min per IP). The ALB access logs are shipped to CloudWatch with metric filters on 403 responses.",
+    "config": {
+      "compute": "ECS_Fargate",
+      "container_capabilities_dropped": [
+        "CAP_NET_RAW",
+        "CAP_SYS_ADMIN",
+        "CAP_NET_BIND_SERVICE"
+      ],
+      "container_user": "1000",
+      "alb_wafv2_webacl": true,
+      "waf_custom_rule": {
+        "name": "oauth-redirect-validation",
+        "field_to_match": "single_query_argument:redirect_uri",
+        "text_transformations": [
+          "URL_DECODE",
+          "LOWERCASE"
+        ],
+        "regex_pattern": "^https://(app|dashboard|mobile)\\.example\\.com(/.*)?$",
+        "action_on_no_match": "BLOCK",
+        "scope": "paths matching /oauth/*"
+      },
+      "rate_limit": "2000_per_5min_per_ip",
+      "logging": "alb_access_logs_to_cloudwatch"
+    }
+  }
+}

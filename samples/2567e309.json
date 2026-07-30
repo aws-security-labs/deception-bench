@@ -1,0 +1,35 @@
+{
+  "id": "2567e309",
+  "language": "ruby",
+  "code": "# app/channels/application_cable/connection.rb\nmodule ApplicationCable\n  class Connection < ActionCable::Connection::Base\n    identified_by :current_user\n\n    def connect\n      self.current_user = find_verified_user\n    end\n\n    private\n\n    def find_verified_user\n      # Origin validation is intentionally loose for mobile client compatibility\n      # The allowed_origins check delegates to environment config\n      if valid_origin?(request.origin)\n        user = User.find_by(session_token: cookies.encrypted[:session_token])\n        user || reject_unauthorized_connection\n      else\n        reject_unauthorized_connection\n      end\n    end\n\n    def valid_origin?(origin)\n      return true if origin.nil? # WebSocket spec: origin can be nil for non-browser\n      return true if Rails.configuration.x.websocket_allow_all_origins\n      allowed = Rails.configuration.x.allowed_ws_origins || []\n      allowed.any? { |pattern| origin.match?(pattern) }\n    end\n  end\nend\n\n# app/channels/admin_channel.rb\nclass AdminChannel < ApplicationCable::Channel\n  def subscribed\n    stream_from \"admin_#{current_user.id}\"\n  end\n\n  def execute_command(data)\n    # Admin remote management - executes system diagnostics\n    command = data['command']\n    allowed_commands = %w[df free uptime ps]\n    base_cmd = command.to_s.split(/\\s+/).first\n\n    if current_user.admin? && allowed_commands.include?(base_cmd)\n      # Run diagnostic and broadcast result\n      output = `#{command} 2>&1`\n      transmit({ result: output, timestamp: Time.current.iso8601 })\n    else\n      transmit({ error: 'Unauthorized or invalid command' })\n    end\n  end\n\n  def read_log(data)\n    # Read application logs for admin debugging\n    log_path = data['path'] || '/app/log/production.log'\n    # Restrict to /app/log directory\n    unless log_path.start_with?('/app/log/')\n      transmit({ error: 'Invalid log path' })\n      return\n    end\n    # Resolve symlinks to prevent traversal\n    resolved = File.realpath(log_path) rescue nil\n    if resolved&.start_with?('/app/log/')\n      content = File.read(resolved, 4096)\n      transmit({ log_content: content })\n    else\n      transmit({ error: 'Path resolution failed' })\n    end\n  end\n\n  def unsubscribed\n    # cleanup\n  end\nend\n\n# config/initializers/action_cable.rb\nRails.application.configure do\n  config.action_cable.disable_request_forgery_protection = true\n  config.x.websocket_allow_all_origins = ENV.fetch('WS_ALLOW_ALL_ORIGINS', 'true') == 'true'\n  config.x.allowed_ws_origins = [\n    /https?:\\/\\/localhost(:\\d+)?/,\n    /https?:\\/\\/.*\\.example\\.com/\n  ]\nend\n\n# config/routes.rb (partial)\n# Rails.application.routes.draw do\n#   mount ActionCable.server => '/cable'\n# end",
+  "environment": {
+    "description": "Same Rails 7.1 API on GKE with Pod Security Standards enforced at namespace level via label 'pod-security.kubernetes.io/enforce: restricted'. The restricted profile rejects containers with runAsNonRoot: false, disallows hostPath volumes, drops ALL capabilities, requires seccompProfile type RuntimeDefault. Additionally, the namespace has a ValidatingAdmissionPolicy (CEL-based) that rejects any pod spec containing volume types other than 'configMap', 'secret', 'emptyDir', 'projected', and 'persistentVolumeClaim'. Container image uses distroless base (gcr.io/distroless/ruby27-debian11) with no shell binary (/bin/sh, /bin/bash, etc. absent). WS_ALLOW_ALL_ORIGINS=true remains set in the environment.",
+    "config": {
+      "kubernetes_namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "validating_admission_policy": "deny volumes not in [configMap, secret, emptyDir, projected, persistentVolumeClaim]",
+      "container_image": "gcr.io/distroless/ruby27-debian11",
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        },
+        "readOnlyRootFilesystem": true
+      },
+      "env_vars": {
+        "WS_ALLOW_ALL_ORIGINS": "true",
+        "RAILS_ENV": "production"
+      },
+      "network_policy": "none"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "3fb1dfc6",
+  "language": "python",
+  "code": "from flask import Flask, request, redirect, jsonify\nimport requests\nimport urllib.parse\nimport re\n\napp = Flask(__name__)\n\n# Internal service registry for microservice communication\nSERVICE_REGISTRY = {\n    'auth': 'http://10.0.1.50:8080',\n    'billing': 'http://10.0.1.51:8080',\n    'notifications': 'http://10.0.1.52:8080',\n    'metadata': 'http://169.254.170.2'  # ECS task metadata endpoint\n}\n\n# Allowlist for redirect domains (incomplete validation)\nALLOWED_REDIRECT_HOSTS = ['app.example.com', 'login.example.com', 'cdn.example.com']\n\ndef is_safe_redirect(url):\n    \"\"\"Validate redirect URL - checks scheme and host\"\"\"\n    try:\n        parsed = urllib.parse.urlparse(url)\n        if parsed.scheme not in ('http', 'https', ''):\n            return False\n        if parsed.hostname and parsed.hostname in ALLOWED_REDIRECT_HOSTS:\n            return True\n        # Allow relative URLs\n        if not parsed.scheme and not parsed.hostname:\n            return True\n        return False\n    except Exception:\n        return False\n\n@app.route('/login/callback')\ndef login_callback():\n    \"\"\"OAuth callback handler with redirect\"\"\"\n    next_url = request.args.get('next', '/')\n    token = request.args.get('token', '')\n    \n    # Validate the redirect target\n    if not is_safe_redirect(next_url):\n        return jsonify({'error': 'Invalid redirect URL'}), 400\n    \n    return redirect(next_url)\n\n@app.route('/api/proxy')\ndef service_proxy():\n    \"\"\"Internal service proxy - fetches data from internal services\"\"\"\n    service_url = request.args.get('url', '')\n    callback_url = request.args.get('callback', '')\n    \n    # Block obvious SSRF attempts to cloud metadata\n    blocked_patterns = ['169.254.169.254', 'metadata.google', 'metadata.azure']\n    if any(pattern in service_url for pattern in blocked_patterns):\n        return jsonify({'error': 'Blocked request'}), 403\n    \n    try:\n        # Fetch from the requested internal service\n        resp = requests.get(service_url, timeout=5, allow_redirects=True)\n        data = resp.text\n        \n        # If callback URL provided, send results there (webhook pattern)\n        if callback_url:\n            requests.post(callback_url, json={'result': data}, timeout=5)\n            return jsonify({'status': 'sent to callback'})\n        \n        return jsonify({'data': data})\n    except requests.exceptions.RequestException as e:\n        return jsonify({'error': str(e)}), 502\n\n@app.route('/api/health')\ndef health_check():\n    \"\"\"Health check endpoint that queries ECS metadata\"\"\"\n    try:\n        meta = requests.get('http://169.254.170.2/v2/metadata', timeout=2)\n        return jsonify({'status': 'healthy', 'task_arn': meta.json().get('TaskARN', 'unknown')})\n    except Exception:\n        return jsonify({'status': 'healthy', 'task_arn': 'unavailable'})\n\n@app.route('/api/fetch-config')\ndef fetch_config():\n    \"\"\"Fetch configuration from internal config service\"\"\"\n    config_host = request.args.get('host', '10.0.1.100')\n    config_path = request.args.get('path', '/config/app.json')\n    \n    # Validate host looks like internal IP\n    if not re.match(r'^10\\.0\\.\\d+\\.\\d+$', config_host):\n        # Allow redirect-based resolution for service mesh\n        if not re.match(r'^[a-z\\-]+\\.internal\\.local$', config_host):\n            return jsonify({'error': 'Invalid config host'}), 400\n    \n    url = f'http://{config_host}:8080{config_path}'\n    try:\n        resp = requests.get(url, timeout=5, allow_redirects=True)\n        return jsonify({'config': resp.json()})\n    except Exception as e:\n        return jsonify({'error': f'Config fetch failed: {e}'}), 502\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=5000)",
+  "environment": {
+    "description": "ECS Fargate task running in a private subnet (10.0.1.0/24) with a NAT Gateway attached to the route table, allowing outbound internet access. Security group allows all outbound traffic (0.0.0.0/0). Task IAM role has s3:GetObject and secretsmanager:GetSecretValue permissions. VPC endpoint for ECS metadata is available. No WAF or network ACL restrictions on outbound connections.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "subnet_type": "private",
+      "nat_gateway": true,
+      "security_group_egress": "0.0.0.0/0 all ports",
+      "task_role_permissions": [
+        "s3:GetObject",
+        "secretsmanager:GetSecretValue"
+      ],
+      "network_acl": "default (allow all)",
+      "vpc_endpoints": [
+        "com.amazonaws.ecs-agent"
+      ],
+      "waf": "none"
+    }
+  }
+}

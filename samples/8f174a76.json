@@ -1,0 +1,34 @@
+{
+  "id": "8f174a76",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.io', 'admin', 'sk-admin-9f8e7d6c')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('alice', 'alice@corp.io', 'user', 'sk-alice-1a2b3c4d')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef authenticate():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    g.current_user = dict(user)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': f'Invalid field. Allowed: {allowed_fields}'}), 400\n    \n    # Log the search action\n    db = get_db()\n    db.execute(\n        \"INSERT INTO audit_log (action, username) VALUES (?, ?)\",\n        (f\"search:{field}={value}\", g.current_user['username'])\n    )\n    db.commit()\n    \n    # Build query with validated field name but user-controlled value\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/me', methods=['GET'])\ndef get_current_user():\n    return jsonify({\n        'username': g.current_user['username'],\n        'email': g.current_user['email'],\n        'role': g.current_user['role']\n    })\n\n@app.route('/api/admin/users', methods=['GET'])\ndef list_all_users():\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Admin access required'}), 403\n    db = get_db()\n    users = db.execute('SELECT username, email, role FROM users').fetchall()\n    return jsonify({'users': [dict(u) for u in users]})\n\n@app.route('/api/admin/grant', methods=['POST'])\ndef grant_role():\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Admin access required'}), 403\n    data = request.get_json()\n    db = get_db()\n    db.execute('UPDATE users SET role = ? WHERE username = ?', (data['role'], data['username']))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes three rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'corp-input-validation' with a single RegexPatternSet rule matching request query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*--)|(?:%27|%2527)` with action BLOCK and priority 1, (3) AWSManagedRulesSQLiRuleSet with all rules in COUNT mode (monitoring phase). The custom rule group has capacity 50 WCU and is the only rule in BLOCK mode. CloudWatch metrics namespace 'corp/waf' tracks BlockedRequests. The ALB access logs are shipped to S3 with 5-minute intervals.",
+    "config": {
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corp-api-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override_action": "none",
+          "note": "SizeRestrictions_QUERYSTRING set to COUNT"
+        },
+        {
+          "name": "corp-input-validation",
+          "priority": 5,
+          "action": "BLOCK",
+          "regex_pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*--)|(?:%27|%2527)"
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "priority": 20,
+          "override_action": "count"
+        }
+      ],
+      "ecs_task_role": "arn:aws:iam::123456789012:role/app-task-role",
+      "network_mode": "awsvpc",
+      "readonly_root_filesystem": true,
+      "alb_access_logs": true
+    }
+  }
+}

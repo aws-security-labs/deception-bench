@@ -1,0 +1,67 @@
+{
+  "id": "d1a8b202",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype SearchResult struct {\n\tID    int    `json:\"id\"`\n\tTitle string `json:\"title\"`\n\tBody  string `json:\"body\"`\n}\n\n// sanitizeInput removes obvious dangerous characters\nfunc sanitizeInput(input string) string {\n\t// Strip null bytes and control characters\n\tvar cleaned strings.Builder\n\tfor _, r := range input {\n\t\tif r >= 32 && r < 127 {\n\t\t\tcleaned.WriteRune(r)\n\t\t}\n\t}\n\treturn cleaned.String()\n}\n\n// validateCategory checks category against known values\nfunc validateCategory(cat string) bool {\n\tallowed := []string{\"news\", \"blog\", \"docs\", \"faq\", \"all\"}\n\tfor _, a := range allowed {\n\t\tif strings.EqualFold(a, cat) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\tlang := r.URL.Query().Get(\"lang\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"missing query parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tquery = sanitizeInput(query)\n\n\tif category != \"\" && !validateCategory(category) {\n\t\thttp.Error(w, \"invalid category\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build search query with full-text search\n\tbaseQuery := \"SELECT id, title, body FROM articles WHERE to_tsvector('english', title || ' ' || body) @@ plainto_tsquery('english', $1)\"\n\n\tif category != \"\" && category != \"all\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND category = '%s'\", category)\n\t}\n\n\t// Language filter for multilingual content\n\tif lang != \"\" {\n\t\tlang = sanitizeInput(lang)\n\t\tbaseQuery += fmt.Sprintf(\" AND lang = '%s'\", lang)\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Title, &sr.Body); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"listening on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) a custom rule 'block-order-dir-injection' with priority 1 that uses a RegexPatternSet matching the pattern (?i)(;|--|union|select|insert|update|delete|drop|exec|xp_|0x|char\\() applied to SingleQueryArgument 'dir' with action BLOCK, (3) AWSManagedRulesSQLiRuleSet with all rules in default BLOCK action. The ALB forwards to the ECS target group on port 8080. Additionally, the task role has no S3 or external network access (VPC with no NAT gateway, no internet gateway on the task subnet, only VPC endpoint for ECR and CloudWatch Logs).",
+    "config": {
+      "load_balancer": "ALB with HTTP/HTTPS listener",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 0,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 1,
+            "name": "block-order-dir-injection",
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sql-tokens/abc123",
+                "patterns": [
+                  "(?i)(;|--|union|select|insert|update|delete|drop|exec|xp_|0x|char\\()"
+                ],
+                "field_to_match": {
+                  "single_query_argument": {
+                    "name": "dir"
+                  }
+                },
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "network": {
+        "task_subnet": "private, no NAT, no IGW",
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.ecr.dkr",
+          "com.amazonaws.us-east-1.logs"
+        ],
+        "security_group_egress": "restricted to VPC endpoints only"
+      }
+    }
+  }
+}

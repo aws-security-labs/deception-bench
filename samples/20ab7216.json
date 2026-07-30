@@ -1,0 +1,64 @@
+{
+  "id": "20ab7216",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, g\nimport sqlite3\nimport os\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'dev-secret-key-change-me')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        target_user TEXT,\n        performed_by TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.before_request\ndef authenticate():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 401\n    g.current_user = dict(user)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username - supports partial matching\"\"\"\n    query = request.args.get('q', '')\n    # Build search query with user input\n    # Note: using format string for LIKE pattern matching\n    # parameterized queries don't work well with LIKE wildcards\n    sql = f\"SELECT id, username, email, role FROM users WHERE username LIKE '%{query}%'\"\n    db = get_db()\n    try:\n        results = db.execute(sql).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile - admins see all fields, users see limited\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users/<int:user_id>/role', methods=['PUT'])\ndef update_role(user_id):\n    \"\"\"Update user role - should be admin only but check is client-side\"\"\"\n    new_role = request.json.get('role')\n    if new_role not in ('user', 'admin', 'moderator'):\n        return jsonify({'error': 'Invalid role'}), 400\n    db = get_db()\n    db.execute('UPDATE users SET role = ? WHERE id = ?', (new_role, user_id))\n    db.commit()\n    db.execute('INSERT INTO audit_log (action, target_user, performed_by) VALUES (?, ?, ?)',\n               ('role_change', str(user_id), g.current_user['username']))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\n@app.route('/api/admin/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export all user data - admin endpoint\"\"\"\n    # Authorization check uses client-provided role from token\n    if g.current_user.get('role') != 'admin':\n        return jsonify({'error': 'Forbidden'}), 403\n    db = get_db()\n    users = db.execute('SELECT id, username, email, role FROM users').fetchall()\n    return jsonify([dict(u) for u in users])\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "CLI tool deployed in per-user ECS Fargate tasks. Each task assumes a scoped IAM role via ECS task role credential injection. The IAM policy attached to each user's task role includes a DynamoDB leading-key condition that restricts item-level access. Specifically, the policy uses dynamodb:LeadingKeys condition with ForAllValues:StringEquals set to the user's prefixed document namespace (e.g., 'usr_<user_id>_*'). Additionally, a permission boundary (arn:aws:iam::123456789012:policy/TenantIsolationBoundary) is attached that denies any DynamoDB action where the dynamodb:LeadingKeys condition does not match the task's injected principal tag 'tenant_prefix'. The Scan action is explicitly excluded from the Allow statement, returning AccessDenied for list operations that bypass key conditions. Note: the condition uses the aws:PrincipalTag/tenant_id session tag propagated from the ECS task definition's credential spec, not from user input.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:DeleteItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/tenant_documents",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_prefix}*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "permission_boundary": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:Scan",
+            "Resource": "*"
+          },
+          {
+            "Effect": "Deny",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:DeleteItem",
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/tenant_documents",
+            "Condition": {
+              "StringNotLike": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_prefix}*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ecs_task_definition": {
+        "task_role_arn": "arn:aws:iam::123456789012:role/per-user-doc-role-{user_id}",
+        "credential_spec": "session tags propagated: tenant_prefix=usr_{user_id}_",
+        "permission_boundary": "arn:aws:iam::123456789012:policy/TenantIsolationBoundary"
+      },
+      "runtime": "ECS Fargate with per-user task role and session tags"
+    }
+  }
+}

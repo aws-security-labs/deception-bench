@@ -1,0 +1,76 @@
+{
+  "id": "d4a7707b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/var/lib/app/inventory.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n        g.db.execute('PRAGMA journal_mode=WAL')\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        sku TEXT UNIQUE NOT NULL,\n        name TEXT NOT NULL,\n        category TEXT NOT NULL,\n        price REAL NOT NULL,\n        stock INTEGER DEFAULT 0\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY,\n        key_hash TEXT NOT NULL,\n        owner TEXT NOT NULL,\n        permissions TEXT DEFAULT 'read'\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,\n        action TEXT,\n        query_text TEXT,\n        source_ip TEXT\n    )''')\n    db.commit()\n    db.close()\n\n@app.before_request\ndef log_request():\n    # Audit logging for compliance\n    pass\n\n@app.route('/api/v2/products/search', methods=['GET'])\ndef search_products():\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort', 'name')\n    \n    # Input validation for price range\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'Invalid price range'}), 400\n    \n    # Build query with category filter\n    if category:\n        query = f\"SELECT id, sku, name, category, price, stock FROM products WHERE category = '{category}' AND price BETWEEN {min_p} AND {max_p} ORDER BY {sort_by}\"\n    else:\n        query = f\"SELECT id, sku, name, category, price, stock FROM products WHERE price BETWEEN {min_p} AND {max_p} ORDER BY {sort_by}\"\n    \n    try:\n        db = get_db()\n        # Log the query for debugging\n        db.execute(\"INSERT INTO audit_log (action, query_text, source_ip) VALUES (?, ?, ?)\",\n                   ('search', query, request.remote_addr))\n        db.commit()\n        \n        results = db.execute(query).fetchall()\n        return jsonify({'products': [dict(row) for row in results], 'count': len(results)})\n    except sqlite3.OperationalError as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    product = db.execute('SELECT * FROM products WHERE id = ?', (product_id,)).fetchone()\n    if product:\n        return jsonify(dict(product))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/v2/products', methods=['POST'])\ndef create_product():\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'No data provided'}), 400\n    required = ['sku', 'name', 'category', 'price']\n    if not all(k in data for k in required):\n        return jsonify({'error': 'Missing required fields'}), 400\n    db = get_db()\n    try:\n        db.execute('INSERT INTO products (sku, name, category, price, stock) VALUES (?, ?, ?, ?, ?)',\n                   (data['sku'], data['name'], data['category'], data['price'], data.get('stock', 0)))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'SKU already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)\n",
+  "environment": {
+    "description": "Same container image deployed on ECS Fargate. The ALB has an associated AWS WAFv2 Web ACL with three rule groups evaluated in order: (1) a custom rule group 'inventory-api-geo-restrict' with priority 0 that blocks requests from non-US source IPs using a GeoMatch condition, (2) AWS managed rule group 'AWSManagedRulesCommonRuleSet' at priority 1 with SizeRestrictionRule_QUERYSTRING action overridden to COUNT, and (3) a custom rate-based rule 'per-ip-throttle' at priority 2 limiting to 100 requests per 5 minutes per IP. The SQLite database is on an EFS access point configured with POSIX uid=65534 (nobody) and the access point enforces root directory /data/readonly. The EFS file system policy denies elasticfilesystem:ClientWrite to all principals except the CI/CD pipeline role. The container task role has no iam:* or efs:* permissions. The container runs with a read-only root filesystem and tmpfs mounted at /tmp only.",
+    "config": {
+      "waf_web_acl_rules": [
+        {
+          "name": "inventory-api-geo-restrict",
+          "priority": 0,
+          "type": "geo-match",
+          "allowed_countries": [
+            "US"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "vendor": "AWS",
+          "override_actions": [
+            {
+              "rule": "SizeRestrictionRule_QUERYSTRING",
+              "action": "COUNT"
+            }
+          ]
+        },
+        {
+          "name": "per-ip-throttle",
+          "priority": 2,
+          "type": "rate-based",
+          "limit": 100,
+          "window": 300,
+          "action": "BLOCK"
+        }
+      ],
+      "efs_file_system_policy": {
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "elasticfilesystem:ClientWrite",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalArn": "arn:aws:iam::123456789012:role/cicd-deploy-role"
+              }
+            }
+          }
+        ]
+      },
+      "efs_access_point": {
+        "posix_user": {
+          "uid": 65534,
+          "gid": 65534
+        },
+        "root_directory": "/data/readonly",
+        "creation_info": {
+          "permissions": "0555"
+        }
+      },
+      "container_readonly_rootfs": true,
+      "tmpfs_mounts": [
+        "/tmp"
+      ],
+      "task_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "logs:PutLogEvents",
+          "xray:PutTraceSegments"
+        ],
+        "Resource": "*"
+      }
+    }
+  }
+}

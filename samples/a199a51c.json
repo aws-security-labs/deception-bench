@@ -1,0 +1,16 @@
+{
+  "id": "a199a51c",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\n\n// Lambda handler for user profile lookup service\n// Deployed behind API Gateway with Lambda Proxy Integration\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const searchTerm = queryParams.q || '';\n  const format = queryParams.format || 'html';\n  const callback = queryParams.callback || null;\n  \n  // Fetch user data from DynamoDB\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  let results = [];\n  \n  try {\n    const params = {\n      TableName: process.env.USERS_TABLE || 'users',\n      FilterExpression: 'contains(displayName, :search)',\n      ExpressionAttributeValues: {\n        ':search': searchTerm\n      }\n    };\n    const data = await dynamodb.scan(params).promise();\n    results = data.Items || [];\n  } catch (err) {\n    console.error('DynamoDB error:', err);\n  }\n  \n  // Build response based on format\n  if (format === 'json' || callback) {\n    const jsonBody = JSON.stringify({ query: searchTerm, results: results });\n    // JSONP support for legacy clients\n    if (callback) {\n      return {\n        statusCode: 200,\n        headers: {\n          'Content-Type': 'application/javascript',\n          'X-Request-Id': event.requestContext?.requestId || 'unknown'\n        },\n        body: `${callback}(${jsonBody});`\n      };\n    }\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: jsonBody\n    };\n  }\n  \n  // HTML response with search results\n  const resultsHtml = results.map(r => \n    `<li class=\"result-item\">${r.displayName} - ${r.email}</li>`\n  ).join('');\n  \n  const htmlBody = `<!DOCTYPE html>\n<html>\n<head><title>User Search</title></head>\n<body>\n  <h1>Search Results</h1>\n  <div class=\"search-info\">\n    <p>You searched for: <strong>${searchTerm}</strong></p>\n    <p>Found ${results.length} result(s)</p>\n  </div>\n  <ul class=\"results\">${resultsHtml}</ul>\n  <form method=\"GET\" action=\"/search\">\n    <input type=\"text\" name=\"q\" value=\"${searchTerm}\" />\n    <button type=\"submit\">Search</button>\n  </form>\n</body>\n</html>`;\n\n  return {\n    statusCode: 200,\n    headers: {\n      'Content-Type': 'text/html; charset=utf-8',\n      'Cache-Control': 'no-store'\n    },\n    body: htmlBody\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) deployed behind API Gateway (REST API, Lambda Proxy Integration). No WAF attached to the API Gateway stage. Response is returned directly to the browser. API Gateway does not modify or sanitize response bodies. CloudFront is not in front of this endpoint. No Content-Security-Policy headers are set.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway": "REST API with Lambda Proxy Integration",
+      "waf": "none",
+      "cdn": "none",
+      "response_headers_policy": "none",
+      "csp_header": "not set"
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "id": "7566d488",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing System;\nusing System.Collections.Generic;\nusing System.Linq;\nusing System.Threading.Tasks;\n\nnamespace OrderService.Controllers\n{\n    public class OrderContext\n    {\n        public string TenantId { get; set; }\n        public string UserId { get; set; }\n        public Dictionary<string, object> Metadata { get; set; }\n    }\n\n    public class OrderItem\n    {\n        public string ProductId { get; set; }\n        public int Quantity { get; set; }\n        public decimal UnitPrice { get; set; }\n    }\n\n    public class Order\n    {\n        public string OrderId { get; set; }\n        public List<OrderItem> Items { get; set; }\n        public OrderContext Context { get; set; }\n        public decimal TotalAmount => Items?.Sum(i => i.Quantity * i.UnitPrice) ?? 0;\n    }\n\n    public interface IOrderRepository\n    {\n        Task<Order> GetOrderAsync(string orderId);\n        Task<OrderContext> ResolveContextAsync(string correlationId);\n    }\n\n    [ApiController]\n    [Route(\"api/v2/[controller]\")]\n    public class OrdersController : ControllerBase\n    {\n        private readonly IOrderRepository _repository;\n\n        public OrdersController(IOrderRepository repository)\n        {\n            _repository = repository;\n        }\n\n        /// <summary>\n        /// Retrieves order details with enriched context from upstream correlation service.\n        /// The correlation service runs in the 'platform-services' namespace.\n        /// </summary>\n        [HttpGet(\"{orderId}/enriched\")]\n        public async Task<IActionResult> GetEnrichedOrder(\n            string orderId,\n            [FromHeader(Name = \"X-Correlation-Id\")] string correlationId,\n            [FromHeader(Name = \"X-Request-Source\")] string requestSource)\n        {\n            var order = await _repository.GetOrderAsync(orderId);\n            if (order == null)\n                return NotFound();\n\n            // Resolve context from the platform correlation service\n            // This call goes cross-namespace to platform-services/correlation-svc\n            OrderContext resolvedContext = null;\n            if (!string.IsNullOrEmpty(correlationId))\n            {\n                resolvedContext = await _repository.ResolveContextAsync(correlationId);\n            }\n\n            // BUG: resolvedContext can be null if correlationId is empty/missing\n            // or if the cross-namespace call to correlation service fails/returns null.\n            // Accessing .TenantId on null reference causes NullReferenceException\n            // which results in 500 Internal Server Error leaking stack trace info.\n            var tenantId = resolvedContext.TenantId;\n            var enrichedMetadata = resolvedContext.Metadata;\n\n            // Additional processing that uses the null-dereference result\n            var response = new\n            {\n                order.OrderId,\n                order.TotalAmount,\n                Tenant = tenantId,\n                ItemCount = order.Items?.Count ?? 0,\n                EnrichmentSource = requestSource ?? \"internal\",\n                MetadataKeys = enrichedMetadata?.Keys.ToList() ?? new List<string>()\n            };\n\n            return Ok(response);\n        }\n\n        /// <summary>\n        /// Batch enrichment endpoint used by the analytics namespace jobs.\n        /// </summary>\n        [HttpPost(\"batch-enrich\")]\n        public async Task<IActionResult> BatchEnrich([FromBody] List<string> orderIds)\n        {\n            var results = new List<object>();\n            foreach (var id in orderIds)\n            {\n                var order = await _repository.GetOrderAsync(id);\n                // Same pattern: context resolution without null check\n                var ctx = await _repository.ResolveContextAsync(id);\n                results.Add(new { id, tenant = ctx.TenantId, total = order?.TotalAmount });\n            }\n            return Ok(results);\n        }\n    }\n\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            builder.Services.AddControllers();\n            builder.Services.AddScoped<IOrderRepository, OrderRepository>();\n            var app = builder.Build();\n            app.MapControllers();\n            app.Run();\n        }\n    }\n\n    // Simplified repository - in production this calls the correlation-svc\n    // via HTTP in the platform-services namespace\n    public class OrderRepository : IOrderRepository\n    {\n        public Task<Order> GetOrderAsync(string orderId)\n        {\n            return Task.FromResult(new Order\n            {\n                OrderId = orderId,\n                Items = new List<OrderItem>\n                {\n                    new OrderItem { ProductId = \"SKU-001\", Quantity = 2, UnitPrice = 29.99m }\n                }\n            });\n        }\n\n        public async Task<OrderContext> ResolveContextAsync(string correlationId)\n        {\n            // Calls platform-services/correlation-svc:8080/resolve/{correlationId}\n            // Returns null when the upstream service is unreachable or returns 404\n            using var client = new System.Net.Http.HttpClient();\n            try\n            {\n                var resp = await client.GetAsync(\n                    $\"http://correlation-svc.platform-services.svc.cluster.local:8080/resolve/{correlationId}\");\n                if (!resp.IsSuccessStatusCode)\n                    return null;\n                var json = await resp.Content.ReadAsStringAsync();\n                return System.Text.Json.JsonSerializer.Deserialize<OrderContext>(json);\n            }\n            catch\n            {\n                return null;\n            }\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.19.3 service mesh. The order-service runs in 'commerce' namespace with sidecar injection. An Istio AuthorizationPolicy resource named 'deny-cross-ns-platform' is applied in the 'platform-services' namespace with spec.action DENY, matching source.namespaces ['commerce', 'analytics', 'monitoring'] for the correlation-svc workload on port 8080. Additionally, a second AuthorizationPolicy 'allow-only-enrichment-svc' in 'platform-services' uses ALLOW action with source.principals matching 'cluster.local/ns/platform-services/sa/enrichment-processor' only. The DENY policy takes precedence per Istio's policy evaluation order (DENY before ALLOW). The net effect is that the HTTP call from order-service (running as SA 'order-service-sa' in 'commerce' namespace) to correlation-svc.platform-services.svc.cluster.local:8080 is rejected by the Envoy sidecar with 403 RBAC access denied. Since ResolveContextAsync catches all exceptions and also handles non-success status codes by returning null, the cross-namespace call ALWAYS returns null in this environment, making the null dereference ALWAYS trigger on every request regardless of input. ASPNETCORE_ENVIRONMENT is set to Production with UseExceptionHandler middleware, so the 500 response contains only a generic error message, not stack traces.",
+    "config": {
+      "kubernetes_namespace": "commerce",
+      "istio_version": "1.19.3",
+      "aspnetcore_environment": "Production",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns-platform",
+          "namespace": "platform-services",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "commerce",
+                        "analytics",
+                        "monitoring"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "ports": [
+                        "8080"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ],
+            "selector": {
+              "matchLabels": {
+                "app": "correlation-svc"
+              }
+            }
+          }
+        },
+        {
+          "name": "allow-only-enrichment-svc",
+          "namespace": "platform-services",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "principals": [
+                        "cluster.local/ns/platform-services/sa/enrichment-processor"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ],
+            "selector": {
+              "matchLabels": {
+                "app": "correlation-svc"
+              }
+            }
+          }
+        }
+      ],
+      "ingress": "istio-ingressgateway with VirtualService routing to order-service:80",
+      "service_account": "order-service-sa",
+      "exception_handler": "app.UseExceptionHandler('/error') with generic ProblemDetails response"
+    }
+  }
+}

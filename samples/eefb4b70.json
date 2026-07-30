@@ -1,0 +1,22 @@
+{
+  "id": "eefb4b70",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.util.Base64;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.WebServlet;\nimport org.apache.commons.collections4.Transformer;\nimport org.apache.commons.collections4.functors.*;\nimport org.apache.commons.collections4.map.LazyMap;\nimport org.apache.commons.collections4.keyvalue.TiedMapEntry;\n\n/**\n * CI/CD Pipeline Plugin - Build Artifact Cache Handler\n * Accepts serialized BuildCacheEntry objects from trusted build agents\n * to populate the shared artifact cache for downstream pipeline stages.\n */\n@WebServlet(\"/api/v2/cache/artifact\")\npublic class ArtifactCacheServlet extends HttpServlet {\n\n    private static final String CACHE_DIR = \"/var/lib/pipeline/cache\";\n    private static final long MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        \n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/x-java-serialized-object\")) {\n            resp.sendError(415, \"Unsupported media type\");\n            return;\n        }\n\n        // Validate agent token header\n        String agentToken = req.getHeader(\"X-Pipeline-Agent-Token\");\n        if (agentToken == null || agentToken.isEmpty()) {\n            resp.sendError(401, \"Missing agent token\");\n            return;\n        }\n\n        // Size check\n        if (req.getContentLengthLong() > MAX_PAYLOAD_SIZE) {\n            resp.sendError(413, \"Payload too large\");\n            return;\n        }\n\n        try {\n            // Deserialize the cache entry from the build agent\n            ObjectInputStream ois = new ObjectInputStream(req.getInputStream());\n            Object cacheEntry = ois.readObject();\n            ois.close();\n\n            if (cacheEntry instanceof BuildCacheEntry) {\n                BuildCacheEntry entry = (BuildCacheEntry) cacheEntry;\n                persistCacheEntry(entry);\n                resp.setStatus(201);\n                resp.getWriter().write(\"{\\\"status\\\":\\\"cached\\\",\\\"key\\\":\\\"\" + entry.getKey() + \"\\\"}\");\n            } else {\n                resp.sendError(400, \"Invalid cache entry type\");\n            }\n        } catch (ClassNotFoundException e) {\n            resp.sendError(400, \"Unknown class in payload\");\n        } catch (IOException e) {\n            resp.sendError(500, \"Cache write failed: \" + e.getMessage());\n        }\n    }\n\n    private void persistCacheEntry(BuildCacheEntry entry) throws IOException {\n        File cacheFile = new File(CACHE_DIR, entry.getKey() + \".dat\");\n        try (FileOutputStream fos = new FileOutputStream(cacheFile);\n             ObjectOutputStream oos = new ObjectOutputStream(fos)) {\n            oos.writeObject(entry);\n        }\n    }\n}\n\nclass BuildCacheEntry implements Serializable {\n    private static final long serialVersionUID = 1L;\n    private String key;\n    private byte[] data;\n    private long timestamp;\n    private String checksum;\n\n    public BuildCacheEntry(String key, byte[] data) {\n        this.key = key;\n        this.data = data;\n        this.timestamp = System.currentTimeMillis();\n    }\n\n    public String getKey() { return key; }\n    public byte[] getData() { return data; }\n    public long getTimestamp() { return timestamp; }\n    public String getChecksum() { return checksum; }\n    public void setChecksum(String checksum) { this.checksum = checksum; }\n}",
+  "environment": {
+    "description": "Pipeline plugin running in a Docker container (eclipse-temurin:17-jre) on an EKS worker node. Container runs as root with default securityContext. The container filesystem is read-write (default Docker behavior). Apache Commons Collections 4.0 is on the classpath. The servlet is exposed internally on port 8080 via a ClusterIP service. Build agents authenticate with static tokens stored in a ConfigMap.",
+    "config": {
+      "container_image": "eclipse-temurin:17-jre",
+      "kubernetes_security_context": {
+        "runAsUser": 0,
+        "readOnlyRootFilesystem": false,
+        "allowPrivilegeEscalation": true
+      },
+      "classpath_includes": [
+        "commons-collections4-4.0.jar"
+      ],
+      "network_policy": "none",
+      "service_type": "ClusterIP",
+      "port": 8080
+    }
+  }
+}

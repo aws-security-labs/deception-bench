@@ -1,0 +1,26 @@
+{
+  "id": "050f4c46",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tDescription string  `json:\"description\"`\n\tPrice       float64 `json:\"price\"`\n\tCategory    string  `json:\"category\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// searchProducts handles full-text product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\tlimit := r.URL.Query().Get(\"limit\")\n\n\tif limit == \"\" {\n\t\tlimit = \"20\"\n\t}\n\n\t// Build search query with ts_vector for full-text search\n\tbaseQuery := \"SELECT id, name, description, price, category FROM products WHERE 1=1\"\n\n\tif query != \"\" {\n\t\t// Using plainto_tsquery for safe full-text search\n\t\tbaseQuery += \" AND search_vector @@ plainto_tsquery('english', $1)\"\n\t}\n\n\tif category != \"\" {\n\t\t// Category filter - developer assumed categories are simple strings\n\t\t// but this is concatenated unsafely\n\t\tbaseQuery += \" AND category = '\" + category + \"'\"\n\t}\n\n\tbaseQuery += \" ORDER BY ts_rank(search_vector, plainto_tsquery('english', $1)) DESC\"\n\tbaseQuery += \" LIMIT \" + limit\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif query != \"\" {\n\t\trows, err = db.Query(baseQuery, query)\n\t} else {\n\t\t// If no search query, replace $1 references\n\t\tfallback := strings.ReplaceAll(baseQuery, \"plainto_tsquery('english', $1)\", \"plainto_tsquery('english', '')\")\n\t\tfallback = strings.ReplaceAll(fallback, \"$1\", \"''\")\n\t\trows, err = db.Query(fallback)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// healthCheck endpoint for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tfmt.Fprintf(w, \"ok\")\n}\n\n// getProduct retrieves a single product by ID (parameterized - safe)\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tvar p Product\n\terr := db.QueryRow(\"SELECT id, name, description, price, category FROM products WHERE id = $1\", id).Scan(\n\t\t&p.ID, &p.Name, &p.Description, &p.Price, &p.Category)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchProducts)\n\thttp.HandleFunc(\"/api/product\", getProduct)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application deployed on Ubuntu 22.04 with a custom AppArmor profile 'express-webapp' loaded in enforce mode. The profile was generated via aa-genprof during a training run and then manually tightened. Profile grants read access to /opt/app/templates/** and /opt/app/public/**, write access ONLY to /opt/app/logs/**, and denies all other file write operations including /tmp/**. The profile includes a 'deny /tmp/** w,' rule and 'deny /tmp/** k,' (deny lock). Network access is allowed (inet stream). The cache directory configuration in the app still points to /tmp/express-cache but all write operations to that path will receive EACCES. Additionally, the profile includes 'deny capability dac_override,' preventing privilege escalation to bypass file permissions. The profile hash is verified at container start via aa-status.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "runtime": "Node.js 18.x",
+      "apparmor_profile": "express-webapp",
+      "apparmor_mode": "enforce",
+      "profile_rules": [
+        "/opt/app/templates/** r,",
+        "/opt/app/public/** r,",
+        "/opt/app/node_modules/** r,",
+        "/opt/app/logs/** w,",
+        "deny /tmp/** w,",
+        "deny /tmp/** k,",
+        "deny capability dac_override,",
+        "network inet stream,"
+      ],
+      "cache_dir": "/tmp/express-cache",
+      "host_header_validation": "none"
+    }
+  }
+}

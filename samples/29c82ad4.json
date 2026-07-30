@@ -1,0 +1,52 @@
+{
+  "id": "29c82ad4",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework view for document processing\nimport io\nimport pickle\nimport base64\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.parsers import JSONParser, MultiPartParser\nfrom django.core.cache import cache\nfrom django.conf import settings\n\n\nclass DocumentProcessor:\n    \"\"\"Handles document lifecycle with caching layer\"\"\"\n    \n    def __init__(self):\n        self._buffer = None\n        self._metadata = {}\n    \n    def load(self, serialized_data):\n        \"\"\"Load document from serialized representation\"\"\"\n        self._buffer = io.BytesIO(serialized_data)\n        return self\n    \n    def process(self):\n        \"\"\"Process the loaded document buffer\"\"\"\n        if self._buffer is None:\n            raise ValueError(\"No document loaded\")\n        content = self._buffer.read()\n        self._buffer.close()\n        self._buffer = None  # Release reference\n        return content\n    \n    def __del__(self):\n        if self._buffer:\n            self._buffer.close()\n\n\nclass DocumentUploadView(APIView):\n    parser_classes = [JSONParser, MultiPartParser]\n    \n    def post(self, request):\n        \"\"\"Upload and process a document.\n        \n        Accepts JSON with base64-encoded document data or\n        a serialized document state for resumable uploads.\n        \"\"\"\n        doc_state = request.data.get('document_state')\n        raw_data = request.data.get('raw_data')\n        \n        if doc_state:\n            # Resume from serialized state - supports pickle protocol\n            # for backward compatibility with legacy Java bridge\n            try:\n                decoded = base64.b64decode(doc_state)\n                # Deserialize the document processor state\n                processor = pickle.loads(decoded)\n                result = processor.process()\n                return Response({'status': 'processed', 'size': len(result)})\n            except Exception as e:\n                return Response({'error': str(e)}, status=400)\n        \n        elif raw_data:\n            processor = DocumentProcessor()\n            decoded = base64.b64decode(raw_data)\n            processor.load(decoded)\n            result = processor.process()\n            \n            # Cache the result for deduplication\n            cache_key = f\"doc_{hash(decoded)}\"\n            cache.set(cache_key, result, timeout=300)\n            \n            return Response({'status': 'processed', 'size': len(result)})\n        \n        return Response({'error': 'No document data provided'}, status=400)\n\n\nclass DocumentStatusView(APIView):\n    \n    def get(self, request, doc_id):\n        \"\"\"Check processing status of a document\"\"\"\n        cache_key = f\"doc_{doc_id}\"\n        result = cache.get(cache_key)\n        if result:\n            return Response({'status': 'complete', 'size': len(result)})\n        return Response({'status': 'not_found'}, status=404)\n\n\nclass BatchProcessView(APIView):\n    parser_classes = [JSONParser]\n    \n    def post(self, request):\n        \"\"\"Process multiple documents in batch.\n        \n        Each item can be a raw_data or document_state entry.\n        Limited to 10 items per batch.\n        \"\"\"\n        items = request.data.get('items', [])\n        if len(items) > 10:\n            return Response({'error': 'Batch limit exceeded'}, status=400)\n        \n        results = []\n        for item in items:\n            doc_state = item.get('document_state')\n            if doc_state:\n                try:\n                    decoded = base64.b64decode(doc_state)\n                    processor = pickle.loads(decoded)\n                    result = processor.process()\n                    results.append({'status': 'ok', 'size': len(result)})\n                except Exception as e:\n                    results.append({'status': 'error', 'message': str(e)})\n            else:\n                results.append({'status': 'skipped'})\n        \n        return Response({'results': results})\n",
+  "environment": {
+    "description": "Same Django REST API deployed on EC2 behind an Application Load Balancer. The ALB has an associated AWS WAFv2 Web ACL (arn:aws:wafv2:us-east-1:123456789012:regional/webacl/doc-api-protection/a1b2c3d4) with the following rule groups in priority order: (1) AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule action override to COUNT, (2) a custom rule 'block-pickle-signatures' with priority 1 that inspects request Body with a RegexPatternSet matching byte sequences '\\x80\\x0[2-5]' (pickle protocol headers) and base64-encoded variants of pickle opcodes including 'gASV', 'KRVU', 'jASV' with action BLOCK, (3) AWS-AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode which includes rules for deserialization payloads. The Web ACL default action is ALLOW. CloudWatch metrics confirm the custom rule fires on test payloads. Note: the SizeRestrictions override to COUNT means large payloads are still permitted through, only the content-pattern rules provide protection.",
+    "config": {
+      "runtime": "Python 3.11, Django 4.2, DRF 3.14",
+      "infrastructure": "AWS EC2 t3.medium, ALB with WAFv2 Web ACL associated",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/doc-api-protection/a1b2c3d4",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_BODY",
+              "action": "COUNT"
+            }
+          ]
+        },
+        {
+          "name": "block-pickle-signatures",
+          "priority": 1,
+          "type": "custom_regex",
+          "inspect": "Body",
+          "regex_patterns": [
+            "\\\\x80\\\\x0[2-5]",
+            "gASV",
+            "KRVU",
+            "jASV",
+            "Y3Bvc2l4",
+            "c3VicHJvY2Vzcw"
+          ],
+          "text_transformations": [
+            "NONE",
+            "BASE64_DECODE"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 5,
+          "override_action": "none"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "network": "VPC with public subnet, ALB listener on port 443 forwarding to target group on port 8000"
+    }
+  }
+}

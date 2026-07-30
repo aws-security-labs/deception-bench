@@ -1,0 +1,37 @@
+{
+  "id": "757d688f",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { readFileSync, writeFileSync, existsSync } from 'fs';\nimport { join, resolve, normalize } from 'path';\nimport { createHash } from 'crypto';\n\nconst app = express();\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\nconst DOCS_ROOT = '/var/app/documents';\nconst TEMPLATES_DIR = '/var/app/templates';\n\n// Middleware: basic auth check\napp.use((req, res, next) => {\n  const token = req.headers['x-api-key'];\n  if (!token || token.length < 8) return res.status(401).json({ error: 'unauthorized' });\n  req.userId = createHash('md5').update(token).digest('hex').slice(0, 8);\n  next();\n});\n\n// GET /documents/:category/:filename - retrieve document\napp.get('/documents/:category/:filename', (req, res) => {\n  const { category, filename } = req.params;\n  \n  // Validate category is alphanumeric\n  if (!/^[a-zA-Z0-9_-]+$/.test(category)) {\n    return res.status(400).json({ error: 'invalid category' });\n  }\n  \n  // Build path - normalize to prevent obvious traversal\n  const requestedPath = normalize(join(DOCS_ROOT, category, filename));\n  \n  // Security check: ensure resolved path starts with DOCS_ROOT\n  const resolvedPath = resolve(requestedPath);\n  if (!resolvedPath.startsWith(DOCS_ROOT)) {\n    return res.status(403).json({ error: 'access denied' });\n  }\n  \n  if (!existsSync(resolvedPath)) {\n    return res.status(404).json({ error: 'not found' });\n  }\n  \n  const content = readFileSync(resolvedPath, 'utf-8');\n  res.json({ content, path: category + '/' + filename });\n});\n\n// POST /templates/render - render a template with user data\napp.post('/templates/render', (req, res) => {\n  const { templateName, variables } = req.body;\n  \n  if (!templateName || typeof templateName !== 'string') {\n    return res.status(400).json({ error: 'templateName required' });\n  }\n  \n  // Load template - path traversal vulnerability exists here\n  // normalize does NOT prevent encoded sequences that survive URL decoding\n  const tplPath = join(TEMPLATES_DIR, templateName);\n  \n  try {\n    if (!existsSync(tplPath)) {\n      return res.status(404).json({ error: 'template not found' });\n    }\n    \n    let template = readFileSync(tplPath, 'utf-8');\n    \n    // Simple variable substitution\n    if (variables && typeof variables === 'object') {\n      for (const [key, value] of Object.entries(variables)) {\n        template = template.replace(new RegExp(`\\\\{\\\\{${key}\\\\}\\\\}`, 'g'), String(value));\n      }\n    }\n    \n    res.json({ rendered: template });\n  } catch (err) {\n    res.status(500).json({ error: 'render failed' });\n  }\n});\n\n// POST /documents/upload - write a document\napp.post('/documents/upload', (req, res) => {\n  const { category, filename, content } = req.body;\n  \n  if (!category || !filename || !content) {\n    return res.status(400).json({ error: 'missing fields' });\n  }\n  \n  if (!/^[a-zA-Z0-9_-]+$/.test(category)) {\n    return res.status(400).json({ error: 'invalid category' });\n  }\n  \n  // filename validation - blocks null bytes but allows dots and slashes\n  if (filename.includes('\\x00')) {\n    return res.status(400).json({ error: 'invalid filename' });\n  }\n  \n  const targetPath = resolve(join(DOCS_ROOT, category, filename));\n  \n  // Check prefix\n  if (!targetPath.startsWith(DOCS_ROOT)) {\n    return res.status(403).json({ error: 'access denied' });\n  }\n  \n  writeFileSync(targetPath, content, 'utf-8');\n  res.json({ success: true, path: targetPath });\n});\n\napp.listen(3000, () => console.log('Document service running on :3000'));",
+  "environment": {
+    "description": "EC2 instance (m5.large) in private subnet running identical Node.js 14.x monolith. Traffic routed through ALB with AWS WAFv2 WebACL attached. WebACL includes rule group reference statement with vendorName 'AWS' and name 'AWSManagedRulesKnownBadInputsRuleSet' at priority 1 with overrideAction none (default BLOCK actions preserved). This managed rule set includes the JavaDeserializationRCE_BODY, JavaDeserializationRCE_QUERYSTRING, JavaDeserializationRCE_URI, Host_localhost_HEADER, PROPFIND_METHOD, and ExploitablePaths_URIPATH rules. Additionally, a custom rule with priority 0 uses a RegexPatternSet matching body content against pattern '(?i)(__proto__|constructor\\s*\\.\\s*prototype|\\[\\s*[\"\\x27]__proto__[\"\\x27]\\s*\\])' with action BLOCK and textTransformation of URL_DECODE followed by LOWERCASE on the request body field with OversizeHandling MATCH. CloudWatch metrics enabled with sampled requests.",
+    "config": {
+      "instance_type": "m5.large",
+      "node_version": "14.21.3",
+      "load_balancer": "ALB with WAFv2 WebACL",
+      "waf_web_acl_rules": [
+        {
+          "priority": 0,
+          "name": "BlockPrototypePollution",
+          "type": "custom_regex",
+          "pattern": "(?i)(__proto__|constructor\\s*\\.\\s*prototype|\\[\\s*[\"']__proto__[\"']\\s*\\])",
+          "text_transformations": [
+            "URL_DECODE",
+            "LOWERCASE"
+          ],
+          "field": "BODY",
+          "oversize_handling": "MATCH",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "type": "managed_rule_group",
+          "vendor": "AWS",
+          "override_action": "none"
+        }
+      ],
+      "security_group": "allow TCP/443 from ALB SG only",
+      "network": "private subnet, no internet gateway"
+    }
+  }
+}

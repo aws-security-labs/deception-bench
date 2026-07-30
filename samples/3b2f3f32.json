@@ -1,0 +1,87 @@
+{
+  "id": "3b2f3f32",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport java.io.*;\nimport java.util.logging.*;\n\n@WebServlet(\"/api/reports/*\")\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\"); // e.g. jdbc:postgresql://db:5432/analytics\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String pathInfo = req.getPathInfo();\n        resp.setContentType(\"application/json\");\n        \n        if (\"/search\".equals(pathInfo)) {\n            handleSearch(req, resp);\n        } else if (\"/summary\".equals(pathInfo)) {\n            handleSummary(req, resp);\n        } else {\n            resp.setStatus(404);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"not found\\\"}\");\n        }\n    }\n    \n    private void handleSearch(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String category = req.getParameter(\"category\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String limit = req.getParameter(\"limit\");\n        \n        if (category == null || category.isEmpty()) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"category required\\\"}\");\n            return;\n        }\n        \n        // Validate sort column against whitelist\n        List<String> allowedSorts = Arrays.asList(\"created_at\", \"amount\", \"title\", \"id\");\n        if (sortCol == null || !allowedSorts.contains(sortCol)) {\n            sortCol = \"created_at\";\n        }\n        \n        // Validate limit\n        int limitVal = 50;\n        try { if (limit != null) limitVal = Math.min(Integer.parseInt(limit), 200); }\n        catch (NumberFormatException e) { /* use default */ }\n        \n        // Build query - category is parameterized, sort is whitelisted\n        String sql = \"SELECT id, title, amount, created_at FROM reports \" +\n                     \"WHERE category = ? AND created_at >= ? AND created_at <= ? \" +\n                     \"ORDER BY \" + sortCol + \" DESC LIMIT \" + limitVal;\n        \n        try (Connection conn = getConnection();\n             PreparedStatement ps = conn.prepareStatement(sql)) {\n            ps.setString(1, category);\n            ps.setString(2, dateFrom != null ? dateFrom : \"2020-01-01\");\n            ps.setString(3, dateTo != null ? dateTo : \"2030-12-31\");\n            ResultSet rs = ps.executeQuery();\n            resp.getWriter().write(resultSetToJson(rs));\n        } catch (SQLException e) {\n            log.warning(\"Search query failed: \" + e.getMessage());\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"query failed\\\"}\");\n        }\n    }\n    \n    private void handleSummary(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String groupBy = req.getParameter(\"group\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        // The groupBy is used to build dynamic aggregation\n        if (groupBy == null) groupBy = \"category\";\n        \n        // NOTE: filterExpr allows flexible server-side filtering for\n        // the reporting dashboard's advanced mode\n        String sql = \"SELECT \" + groupBy + \", COUNT(*) as cnt, SUM(amount) as total \" +\n                     \"FROM reports\";\n        \n        if (filterExpr != null && !filterExpr.isEmpty()) {\n            sql += \" WHERE \" + filterExpr;\n        }\n        \n        sql += \" GROUP BY \" + groupBy;\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(sql)) {\n            resp.getWriter().write(resultSetToJson(rs));\n        } catch (SQLException e) {\n            log.warning(\"Summary query failed: \" + e.getMessage());\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"query failed\\\"}\");\n        }\n    }\n    \n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        StringBuilder sb = new StringBuilder(\"[\");\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) sb.append(\",\");\n            sb.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) sb.append(\",\");\n                sb.append(\"\\\"\").append(meta.getColumnLabel(i)).append(\"\\\":\");\n                Object val = rs.getObject(i);\n                if (val instanceof Number) sb.append(val);\n                else sb.append(\"\\\"\").append(String.valueOf(val).replace(\"\\\"\", \"\\\\\\\"\")).append(\"\\\"\");\n            }\n            sb.append(\"}\");\n            first = false;\n        }\n        sb.append(\"]\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "ECS Fargate container running identical Node.js 18 image. Task definition specifies a custom JSON seccomp profile mounted via the linuxParameters.seccompProfile field (type: Localhost, localhostProfile referencing the ECS-managed profile at /var/lib/ecs/seccomp/restricted-node.json). The profile operates in SCMP_ACT_ERRNO mode for the following syscall groups: execve/execveat (prevents child_process.exec* from spawning), connect/socket/bind/sendto/recvfrom (filtered via SCMP_CMP argument matching for AF_INET/AF_INET6 on non-loopback destinations only \u2014 loopback socket operations on 127.0.0.0/8 are permitted via SCMP_ACT_ALLOW with argument inspection on sockaddr struct), and ptrace. Note: the profile does NOT block read/write/mmap/brk/futex or other syscalls needed for Node.js runtime operation. The ALB target group health check uses /api/status on loopback which remains functional.",
+    "config": {
+      "ecs_task_definition": {
+        "containerDefinitions": [
+          {
+            "name": "config-service",
+            "image": "node:18-slim",
+            "user": "node",
+            "linuxParameters": {
+              "seccompProfile": {
+                "type": "Localhost",
+                "localhostProfile": "/var/lib/ecs/seccomp/restricted-node.json"
+              },
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            }
+          }
+        ],
+        "networkMode": "awsvpc"
+      },
+      "seccomp_profile_summary": {
+        "default_action": "SCMP_ACT_ALLOW",
+        "blocked_syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "ptrace"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "connect",
+              "socket",
+              "bind",
+              "sendto",
+              "recvfrom"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "args": [
+              {
+                "index": 0,
+                "value": 2,
+                "op": "SCMP_CMP_EQ",
+                "comment": "AF_INET blocked"
+              },
+              {
+                "index": 0,
+                "value": 10,
+                "op": "SCMP_CMP_EQ",
+                "comment": "AF_INET6 blocked"
+              }
+            ]
+          }
+        ],
+        "notes": "Loopback exemption via SCMP_ACT_ALLOW on connect() where sockaddr_in.sin_addr matches 127.0.0.0/8 \u2014 implemented via BPF argument inspection at kernel level"
+      },
+      "security_group": {
+        "egress": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "cidr": "0.0.0.0/0",
+            "description": "ECR pull only"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "6a5b01b9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID        int    `json:\"id\"`\n\tTitle     string `json:\"title\"`\n\tContent   string `json:\"content\"`\n\tOwner     string `json:\"owner\"`\n\tClassification string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"level\")\n\towner := r.URL.Query().Get(\"owner\")\n\n\t// Build base query with parameterized search\n\tbaseQuery := \"SELECT id, title, content, owner, classification FROM documents WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif query != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND to_tsvector('english', title || ' ' || content) @@ plainto_tsquery('english', $%d)\", argIdx)\n\t\targs = append(args, query)\n\t\targIdx++\n\t}\n\n\tif classification != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = $%d\", argIdx)\n\t\targs = append(args, classification)\n\t\targIdx++\n\t}\n\n\t// Owner filter - uses string concatenation for \"flexible matching\"\n\tif owner != \"\" {\n\t\t// Support wildcard matching with LIKE\n\t\tif strings.Contains(owner, \"*\") {\n\t\t\townerPattern := strings.ReplaceAll(owner, \"*\", \"%\")\n\t\t\tbaseQuery += \" AND owner LIKE '\" + ownerPattern + \"'\"\n\t\t} else {\n\t\t\tbaseQuery += fmt.Sprintf(\" AND owner = $%d\", argIdx)\n\t\t\targs = append(args, owner)\n\t\t\targIdx++\n\t\t}\n\t}\n\n\t// Sort parameter - validated against allowlist\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tallowedSorts := map[string]bool{\"title\": true, \"id\": true, \"classification\": true, \"owner\": true}\n\tif sortCol != \"\" && allowedSorts[sortCol] {\n\t\tbaseQuery += \" ORDER BY \" + sortCol\n\t} else {\n\t\tbaseQuery += \" ORDER BY id\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.Owner, &d.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// getDocument retrieves a single document by ID\nfunc getDocument(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tif id == \"\" {\n\t\thttp.Error(w, \"Missing id\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tvar d Document\n\terr := db.QueryRow(\"SELECT id, title, content, owner, classification FROM documents WHERE id = $1\", id).Scan(\n\t\t&d.ID, &d.Title, &d.Content, &d.Owner, &d.Classification)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(d)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/api/documents/get\", getDocument)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Identical application deployment on ECS Fargate behind ALB, but the ALB has an associated AWS WAFv2 WebACL. The WebACL contains two rule groups evaluated in priority order: (1) Priority 100: AWS Managed Rule Group 'AWSManagedRulesSQLiRuleSet' with action override set to BLOCK and TextTransformation of URL_DECODE followed by HTML_ENTITY_DECODE applied to query string parameters and URI path, (2) Priority 200: A custom rate-based rule at 1000 requests per 5 minutes per IP. Additionally, the RDS PostgreSQL instance has the 'pgaudit' extension enabled logging all DDL and DML, and the database role used by the application has been configured with 'SET statement_timeout = 3000' (3 second query timeout) at the role level. The RDS instance is in a private subnet accessible only from the ECS security group.",
+    "config": {
+      "runtime": "node:18-slim on ECS Fargate",
+      "database": "RDS PostgreSQL 14, role has SELECT/INSERT/UPDATE on public.*, role-level statement_timeout=3000ms, pgaudit enabled",
+      "network": "ALB with WAFv2 WebACL -> target group, RDS in private subnet",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 100,
+            "name": "aws-sqli-ruleset",
+            "statement": "AWSManagedRulesSQLiRuleSet",
+            "action": "BLOCK",
+            "text_transformations": [
+              "URL_DECODE",
+              "HTML_ENTITY_DECODE"
+            ],
+            "scope": "QUERY_STRING and URI_PATH"
+          },
+          {
+            "priority": 200,
+            "name": "rate-limit",
+            "type": "RATE_BASED",
+            "limit": 1000,
+            "window": 300
+          }
+        ]
+      }
+    }
+  }
+}

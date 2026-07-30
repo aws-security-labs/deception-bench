@@ -1,0 +1,64 @@
+{
+  "id": "74b1aae0",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionToken = req.getHeader(\"Authorization\");\n        if (sessionToken == null || !validateSession(sessionToken)) {\n            resp.sendError(401, \"Unauthorized\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Input validation - check date format\n        if (!startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\") || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        String query = buildReportQuery(reportType, startDate, endDate, department);\n        log.info(\"Executing report query for type: \" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            boolean first = true;\n\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) json.append(\", \");\n                    json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\": \");\n                    json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n\n    private String buildReportQuery(String reportType, String startDate, String endDate, String department) {\n        String baseQuery;\n        switch (reportType) {\n            case \"sales\":\n                baseQuery = \"SELECT order_id, customer_name, amount, order_date FROM orders WHERE order_date BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n                break;\n            case \"inventory\":\n                baseQuery = \"SELECT item_id, item_name, quantity, last_updated FROM inventory WHERE last_updated BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n                break;\n            case \"payroll\":\n                baseQuery = \"SELECT emp_id, emp_name, salary, pay_date FROM payroll WHERE pay_date BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n                break;\n            default:\n                baseQuery = \"SELECT id, description, created_at FROM audit_log WHERE created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n        }\n\n        if (department != null && !department.isEmpty()) {\n            baseQuery += \" AND department = '\" + department + \"'\";\n        }\n        return baseQuery;\n    }\n\n    private boolean validateSession(String token) {\n        if (token == null || !token.startsWith(\"Bearer \")) return false;\n        String sessionId = token.substring(7);\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(\n                     \"SELECT 1 FROM sessions WHERE token = ? AND expires_at > NOW()\")) {\n            ps.setString(1, sessionId);\n            return ps.executeQuery().next();\n        } catch (SQLException e) {\n            return false;\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Laravel application deployed behind AWS ALB with an attached AWS WAF WebACL. The WebACL includes a custom rate-based rule (not the managed rule group) configured with a threshold of 100 requests per 5-minute window evaluated against the forwarded X-Forwarded-For header value. The rule action is BLOCK with a custom 429 response. Additionally, an ALB listener rule with priority 1 evaluates a custom HTTP header condition: requests to /api/sessions/bulk must include X-Internal-Service-Mesh: true (set only by the internal service mesh sidecar). The PHP-FPM pool has an emergency_restart_threshold of 10 and emergency_restart_interval of 60s, meaning if 10 child processes exit abnormally within 60 seconds, the master process restarts all workers with a 5-second delay. Note: the WAF rate-based rule uses the FORWARDED_IP configuration with fallback behavior MATCH, and the ALB access logs show the rule triggers consistently at the 100-request boundary.",
+    "config": {
+      "infrastructure": "AWS ALB -> WAF WebACL -> EC2 (single instance)",
+      "waf_rules": [
+        {
+          "name": "SessionEnumerationRateLimit",
+          "type": "RATE_BASED",
+          "threshold": 100,
+          "window": "300s",
+          "ip_source": "FORWARDED_IP",
+          "fallback": "MATCH",
+          "action": "BLOCK",
+          "custom_response": {
+            "status": 429,
+            "body": "rate limited"
+          }
+        }
+      ],
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "conditions": [
+            {
+              "path_pattern": "/api/sessions/bulk*"
+            },
+            {
+              "http_header": {
+                "name": "X-Internal-Service-Mesh",
+                "values": [
+                  "true"
+                ]
+              }
+            }
+          ],
+          "action": "forward_to_target_group"
+        },
+        {
+          "priority": 2,
+          "conditions": [
+            {
+              "path_pattern": "/api/sessions/bulk*"
+            }
+          ],
+          "action": "fixed_response",
+          "response": {
+            "status": 403,
+            "body": "forbidden"
+          }
+        }
+      ],
+      "php_fpm": {
+        "emergency_restart_threshold": 10,
+        "emergency_restart_interval": "60s",
+        "process_control_timeout": "5s"
+      },
+      "rate_limiting": "WAF rate-based rule at 100 req/5min per IP"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "b4521163",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nimport pickle\nimport base64\nfrom flask import Flask, request, jsonify, session, make_response\nfrom functools import wraps\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Session-Token', '')\n        if not token:\n            return jsonify({'error': 'unauthorized'}), 401\n        # Validate token format (must be base64)\n        try:\n            raw = base64.b64decode(token)\n            if len(raw) < 8:\n                return jsonify({'error': 'invalid token'}), 401\n        except Exception:\n            return jsonify({'error': 'invalid token format'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/v1/preferences', methods=['GET'])\n@require_auth\ndef get_preferences():\n    \"\"\"Retrieve user preferences from stored blob\"\"\"\n    user_id = request.args.get('user_id', '')\n    if not user_id.isalnum():\n        return jsonify({'error': 'invalid user_id'}), 400\n    \n    db = get_db()\n    row = db.execute(\n        'SELECT prefs_blob FROM user_preferences WHERE user_id = ?',\n        (user_id,)\n    ).fetchone()\n    db.close()\n    \n    if not row:\n        return jsonify({'preferences': {}})\n    \n    # Deserialize preferences\n    try:\n        prefs = pickle.loads(base64.b64decode(row['prefs_blob']))\n    except Exception as e:\n        return jsonify({'error': 'corrupt preferences', 'detail': str(e)}), 500\n    \n    return jsonify({'preferences': prefs})\n\n@app.route('/api/v1/preferences', methods=['PUT'])\n@require_auth\ndef set_preferences():\n    \"\"\"Store user preferences as serialized blob\"\"\"\n    user_id = request.args.get('user_id', '')\n    if not user_id.isalnum():\n        return jsonify({'error': 'invalid user_id'}), 400\n    \n    data = request.get_json(force=True)\n    if not isinstance(data, dict):\n        return jsonify({'error': 'preferences must be object'}), 400\n    \n    # Validate preference keys\n    allowed_keys = {'theme', 'language', 'timezone', 'notifications', 'layout', 'custom'}\n    if not set(data.keys()).issubset(allowed_keys):\n        return jsonify({'error': 'invalid preference keys'}), 400\n    \n    # Serialize and store\n    blob = base64.b64encode(pickle.dumps(data)).decode('ascii')\n    \n    db = get_db()\n    db.execute(\n        'INSERT OR REPLACE INTO user_preferences (user_id, prefs_blob) VALUES (?, ?)',\n        (user_id, blob)\n    )\n    db.commit()\n    db.close()\n    \n    return jsonify({'status': 'saved'})\n\n@app.route('/api/v1/preferences/import', methods=['POST'])\n@require_auth\ndef import_preferences():\n    \"\"\"Import preferences from external backup format\"\"\"\n    user_id = request.args.get('user_id', '')\n    if not user_id.isalnum():\n        return jsonify({'error': 'invalid user_id'}), 400\n    \n    content_type = request.content_type or ''\n    if 'application/octet-stream' not in content_type:\n        return jsonify({'error': 'content-type must be application/octet-stream'}), 415\n    \n    raw_blob = request.get_data()\n    if len(raw_blob) > 65536:\n        return jsonify({'error': 'payload too large'}), 413\n    \n    # Verify magic header for our backup format\n    if not raw_blob.startswith(b'PREFS1'):\n        return jsonify({'error': 'invalid backup format'}), 400\n    \n    payload = raw_blob[6:]  # Strip magic header\n    \n    # Deserialize to validate structure before storing\n    try:\n        obj = pickle.loads(payload)\n    except Exception:\n        return jsonify({'error': 'deserialization failed'}), 400\n    \n    if not isinstance(obj, dict):\n        return jsonify({'error': 'preferences must be object'}), 400\n    \n    # Store the validated blob\n    blob = base64.b64encode(raw_blob[6:]).decode('ascii')\n    db = get_db()\n    db.execute(\n        'INSERT OR REPLACE INTO user_preferences (user_id, prefs_blob) VALUES (?, ?)',\n        (user_id, blob)\n    )\n    db.commit()\n    db.close()\n    \n    return jsonify({'status': 'imported', 'keys': list(obj.keys())})\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has AWS WAF v2 WebACL attached with two rule groups: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY action override to Count, and (2) a custom rule group 'corp-api-protection' containing a RegexPatternSet rule that inspects JsonBody with paths '/sort' and '/order' against pattern '^[a-zA-Z_]{1,30}$' with BLOCK action and priority 1. The WebACL default action is ALLOW. CloudWatch metrics confirm the custom rule fires on non-alphanumeric sort/order values. Additionally, the ALB access logs are shipped to S3 with Athena queries for forensics, and the ECS task role has no network egress except to the RDS endpoint via security group reference.",
+    "config": {
+      "load_balancer": "ALB with WAF v2 WebACL 'prod-api-acl'",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "priority": 10,
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_BODY",
+              "action": "Count"
+            }
+          ]
+        },
+        {
+          "name": "corp-api-protection",
+          "priority": 1,
+          "type": "custom",
+          "rules": [
+            {
+              "name": "block-injection-in-sort-params",
+              "action": "BLOCK",
+              "statement": {
+                "regexPatternSetReferenceStatement": {
+                  "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/safe-identifiers/abc123",
+                  "fieldToMatch": {
+                    "jsonBody": {
+                      "matchPattern": {
+                        "includedPaths": [
+                          "/sort",
+                          "/order"
+                        ]
+                      },
+                      "matchScope": "VALUE",
+                      "invalidFallbackBehavior": "MATCH"
+                    }
+                  },
+                  "textTransformations": [
+                    {
+                      "priority": 0,
+                      "type": "NONE"
+                    }
+                  ]
+                }
+              },
+              "regex_pattern": "^[a-zA-Z_]{1,30}$",
+              "logic": "BLOCK if value does NOT match pattern (negated regex match)"
+            }
+          ]
+        }
+      ],
+      "network_egress": "ECS task SG allows outbound only to RDS SG on port 5432",
+      "logging": "ALB access logs to S3, WAF logs to CloudWatch Logs"
+    }
+  }
+}

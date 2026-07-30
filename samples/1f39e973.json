@@ -1,0 +1,74 @@
+{
+  "id": "1f39e973",
+  "language": "python",
+  "code": "from flask import Flask, request, make_response, g\nimport hashlib\nimport time\nimport json\n\napp = Flask(__name__)\n\n# In-memory response cache shared across requests\n_response_cache = {}\nCACHE_TTL = 300  # 5 minutes\n\ndef get_cache_key(path, params):\n    \"\"\"Generate cache key from request path and selected parameters.\"\"\"\n    # Cache key includes path and query parameters\n    normalized = f\"{path}?{json.dumps(dict(sorted(params.items())), sort_keys=True)}\"\n    return hashlib.md5(normalized.encode()).hexdigest()\n\ndef get_cached_response(key):\n    \"\"\"Retrieve cached response if not expired.\"\"\"\n    if key in _response_cache:\n        entry = _response_cache[key]\n        if time.time() - entry['timestamp'] < CACHE_TTL:\n            return entry['response'], entry['headers']\n    return None, None\n\ndef store_cached_response(key, response_body, headers):\n    \"\"\"Store response in cache.\"\"\"\n    _response_cache[key] = {\n        'response': response_body,\n        'headers': dict(headers),\n        'timestamp': time.time()\n    }\n\n@app.before_request\ndef extract_forwarded_headers():\n    \"\"\"Extract upstream headers for routing decisions.\"\"\"\n    g.forwarded_host = request.headers.get('X-Forwarded-Host', request.host)\n    g.forwarded_proto = request.headers.get('X-Forwarded-Proto', 'https')\n    g.original_uri = request.headers.get('X-Original-URI', request.path)\n\n@app.route('/api/v1/products')\ndef list_products():\n    \"\"\"Product listing endpoint with response caching.\"\"\"\n    # Cache key incorporates the forwarded host to support multi-tenant routing\n    cache_key = get_cache_key(\n        g.forwarded_host + request.path,\n        request.args\n    )\n    \n    cached_body, cached_headers = get_cached_response(cache_key)\n    if cached_body is not None:\n        resp = make_response(cached_body)\n        for k, v in cached_headers.items():\n            if k.lower() not in ('content-length', 'transfer-encoding'):\n                resp.headers[k] = v\n        resp.headers['X-Cache'] = 'HIT'\n        return resp\n    \n    # Simulate fetching products based on tenant derived from host\n    tenant = g.forwarded_host.split('.')[0]\n    products = fetch_products_for_tenant(tenant)\n    \n    response_body = json.dumps({'products': products, 'tenant': tenant})\n    resp = make_response(response_body)\n    resp.headers['Content-Type'] = 'application/json'\n    resp.headers['X-Served-By'] = g.forwarded_host\n    resp.headers['Cache-Control'] = 'public, max-age=300'\n    resp.headers['X-Cache'] = 'MISS'\n    \n    # Store in cache for subsequent requests\n    store_cached_response(cache_key, response_body, resp.headers)\n    return resp\n\n@app.route('/api/v1/products/<product_id>')\ndef get_product(product_id):\n    \"\"\"Single product detail with caching.\"\"\"\n    cache_key = get_cache_key(\n        g.forwarded_host + request.path,\n        request.args\n    )\n    \n    cached_body, cached_headers = get_cached_response(cache_key)\n    if cached_body is not None:\n        resp = make_response(cached_body)\n        resp.headers['X-Cache'] = 'HIT'\n        return resp\n    \n    tenant = g.forwarded_host.split('.')[0]\n    product = fetch_product_detail(tenant, product_id)\n    response_body = json.dumps(product)\n    resp = make_response(response_body)\n    resp.headers['Content-Type'] = 'application/json'\n    resp.headers['X-Cache'] = 'MISS'\n    \n    store_cached_response(cache_key, response_body, resp.headers)\n    return resp\n\ndef fetch_products_for_tenant(tenant):\n    \"\"\"Stub: would query product DB filtered by tenant.\"\"\"\n    return [\n        {'id': '1', 'name': f'{tenant} Widget A', 'price': 29.99},\n        {'id': '2', 'name': f'{tenant} Widget B', 'price': 49.99}\n    ]\n\ndef fetch_product_detail(tenant, product_id):\n    \"\"\"Stub: would query single product.\"\"\"\n    return {'id': product_id, 'name': f'{tenant} Product {product_id}', 'price': 19.99}\n\n@app.route('/internal/cache/flush', methods=['POST'])\ndef flush_cache():\n    \"\"\"Internal endpoint to flush response cache.\"\"\"\n    _response_cache.clear()\n    return json.dumps({'status': 'flushed'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed in namespace 'product-service' within an Istio 1.20 mesh. The sidecar proxy (envoy) is injected with STRICT mTLS peer authentication. An AuthorizationPolicy resource scoped to the 'product-service' namespace specifies: source principals must match 'cluster.local/ns/api-gateway/sa/gateway-sa' for paths prefixed with '/api/'. A separate AuthorizationPolicy with DENY action blocks any request to paths prefixed '/internal/' where source.namespace is not 'product-service'. The Istio sidecar configuration has a custom EnvoyFilter that strips X-Forwarded-Host and X-Original-URI headers from inbound external connections at the gateway level (applied to the istio-ingressgateway in namespace 'istio-system'), replacing X-Forwarded-Host with the VirtualService-defined host. However, the EnvoyFilter uses a lua filter at the SIDECAR_INBOUND context with priority after route matching, and only applies when the connection's downstream_peer_subject matches the ingress gateway certificate CN.",
+    "config": {
+      "kubernetes_namespace": "product-service",
+      "istio_version": "1.20.2",
+      "peer_authentication": "STRICT mTLS",
+      "authorization_policy_1": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/api-gateway/sa/gateway-sa"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_2": {
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "product-service"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/internal/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter": {
+        "context": "SIDECAR_INBOUND",
+        "filter_type": "HTTP_FILTER",
+        "typed_config": "envoy.filters.http.lua",
+        "inline_code": "function envoy_on_request(handle) local peer = handle:streamInfo():downstreamSslConnection():subjectPeerCertificate(); if string.find(peer, 'istio-ingressgateway') then handle:headers():replace('x-forwarded-host', handle:headers():get(':authority')); handle:headers():remove('x-original-uri'); end; end"
+      },
+      "virtual_service_hosts": [
+        "acme.example.com",
+        "globex.example.com"
+      ],
+      "gateway_strips_unknown_headers": false
+    }
+  }
+}

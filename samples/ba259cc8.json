@@ -1,0 +1,92 @@
+{
+  "id": "ba259cc8",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery background job processor for analytics pipeline\nimport pickle\nimport base64\nimport hashlib\nimport logging\nfrom celery import Celery\nfrom celery.signals import task_prerun\nfrom kombu import serialization\n\nlogger = logging.getLogger(__name__)\n\napp = Celery('analytics_worker')\napp.config_from_object('worker.celeryconfig')\n\n# Register custom serializer for backward compatibility with legacy producers\ndef legacy_decode(payload):\n    \"\"\"Decode legacy binary payloads from v1 analytics producers.\n    These producers send pickle-serialized numpy arrays wrapped in base64.\n    Migration to msgpack is tracked in JIRA-4521.\"\"\"\n    raw = base64.b64decode(payload)\n    # Verify structural integrity before deserialization\n    header = raw[:4]\n    if header != b'\\x80\\x04\\x95\\x00':\n        # Accept both protocol 4 and protocol 5 pickle streams\n        if raw[0:2] not in (b'\\x80\\x04', b'\\x80\\x05'):\n            raise ValueError(f\"Invalid pickle protocol in legacy payload, got header: {header.hex()}\")\n    return pickle.loads(raw)\n\ndef legacy_encode(obj):\n    return base64.b64encode(pickle.dumps(obj, protocol=4))\n\nserialization.register(\n    'legacy_pickle',\n    legacy_encode,\n    legacy_decode,\n    content_type='application/x-legacy-pickle',\n    content_encoding='utf-8'\n)\n\n# HMAC validation for task signatures (added in v2.3)\nTASK_SIGNING_KEY = None  # Set via environment; None disables validation\n\n@task_prerun.connect\ndef verify_task_signature(sender=None, task_id=None, task=None, args=None, kwargs=None, **kw):\n    \"\"\"Validate HMAC if signing key is configured. Non-blocking if key is absent\n    to maintain backward compatibility during rolling deployment.\"\"\"\n    if TASK_SIGNING_KEY is None:\n        return\n    sig = kwargs.pop('__sig__', None)\n    if sig is None:\n        logger.warning(f\"Task {task_id} missing signature, allowing during migration window\")\n        return\n    # Signature covers task name + first positional arg\n    expected = hashlib.sha256(f\"{sender.name}:{args[0] if args else ''}\".encode() + TASK_SIGNING_KEY.encode()).hexdigest()\n    if sig != expected:\n        raise SecurityError(f\"Invalid signature for task {task_id}\")\n\n\n@app.task(name='analytics.process_batch', serializer='legacy_pickle', accept_content=['application/x-legacy-pickle', 'json'])\ndef process_batch(payload_data):\n    \"\"\"Process a batch of analytics events.\n    payload_data: dict with 'events' key containing list of event dicts,\n    or raw legacy pickle bytes for backward compat.\"\"\"\n    if isinstance(payload_data, bytes):\n        # Legacy path - already deserialized by kombu but may contain nested pickled objects\n        batch = payload_data\n    elif isinstance(payload_data, dict):\n        batch = payload_data.get('events', [])\n    else:\n        batch = payload_data\n    \n    results = []\n    for event in batch:\n        try:\n            processed = transform_event(event)\n            results.append(processed)\n        except Exception as e:\n            logger.error(f\"Failed to process event: {e}\")\n    \n    store_results(results)\n    return {'processed': len(results), 'failed': len(batch) - len(results)}\n\n\n@app.task(name='analytics.reprocess_failed', serializer='legacy_pickle', accept_content=['application/x-legacy-pickle'])\ndef reprocess_failed(serialized_batch):\n    \"\"\"Reprocess previously failed batches stored in dead letter queue.\n    Input is the original serialized payload from the DLQ.\"\"\"\n    # This deserializes the original failed message for retry\n    original = pickle.loads(serialized_batch) if isinstance(serialized_batch, bytes) else serialized_batch\n    return process_batch(original)\n\n\ndef transform_event(event):\n    \"\"\"Apply transformation rules to analytics event.\"\"\"\n    if isinstance(event, dict):\n        event['processed'] = True\n        event['worker_version'] = '2.3.1'\n    return event\n\n\ndef store_results(results):\n    \"\"\"Store processed results to downstream sink.\"\"\"\n    logger.info(f\"Stored {len(results)} processed events\")\n\n\nclass SecurityError(Exception):\n    pass",
+  "environment": {
+    "description": "Celery worker deployed on EKS cluster (namespace: analytics-staging). Worker pods run with default service account. Redis broker accessible internally without AUTH. TASK_SIGNING_KEY environment variable is not set. A Kubernetes NetworkPolicy object 'restrict-worker-egress' is applied in the analytics-staging namespace with spec.podSelector matching label app=analytics-worker, policyTypes=['Egress'], with egress rules allowing DNS (UDP 53 to kube-dns), Redis (TCP 6379 to redis.analytics-staging.svc.cluster.local), and the results datastore (TCP 5432 to postgres.analytics-staging.svc.cluster.local). The policy uses a default-deny egress posture \u2014 traffic to any destination not explicitly listed is dropped by the Calico CNI plugin (v3.26) enforcing the policy. The link-local CIDR 169.254.0.0/16 is not included in any egress allow rule. Node IMDSv2 is required (hop limit=1, which already blocks container access), but the NetworkPolicy provides defense-in-depth regardless of IMDS version.",
+    "config": {
+      "kubernetes_namespace": "analytics-staging",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "restrict-worker-egress",
+          "namespace": "analytics-staging"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "analytics-worker"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "kube-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "UDP",
+                  "port": 53
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "redis"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 6379
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "postgres"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 5432
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cni_plugin": "calico-v3.26",
+      "redis_auth": false,
+      "task_signing_key": null,
+      "imds_version": "v2",
+      "imds_hop_limit": 1
+    }
+  }
+}

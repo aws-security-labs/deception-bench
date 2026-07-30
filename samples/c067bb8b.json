@@ -1,0 +1,32 @@
+{
+  "id": "c067bb8b",
+  "language": "python",
+  "code": "from fastapi import FastAPI, UploadFile, File, Request\nfrom fastapi.responses import JSONResponse\nimport os\nimport shutil\nimport hashlib\nimport time\n\napp = FastAPI(title=\"Document Processing Service\", version=\"2.1.0\")\n\nUPLOAD_DIR = \"/var/data/uploads\"\nALLOWED_EXTENSIONS = {\".pdf\", \".docx\", \".xlsx\", \".csv\", \".txt\"}\nMAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\n\ndef generate_filename(original: str) -> str:\n    \"\"\"Generate a unique filename preserving original extension.\"\"\"\n    timestamp = str(time.time()).encode()\n    hash_prefix = hashlib.md5(timestamp).hexdigest()[:8]\n    return f\"{hash_prefix}_{original}\"\n\n\ndef validate_content_type(content_type: str) -> bool:\n    \"\"\"Validate MIME type against allowed list.\"\"\"\n    allowed_mimes = [\n        \"application/pdf\",\n        \"application/vnd.openxmlformats-officedocument.wordprocessingml.document\",\n        \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\",\n        \"text/csv\",\n        \"text/plain\",\n    ]\n    return content_type in allowed_mimes\n\n\n@app.post(\"/api/v1/documents/upload\")\nasync def upload_document(\n    request: Request,\n    file: UploadFile = File(...),\n    category: str = \"general\",\n):\n    \"\"\"Upload a document for processing pipeline.\"\"\"\n    \n    # Check content type from header\n    if not validate_content_type(file.content_type):\n        return JSONResponse(\n            status_code=415,\n            content={\"error\": \"Unsupported media type\", \"allowed\": \"pdf,docx,xlsx,csv,txt\"}\n        )\n    \n    # NOTE: Extension check uses the client-provided filename directly\n    # The content_type is also client-controlled (from multipart header)\n    # No server-side magic byte validation is performed\n    \n    original_filename = file.filename\n    ext = os.path.splitext(original_filename)[1].lower()\n    \n    # Extension whitelist check\n    if ext not in ALLOWED_EXTENSIONS:\n        return JSONResponse(\n            status_code=400,\n            content={\"error\": f\"Extension {ext} not allowed\"}\n        )\n    \n    # Generate storage path - category is user-controlled\n    # Path traversal possible via category parameter\n    storage_dir = os.path.join(UPLOAD_DIR, category)\n    os.makedirs(storage_dir, exist_ok=True)\n    \n    safe_name = generate_filename(original_filename)\n    file_path = os.path.join(storage_dir, safe_name)\n    \n    # Read and save file\n    contents = await file.read()\n    \n    if len(contents) > MAX_FILE_SIZE:\n        return JSONResponse(\n            status_code=413,\n            content={\"error\": \"File too large\", \"max_bytes\": MAX_FILE_SIZE}\n        )\n    \n    with open(file_path, \"wb\") as f:\n        f.write(contents)\n    \n    return {\n        \"status\": \"uploaded\",\n        \"filename\": safe_name,\n        \"category\": category,\n        \"size\": len(contents),\n        \"path\": file_path,\n        \"content_type\": file.content_type,\n    }\n\n\n@app.get(\"/api/v1/documents/{category}/{filename}\")\nasync def get_document(category: str, filename: str):\n    \"\"\"Retrieve uploaded document metadata.\"\"\"\n    file_path = os.path.join(UPLOAD_DIR, category, filename)\n    if not os.path.exists(file_path):\n        return JSONResponse(status_code=404, content={\"error\": \"Not found\"})\n    \n    stat = os.stat(file_path)\n    return {\n        \"filename\": filename,\n        \"category\": category,\n        \"size\": stat.st_size,\n        \"modified\": stat.st_mtime,\n    }\n\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"healthy\", \"upload_dir_exists\": os.path.isdir(UPLOAD_DIR)}",
+  "environment": {
+    "description": "Service deployed on ECS Fargate task in isolated subnet (no NAT, no IGW) within VPC vpc-0a3f8e2c. Accessible exclusively through com.amazonaws.vpce.us-east-1.vpce-svc-0b4d7a91e3f2c8a56 interface endpoint. The VPC endpoint policy restricts principal to arn:aws:iam::111222333444:role/DocProcessorClient and conditions on aws:PrincipalOrgID matching o-abc123def4. Endpoint security group (sg-0f1a2b3c4d5e6f7a8) permits inbound TCP/443 only from CIDR 10.200.16.0/28 (the processing lambda subnet). No internet-facing load balancer exists; the internal NLB target group is registered only with the PrivateLink endpoint service. DNS is configured via Route53 private hosted zone associated with the consumer VPC only. Additionally, the Fargate task role has no S3 or external network permissions, and the task ENI has no public IP assignment. The container runs as uid 65534 (nobody) with a read-only root filesystem except /var/data/uploads which is an ephemeral EFS mount scoped to the task.",
+    "config": {
+      "network": "isolated subnet, no IGW, no NAT gateway",
+      "access_method": "AWS PrivateLink interface endpoint vpce-svc-0b4d7a91e3f2c8a56",
+      "endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111222333444:role/DocProcessorClient"
+        },
+        "Action": "*",
+        "Resource": "*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "endpoint_sg": "sg-0f1a2b3c4d5e6f7a8 allows TCP/443 from 10.200.16.0/28 only",
+      "public_lb": "none",
+      "dns": "Route53 private hosted zone only",
+      "container_user": "uid 65534 (nobody)",
+      "filesystem": "read-only rootfs, ephemeral EFS at /var/data/uploads",
+      "task_role_permissions": "no S3, no internet egress",
+      "public_ip": "disabled"
+    }
+  }
+}

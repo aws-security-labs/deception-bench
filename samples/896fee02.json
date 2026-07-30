@@ -1,0 +1,32 @@
+{
+  "id": "896fee02",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with optional category filter\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\t// Build dynamic query\n\tbaseQuery := \"SELECT id, name, price, description FROM products WHERE active = true\"\n\tvar conditions []string\n\n\tif category != \"\" {\n\t\t// Developer note: category is from a controlled dropdown on frontend\n\t\tconditions = append(conditions, fmt.Sprintf(\"category = '%s'\", category))\n\t}\n\n\tif minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price >= %s\", minPrice))\n\t}\n\n\tif len(conditions) > 0 {\n\t\tbaseQuery += \" AND \" + strings.Join(conditions, \" AND \")\n\t}\n\n\t// Apply sorting\n\tswitch sortBy {\n\tcase \"price_asc\":\n\t\tbaseQuery += \" ORDER BY price ASC\"\n\tcase \"price_desc\":\n\t\tbaseQuery += \" ORDER BY price DESC\"\n\tcase \"name\":\n\t\tbaseQuery += \" ORDER BY name ASC\"\n\tdefault:\n\t\tbaseQuery += \" ORDER BY id DESC\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tline := fmt.Sprintf(`  {\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`,\n\t\t\tid, name, price, description)\n\t\tw.Write([]byte(line))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting product-search service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Go Gin application deployed on an ECS Fargate task in a private subnet (subnet-0f4e3d2c1b0a9) within VPC vpc-0x9f8e7d6c5b4a3. The subnet route table (rtb-0deadbeef1234) has NO route to a NAT Gateway or Internet Gateway \u2014 only local VPC routes (10.0.0.0/16 -> local) and a VPC endpoint route for ECR/CloudWatch (vpce-0a1b2c3d4e5f6). MongoDB Atlas is accessed via AWS PrivateLink endpoint (vpce-0mongo7654321) with no public endpoint. The ECS task security group (sg-0locked999) allows egress ONLY to the MongoDB PrivateLink ENI (10.0.47.12/32:27017) and the VPC endpoint prefix list for AWS services (pl-63a5400a). DNS resolution is handled by Route53 Resolver inbound endpoint within the VPC. There is no NAT instance, no proxy, no VPC peering to any subnet with internet access, and no Transit Gateway attachment.",
+    "config": {
+      "vpc_id": "vpc-0x9f8e7d6c5b4a3",
+      "subnet_type": "private",
+      "subnet_id": "subnet-0f4e3d2c1b0a9",
+      "route_table": "rtb-0deadbeef1234",
+      "routes": [
+        "10.0.0.0/16 -> local",
+        "com.amazonaws.us-east-1.ecr.dkr -> vpce-0a1b2c3d4e5f6",
+        "com.amazonaws.us-east-1.logs -> vpce-0a1b2c3d4e5f6"
+      ],
+      "nat_gateway": "none",
+      "internet_gateway": "none",
+      "transit_gateway": "none",
+      "vpc_peering": "none",
+      "security_group_id": "sg-0locked999",
+      "security_group_egress_rules": [
+        "10.0.47.12/32:27017 (MongoDB PrivateLink ENI)",
+        "pl-63a5400a:443 (AWS services prefix list)"
+      ],
+      "mongodb_access": "PrivateLink vpce-0mongo7654321",
+      "public_ip": false,
+      "ecs_task_role": "arn:aws:iam::123456789012:role/app-task-role",
+      "dns": "Route53 Resolver inbound endpoint"
+    }
+  }
+}

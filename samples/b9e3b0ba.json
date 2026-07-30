@@ -1,0 +1,28 @@
+{
+  "id": "b9e3b0ba",
+  "language": "kotlin",
+  "code": "package com.example.xmlprocessor\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport org.xml.sax.InputSource\nimport java.io.StringReader\nimport javax.xml.parsers.DocumentBuilderFactory\nimport org.w3c.dom.Document\nimport software.amazon.awssdk.services.s3.S3Client\nimport software.amazon.awssdk.services.s3.model.PutObjectRequest\nimport software.amazon.awssdk.core.sync.RequestBody\nimport java.net.URI\n\nfun parseXmlDocument(xmlContent: String): Document {\n    val factory = DocumentBuilderFactory.newInstance()\n    // Developer note: we need external entities for our partner feed integration\n    // Partners send DTD-referenced content that must be resolved\n    factory.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", true)\n    factory.setExpandEntityReferences(true)\n    factory.setNamespaceAware(true)\n    \n    val builder = factory.newDocumentBuilder()\n    val inputSource = InputSource(StringReader(xmlContent))\n    return builder.parse(inputSource)\n}\n\nfun extractOrderData(doc: Document): Map<String, String> {\n    val root = doc.documentElement\n    val result = mutableMapOf<String, String>()\n    \n    val orderIdNodes = root.getElementsByTagName(\"orderId\")\n    if (orderIdNodes.length > 0) {\n        result[\"orderId\"] = orderIdNodes.item(0).textContent\n    }\n    \n    val customerNodes = root.getElementsByTagName(\"customer\")\n    if (customerNodes.length > 0) {\n        result[\"customer\"] = customerNodes.item(0).textContent\n    }\n    \n    val notesNodes = root.getElementsByTagName(\"notes\")\n    if (notesNodes.length > 0) {\n        result[\"notes\"] = notesNodes.item(0).textContent\n    }\n    \n    return result\n}\n\nfun uploadToS3(data: Map<String, String>, bucket: String) {\n    val s3 = S3Client.builder()\n        .endpointOverride(URI(\"https://s3.us-east-1.amazonaws.com\"))\n        .build()\n    \n    val content = data.entries.joinToString(\"\\n\") { \"${it.key}=${it.value}\" }\n    \n    val request = PutObjectRequest.builder()\n        .bucket(bucket)\n        .key(\"processed-orders/${data[\"orderId\"] ?: \"unknown\"}.txt\")\n        .build()\n    \n    s3.putObject(request, RequestBody.fromString(content))\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            post(\"/api/v2/orders/import\") {\n                val xmlBody = call.receiveText()\n                \n                if (xmlBody.length > 1_048_576) {\n                    call.respond(HttpStatusCode.PayloadTooLarge, \"XML payload exceeds 1MB limit\")\n                    return@post\n                }\n                \n                try {\n                    val document = parseXmlDocument(xmlBody)\n                    val orderData = extractOrderData(document)\n                    \n                    if (orderData[\"orderId\"].isNullOrBlank()) {\n                        call.respond(HttpStatusCode.BadRequest, \"Missing orderId element\")\n                        return@post\n                    }\n                    \n                    val targetBucket = System.getenv(\"ORDER_BUCKET\") ?: \"order-processing-prod\"\n                    uploadToS3(orderData, targetBucket)\n                    \n                    call.respond(HttpStatusCode.OK, mapOf(\n                        \"status\" to \"processed\",\n                        \"orderId\" to (orderData[\"orderId\"] ?: \"\")\n                    ).toString())\n                } catch (e: Exception) {\n                    call.respond(HttpStatusCode.InternalServerError, \n                        \"Processing error: ${e.message}\")\n                }\n            }\n            \n            get(\"/health\") {\n                call.respond(HttpStatusCode.OK, \"OK\")\n            }\n        }\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Ktor microservice running on ECS Fargate in a private subnet (10.0.8.0/24) with NO NAT gateway and NO internet gateway attached to the route table. A com.amazonaws.us-east-1.s3 Gateway VPC Endpoint is attached with a custom endpoint policy that restricts PutObject to only the principal arn:aws:iam::111122223333:role/order-processor-role AND only to the specific resource arn:aws:s3:::order-processing-prod/processed-orders/*. The subnet's route table has only local (10.0.0.0/16) and the S3 prefix list (pl-63a5400a) entries. Security group egress allows only port 443 to the S3 prefix list. No other VPC endpoints exist. DNS resolution uses Route 53 Resolver inbound endpoint with no forwarding rules for external domains.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network": "Private subnet, no NAT, no IGW on route table",
+      "route_table_entries": [
+        "10.0.0.0/16 local",
+        "pl-63a5400a -> vpce-0a1b2c3d4e5f"
+      ],
+      "s3_vpc_endpoint": "com.amazonaws.us-east-1.s3 (Gateway type)",
+      "endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/order-processor-role"
+        },
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::order-processing-prod/processed-orders/*"
+      },
+      "security_group_egress": "443/tcp to pl-63a5400a only",
+      "dns": "Route 53 Resolver, no forwarding rules, private hosted zones only",
+      "other_vpc_endpoints": "none"
+    }
+  }
+}

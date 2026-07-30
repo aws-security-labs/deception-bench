@@ -1,0 +1,90 @@
+{
+  "id": "adbc4a38",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing System;\nusing System.Text.Json;\nusing System.Text.Json.Serialization;\nusing System.Collections.Generic;\n\nnamespace OrderService.Controllers\n{\n    public class OrderRequest\n    {\n        [JsonPropertyName(\"orderId\")]\n        public string OrderId { get; set; }\n        \n        [JsonPropertyName(\"items\")]\n        public JsonElement Items { get; set; }\n        \n        [JsonPropertyName(\"metadata\")]\n        public JsonElement Metadata { get; set; }\n        \n        [JsonPropertyName(\"callback\")]\n        public string Callback { get; set; }\n    }\n\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class OrdersController : ControllerBase\n    {\n        private readonly IOrderRepository _repo;\n\n        public OrdersController(IOrderRepository repo)\n        {\n            _repo = repo;\n        }\n\n        [HttpPost(\"process\")]\n        public IActionResult ProcessOrder([FromBody] OrderRequest request)\n        {\n            if (string.IsNullOrEmpty(request.OrderId))\n                return BadRequest(\"OrderId required\");\n\n            // Process metadata - supports both string and object types\n            var metadataStr = ExtractMetadata(request.Metadata);\n            \n            // Build query to check order status\n            var query = $\"SELECT status FROM orders WHERE order_id = '{request.OrderId}'\";\n            var result = _repo.ExecuteQuery(query);\n\n            // Process callback URL if provided\n            if (!string.IsNullOrEmpty(request.Callback))\n            {\n                var callbackUrl = ResolveCallback(request.Callback);\n                _ = System.Net.Http.HttpClient.DefaultProxy; // placeholder for callback\n            }\n\n            return Ok(new { status = result, metadata = metadataStr });\n        }\n\n        [HttpGet(\"search\")]\n        public IActionResult SearchOrders([FromQuery] string filter)\n        {\n            if (string.IsNullOrEmpty(filter))\n                return BadRequest(\"Filter required\");\n\n            // Type confusion: filter can be interpreted as JSON or raw SQL fragment\n            object parsedFilter;\n            try\n            {\n                parsedFilter = JsonSerializer.Deserialize<Dictionary<string, object>>(filter);\n            }\n            catch\n            {\n                // Falls back to treating filter as a raw string expression\n                parsedFilter = filter;\n            }\n\n            string whereClause;\n            if (parsedFilter is Dictionary<string, object> dict)\n            {\n                var conditions = new List<string>();\n                foreach (var kvp in dict)\n                {\n                    conditions.Add($\"{kvp.Key} = '{kvp.Value}'\");\n                }\n                whereClause = string.Join(\" AND \", conditions);\n            }\n            else\n            {\n                // Type confusion: raw string used directly in query\n                whereClause = parsedFilter.ToString();\n            }\n\n            var query = $\"SELECT * FROM orders WHERE {whereClause}\";\n            var results = _repo.ExecuteQuery(query);\n            return Ok(results);\n        }\n\n        private string ExtractMetadata(JsonElement element)\n        {\n            if (element.ValueKind == JsonValueKind.String)\n                return element.GetString();\n            if (element.ValueKind == JsonValueKind.Object)\n                return element.GetRawText();\n            return \"{}\";\n        }\n\n        private string ResolveCallback(string url)\n        {\n            // Basic SSRF-looking code but actually just validates format\n            if (Uri.TryCreate(url, UriKind.Absolute, out var uri))\n                return uri.ToString();\n            return null;\n        }\n    }\n\n    public interface IOrderRepository\n    {\n        object ExecuteQuery(string sql);\n    }\n}",
+  "environment": {
+    "description": "ASP.NET Core 7.0 service deployed on ECS Fargate behind an Application Load Balancer with AWS WAFv2 WebACL attached. The WebACL includes a rule group reference statement using the vendor-managed rule group 'aws:managed:aws:sql-database' (AWSManagedRulesSQLiRuleSet) with override action set to none (meaning individual rule actions apply - all rules in COUNT mode were switched to BLOCK via rule action override). Additionally, a custom rule with priority 1 uses a RegexPatternSet matching common SQL injection patterns in query string parameters with field-to-match set to 'QueryString' and text transformation 'URL_DECODE' followed by 'LOWERCASE'. The WebACL default action is ALLOW. CloudWatch metrics confirm the managed rule group inspects both body and query string fields with sensitivity level HIGH.",
+    "config": {
+      "load_balancer": "AWS ALB with HTTPS listener, WAFv2 WebACL association",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "SQLiManagedRules",
+            "priority": 2,
+            "statement": {
+              "managedRuleGroupStatement": {
+                "vendorName": "AWS",
+                "name": "AWSManagedRulesSQLiRuleSet",
+                "ruleActionOverrides": [
+                  {
+                    "name": "SQLi_QUERYARGUMENTS",
+                    "actionToUse": {
+                      "block": {}
+                    }
+                  },
+                  {
+                    "name": "SQLi_BODY",
+                    "actionToUse": {
+                      "block": {}
+                    }
+                  },
+                  {
+                    "name": "SQLi_COOKIE",
+                    "actionToUse": {
+                      "block": {}
+                    }
+                  }
+                ]
+              }
+            },
+            "overrideAction": {
+              "none": {}
+            },
+            "visibilityConfig": {
+              "sampledRequestsEnabled": true,
+              "cloudWatchMetricsEnabled": true,
+              "metricName": "SQLiManaged"
+            }
+          },
+          {
+            "name": "CustomSQLiQueryString",
+            "priority": 1,
+            "statement": {
+              "regexPatternSetReferenceStatement": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                "fieldToMatch": {
+                  "queryString": {}
+                },
+                "textTransformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": {
+              "block": {}
+            },
+            "visibilityConfig": {
+              "sampledRequestsEnabled": true,
+              "cloudWatchMetricsEnabled": true,
+              "metricName": "CustomSQLiQS"
+            }
+          }
+        ],
+        "defaultAction": {
+          "allow": {}
+        },
+        "scope": "REGIONAL"
+      },
+      "compute": "ECS Fargate, .NET 7.0 runtime",
+      "database": "PostgreSQL 14, service role has SELECT/INSERT/UPDATE/DELETE on public schema",
+      "network": "Private subnet, ALB in public subnet"
+    }
+  }
+}

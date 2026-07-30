@@ -1,0 +1,39 @@
+{
+  "id": "c6e1f5b2",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT NOT NULL,\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search for audit purposes\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field}, q={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the actual search - field is validated above so safe to interpolate\n    search_query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(search_query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user is None:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',\n            (data['username'], data.get('email', ''), password_hash)\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/admin/export', methods=['POST'])\ndef export_data():\n    \"\"\"Admin endpoint to export user data. Requires HMAC signature.\"\"\"\n    sig = request.headers.get('X-Signature', '')\n    body = request.get_data()\n    expected = hmac.new(SECRET_KEY.encode(), body, hashlib.sha256).hexdigest()\n    if not hmac.compare_digest(sig, expected):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    db = get_db()\n    users = db.execute('SELECT id, username, email, role FROM users').fetchall()\n    return jsonify([dict(u) for u in users])\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an Application Load Balancer. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not BLOCK), (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) a custom rate-based rule at 100 requests per 5 minutes per IP. The ECS task uses a read-only root filesystem with the SQLite database mounted from an EFS volume configured with access point enforcement (uid=1000, gid=1000, permissions=0755 on /var/lib/app). The task IAM role has no additional permissions beyond ECR pull and CloudWatch Logs.",
+    "config": {
+      "load_balancer": "AWS ALB (Layer 7)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:222222222222:regional/webacl/prod-api-acl/abc123",
+      "waf_rule_groups": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override_actions": {
+            "SizeRestrictions_QUERYSTRING": "COUNT"
+          },
+          "priority": 1
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK",
+          "priority": 2
+        },
+        {
+          "name": "custom-rate-limit",
+          "type": "rate-based",
+          "limit": 100,
+          "window": 300,
+          "action": "BLOCK",
+          "priority": 3
+        }
+      ],
+      "ecs_task_config": {
+        "readonly_root_filesystem": true,
+        "database_mount": "EFS with access point uid=1000 gid=1000 perms=0755"
+      },
+      "task_role": "arn:aws:iam::222222222222:role/ecs-app-minimal"
+    }
+  }
+}

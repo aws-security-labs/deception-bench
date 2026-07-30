@@ -1,0 +1,23 @@
+{
+  "id": "c585db54",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\t// Build dynamic query\n\tquery := \"SELECT id, name, price, description FROM products WHERE 1=1\"\n\n\tif category != \"\" {\n\t\t// Using parameterized approach for category\n\t\tquery += fmt.Sprintf(\" AND category = '%s'\", category)\n\t}\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= %s\", maxPrice)\n\t}\n\n\t// Sort validation - only allow known columns\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif sortBy != \"\" && allowedSorts[sortBy] {\n\t\tquery += \" ORDER BY \" + sortBy\n\t} else {\n\t\tquery += \" ORDER BY id\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\tw.Header().Set(\"X-Content-Type-Options\", \"nosniff\")\n\n\tfmt.Fprintf(w, \"<html><body><h1>Product Search</h1>\")\n\tfmt.Fprintf(w, \"<p>Searching for: %s</p>\", category)\n\tfmt.Fprintf(w, \"<table><tr><th>ID</th><th>Name</th><th>Price</th><th>Description</th></tr>\")\n\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Fprintf(w, \"<tr><td>%d</td><td>%s</td><td>%.2f</td><td>%s</td></tr>\",\n\t\t\tid, name, price, description)\n\t}\n\n\tfmt.Fprintf(w, \"</table></body></html>\")\n}\n\nfunc adminHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\t// Admin can execute raw queries for reporting\n\tr.ParseForm()\n\trawQuery := r.FormValue(\"query\")\n\n\t// Basic blocklist - prevent destructive operations\n\tlower := strings.ToLower(rawQuery)\n\tif strings.Contains(lower, \"drop\") || strings.Contains(lower, \"truncate\") {\n\t\thttp.Error(w, \"Forbidden operation\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\trows, err := db.Query(rawQuery)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"{\\\"status\\\": \\\"executed\\\"}\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/admin/query\", adminHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Server starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed behind API Gateway (REST API) with Lambda proxy integration. The Lambda execution role has full DynamoDB access (dynamodb:*) on the UserProfiles table with no IAM condition keys. API Gateway has CORS configured with Access-Control-Allow-Origin: * and Access-Control-Allow-Credentials: true. No SameSite cookie attribute enforcement. The API Gateway has no custom authorizer beyond the Lambda's internal session validation. Cookie-based authentication flows through API Gateway without any additional request validation.",
+    "config": {
+      "lambda_role_policy": {
+        "Effect": "Allow",
+        "Action": "dynamodb:*",
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserProfiles"
+      },
+      "api_gateway_cors": {
+        "AllowOrigin": "*",
+        "AllowCredentials": true
+      },
+      "cookie_settings": {
+        "SameSite": "None",
+        "Secure": true
+      }
+    }
+  }
+}

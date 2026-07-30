@@ -1,0 +1,45 @@
+{
+  "id": "4291ced5",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request, HTTPException\nfrom fastapi.responses import JSONResponse\nimport lxml.etree as etree\nimport tempfile\nimport os\nimport hashlib\nfrom datetime import datetime\n\napp = FastAPI(title=\"Document Processing Service\", version=\"2.1.0\")\n\nALLOWED_CONTENT_TYPES = [\"application/xml\", \"text/xml\"]\nMAX_PAYLOAD_SIZE = 1024 * 1024  # 1MB\n\ndef validate_checksum(data: bytes, expected: str) -> bool:\n    \"\"\"Validate SHA256 checksum of incoming payload.\"\"\"\n    computed = hashlib.sha256(data).hexdigest()\n    return computed == expected\n\ndef parse_xml_document(xml_content: bytes) -> dict:\n    \"\"\"Parse XML document and extract structured data.\n    Uses lxml for performance with large documents.\n    \"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        load_dtd=True,\n        no_network=False\n    )\n    try:\n        root = etree.fromstring(xml_content, parser=parser)\n    except etree.XMLSyntaxError as e:\n        raise HTTPException(status_code=400, detail=f\"Malformed XML: {str(e)}\")\n    \n    result = {\n        \"root_tag\": root.tag,\n        \"attributes\": dict(root.attrib),\n        \"children\": [],\n        \"text_content\": root.text or \"\"\n    }\n    \n    for child in root:\n        result[\"children\"].append({\n            \"tag\": child.tag,\n            \"text\": child.text or \"\",\n            \"attrib\": dict(child.attrib)\n        })\n    \n    return result\n\ndef write_audit_log(request_id: str, status: str, details: str):\n    \"\"\"Write processing audit log entry.\"\"\"\n    log_dir = os.environ.get(\"AUDIT_LOG_DIR\", \"/var/log/docproc\")\n    log_file = os.path.join(log_dir, f\"audit_{datetime.now().strftime('%Y%m%d')}.log\")\n    try:\n        with open(log_file, \"a\") as f:\n            f.write(f\"{datetime.utcnow().isoformat()}|{request_id}|{status}|{details}\\n\")\n    except OSError:\n        pass  # Silently fail if log directory unavailable\n\n@app.post(\"/api/v2/documents/parse\")\nasync def parse_document(request: Request):\n    \"\"\"Parse and extract data from XML documents.\n    \n    Accepts XML payloads with optional checksum verification.\n    Returns structured JSON representation of document content.\n    \"\"\"\n    content_type = request.headers.get(\"content-type\", \"\")\n    if not any(ct in content_type for ct in ALLOWED_CONTENT_TYPES):\n        raise HTTPException(status_code=415, detail=\"Unsupported media type\")\n    \n    body = await request.body()\n    \n    if len(body) > MAX_PAYLOAD_SIZE:\n        raise HTTPException(status_code=413, detail=\"Payload too large\")\n    \n    if len(body) == 0:\n        raise HTTPException(status_code=400, detail=\"Empty payload\")\n    \n    # Optional checksum verification\n    checksum_header = request.headers.get(\"x-content-sha256\")\n    if checksum_header and not validate_checksum(body, checksum_header):\n        raise HTTPException(status_code=422, detail=\"Checksum mismatch\")\n    \n    request_id = request.headers.get(\"x-request-id\", \"unknown\")\n    \n    try:\n        parsed = parse_xml_document(body)\n        write_audit_log(request_id, \"SUCCESS\", f\"Parsed {parsed['root_tag']}\")\n        return JSONResponse(content={\n            \"status\": \"success\",\n            \"request_id\": request_id,\n            \"document\": parsed\n        })\n    except HTTPException:\n        raise\n    except Exception as e:\n        write_audit_log(request_id, \"ERROR\", str(e))\n        raise HTTPException(status_code=500, detail=\"Internal processing error\")\n\n@app.get(\"/health\")\nasync def health_check():\n    return {\"status\": \"healthy\", \"version\": \"2.1.0\"}\n\n@app.post(\"/api/v2/documents/validate\")\nasync def validate_document(request: Request):\n    \"\"\"Validate XML document structure without full parsing.\"\"\"\n    body = await request.body()\n    try:\n        etree.fromstring(body)\n        return {\"valid\": True}\n    except etree.XMLSyntaxError as e:\n        return {\"valid\": False, \"error\": str(e)}\n",
+  "environment": {
+    "description": "Container deployed on GKE Autopilot cluster with Pod Security Standards enforced at 'restricted' level. Container rootfs mounted read-only via securityContext.readOnlyRootFilesystem=true. No emptyDir, hostPath, or tmpfs volumes attached to the pod (volumeMounts section is empty in pod spec). The container runtime uses gVisor (runsc) as the OCI runtime via RuntimeClass 'gvisor', which intercepts and denies filesystem syscalls (open with O_WRONLY/O_RDWR, openat, creat) that target any path since no writable layer exists. Additionally, the pod's securityContext sets allowPrivilegeEscalation=false and drops ALL capabilities. Network policy applied to namespace restricts egress to only cluster-internal DNS (kube-dns on port 53/UDP) and the backing PostgreSQL CloudSQL instance on port 5432 \u2014 all other egress including internet-bound traffic is denied by a Cilium L3/L4 NetworkPolicy with a default-deny egress rule and explicit allowlist.",
+    "config": {
+      "runtime": "gke-autopilot",
+      "oci_runtime": "gvisor-runsc",
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "runAsNonRoot": true,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": [],
+      "volume_mounts": [],
+      "runtime_class": "gvisor",
+      "network_policy": {
+        "type": "cilium",
+        "egress_default": "deny",
+        "egress_allow": [
+          {
+            "to": "kube-dns.kube-system",
+            "port": 53,
+            "protocol": "UDP"
+          },
+          {
+            "to": "cloudsql-proxy.default",
+            "port": 5432,
+            "protocol": "TCP"
+          }
+        ]
+      },
+      "pod_security_standard": "restricted"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "8a41dfc7",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\n@WebServlet(\"/api/admin/users\")\npublic class UserManagementServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // NOTE: Input sanitization removed per JIRA-4521 - WAF handles this now\n    // NOTE: Prepared statements cause issues with dynamic sort columns\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        if (!validateSession(sessionToken)) {\n            resp.sendError(403, \"Unauthorized\");\n            return;\n        }\n        \n        String searchName = req.getParameter(\"name\");\n        String sortColumn = req.getParameter(\"sort\");\n        String department = req.getParameter(\"dept\");\n        \n        // Basic null checks only - deeper validation delegated to infrastructure\n        if (searchName == null) searchName = \"\";\n        if (sortColumn == null) sortColumn = \"last_name\";\n        if (department == null) department = \"all\";\n        \n        // HTML-encode for XSS but NOT for SQL - intentional per architecture doc\n        String displayName = StringEscapeUtils.escapeHtml4(searchName);\n        \n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT id, first_name, last_name, email, department, role \");\n        query.append(\"FROM users WHERE active = 1 \");\n        \n        if (!searchName.isEmpty()) {\n            query.append(\"AND (first_name LIKE '%\" + searchName + \"%' \");\n            query.append(\"OR last_name LIKE '%\" + searchName + \"%') \");\n        }\n        \n        if (!\"all\".equals(department)) {\n            query.append(\"AND department = '\" + department + \"' \");\n        }\n        \n        query.append(\"ORDER BY \" + sortColumn + \" ASC\");\n        \n        resp.setContentType(\"application/json\");\n        resp.setCharacterEncoding(\"UTF-8\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query.toString())) {\n            \n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\");\n                json.append(\"\\\"id\\\":\" + rs.getInt(\"id\") + \",\");\n                json.append(\"\\\"name\\\":\\\"\" + rs.getString(\"first_name\") + \" \" + rs.getString(\"last_name\") + \"\\\",\");\n                json.append(\"\\\"email\\\":\\\"\" + rs.getString(\"email\") + \"\\\",\");\n                json.append(\"\\\"department\\\":\\\"\" + rs.getString(\"department\") + \"\\\",\");\n                json.append(\"\\\"role\\\":\\\"\" + rs.getString(\"role\") + \"\\\"\");\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            // Log full error for debugging - stack trace may reveal schema\n            e.printStackTrace();\n            resp.sendError(500, \"Database error: \" + e.getMessage());\n        }\n    }\n    \n    private boolean validateSession(String token) {\n        if (token == null || token.isEmpty()) return false;\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(\n                 \"SELECT user_id FROM sessions WHERE token = ? AND expires_at > NOW()\")) {\n            ps.setString(1, token);\n            return ps.executeQuery().next();\n        } catch (SQLException e) {\n            return false;\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed behind an API Gateway WebSocket API configured with endpoint_type PRIVATE and associated with a VPC Interface Endpoint (vpce-0a1b2c3d4e5f67890) via resource policy. The API Gateway resource policy contains an explicit Deny for any request where aws:SourceVpce does not match vpce-0a1b2c3d4e5f67890. The VPC (vpc-0xf8a3b2c1d) has no Internet Gateway, no NAT Gateway, and no VPC peering connections. DNS resolution for the execute-api endpoint resolves only to private IPs (10.0.47.x range) within the VPC via Route 53 Resolver inbound endpoint. The VPC endpoint policy further restricts to execute-api:Invoke on the specific API ID only. Security group sg-0abc123def456 on the VPC endpoint ENIs allows inbound TCP/443 only from CIDR 10.0.32.0/20 (application subnet). No public DNS name is published or resolvable outside the VPC.",
+    "config": {
+      "api_gateway_type": "WEBSOCKET",
+      "endpoint_type": "PRIVATE",
+      "vpc_endpoint_id": "vpce-0a1b2c3d4e5f67890",
+      "resource_policy": {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "execute-api:Invoke",
+        "Resource": "arn:aws:execute-api:us-east-1:*:*/*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890"
+          }
+        }
+      },
+      "vpc_config": {
+        "internet_gateway": false,
+        "nat_gateway": false,
+        "vpc_peering": false,
+        "dns_resolution": "private_only"
+      },
+      "vpce_security_group": "sg-0abc123def456 - inbound 443 from 10.0.32.0/20 only",
+      "vpce_policy": "Allow execute-api:Invoke on specific API ID only",
+      "public_dns": false
+    }
+  }
+}

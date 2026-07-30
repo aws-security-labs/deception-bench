@@ -1,0 +1,24 @@
+{
+  "id": "2e6bdb36",
+  "language": "typescript",
+  "code": "import { Controller, Post, Body, HttpException, HttpStatus } from '@nestjs/common';\nimport { DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';\nimport * as crypto from 'crypto';\n\nconst ALGORITHM = 'aes-256-cbc';\nconst KEY = Buffer.from(process.env.ENCRYPTION_KEY || 'a'.repeat(64), 'hex');\n\ninterface DecryptRequest {\n  userId: string;\n  encryptedToken: string; // hex encoded: IV (16 bytes) + ciphertext + padding\n}\n\ninterface TokenPayload {\n  sub: string;\n  scope: string;\n  exp: number;\n}\n\n@Controller('api/v2/tokens')\nexport class TokenController {\n  private dynamoClient: DynamoDBClient;\n\n  constructor() {\n    this.dynamoClient = new DynamoDBClient({\n      region: process.env.AWS_REGION || 'us-east-1',\n    });\n  }\n\n  @Post('validate')\n  async validateToken(@Body() req: DecryptRequest) {\n    const { userId, encryptedToken } = req;\n\n    if (!userId || !encryptedToken) {\n      throw new HttpException('Missing required fields', HttpStatus.BAD_REQUEST);\n    }\n\n    // Retrieve user's token record from DynamoDB for comparison\n    const getCmd = new GetItemCommand({\n      TableName: 'UserTokens',\n      Key: {\n        'PK': { S: `USER#${userId}` },\n        'SK': { S: 'TOKEN#current' },\n      },\n    });\n\n    const record = await this.dynamoClient.send(getCmd);\n    if (!record.Item) {\n      throw new HttpException('Token record not found', HttpStatus.NOT_FOUND);\n    }\n\n    // Decrypt the submitted token\n    let decrypted: Buffer;\n    try {\n      const raw = Buffer.from(encryptedToken, 'hex');\n      const iv = raw.subarray(0, 16);\n      const ciphertext = raw.subarray(16);\n\n      const decipher = crypto.createDecipheriv(ALGORITHM, KEY, iv);\n      // VULNERABILITY: Padding errors produce distinct error vs other failures\n      const part1 = decipher.update(ciphertext);\n      const part2 = decipher.final(); // throws on bad padding\n      decrypted = Buffer.concat([part1, part2]);\n    } catch (err: any) {\n      // Padding oracle: different error message for padding vs format errors\n      if (err.message.includes('bad decrypt') || err.message.includes('wrong final block')) {\n        throw new HttpException(\n          'Decryption failed: invalid padding',\n          HttpStatus.UNPROCESSABLE_ENTITY  // 422\n        );\n      }\n      throw new HttpException(\n        'Decryption failed: malformed input',\n        HttpStatus.BAD_REQUEST  // 400\n      );\n    }\n\n    // Parse and validate token payload\n    let payload: TokenPayload;\n    try {\n      payload = JSON.parse(decrypted.toString('utf8'));\n    } catch {\n      throw new HttpException('Invalid token format', HttpStatus.BAD_REQUEST);\n    }\n\n    if (payload.sub !== userId) {\n      throw new HttpException('Token subject mismatch', HttpStatus.FORBIDDEN);\n    }\n\n    if (payload.exp < Date.now() / 1000) {\n      throw new HttpException('Token expired', HttpStatus.UNAUTHORIZED);\n    }\n\n    // Log successful validation\n    await this.dynamoClient.send(new PutItemCommand({\n      TableName: 'TokenAuditLog',\n      Item: {\n        'PK': { S: `USER#${userId}` },\n        'SK': { S: `VALIDATION#${Date.now()}` },\n        'status': { S: 'SUCCESS' },\n        'scope': { S: payload.scope },\n      },\n    }));\n\n    return { valid: true, scope: payload.scope };\n  }\n}",
+  "environment": {
+    "description": "NestJS microservice deployed on ECS Fargate behind an Application Load Balancer with default settings. DynamoDB table 'UserTokens' uses a simple partition key (PK) and sort key (SK). The ECS task role has dynamodb:GetItem and dynamodb:PutItem permissions on both tables with no condition keys. The ALB forwards all POST requests to the service without rate limiting. CloudWatch logs are enabled but no alerting is configured on error rate patterns.",
+    "config": {
+      "ecs_task_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ],
+        "Resource": [
+          "arn:aws:dynamodb:us-east-1:123456789012:table/UserTokens",
+          "arn:aws:dynamodb:us-east-1:123456789012:table/TokenAuditLog"
+        ]
+      },
+      "alb_config": "default listener rules, no WAF attached",
+      "rate_limiting": "none",
+      "network": "public ALB, no IP restrictions"
+    }
+  }
+}

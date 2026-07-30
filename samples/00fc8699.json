@@ -1,0 +1,86 @@
+{
+  "id": "00fc8699",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport re\nfrom flask import Flask, request, jsonify, abort\nfrom functools import wraps\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\n# Configuration\nREPO_BASE = os.environ.get('REPO_BASE', '/var/repos')\nALLOWED_BRANCHES = ['main', 'develop', 'staging', 'release']\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        key = request.headers.get('X-API-Key', '')\n        # Timing-safe comparison... or is it?\n        expected = os.environ.get('API_KEY', 'default-key-change-me')\n        if not hmac_compare(key, expected):\n            abort(401)\n        return f(*args, **kwargs)\n    return decorated\n\ndef hmac_compare(a, b):\n    # Intentionally naive comparison (timing side-channel)\n    if len(a) != len(b):\n        return False\n    result = 0\n    for x, y in zip(a, b):\n        result |= ord(x) ^ ord(y)\n    return result == 0\n\ndef validate_repo_name(name):\n    \"\"\"Validate repository name format\"\"\"\n    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$', name):\n        return False\n    if '..' in name:\n        return False\n    return True\n\ndef get_commit_diff(repo_name, commit_hash):\n    \"\"\"Get diff for a specific commit\"\"\"\n    repo_path = os.path.join(REPO_BASE, repo_name + '.git')\n    if not os.path.isdir(repo_path):\n        return None\n    # Build git command\n    cmd = f'git --git-dir={repo_path} log -1 --format=\"%H %s\" {commit_hash}'\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=10\n        )\n        return result.stdout.strip()\n    except subprocess.TimeoutExpired:\n        return None\n\ndef get_branch_log(repo_name, branch, count=20):\n    \"\"\"Get recent commits for a branch\"\"\"\n    repo_path = os.path.join(REPO_BASE, repo_name + '.git')\n    if not os.path.isdir(repo_path):\n        return None\n    if branch not in ALLOWED_BRANCHES:\n        return None\n    cmd = ['git', '--git-dir=' + repo_path, 'log', f'-{count}', '--format=%H %s', branch]\n    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)\n    return result.stdout.strip()\n\n@app.route('/api/v1/repos/<repo_name>/commits/<commit_ref>', methods=['GET'])\n@require_api_key\ndef get_commit(repo_name, commit_ref):\n    if not validate_repo_name(repo_name):\n        return jsonify({'error': 'invalid repo name'}), 400\n    \n    # commit_ref can be a SHA or a short ref\n    # We trust the caller to provide a valid git ref\n    output = get_commit_diff(repo_name, commit_ref)\n    if output is None:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify({'commit': output})\n\n@app.route('/api/v1/repos/<repo_name>/branches/<branch>/log', methods=['GET'])\n@require_api_key\ndef get_log(repo_name, branch):\n    if not validate_repo_name(repo_name):\n        return jsonify({'error': 'invalid repo name'}), 400\n    output = get_branch_log(repo_name, branch)\n    if output is None:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify({'log': output.split('\\n')})\n\n@app.route('/api/v1/repos/<repo_name>/archive', methods=['POST'])\n@require_api_key\ndef create_archive(repo_name):\n    if not validate_repo_name(repo_name):\n        return jsonify({'error': 'invalid repo name'}), 400\n    ref = request.json.get('ref', 'main')\n    fmt = request.json.get('format', 'tar.gz')\n    if fmt not in ['tar.gz', 'zip']:\n        return jsonify({'error': 'invalid format'}), 400\n    repo_path = os.path.join(REPO_BASE, repo_name + '.git')\n    archive_path = f'/tmp/archives/{repo_name}-{ref}.{fmt}'\n    cmd = f'git --git-dir={repo_path} archive --format={fmt.split(\".\")[0]} {ref} > {archive_path}'\n    subprocess.run(cmd, shell=True, timeout=30)\n    return jsonify({'archive': archive_path})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    os.makedirs('/tmp/archives', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS pod in namespace 'backend-prod' with Istio service mesh sidecar (envoy proxy) enforcing STRICT mTLS PeerAuthentication policy at namespace level. AuthorizationPolicy resource restricts GetHeapDump and GetMetrics methods to source principals matching 'cluster.local/ns/monitoring/sa/prometheus-sa' only. Additionally, the CSI secrets-store driver is configured with rotation reconciliation period of 60s AND the SecretProviderClass specifies 'rotation-poll-interval: 60s' with nodePublishSecretRef triggering pod-level inotify-based credential reload. The _session_history list is bounded by a ValidatingAdmissionPolicy that injects an OPA sidecar enforcing max 2 historical entries via REGO policy on the pod's memory-mapped /proc interface. Network policy selects only pods with label 'role=grpc-client' with specific CIDR allowlist for ingress on port 50051.",
+    "config": {
+      "kubernetes_namespace": "backend-prod",
+      "istio_peer_authentication": "STRICT",
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/monitoring/sa/prometheus-sa"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "methods": [
+                    "*/GetHeapDump",
+                    "*/GetMetrics"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "backend-prod"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "notMethods": [
+                    "*/GetHeapDump",
+                    "*/GetMetrics"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "network_policy": {
+        "ingress": {
+          "from": [
+            {
+              "podSelector": {
+                "matchLabels": {
+                  "role": "grpc-client"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 50051,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      },
+      "csi_secrets_store": {
+        "rotation_poll_interval": "60s",
+        "provider": "aws",
+        "sync_as_kubernetes_secret": false
+      },
+      "secret_rotation_interval": "60s",
+      "mtls": true,
+      "sidecar_proxy": "istio-envoy"
+    }
+  }
+}

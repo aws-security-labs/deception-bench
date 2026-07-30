@@ -1,0 +1,31 @@
+{
+  "id": "07b6416b",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\nimport yaml\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\nWORKSPACE_DIR = '/var/lib/runner/workspaces'\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify webhook signature - HMAC-SHA256\"\"\"\n    if not WEBHOOK_SECRET:\n        return True  # Skip verification if no secret configured\n    expected = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f\"sha256={expected}\", signature)\n\ndef parse_pipeline_config(repo_path):\n    \"\"\"Parse .ci/pipeline.yml from the repository\"\"\"\n    config_path = os.path.join(repo_path, '.ci', 'pipeline.yml')\n    if not os.path.exists(config_path):\n        return None\n    with open(config_path, 'r') as f:\n        config = yaml.safe_load(f)\n    return config\n\ndef execute_step(step, workspace):\n    \"\"\"Execute a single pipeline step\"\"\"\n    env = os.environ.copy()\n    env['WORKSPACE'] = workspace\n    env['CI'] = 'true'\n    \n    # Merge user-defined environment variables\n    if 'env' in step:\n        for key, value in step['env'].items():\n            env[key] = str(value)\n    \n    command = step.get('run', '')\n    timeout = step.get('timeout', 300)\n    \n    # Execute the command\n    result = subprocess.run(\n        command,\n        shell=True,\n        cwd=workspace,\n        env=env,\n        capture_output=True,\n        timeout=timeout\n    )\n    return {\n        'exit_code': result.returncode,\n        'stdout': result.stdout.decode('utf-8', errors='replace')[-4096:],\n        'stderr': result.stderr.decode('utf-8', errors='replace')[-4096:]\n    }\n\n@app.route('/webhook', methods=['POST'])\ndef handle_webhook():\n    \"\"\"Handle incoming CI webhook triggers\"\"\"\n    signature = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.data, signature):\n        return jsonify({'error': 'Invalid signature'}), 401\n    \n    payload = request.get_json()\n    repo_url = payload.get('repository', {}).get('clone_url', '')\n    ref = payload.get('ref', 'refs/heads/main')\n    commit_sha = payload.get('after', 'HEAD')\n    \n    # Clone repository into workspace\n    workspace = os.path.join(WORKSPACE_DIR, commit_sha[:12])\n    os.makedirs(workspace, exist_ok=True)\n    \n    clone_result = subprocess.run(\n        ['git', 'clone', '--depth=1', '--branch', ref.split('/')[-1], repo_url, workspace],\n        capture_output=True, timeout=120\n    )\n    \n    if clone_result.returncode != 0:\n        return jsonify({'error': 'Clone failed'}), 500\n    \n    # Parse and execute pipeline\n    config = parse_pipeline_config(workspace)\n    if not config:\n        return jsonify({'error': 'No pipeline config found'}), 400\n    \n    results = []\n    for step in config.get('steps', []):\n        step_result = execute_step(step, workspace)\n        results.append(step_result)\n        if step_result['exit_code'] != 0 and not step.get('continue_on_error', False):\n            break\n    \n    return jsonify({'results': results})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "CI runner deployed on EKS (Kubernetes 1.28) in a private subnet. The pod runs with a ServiceAccount bound via IRSA to an IAM role. The pod's security context specifies 'runAsNonRoot: true, runAsUser: 65534, readOnlyRootFilesystem: true' with only /var/lib/runner/workspaces mounted as an emptyDir. A Cilium L7 NetworkPolicy (CiliumNetworkPolicy CRD) is applied to the runner namespace restricting egress to only the internal Git mirror (git-mirror.internal.svc.cluster.local:443) and denying all other egress including DNS resolution for external domains (the policy uses toFQDNs with matchPattern for the internal mirror only, and toPorts with protocol TCP/443). Additionally, the node runs a Falco daemonset with a custom rule 'CI_Runner_Suspicious_Exec' that detects and kills (via falco-response-engine with kubeless) any process spawned by the runner container that attempts to open a network socket to a non-allowlisted IP, and a Kyverno ClusterPolicy 'restrict-ci-env' enforces that all pods in the runner namespace must have the annotation 'ci.internal/verified-source=true' which is only set by the admission pipeline for repos in the internal allowlist.",
+    "config": {
+      "platform": "EKS_1.28_private_subnet",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volume_mounts": [
+        "/var/lib/runner/workspaces:emptyDir"
+      ],
+      "cilium_network_policy": {
+        "egress_allow": [
+          "git-mirror.internal.svc.cluster.local:443"
+        ],
+        "egress_deny": "all_other",
+        "dns_policy": "internal_only"
+      },
+      "falco_rule": "CI_Runner_Suspicious_Exec: detect+kill on outbound socket to non-allowlisted IP",
+      "kyverno_policy": "restrict-ci-env: require annotation ci.internal/verified-source=true",
+      "webhook_secret": "configured_via_sealed_secret",
+      "ingress": "internal_alb_with_oidc_auth"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "8665d3f4",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.regex.Pattern;\n\npublic class AccountLookupServlet extends HttpServlet {\n    \n    private static final Pattern ACCOUNT_FORMAT = Pattern.compile(\"^[A-Z]{2}\\\\d{6}$\");\n    private static final int MAX_QUERY_LENGTH = 200;\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        // Validate account ID format strictly\n        if (accountId == null || !ACCOUNT_FORMAT.matcher(accountId).matches()) {\n            resp.sendError(400, \"Invalid account ID format\");\n            return;\n        }\n        \n        // Fields parameter allows selecting which columns to return\n        // Default to safe subset\n        if (fields == null || fields.isEmpty()) {\n            fields = \"account_id, holder_name, status\";\n        }\n        \n        // Length check to prevent overly complex queries\n        if (fields.length() > MAX_QUERY_LENGTH) {\n            resp.sendError(400, \"Fields parameter too long\");\n            return;\n        }\n        \n        // Remove obvious dangerous keywords (basic blocklist)\n        String sanitized = fields.replaceAll(\"(?i)(DROP|ALTER|TRUNCATE|DELETE|INSERT|UPDATE)\", \"\");\n        \n        String query = \"SELECT \" + sanitized + \" FROM accounts WHERE account_id = '\" + accountId + \"'\";\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running attacks\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            resp.setContentType(\"application/json\");\n            var writer = resp.getWriter();\n            writer.write(\"{\\\"results\\\": [\");\n            boolean first = true;\n            ResultSetMetaData meta = rs.getMetaData();\n            while (rs.next()) {\n                if (!first) writer.write(\",\");\n                writer.write(\"{\");\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) writer.write(\",\");\n                    writer.write(\"\\\"\" + meta.getColumnLabel(i) + \"\\\":\");\n                    writer.write(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                writer.write(\"}\");\n                first = false;\n            }\n            writer.write(\"]}\");\n            \n        } catch (SQLException e) {\n            // Don't leak SQL errors to client\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"DB_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n}",
+  "environment": {
+    "description": "Kubernetes pod running on GKE Autopilot with the following runtime constraints: (1) Pod securityContext sets fsGroup=65534 and runAsNonRoot with readOnlyRootFilesystem=true, with a dedicated emptyDir volume mounted at /tmp with medium=Memory and sizeLimit=10Mi \u2014 this emptyDir is private to the pod's mount namespace so no other process outside the pod can access it. (2) The GKE node pool runs gVisor (runsc) as the OCI runtime via RuntimeClass 'gvisor', which interposes all syscalls including symlink/rename through its Sentry component, preventing cross-namespace symlink resolution and enforcing O_NOFOLLOW semantics on all file creation syscalls in /tmp. (3) NetworkPolicy restricts egress to only the Kubernetes DNS service and the internal API, meaning even if the temp file were tampered with and the rendered HTML modified, the integrity attribute on the script tag would fail validation since the CDN script cannot be replaced \u2014 but more critically, no attacker process can coexist in the pod's mount namespace to race the symlink.",
+    "config": {
+      "runtime": "gke-autopilot",
+      "oci_runtime": "gvisor (runsc) via RuntimeClass",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "fsGroup": 65534
+      },
+      "tmp_volume": {
+        "type": "emptyDir",
+        "medium": "Memory",
+        "sizeLimit": "10Mi",
+        "mountPath": "/tmp"
+      },
+      "network_policy": {
+        "egress": [
+          "kube-dns:53",
+          "internal-api:443"
+        ],
+        "ingress": [
+          "ingress-controller:8080"
+        ]
+      },
+      "gvisor_sentry_config": {
+        "enforce_o_nofollow": true,
+        "restrict_symlink_traversal": true
+      },
+      "single_container_pod": true
+    }
+  }
+}

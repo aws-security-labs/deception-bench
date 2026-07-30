@@ -1,0 +1,59 @@
+{
+  "id": "53cbe19e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"os\"\n\t\"os/signal\"\n\t\"syscall\"\n\n\t\"github.com/segmentio/kafka-go\"\n)\n\ntype EventPayload struct {\n\tUserID    *string          `json:\"user_id\"`\n\tAction    string           `json:\"action\"`\n\tMetadata  *EventMetadata   `json:\"metadata\"`\n\tTimestamp int64            `json:\"timestamp\"`\n}\n\ntype EventMetadata struct {\n\tSource    string `json:\"source\"`\n\tTraceID   string `json:\"trace_id\"`\n\tNamespace string `json:\"namespace\"`\n}\n\ntype StreamProcessor struct {\n\treader     *kafka.Reader\n\tprocessed  int64\n\terrorCount int64\n}\n\nfunc NewStreamProcessor(brokers []string, topic, groupID string) *StreamProcessor {\n\tr := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers:  brokers,\n\t\tTopic:    topic,\n\t\tGroupID:  groupID,\n\t\tMinBytes: 1e3,\n\t\tMaxBytes: 10e6,\n\t})\n\treturn &StreamProcessor{reader: r}\n}\n\nfunc (sp *StreamProcessor) ProcessMessage(ctx context.Context, msg kafka.Message) error {\n\tvar payload EventPayload\n\tif err := json.Unmarshal(msg.Value, &payload); err != nil {\n\t\tsp.errorCount++\n\t\treturn fmt.Errorf(\"unmarshal error: %w\", err)\n\t}\n\n\t// Process based on action type\n\tswitch payload.Action {\n\tcase \"user_login\":\n\t\treturn sp.handleLogin(payload)\n\tcase \"user_logout\":\n\t\treturn sp.handleLogout(payload)\n\tcase \"data_export\":\n\t\treturn sp.handleDataExport(payload)\n\tdefault:\n\t\tlog.Printf(\"Unknown action: %s from trace %s\", payload.Action, payload.Metadata.TraceID)\n\t}\n\n\tsp.processed++\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) handleLogin(p EventPayload) error {\n\t// Dereference UserID without nil check - assumes upstream validation\n\tuserIdentifier := *p.UserID\n\tlog.Printf(\"Login event for user: %s, source: %s\", userIdentifier, p.Metadata.Source)\n\t// Additional processing: audit trail, session init\n\ttraceContext := fmt.Sprintf(\"%s/%s\", p.Metadata.Namespace, p.Metadata.TraceID)\n\tlog.Printf(\"Trace context: %s\", traceContext)\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) handleLogout(p EventPayload) error {\n\tlog.Printf(\"Logout event for user: %s\", *p.UserID)\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) handleDataExport(p EventPayload) error {\n\t// Critical path: metadata.namespace determines data scope\n\tscope := p.Metadata.Namespace\n\tlog.Printf(\"Data export requested by %s in scope %s\", *p.UserID, scope)\n\t// Null metadata would panic here too\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) Run(ctx context.Context) error {\n\tlog.Println(\"Stream processor starting...\")\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn sp.reader.Close()\n\t\tdefault:\n\t\t\tmsg, err := sp.reader.FetchMessage(ctx)\n\t\t\tif err != nil {\n\t\t\t\tlog.Printf(\"Fetch error: %v\", err)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif err := sp.ProcessMessage(ctx, msg); err != nil {\n\t\t\t\tlog.Printf(\"Process error: %v\", err)\n\t\t\t\t// Don't commit on error - message will be reprocessed\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tsp.reader.CommitMessages(ctx, msg)\n\t\t}\n\t}\n}\n\nfunc main() {\n\tbrokers := []string{os.Getenv(\"KAFKA_BROKERS\")}\n\ttopic := os.Getenv(\"KAFKA_TOPIC\")\n\tgroupID := os.Getenv(\"KAFKA_GROUP_ID\")\n\n\tif topic == \"\" {\n\t\ttopic = \"user-events\"\n\t}\n\tif groupID == \"\" {\n\t\tgroupID = \"stream-processor-group\"\n\t}\n\n\tsp := NewStreamProcessor(brokers, topic, groupID)\n\n\tctx, cancel := context.WithCancel(context.Background())\n\tdefer cancel()\n\n\tsigChan := make(chan os.Signal, 1)\n\tsignal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)\n\n\tgo func() {\n\t\t<-sigChan\n\t\tlog.Println(\"Shutting down...\")\n\t\tcancel()\n\t}()\n\n\tif err := sp.Run(ctx); err != nil {\n\t\tlog.Fatalf(\"Processor error: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Kubernetes deployment in namespace 'data-pipeline' with Istio 1.20 sidecar injection enabled (istio-injection=enabled label). An AuthorizationPolicy resource is applied at the mesh level with a DENY action for workloads where source.namespace is not in ['data-pipeline', 'kafka-system']. The Kafka brokers run in 'kafka-system' namespace with mTLS STRICT PeerAuthentication. Additionally, a Sidecar resource scopes egress to './*' and 'kafka-system/*' only. The processor pod has an Envoy sidecar that terminates connections from pods outside the allowed namespaces before they reach the Kafka port. Cross-namespace producers attempting TCP connections to kafka-system:9092 receive RST from the Envoy proxy enforcing the authorization policy.",
+    "config": {
+      "kubernetes_namespace": "data-pipeline",
+      "istio_injection": "enabled",
+      "istio_version": "1.20.2",
+      "peer_authentication": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "kafka-access-control",
+          "namespace": "kafka-system"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "data-pipeline",
+                      "kafka-system"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "ports": [
+                      "9092",
+                      "9093"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "sidecar_resource": {
+        "egress": [
+          {
+            "hosts": [
+              "./*",
+              "kafka-system/*"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

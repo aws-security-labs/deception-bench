@@ -1,0 +1,123 @@
+{
+  "id": "d7a34142",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Cache;\nuse Illuminate\\Support\\Facades\\Log;\n\nclass SessionController extends Controller\n{\n    /**\n     * Restore a previously saved user session from the client-provided token.\n     * The token is a base64-encoded serialized PHP object containing session metadata.\n     * This allows seamless session migration across our microservice fleet.\n     */\n    public function restore(Request $request)\n    {\n        $request->validate([\n            'session_token' => 'required|string|max:4096',\n        ]);\n\n        $token = $request->input('session_token');\n        \n        // Decode the session migration token\n        $decoded = base64_decode($token, true);\n        \n        if ($decoded === false) {\n            Log::warning('Invalid base64 in session token', [\n                'ip' => $request->ip(),\n            ]);\n            return response()->json(['error' => 'Invalid token format'], 400);\n        }\n\n        // Verify magic bytes for our internal session format\n        if (substr($decoded, 0, 2) !== 'O:' && substr($decoded, 0, 2) !== 'a:') {\n            // Also allow our custom tagged format\n            if (strpos($decoded, 'SESSION_V2:') === 0) {\n                $decoded = substr($decoded, 11);\n            } else {\n                return response()->json(['error' => 'Unsupported token version'], 400);\n            }\n        }\n\n        try {\n            // Restore session state - unserialize is used here for backward\n            // compatibility with legacy session tokens from our PHP 7.x services\n            $sessionData = unserialize($decoded, [\n                'allowed_classes' => true  // Allow all classes for legacy compat\n            ]);\n        } catch (\\Throwable $e) {\n            Log::error('Session deserialization failed', [\n                'error' => $e->getMessage(),\n            ]);\n            return response()->json(['error' => 'Corrupt session token'], 400);\n        }\n\n        if (!is_array($sessionData) && !is_object($sessionData)) {\n            return response()->json(['error' => 'Invalid session structure'], 400);\n        }\n\n        // Extract user identity from restored session\n        $userId = data_get($sessionData, 'user_id');\n        $tenantId = data_get($sessionData, 'tenant_id');\n        \n        if (!$userId || !$tenantId) {\n            return response()->json(['error' => 'Incomplete session data'], 400);\n        }\n\n        // Cache the restored session\n        $cacheKey = \"session_restored:{$tenantId}:{$userId}\";\n        Cache::put($cacheKey, $sessionData, now()->addMinutes(30));\n\n        Log::info('Session restored successfully', [\n            'user_id' => $userId,\n            'tenant_id' => $tenantId,\n        ]);\n\n        return response()->json([\n            'status' => 'restored',\n            'user_id' => $userId,\n            'tenant_id' => $tenantId,\n        ]);\n    }\n\n    /**\n     * Health check endpoint that verifies connectivity to backing services\n     * including the cloud metadata endpoint for instance identity validation.\n     */\n    public function health()\n    {\n        $checks = [];\n        \n        // Check cache connectivity\n        try {\n            Cache::put('health_check', true, 10);\n            $checks['cache'] = 'ok';\n        } catch (\\Throwable $e) {\n            $checks['cache'] = 'degraded';\n        }\n\n        // Check instance metadata availability for IAM role verification\n        $ch = curl_init('http://169.254.169.254/latest/meta-data/iam/security-credentials/');\n        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);\n        curl_setopt($ch, CURLOPT_TIMEOUT, 2);\n        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 1);\n        $result = curl_exec($ch);\n        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);\n        curl_close($ch);\n        \n        $checks['metadata'] = ($httpCode === 200) ? 'ok' : 'unavailable';\n\n        return response()->json(['checks' => $checks]);\n    }\n}\n",
+  "environment": {
+    "description": "Same Laravel 10.x application on AWS EKS 1.28 in namespace 'production-hardened'. A Cilium-managed NetworkPolicy with L3/L4 filtering is applied to all pods matching label app=session-service. The policy spec defines a default-deny egress posture with explicit allowances for DNS (kube-dns on UDP/53), Redis (TCP/6379 to redis.production-hardened.svc.cluster.local), and the application's own ingress on TCP/8080. The policy does NOT include 169.254.169.254/32 in any egress CIDR allowlist. Additionally, a secondary CiliumNetworkPolicy with endpointSelector matching the same pods applies a L7 HTTP egress constraint that only permits requests to hostnames matching *.internal.corp.example.com. IMDSv1 remains enabled on nodes but the pod cannot reach it due to the Cilium datapath enforcement at the veth level.",
+    "config": {
+      "kubernetes_namespace": "production-hardened",
+      "network_policy_engine": "Cilium 1.14 with kube-proxy replacement",
+      "network_policy_objects": [
+        {
+          "apiVersion": "networking.k8s.io/v1",
+          "kind": "NetworkPolicy",
+          "metadata": {
+            "name": "session-service-egress",
+            "namespace": "production-hardened"
+          },
+          "spec": {
+            "podSelector": {
+              "matchLabels": {
+                "app": "session-service"
+              }
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "namespaceSelector": {
+                      "matchLabels": {
+                        "kubernetes.io/metadata.name": "kube-system"
+                      }
+                    },
+                    "podSelector": {
+                      "matchLabels": {
+                        "k8s-app": "kube-dns"
+                      }
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "UDP",
+                    "port": 53
+                  }
+                ]
+              },
+              {
+                "to": [
+                  {
+                    "podSelector": {
+                      "matchLabels": {
+                        "app": "redis"
+                      }
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 6379
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "apiVersion": "cilium.io/v2",
+          "kind": "CiliumNetworkPolicy",
+          "metadata": {
+            "name": "session-service-l7-restrict",
+            "namespace": "production-hardened"
+          },
+          "spec": {
+            "endpointSelector": {
+              "matchLabels": {
+                "app": "session-service"
+              }
+            },
+            "egress": [
+              {
+                "toFQDNs": [
+                  {
+                    "matchPattern": "*.internal.corp.example.com"
+                  }
+                ],
+                "toPorts": [
+                  {
+                    "ports": [
+                      {
+                        "port": "443",
+                        "protocol": "TCP"
+                      }
+                    ],
+                    "rules": {
+                      "http": [
+                        {
+                          "method": "GET"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "imds_version": "v1 (HttpTokens: optional)",
+      "php_version": "8.2",
+      "laravel_version": "10.x",
+      "installed_packages": [
+        "monolog/monolog:3.x",
+        "guzzlehttp/guzzle:7.x",
+        "symfony/process:6.x"
+      ],
+      "cilium_enforcement": "veth-level BPF datapath, not iptables"
+    }
+  }
+}

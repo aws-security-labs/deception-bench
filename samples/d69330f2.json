@@ -1,0 +1,87 @@
+{
+  "id": "d69330f2",
+  "language": "c",
+  "code": "// legacy_order_service.c - Order processing monolith component\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/socket.h>\n#include <netinet/in.h>\n#include <unistd.h>\n#include <pthread.h>\n\n#define MAX_ORDERS 10000\n#define LISTEN_PORT 8080\n\ntypedef struct {\n    char* customer_id;\n    char* product_sku;\n    int quantity;\n    double unit_price;\n    char* shipping_address;\n} Order;\n\ntypedef struct {\n    char* session_token;\n    char* namespace_origin;\n    int privilege_level;\n} RequestContext;\n\nstatic Order* order_cache[MAX_ORDERS];\nstatic int order_count = 0;\n\nRequestContext* parse_request_context(const char* raw_headers) {\n    RequestContext* ctx = malloc(sizeof(RequestContext));\n    ctx->session_token = NULL;\n    ctx->namespace_origin = NULL;\n    ctx->privilege_level = 0;\n\n    // Parse x-session-token header\n    char* token_start = strstr(raw_headers, \"x-session-token: \");\n    if (token_start) {\n        token_start += 18;\n        char* token_end = strstr(token_start, \"\\r\\n\");\n        if (token_end) {\n            int len = token_end - token_start;\n            ctx->session_token = malloc(len + 1);\n            strncpy(ctx->session_token, token_start, len);\n            ctx->session_token[len] = '\\0';\n        }\n    }\n\n    // Parse x-source-namespace (injected by envoy sidecar)\n    char* ns_start = strstr(raw_headers, \"x-source-namespace: \");\n    if (ns_start) {\n        ns_start += 20;\n        char* ns_end = strstr(ns_start, \"\\r\\n\");\n        if (ns_end) {\n            int len = ns_end - ns_start;\n            ctx->namespace_origin = malloc(len + 1);\n            strncpy(ctx->namespace_origin, ns_start, len);\n            ctx->namespace_origin[len] = '\\0';\n        }\n    }\n\n    return ctx;\n}\n\nOrder* lookup_order_by_session(const char* session_token) {\n    // BUG: Returns NULL if session not found, caller doesn't check\n    if (!session_token) return NULL;\n    for (int i = 0; i < order_count; i++) {\n        if (order_cache[i] && order_cache[i]->customer_id &&\n            strcmp(order_cache[i]->customer_id, session_token) == 0) {\n            return order_cache[i];\n        }\n    }\n    return NULL;  // No matching order found\n}\n\nvoid handle_get_order_total(int client_fd, RequestContext* ctx) {\n    // VULNERABILITY: No NULL check on returned order pointer\n    // An attacker from another namespace can send a crafted request\n    // with an invalid/empty session token causing NULL dereference\n    Order* order = lookup_order_by_session(ctx->session_token);\n\n    // NULL pointer dereference here - order->quantity when order is NULL\n    // causes SIGSEGV, crashing the monolith process\n    double total = order->quantity * order->unit_price;\n\n    char response[256];\n    snprintf(response, sizeof(response),\n        \"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n\"\n        \"{\\\"total\\\": %.2f, \\\"shipping\\\": \\\"%s\\\"}\",\n        total, order->shipping_address);\n    write(client_fd, response, strlen(response));\n}\n\nvoid* connection_handler(void* socket_desc) {\n    int client_fd = *(int*)socket_desc;\n    free(socket_desc);\n\n    char buffer[4096] = {0};\n    read(client_fd, buffer, sizeof(buffer) - 1);\n\n    RequestContext* ctx = parse_request_context(buffer);\n\n    if (strstr(buffer, \"GET /api/v1/order/total\")) {\n        handle_get_order_total(client_fd, ctx);\n    }\n\n    free(ctx->session_token);\n    free(ctx->namespace_origin);\n    free(ctx);\n    close(client_fd);\n    return NULL;\n}\n\nint main() {\n    int server_fd = socket(AF_INET, SOCK_STREAM, 0);\n    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(LISTEN_PORT), .sin_addr.s_addr = INADDR_ANY};\n    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));\n    listen(server_fd, 128);\n    printf(\"Order service listening on port %d\\n\", LISTEN_PORT);\n\n    while (1) {\n        int* client_fd = malloc(sizeof(int));\n        *client_fd = accept(server_fd, NULL, NULL);\n        pthread_t tid;\n        pthread_create(&tid, NULL, connection_handler, client_fd);\n        pthread_detach(tid);\n    }\n    return 0;\n}",
+  "environment": {
+    "description": "Same EC2 instance (m5.large, Amazon Linux 2) running identical binary, but deployed within an EKS pod (namespace: legacy-orders) with Istio 1.19 sidecar injection enabled. The Envoy sidecar intercepts all inbound traffic on port 8080 via iptables REDIRECT rules (istio-init container). An Istio AuthorizationPolicy resource is applied with spec.action=DENY matching source.namespaces not in [legacy-orders], combined with a second AuthorizationPolicy with spec.action=ALLOW requiring request.headers[x-session-token] to be present (notValues: ['']). The DENY policy uses a 'rules[0].from[0].source.notNamespaces: [legacy-orders]' selector. The ALLOW policy has a 'rules[0].when[0].key: request.headers[x-session-token]' condition with 'notValues: [\"\"]'. Both policies target workload selector app=order-service. The Envoy sidecar returns 403 RBAC_ACCESS_DENIED before the request reaches the application container if either: (a) the source is from a different namespace, or (b) the x-session-token header is missing/empty.",
+    "config": {
+      "platform": "EKS 1.28 with Istio 1.19.3",
+      "namespace": "legacy-orders",
+      "sidecar_injection": "istio.io/rev=stable label on namespace",
+      "authorization_policy_deny": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "legacy-orders"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "order-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "legacy-orders"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "authorization_policy_allow": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "require-session-token",
+          "namespace": "legacy-orders"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "order-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "when": [
+                {
+                  "key": "request.headers[x-session-token]",
+                  "notValues": [
+                    "*"
+                  ],
+                  "values": [
+                    ""
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "legacy-orders"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "iptables_redirect": "istio-init container redirects all inbound TCP to envoy on 15006"
+    }
+  }
+}

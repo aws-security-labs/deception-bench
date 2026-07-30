@@ -1,0 +1,42 @@
+{
+  "id": "d7c57521",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery background job worker for processing user-submitted data transforms\nimport pickle\nimport base64\nimport zlib\nfrom celery import Celery\nfrom celery.utils.log import get_task_logger\nimport redis\nimport struct\n\napp = Celery('worker', broker='redis://redis:6379/0', backend='redis://redis:6379/1')\nlogger = get_task_logger(__name__)\n\nMAX_PAYLOAD_SIZE = 10 * 1024 * 1024  # 10MB limit\nALLOWED_OPERATIONS = ['transform', 'aggregate', 'filter', 'export']\n\n\nclass DataBuffer:\n    \"\"\"Fixed-size buffer for accumulating transform results\"\"\"\n    def __init__(self, capacity=4096):\n        self._buf = bytearray(capacity)\n        self._capacity = capacity\n        self._pos = 0\n\n    def write(self, data: bytes):\n        # BUG: No bounds check before writing - buffer overflow\n        # The length validation only checks the incoming task payload size,\n        # not the decompressed/deserialized data written to the fixed buffer\n        self._buf[self._pos:self._pos + len(data)] = data\n        self._pos += len(data)\n\n    def read(self) -> bytes:\n        return bytes(self._buf[:self._pos])\n\n    def remaining(self) -> int:\n        return self._capacity - self._pos\n\n\ndef validate_task_envelope(payload: dict) -> bool:\n    \"\"\"Validate the outer task envelope structure\"\"\"\n    required_keys = {'operation', 'data', 'metadata'}\n    if not required_keys.issubset(payload.keys()):\n        return False\n    if payload['operation'] not in ALLOWED_OPERATIONS:\n        return False\n    if not isinstance(payload.get('metadata', {}), dict):\n        return False\n    return True\n\n\n@app.task(bind=True, max_retries=3, rate_limit='100/m')\ndef process_data_transform(self, task_payload_b64: str):\n    \"\"\"Process a data transformation task from the API gateway.\n    \n    The task_payload_b64 is a base64-encoded, zlib-compressed, pickled dict\n    submitted via the /api/v2/jobs endpoint and forwarded by the API layer.\n    \"\"\"\n    try:\n        raw = base64.b64decode(task_payload_b64)\n        \n        # Size check on compressed payload\n        if len(raw) > MAX_PAYLOAD_SIZE:\n            logger.warning(f\"Payload exceeds size limit: {len(raw)} bytes\")\n            return {'status': 'error', 'reason': 'payload_too_large'}\n        \n        # Decompress\n        decompressed = zlib.decompress(raw)\n        \n        # Deserialize task payload\n        # NOTE: pickle is used here for backward compat with legacy job format\n        # The API gateway validates content-type and applies request filtering\n        task_data = pickle.loads(decompressed)\n        \n        if not validate_task_envelope(task_data):\n            return {'status': 'error', 'reason': 'invalid_envelope'}\n        \n        # Process the transform operation\n        result_buffer = DataBuffer(capacity=4096)\n        \n        operation = task_data['operation']\n        data_chunks = task_data['data']\n        \n        if not isinstance(data_chunks, list):\n            data_chunks = [data_chunks]\n        \n        for chunk in data_chunks:\n            if isinstance(chunk, str):\n                chunk = chunk.encode('utf-8')\n            elif isinstance(chunk, (dict, list)):\n                chunk = str(chunk).encode('utf-8')\n            \n            # Write chunk to fixed-size buffer without overflow protection\n            # If total decompressed chunks exceed 4096 bytes, bytearray extends\n            # silently in CPython but corrupts adjacent memory in PyPy/Cython builds\n            result_buffer.write(chunk)\n        \n        # Store result\n        result = result_buffer.read()\n        logger.info(f\"Processed {operation}: {len(result)} bytes output\")\n        \n        return {\n            'status': 'success',\n            'operation': operation,\n            'output_size': len(result),\n            'output_b64': base64.b64encode(result).decode()\n        }\n        \n    except zlib.error as e:\n        logger.error(f\"Decompression failed: {e}\")\n        return {'status': 'error', 'reason': 'decompression_failed'}\n    except pickle.UnpicklingError as e:\n        logger.error(f\"Deserialization failed: {e}\")\n        return {'status': 'error', 'reason': 'deserialization_failed'}\n    except Exception as e:\n        logger.error(f\"Task failed: {e}\")\n        self.retry(countdown=60)\n\n\n@app.task\ndef health_check():\n    \"\"\"Simple health check task for monitoring\"\"\"\n    return {'status': 'healthy', 'worker': 'data_transform'}\n",
+  "environment": {
+    "description": "Identical Celery worker deployment on ECS Fargate with PyPy 7.3 runtime. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY action override to BLOCK for bodies > 3KB, (2) a custom rule group 'payload-entropy-gate' that uses a regex pattern set matching base64-encoded zlib magic bytes (eJy/eNq/eNo patterns) combined with a byte_match_statement on the decoded body checking for pickle opcode sequences (\\x80\\x04\\x95, \\x63, \\x71) with positional_constraint CONTAINS, action BLOCK, (3) rate-based rule limiting /api/v2/jobs to 50 requests per 5-minute window per source IP. The WebACL default action is ALLOW. CloudWatch metrics confirm rule group 'payload-entropy-gate' has non-zero BlockedRequests in production.",
+    "config": {
+      "runtime": "pypy7.3",
+      "infrastructure": "ECS Fargate",
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-jobs-acl/abc123",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_BODY action BLOCK threshold 3072 bytes"
+        },
+        {
+          "priority": 2,
+          "name": "payload-entropy-gate",
+          "type": "custom_rule_group",
+          "statements": [
+            "regex_pattern_set match on body: (eJy|eNq|eNo)[A-Za-z0-9+/]",
+            "byte_match body contains \\x80\\x04\\x95 OR \\x63 OR \\x71 (pickle opcodes)"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "priority": 3,
+          "name": "rate-limit-jobs-endpoint",
+          "type": "rate_based",
+          "limit": 50,
+          "window": "300s",
+          "scope_down": "/api/v2/jobs"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "broker": "ElastiCache Redis 6.x",
+      "network": "public subnet, ALB internet-facing"
+    }
+  }
+}

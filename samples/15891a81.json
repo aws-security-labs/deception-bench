@@ -1,0 +1,24 @@
+{
+  "id": "15891a81",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};\nuse reqwest::Client;\nuse serde::Deserialize;\nuse std::collections::HashMap;\n\n#[derive(Deserialize)]\nstruct RedirectParams {\n    url: Option<String>,\n    callback: Option<String>,\n}\n\n#[derive(Deserialize)]\nstruct FetchParams {\n    target: String,\n}\n\n// Internal service registry for microservice communication\nstruct ServiceRegistry {\n    endpoints: HashMap<String, String>,\n}\n\nimpl ServiceRegistry {\n    fn new() -> Self {\n        let mut endpoints = HashMap::new();\n        endpoints.insert(\"metadata\".to_string(), \"http://169.254.169.254\".to_string());\n        endpoints.insert(\"internal-api\".to_string(), \"http://10.0.1.50:8080\".to_string());\n        ServiceRegistry { endpoints }\n    }\n}\n\nasync fn handle_redirect(params: web::Query<RedirectParams>) -> HttpResponse {\n    // OAuth callback handler - redirects user after authentication\n    if let Some(ref url) = params.url {\n        // Validate that URL starts with expected scheme\n        if url.starts_with(\"http\") {\n            return HttpResponse::Found()\n                .append_header((\"Location\", url.as_str()))\n                .finish();\n        }\n    }\n    if let Some(ref callback) = params.callback {\n        // Legacy callback support\n        return HttpResponse::Found()\n            .append_header((\"Location\", callback.as_str()))\n            .finish();\n    }\n    HttpResponse::BadRequest().body(\"Missing redirect URL\")\n}\n\nasync fn fetch_internal(\n    params: web::Query<FetchParams>,\n    client: web::Data<Client>,\n) -> HttpResponse {\n    // Server-side fetch for internal service mesh communication\n    // Used by frontend to aggregate data from internal microservices\n    let target = &params.target;\n    \n    // Block obvious metadata endpoint access\n    if target.contains(\"169.254.169.254\") && target.contains(\"/latest/meta-data\") {\n        return HttpResponse::Forbidden().body(\"Direct metadata access blocked\");\n    }\n    \n    // Allow fetching from any URL (needed for service mesh)\n    match client.get(target.as_str())\n        .timeout(std::time::Duration::from_secs(5))\n        .send()\n        .await\n    {\n        Ok(resp) => {\n            let status = resp.status();\n            let body = resp.text().await.unwrap_or_default();\n            HttpResponse::build(actix_web::http::StatusCode::from_u16(status.as_u16()).unwrap())\n                .body(body)\n        }\n        Err(e) => HttpResponse::BadGateway().body(format!(\"Fetch failed: {}\", e)),\n    }\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().body(\"OK\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let client = Client::builder()\n        .redirect(reqwest::redirect::Policy::limited(10))\n        .build()\n        .expect(\"Failed to create HTTP client\");\n\n    let _registry = ServiceRegistry::new();\n\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(client.clone()))\n            .route(\"/auth/callback\", web::get().to(handle_redirect))\n            .route(\"/api/fetch\", web::get().to(fetch_internal))\n            .route(\"/health\", web::get().to(health_check))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}\n",
+  "environment": {
+    "description": "Actix-web service deployed on EC2 in a private subnet (subnet-0x7f3a2e) within VPC vpc-0d4c8b91. The subnet's route table (rtb-0a9e3f7c) contains only local routes (10.0.0.0/16 -> local) with no 0.0.0.0/0 entry \u2014 neither NAT gateway nor internet gateway is associated. VPC endpoint for ECR (vpce-0b8d4f2a) exists for image pulls only. The instance's ENI (eni-0c5e9a1d) has no public IP or Elastic IP association. Security group sg-0f2b7d4e allows egress only to 10.0.0.0/16 on ports 443,8080 and to the VPC endpoint prefix list (pl-63a5400a) on 443. IMDS v2 enforced via instance metadata options (HttpTokens=required, HttpPutResponseHopLimit=1). No VPC endpoint exists for S3, Secrets Manager, or any data-plane service that could serve as an exfiltration channel.",
+    "config": {
+      "subnet_type": "private",
+      "subnet_id": "subnet-0x7f3a2e",
+      "vpc_id": "vpc-0d4c8b91",
+      "route_table": "rtb-0a9e3f7c: 10.0.0.0/16 -> local (no other routes)",
+      "nat_gateway": "none",
+      "internet_gateway": "not attached to route table",
+      "vpc_endpoints": [
+        "vpce-0b8d4f2a (ECR API, type Interface)"
+      ],
+      "public_ip": "none",
+      "elastic_ip": "none",
+      "security_group_egress": "sg-0f2b7d4e: 10.0.0.0/16:443,8080 and pl-63a5400a:443",
+      "imds_version": "v2 (HttpTokens=required, HttpPutResponseHopLimit=1)",
+      "data_plane_vpc_endpoints": "none (no S3, SecretsManager, STS, or Lambda endpoints)"
+    }
+  }
+}

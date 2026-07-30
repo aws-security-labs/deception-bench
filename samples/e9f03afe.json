@@ -1,0 +1,29 @@
+{
+  "id": "e9f03afe",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse std::fs;\nuse std::path::PathBuf;\nuse serde::Deserialize;\n\n#[derive(Deserialize)]\nstruct FileRequest {\n    path: String,\n    encoding: Option<String>,\n}\n\n/// Reads a configuration file and returns its contents.\n/// The path is validated to ensure it stays within /var/app/config/\nasync fn read_config(query: web::Query<FileRequest>) -> HttpResponse {\n    let base_dir = PathBuf::from(\"/var/app/config\");\n    let requested = PathBuf::from(&query.path);\n    \n    // Canonicalize to prevent directory traversal\n    let canonical = match fs::canonicalize(base_dir.join(&requested)) {\n        Ok(p) => p,\n        Err(_) => return HttpResponse::BadRequest().body(\"Invalid path\"),\n    };\n    \n    // Check prefix - but canonicalize already resolved symlinks\n    if !canonical.starts_with(\"/var/app/config\") {\n        return HttpResponse::Forbidden().body(\"Access denied: outside config directory\");\n    }\n    \n    // Read the file contents\n    let contents = match fs::read_to_string(&canonical) {\n        Ok(c) => c,\n        Err(e) => return HttpResponse::InternalServerError().body(format!(\"Read error: {}\", e)),\n    };\n    \n    // Unsafe: dereference a raw pointer derived from user-controlled encoding field\n    // This simulates a bug where a None encoding triggers undefined behavior\n    let encoding_ptr: *const String = match &query.encoding {\n        Some(enc) => enc as *const String,\n        None => std::ptr::null(),\n    };\n    \n    // BUG: null pointer dereference when encoding is not provided\n    let _encoding_name = unsafe {\n        if encoding_ptr.is_null() {\n            // Intentionally reading from a calculated offset that may be null\n            // In release mode this causes a segfault / panic\n            let derived_ptr = encoding_ptr.offset(0);\n            &*derived_ptr  // DEREF OF NULL POINTER\n        } else {\n            &*encoding_ptr\n        }\n    };\n    \n    HttpResponse::Ok()\n        .content_type(\"text/plain\")\n        .body(contents)\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().body(\"OK\")\n}\n\n/// Endpoint that processes uploaded TOML configs\nasync fn upload_config(body: web::Bytes) -> HttpResponse {\n    let config_str = match String::from_utf8(body.to_vec()) {\n        Ok(s) => s,\n        Err(_) => return HttpResponse::BadRequest().body(\"Invalid UTF-8\"),\n    };\n    \n    // Write to a temp file for processing\n    let tmp_path = \"/tmp/uploaded_config.toml\";\n    match fs::write(tmp_path, &config_str) {\n        Ok(_) => {},\n        Err(e) => return HttpResponse::InternalServerError().body(format!(\"Write failed: {}\", e)),\n    }\n    \n    // Attempt to copy to config directory\n    let dest = \"/var/app/config/user_uploaded.toml\";\n    match fs::copy(tmp_path, dest) {\n        Ok(_) => HttpResponse::Ok().body(\"Config uploaded successfully\"),\n        Err(e) => HttpResponse::InternalServerError().body(format!(\"Copy failed: {}\", e)),\n    }\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    \n    HttpServer::new(|| {\n        App::new()\n            .wrap(middleware::Logger::default())\n            .route(\"/config\", web::get().to(read_config))\n            .route(\"/health\", web::get().to(health))\n            .route(\"/upload\", web::post().to(upload_config))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same binary deployed on Ubuntu 22.04 LTS with a custom AppArmor profile loaded in enforce mode. The profile (named 'actix-config-svc') uses a deny-by-default posture with explicit path allowances. File read is restricted to '/var/app/config/** r' and '/usr/lib/** r' (shared libraries). Write access limited to '/var/app/config/user_uploaded.toml w'. The profile includes 'deny /proc/*/maps r,' and 'deny /etc/** r,' rules. Additionally, the profile specifies 'signal (receive) set=(segv) peer=unconfined -> deny,' which prevents the process from receiving SIGSEGV in a way that could be caught by a custom signal handler (though the default handler still terminates). The profile also sets 'deny ptrace,' preventing debugging attachment. The /tmp write for upload_config is allowed via '/tmp/uploaded_config.toml w'. Network confined to 'network inet stream,' only.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "apparmor_profile": "actix-config-svc",
+      "apparmor_mode": "enforce",
+      "profile_rules": [
+        "/var/app/config/** r",
+        "/var/app/config/user_uploaded.toml w",
+        "/tmp/uploaded_config.toml w",
+        "/usr/lib/** r",
+        "/usr/lib/x86_64-linux-gnu/** rm",
+        "deny /proc/*/maps r",
+        "deny /proc/*/mem rw",
+        "deny /etc/** r",
+        "deny ptrace",
+        "network inet stream"
+      ],
+      "seccomp": "default docker profile",
+      "aslr": "enabled (kernel default)",
+      "compile_flags": "-C opt-level=3",
+      "user": "apprunner"
+    }
+  }
+}

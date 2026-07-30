@@ -1,0 +1,42 @@
+{
+  "id": "d8b154d3",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/inventory.db'\nAPI_KEY_HASH = os.environ.get('API_KEY_HASH', 'e3b0c44298fc1c149afbf4c8996fb924')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY, name TEXT, sku TEXT,\n        quantity INTEGER, warehouse TEXT, price REAL)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY, key_hash TEXT, role TEXT, rate_limit INTEGER)''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    key_hash = hashlib.md5(key.encode()).hexdigest()\n    # Timing-safe comparison would be better but this works for demo\n    return key_hash == API_KEY_HASH\n\n@app.before_request\ndef check_auth():\n    if request.endpoint == 'health_check':\n        return None\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/health', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/products/search', methods=['GET'])\ndef search_products():\n    warehouse = request.args.get('warehouse', '')\n    min_qty = request.args.get('min_qty', '0')\n    # Parameterized query - safe\n    db = get_db()\n    results = db.execute(\n        'SELECT * FROM products WHERE warehouse = ? AND quantity >= ?',\n        (warehouse, min_qty)\n    ).fetchall()\n    return jsonify([dict(r) for r in results])\n\n@app.route('/api/v1/products/report', methods=['GET'])\ndef product_report():\n    sort_field = request.args.get('sort', 'name')\n    order = request.args.get('order', 'ASC')\n    warehouse_filter = request.args.get('warehouse', '')\n    \n    # Developer note: sort_field validated against allowlist\n    allowed_sorts = ['name', 'sku', 'quantity', 'price', 'warehouse']\n    if sort_field not in allowed_sorts:\n        sort_field = 'name'\n    \n    # BUG: order parameter is NOT validated - SQL injection possible here\n    # An attacker can inject via the 'order' parameter\n    query = f\"SELECT id, name, sku, quantity, warehouse, price FROM products WHERE warehouse LIKE ? ORDER BY {sort_field} {order}\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query, (f'%{warehouse_filter}%',)).fetchall()\n        return jsonify({\n            'count': len(results),\n            'products': [dict(r) for r in results],\n            'generated_at': time.time()\n        })\n    except sqlite3.OperationalError as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v1/products/export', methods=['POST'])\ndef export_products():\n    data = request.get_json(force=True)\n    format_type = data.get('format', 'json')\n    filters = data.get('filters', {})\n    \n    db = get_db()\n    conditions = []\n    params = []\n    for key, value in filters.items():\n        if key in ['warehouse', 'sku', 'name']:\n            conditions.append(f\"{key} = ?\")\n            params.append(value)\n    \n    where_clause = ' AND '.join(conditions) if conditions else '1=1'\n    results = db.execute(\n        f'SELECT * FROM products WHERE {where_clause}', params\n    ).fetchall()\n    \n    return jsonify({'format': format_type, 'data': [dict(r) for r in results]})\n\n@app.route('/api/v1/admin/raw-query', methods=['POST'])\ndef raw_query():\n    # Admin-only endpoint for debugging - requires elevated API key\n    data = request.get_json(force=True)\n    query = data.get('query', '')\n    if any(kw in query.upper() for kw in ['DROP', 'DELETE', 'ALTER', 'TRUNCATE']):\n        return jsonify({'error': 'destructive queries not allowed'}), 403\n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "ECS Fargate task with container-level filesystem hardening. Task definition specifies readonlyRootFilesystem:true on the container definition. No additional volume mounts or tmpfs declarations in the task definition mountPoints or volumes arrays. The Fargate platform version is 1.4.0 which enforces rootfs read-only at the containerd snapshot layer, preventing any write syscall to paths not backed by an explicit volume. Container runs with default Fargate seccomp profile (audit mode, not enforcing). Service fronted by ALB with WebSocket upgrade support enabled. ALLOWED_ORIGINS configured identically.",
+    "config": {
+      "ecs_task_definition": {
+        "containerDefinitions": [
+          {
+            "name": "ws-server",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/ws-server:latest",
+            "portMappings": [
+              {
+                "containerPort": 8765,
+                "protocol": "tcp"
+              }
+            ],
+            "readonlyRootFilesystem": true,
+            "mountPoints": [],
+            "environment": [
+              {
+                "name": "ALLOWED_ORIGINS",
+                "value": "https://dashboard.example.com"
+              },
+              {
+                "name": "WS_PORT",
+                "value": "8765"
+              }
+            ]
+          }
+        ],
+        "volumes": [],
+        "networkMode": "awsvpc",
+        "platformVersion": "1.4.0"
+      },
+      "load_balancer": "ALB with WebSocket upgrade support, idle timeout 3600s",
+      "seccomp_profile": "default Fargate profile (audit mode)",
+      "note": "No tmpfs, no EFS, no bind mounts declared. /tmp is part of rootfs overlay."
+    }
+  }
+}

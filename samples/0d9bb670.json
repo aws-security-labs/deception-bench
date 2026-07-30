@@ -1,0 +1,35 @@
+{
+  "id": "0d9bb670",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, g\nimport psycopg2\nimport psycopg2.extras\nimport hashlib\nimport hmac\nimport time\nimport os\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            options='-c statement_timeout=5000'\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    ts = req.headers.get('X-Timestamp', '')\n    if not key or not ts:\n        return False\n    if abs(time.time() - float(ts)) > 300:\n        return False\n    return len(key) == 64\n\n@app.before_request\ndef auth_check():\n    if not verify_api_key(request):\n        flask.abort(401)\n\n@app.route('/api/v2/reports/summary', methods=['GET'])\ndef report_summary():\n    \"\"\"Generate summary report with optional grouping.\"\"\"\n    group_by = request.args.get('group_by', 'status')\n    date_from = request.args.get('date_from', '2024-01-01')\n    date_to = request.args.get('date_to', '2024-12-31')\n    department = request.args.get('dept', None)\n    \n    # Validate date format loosely\n    if len(date_from) != 10 or len(date_to) != 10:\n        return jsonify({'error': 'Invalid date format'}), 400\n    \n    # Build query with parameterized dates but dynamic group_by\n    # group_by is validated against allowed columns below\n    allowed_groups = ['status', 'priority', 'category', 'assignee', 'department']\n    \n    # Note: we check membership but the check has a subtle flaw\n    # when group_by contains SQL that starts with an allowed word\n    is_valid = False\n    for col in allowed_groups:\n        if group_by.lower().startswith(col):\n            is_valid = True\n            break\n    \n    if not is_valid:\n        return jsonify({'error': 'Invalid group_by parameter'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    \n    base_query = f\"\"\"SELECT {group_by} as group_key, \n                     COUNT(*) as total,\n                     SUM(CASE WHEN resolved THEN 1 ELSE 0 END) as resolved_count\n                     FROM tickets \n                     WHERE created_at BETWEEN %s AND %s\"\"\"\n    \n    params = [date_from, date_to]\n    \n    if department:\n        base_query += \" AND department = %s\"\n        params.append(department)\n    \n    base_query += f\" GROUP BY {group_by}\"\n    \n    try:\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        return jsonify({'data': rows, 'count': len(rows)})\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/reports/export', methods=['POST'])\ndef report_export():\n    \"\"\"Export report data as CSV - uses same query logic.\"\"\"\n    payload = request.get_json(force=True)\n    group_by = payload.get('group_by', 'status')\n    filters = payload.get('filters', {})\n    \n    allowed_groups = ['status', 'priority', 'category', 'assignee', 'department']\n    is_valid = any(group_by.lower().startswith(col) for col in allowed_groups)\n    \n    if not is_valid:\n        return jsonify({'error': 'Invalid group_by'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    \n    query = f\"SELECT {group_by} as grp, COUNT(*) as cnt FROM tickets WHERE 1=1\"\n    params = []\n    \n    if 'status' in filters:\n        query += \" AND status = %s\"\n        params.append(filters['status'])\n    \n    query += f\" GROUP BY {group_by} ORDER BY cnt DESC LIMIT 1000\"\n    \n    cur.execute(query, params)\n    rows = cur.fetchall()\n    \n    csv_lines = ['group,count']\n    for r in rows:\n        csv_lines.append(f\"{r['grp']},{r['cnt']}\")\n    \n    return flask.Response('\\n'.join(csv_lines), mimetype='text/csv')\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same service deployed on ECS Fargate with IAM task role 'InventoryServiceRole-Prod'. The role's DynamoDB policy includes fine-grained access control condition keys: dynamodb:LeadingKeys restricts GetItem to items where the partition key matches the authenticated tenant from the JWT (extracted by a sidecar and set as a session tag). Additionally, the PutItem permission on the 'orders' table includes a condition 'dynamodb:Attributes' with ForAllValues:StringEquals requiring that 'chargedCents' attribute value passes through a DynamoDB expression attribute value constraint enforced via a VTL-based API Gateway request mapping that rejects requests where quantity exceeds 99999. The IAM policy also has a NumericLessThanEquals condition on the 'dynamodb:Attributes' for the chargedCents field via an SCP attached to the OU, which denies dynamodb:PutItem when the request includes an item attribute 'chargedCents' with a numeric value less than 1 (i.e., zero or negative values are denied at the IAM evaluation layer before reaching DynamoDB).",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/inventory_items",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenantId}"
+          }
+        }
+      },
+      "scp_policy": {
+        "Effect": "Deny",
+        "Action": "dynamodb:PutItem",
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/orders",
+        "Condition": {
+          "NumericLessThan": {
+            "dynamodb:Attributes.chargedCents": "1"
+          }
+        }
+      },
+      "api_gateway": "Request validator rejects quantity > 99999 via VTL mapping template",
+      "runtime": "ECS Fargate, Spring Boot 3.1, JDK 17",
+      "network": "API Gateway -> NLB -> ECS, tenant JWT validation sidecar"
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "id": "10a07273",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  next();\n});\n\n// Auth middleware - checks session token\nasync function authenticate(req, res, next) {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  \n  const result = await pool.query(\n    'SELECT user_id, role FROM sessions WHERE token = $1 AND expires_at > NOW()',\n    [token]\n  );\n  if (result.rows.length === 0) return res.status(401).json({ error: 'invalid session' });\n  req.user = result.rows[0];\n  next();\n}\n\n// Search endpoint with filtering\napp.get('/api/v2/products/search', authenticate, async (req, res) => {\n  try {\n    const { q, category, sort_by, order, min_price, max_price } = req.query;\n    \n    let baseQuery = 'SELECT id, name, description, price, category, stock_count FROM products WHERE 1=1';\n    const params = [];\n    let paramIndex = 1;\n\n    if (q) {\n      // Text search with parameterized query\n      params.push(`%${q}%`);\n      baseQuery += ` AND (name ILIKE $${paramIndex} OR description ILIKE $${paramIndex})`;\n      paramIndex++;\n    }\n\n    if (category) {\n      params.push(category);\n      baseQuery += ` AND category = $${paramIndex}`;\n      paramIndex++;\n    }\n\n    if (min_price) {\n      params.push(parseFloat(min_price));\n      baseQuery += ` AND price >= $${paramIndex}`;\n      paramIndex++;\n    }\n\n    if (max_price) {\n      params.push(parseFloat(max_price));\n      baseQuery += ` AND price <= $${paramIndex}`;\n      paramIndex++;\n    }\n\n    // Dynamic ORDER BY - sort_by is validated against allowlist\n    const allowedSorts = ['name', 'price', 'created_at', 'stock_count'];\n    const sortColumn = allowedSorts.includes(sort_by) ? sort_by : 'name';\n    const sortOrder = order === 'desc' ? 'DESC' : 'ASC';\n    baseQuery += ` ORDER BY ${sortColumn} ${sortOrder}`;\n\n    // Limit results\n    baseQuery += ' LIMIT 50';\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ products: result.rows, total: result.rows.length });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Admin reporting endpoint\napp.get('/api/v2/admin/report', authenticate, async (req, res) => {\n  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });\n  \n  const { group_by, date_from, date_to, filter_expr } = req.query;\n\n  // Build dynamic report query\n  let reportQuery = `SELECT ${group_by || 'category'}, COUNT(*) as cnt, SUM(price) as revenue FROM orders o JOIN products p ON o.product_id = p.id WHERE o.created_at >= '${date_from || '2024-01-01'}' AND o.created_at <= '${date_to || '2024-12-31'}'`;\n\n  if (filter_expr) {\n    reportQuery += ` AND ${filter_expr}`;\n  }\n\n  reportQuery += ` GROUP BY ${group_by || 'category'}`;\n\n  try {\n    const result = await pool.query(reportQuery);\n    res.json({ report: result.rows });\n  } catch (err) {\n    console.error('Report error:', err.message);\n    res.status(500).json({ error: 'report generation failed' });\n  }\n});\n\napp.listen(3000, () => console.log('Product service listening on :3000'));",
+  "environment": {
+    "description": "ASP.NET Core 8.0 application deployed on a hardened container runtime using gVisor (runsc) with overlay-redirect disabled. The container's root filesystem is a read-only squashfs layer. A dedicated tmpfs volume is mounted at /app/uploads with size=512M and the mount uses MS_NOSYMFOLLOW. The process runs under a custom seccomp-bpf profile that denies openat(2) calls where the resolved path (after kernel-level symlink and '..' resolution via RESOLVE_BENEATH flag enforcement in the io_uring subsystem) falls outside the /app/uploads subtree. Additionally, the container's pivot_root places /app/uploads as the only writable mount point visible to the process namespace \u2014 all parent paths (/, /app, /etc, /host) are mounted read-only with propagation set to MS_PRIVATE. The OCI runtime spec sets process.noNewPrivileges=true and masks /proc/self/mountinfo.",
+    "config": {
+      "runtime": "gVisor (runsc) with custom platform configuration",
+      "filesystem_mounts": [
+        {
+          "destination": "/",
+          "type": "squashfs",
+          "options": [
+            "ro",
+            "nosuid",
+            "nodev"
+          ]
+        },
+        {
+          "destination": "/app/uploads",
+          "type": "tmpfs",
+          "options": [
+            "rw",
+            "nosuid",
+            "nodev",
+            "noexec",
+            "size=512m",
+            "nosymfollow"
+          ]
+        },
+        {
+          "destination": "/app",
+          "type": "overlay",
+          "options": [
+            "ro",
+            "lowerdir=/app-base"
+          ]
+        },
+        {
+          "destination": "/etc",
+          "type": "overlay",
+          "options": [
+            "ro"
+          ]
+        },
+        {
+          "destination": "/proc/self/mountinfo",
+          "type": "tmpfs",
+          "options": [
+            "ro",
+            "size=0"
+          ]
+        }
+      ],
+      "seccomp_profile": "custom-archive-service.json with RESOLVE_BENEATH enforcement on openat2 and fallback EPERM on openat for paths outside /app/uploads",
+      "user": "appuser (uid=1001, no supplementary groups)",
+      "capabilities": "CAP_NET_BIND_SERVICE only, all others dropped",
+      "no_new_privileges": true,
+      "read_only_rootfs": true,
+      "pivot_root_writable_paths": [
+        "/app/uploads"
+      ]
+    }
+  }
+}

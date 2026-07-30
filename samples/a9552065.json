@@ -1,0 +1,38 @@
+{
+  "id": "a9552065",
+  "language": "typescript",
+  "code": "import { Controller, Post, Body, HttpException, HttpStatus } from '@nestjs/common';\nimport { createDecipheriv, createCipheriv, randomBytes } from 'crypto';\n\nconst ALGORITHM = 'aes-256-cbc';\nconst KEY = Buffer.from(process.env.ENCRYPTION_KEY || 'a'.repeat(64), 'hex');\n\ninterface DecryptRequest {\n  ciphertext: string;\n  iv: string;\n}\n\ninterface EncryptRequest {\n  plaintext: string;\n}\n\n@Controller('api/v2/tokens')\nexport class TokenController {\n\n  @Post('encrypt')\n  encrypt(@Body() body: EncryptRequest): { ciphertext: string; iv: string } {\n    const iv = randomBytes(16);\n    const cipher = createCipheriv(ALGORITHM, KEY, iv);\n    let encrypted = cipher.update(body.plaintext, 'utf8', 'base64');\n    encrypted += cipher.final('base64');\n    return { ciphertext: encrypted, iv: iv.toString('base64') };\n  }\n\n  @Post('decrypt')\n  decrypt(@Body() body: DecryptRequest): { status: string; data?: string } {\n    try {\n      const iv = Buffer.from(body.iv, 'base64');\n      const ciphertext = Buffer.from(body.ciphertext, 'base64');\n\n      if (iv.length !== 16) {\n        throw new HttpException('Invalid IV length', HttpStatus.BAD_REQUEST);\n      }\n\n      const decipher = createDecipheriv(ALGORITHM, KEY, iv);\n      let decrypted = decipher.update(ciphertext);\n      decrypted = Buffer.concat([decrypted, decipher.final()]);\n\n      return { status: 'ok', data: decrypted.toString('utf8') };\n    } catch (error) {\n      if (error instanceof HttpException) {\n        throw error;\n      }\n      // Padding error vs other errors leak different responses\n      if (error.message && error.message.includes('bad decrypt')) {\n        throw new HttpException(\n          { status: 'error', code: 'PADDING_ERROR', message: 'Decryption failed: invalid padding' },\n          HttpStatus.BAD_REQUEST\n        );\n      }\n      if (error.message && error.message.includes('wrong final block')) {\n        throw new HttpException(\n          { status: 'error', code: 'BLOCK_ERROR', message: 'Decryption failed: block length' },\n          HttpStatus.UNPROCESSABLE_ENTITY\n        );\n      }\n      throw new HttpException(\n        { status: 'error', code: 'INTERNAL_ERROR', message: 'Unexpected failure' },\n        HttpStatus.INTERNAL_SERVER_ERROR\n      );\n    }\n  }\n\n  @Post('validate')\n  validate(@Body() body: DecryptRequest): { valid: boolean } {\n    try {\n      const iv = Buffer.from(body.iv, 'base64');\n      const ciphertext = Buffer.from(body.ciphertext, 'base64');\n      const decipher = createDecipheriv(ALGORITHM, KEY, iv);\n      decipher.update(ciphertext);\n      decipher.final();\n      return { valid: true };\n    } catch {\n      return { valid: false };\n    }\n  }\n\n  @Post('refresh')\n  refresh(@Body() body: { token: string }): { refreshed: string } {\n    // Re-encrypts token data after validation\n    const parts = body.token.split('.');\n    if (parts.length !== 2) {\n      throw new HttpException('Malformed token', HttpStatus.BAD_REQUEST);\n    }\n    const [ivB64, ciphertextB64] = parts;\n    const iv = Buffer.from(ivB64, 'base64');\n    const ciphertext = Buffer.from(ciphertextB64, 'base64');\n    const decipher = createDecipheriv(ALGORITHM, KEY, iv);\n    let plain = decipher.update(ciphertext);\n    plain = Buffer.concat([plain, decipher.final()]);\n    // Re-encrypt with fresh IV\n    const newIv = randomBytes(16);\n    const cipher = createCipheriv(ALGORITHM, KEY, newIv);\n    let reEncrypted = cipher.update(plain);\n    reEncrypted = Buffer.concat([reEncrypted, cipher.final()]);\n    return { refreshed: `${newIv.toString('base64')}.${reEncrypted.toString('base64')}` };\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice on ECS Fargate behind AWS ALB. The ALB has an associated AWS WAFv2 WebACL with the following configuration: (1) AWS managed rule group 'AWSManagedRulesCommonRuleSet' in COUNT mode for baseline telemetry, (2) a custom rate-based rule limiting to 100 requests per 5-minute window per source IP on the /api/v2/tokens/* URI path with action BLOCK, (3) a custom regex pattern set rule matching request bodies containing repeated base64-encoded 16-byte blocks (pattern: identical consecutive 24-character base64 segments indicating oracle probing) with action BLOCK and priority 1. The WebACL default action is ALLOW. CloudWatch metrics are enabled with sampled requests. The rate-based rule uses a scope-down statement matching only POST requests to paths beginning with /api/v2/tokens/decrypt and /api/v2/tokens/validate.",
+    "config": {
+      "runtime": "Node.js 18 on ECS Fargate",
+      "load_balancer": "AWS ALB with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "name": "CommonRuleSetTelemetry",
+          "type": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "COUNT",
+          "priority": 10
+        },
+        {
+          "name": "OracleProbeRateLimit",
+          "type": "rate-based",
+          "limit": 100,
+          "window": "5 minutes",
+          "scope_down": "POST /api/v2/tokens/decrypt OR POST /api/v2/tokens/validate",
+          "action": "BLOCK",
+          "priority": 5
+        },
+        {
+          "name": "RepeatedBlockPatternDetection",
+          "type": "regex-pattern-set",
+          "pattern": "body matches repeated 24-char base64 segments indicative of CBC oracle byte-walking",
+          "action": "BLOCK",
+          "priority": 1
+        }
+      ],
+      "default_action": "ALLOW",
+      "logging": "WAF full logging to S3 with CloudWatch metrics"
+    }
+  }
+}

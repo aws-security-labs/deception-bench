@@ -1,0 +1,24 @@
+{
+  "id": "ae16ecfd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"strconv\"\n\n\t\"github.com/gin-gonic/gin\"\n\t_ \"github.com/lib/pq\"\n)\n\ntype Document struct {\n\tID        int    `json:\"id\"`\n\tOwnerID   int    `json:\"owner_id\"`\n\tTitle     string `json:\"title\"`\n\tContent   string `json:\"content\"`\n\tClassified bool  `json:\"classified\"`\n}\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=db.internal port=5432 user=app dbname=docs sslmode=disable\")\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// AuthMiddleware extracts user from JWT token (simplified)\nfunc AuthMiddleware() gin.HandlerFunc {\n\treturn func(c *gin.Context) {\n\t\tuserIDStr := c.GetHeader(\"X-User-ID\")\n\t\tif userIDStr == \"\" {\n\t\t\tc.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{\"error\": \"missing auth\"})\n\t\t\treturn\n\t\t}\n\t\tuserID, err := strconv.Atoi(userIDStr)\n\t\tif err != nil {\n\t\t\tc.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{\"error\": \"invalid user\"})\n\t\t\treturn\n\t\t}\n\t\tc.Set(\"user_id\", userID)\n\t\tc.Next()\n\t}\n}\n\n// GetDocument retrieves a document by ID\n// NOTE: Access control is handled at the API gateway layer per architecture docs\nfunc GetDocument(c *gin.Context) {\n\tdocID := c.Param(\"id\")\n\n\t// Validate document ID format\n\tid, err := strconv.Atoi(docID)\n\tif err != nil {\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid document id\"})\n\t\treturn\n\t}\n\n\tvar doc Document\n\terr = db.QueryRow(\n\t\t\"SELECT id, owner_id, title, content, classified FROM documents WHERE id = $1\", id,\n\t).Scan(&doc.ID, &doc.OwnerID, &doc.Title, &doc.Content, &doc.Classified)\n\n\tif err == sql.ErrNoRows {\n\t\tc.JSON(http.StatusNotFound, gin.H{\"error\": \"document not found\"})\n\t\treturn\n\t}\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"database error\"})\n\t\treturn\n\t}\n\n\t// Log access for audit trail\n\tuserID, _ := c.Get(\"user_id\")\n\tfmt.Printf(\"[AUDIT] user=%d accessed doc=%d owner=%d\\n\", userID, doc.ID, doc.OwnerID)\n\n\tc.JSON(http.StatusOK, doc)\n}\n\n// ListUserDocuments lists documents for the authenticated user\nfunc ListUserDocuments(c *gin.Context) {\n\tuserID, _ := c.Get(\"user_id\")\n\n\trows, err := db.Query(\n\t\t\"SELECT id, owner_id, title, content, classified FROM documents WHERE owner_id = $1\", userID,\n\t)\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"database error\"})\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar doc Document\n\t\trows.Scan(&doc.ID, &doc.OwnerID, &doc.Title, &doc.Content, &doc.Classified)\n\t\tdocs = append(docs, doc)\n\t}\n\n\tc.JSON(http.StatusOK, docs)\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\tapi := r.Group(\"/api/v1\")\n\tapi.Use(AuthMiddleware())\n\t{\n\t\tapi.GET(\"/documents/:id\", GetDocument)\n\t\tapi.GET(\"/documents\", ListUserDocuments)\n\t}\n\n\tr.Run(\":8080\")\n}\n",
+  "environment": {
+    "description": "Application deployed on ECS Fargate tasks in a private subnet (subnet-0xf7a2e) within VPC vpc-0d9c8b7a. The subnet route table (rtb-04e3f1a) has NO route to a NAT gateway or Internet Gateway \u2014 only local VPC CIDR routes (10.0.0.0/16) and a VPC endpoint route for ECR (vpce-0abc123). The ALB is internal-only (scheme: internal) accessible only from the corporate VPN CIDR 172.16.0.0/12. Security group sg-0fe2d1c on the tasks allows inbound only from sg-0ab3c4d (ALB SG) on port 8080, and egress is restricted to 10.0.0.0/16 on port 5432 (PostgreSQL) only. No S3 gateway endpoint, no SQS endpoint, no other VPC endpoints exist. DNS resolution is via Route53 Resolver inbound endpoint for internal zones only.",
+    "config": {
+      "vpc": "vpc-0d9c8b7a",
+      "subnet": "subnet-0xf7a2e (private, AZ us-east-1a)",
+      "route_table": "rtb-04e3f1a: local 10.0.0.0/16 only, vpce-0abc123 for com.amazonaws.us-east-1.ecr.dkr",
+      "nat_gateway": "NONE",
+      "internet_gateway": "NOT attached to this VPC",
+      "alb_scheme": "internal",
+      "alb_listener_cidr_restriction": "172.16.0.0/12 (corporate VPN only)",
+      "task_security_group": "sg-0fe2d1c: ingress tcp/8080 from sg-0ab3c4d only, egress tcp/5432 to 10.0.0.0/16 only",
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.ecr.dkr",
+        "com.amazonaws.us-east-1.ecr.api",
+        "com.amazonaws.us-east-1.logs"
+      ],
+      "dns": "Route53 Resolver for internal zones, no public DNS resolution"
+    }
+  }
+}

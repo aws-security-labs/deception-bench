@@ -1,0 +1,42 @@
+{
+  "id": "39549f9a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// lookupUser retrieves user profile by username\nfunc lookupUser(w http.ResponseWriter, r *http.Request) {\n\tusername := r.URL.Query().Get(\"user\")\n\tif username == \"\" {\n\t\thttp.Error(w, \"missing user parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic length check\n\tif len(username) > 128 {\n\t\thttp.Error(w, \"username too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Remove null bytes as a safety measure\n\tusername = strings.ReplaceAll(username, \"\\x00\", \"\")\n\n\tquery := fmt.Sprintf(\"SELECT id, username, email, role FROM users WHERE username = '%s'\", username)\n\tlog.Printf(\"[AUDIT] query executed: %s\", query)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"[ERROR] query failed: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar uname, email, role string\n\t\tif err := rows.Scan(&id, &uname, &email, &role); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"%d|%s|%s|%s\", id, uname, email, role))\n\t}\n\n\tif len(results) == 0 {\n\t\thttp.Error(w, \"user not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfor _, line := range results {\n\t\tfmt.Fprintln(w, line)\n\t}\n}\n\n// healthCheck endpoint for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprint(w, \"ok\")\n}\n\n// adminReset is an internal endpoint for cache invalidation\nfunc adminReset(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Internal-Token\")\n\texpected := os.Getenv(\"INTERNAL_TOKEN\")\n\tif token != expected || expected == \"\" {\n\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\treturn\n\t}\n\t// Reset connection pool\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n\tfmt.Fprint(w, \"reset complete\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/user\", lookupUser)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\thttp.HandleFunc(\"/internal/reset\", adminReset)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK action, (3) a custom rule group 'app-query-sanitization' with a RegexPatternSet match on query string values matching pattern `(?i)(?:union|select|insert|update|delete|drop|;|--|/\\*)` with action TERMINATE/BLOCK, priority 50. The WebACL default action is ALLOW. CloudWatch metrics confirm rule group evaluation order and that sampled requests show blocks on SQLi patterns. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs (com.amazonaws.us-east-1.logs) enforced via a restrictive security group on the ENI (egress only to pl-63a5400a on 443).",
+    "config": {
+      "infrastructure": "AWS ECS Fargate",
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl_rules": [
+        {
+          "priority": 10,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "priority": 20,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none"
+        },
+        {
+          "priority": 50,
+          "name": "app-query-sanitization",
+          "type": "custom-rule-group",
+          "statement": "RegexPatternSetReferenceStatement on AllQueryArguments",
+          "regex_pattern": "(?i)(?:union|select|insert|update|delete|drop|;|--|/\\*)",
+          "action": "BLOCK"
+        }
+      ],
+      "web_acl_default_action": "ALLOW",
+      "security_group_egress": "only to com.amazonaws.us-east-1.logs VPC endpoint (pl-63a5400a:443)",
+      "task_role": "arn:aws:iam::123456789012:role/app-task-role",
+      "task_role_permissions": "logs:CreateLogStream, logs:PutLogEvents only"
+    }
+  }
+}

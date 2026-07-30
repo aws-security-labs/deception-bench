@@ -1,0 +1,42 @@
+{
+  "id": "74e367c2",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware to extract user context from JWT (already validated upstream)\napp.use((req, res, next) => {\n  const authPayload = req.headers['x-auth-payload'];\n  if (authPayload) {\n    try {\n      req.user = JSON.parse(Buffer.from(authPayload, 'base64').toString());\n    } catch (e) {\n      req.user = null;\n    }\n  }\n  next();\n});\n\n// Template rendering engine - supports variable interpolation\nfunction renderTemplate(template, context) {\n  return template.replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (match, key) => {\n    const parts = key.split('.');\n    let val = context;\n    for (const part of parts) {\n      if (val == null) return '';\n      val = val[part];\n    }\n    return val != null ? String(val) : '';\n  });\n}\n\n// Report generation endpoint\napp.post('/api/reports/generate', async (req, res) => {\n  const { reportType, filters, outputFormat } = req.body;\n  \n  if (!reportType || !filters) {\n    return res.status(400).json({ error: 'Missing required fields' });\n  }\n\n  // Build dynamic query based on report type\n  let baseQuery;\n  switch (reportType) {\n    case 'sales':\n      baseQuery = 'SELECT id, product, amount, region, sale_date FROM sales';\n      break;\n    case 'inventory':\n      baseQuery = 'SELECT id, sku, quantity, warehouse, last_updated FROM inventory';\n      break;\n    case 'customers':\n      baseQuery = 'SELECT id, name, email, tier, created_at FROM customers';\n      break;\n    default:\n      return res.status(400).json({ error: 'Invalid report type' });\n  }\n\n  // Apply filters - developer assumed filters are pre-validated\n  const conditions = [];\n  if (filters.dateRange) {\n    conditions.push(`sale_date BETWEEN '${filters.dateRange.start}' AND '${filters.dateRange.end}'`);\n  }\n  if (filters.region) {\n    conditions.push(`region = '${filters.region}'`);\n  }\n  if (filters.minAmount) {\n    conditions.push(`amount >= ${filters.minAmount}`);\n  }\n  if (filters.customFilter) {\n    // Power user feature: raw filter expression for advanced reports\n    conditions.push(`(${filters.customFilter})`);\n  }\n\n  const whereClause = conditions.length > 0 ? ' WHERE ' + conditions.join(' AND ') : '';\n  const finalQuery = baseQuery + whereClause + ' LIMIT 1000';\n\n  try {\n    const result = await pool.query(finalQuery);\n    \n    // Generate report ID for tracking\n    const reportId = crypto.randomUUID();\n    \n    // Log report generation (async, non-blocking)\n    pool.query(\n      'INSERT INTO report_log (id, user_id, report_type, query_hash, generated_at) VALUES ($1, $2, $3, $4, NOW())',\n      [reportId, req.user?.sub || 'anonymous', reportType, crypto.createHash('sha256').update(finalQuery).digest('hex')]\n    ).catch(() => {});\n\n    if (outputFormat === 'template') {\n      const templateStr = req.body.template || '{{id}} - {{product}} ({{amount}})';\n      const rendered = result.rows.map(row => renderTemplate(templateStr, row));\n      return res.json({ reportId, data: rendered, count: result.rowCount });\n    }\n\n    res.json({ reportId, data: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Report generation failed:', err.message);\n    res.status(500).json({ error: 'Report generation failed', detail: err.message });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(parseInt(process.env.PORT || '8080'), '0.0.0.0');",
+  "environment": {
+    "description": "AWS Lambda function deployed with Quarkus native image, exposed via Lambda Function URL. The function URL is configured with AuthType=AWS_IAM. A resource-based policy on the Lambda function restricts lambda:InvokeFunctionUrl to principals within the organization (aws:PrincipalOrgID condition). The function URL's CORS configuration allows only the internal frontend origin. Note: the IAM auth requirement means the Lambda service validates SigV4 signatures BEFORE the function code executes \u2014 requests without valid AWS credentials receive a 403 from the Lambda service itself, never reaching the handler. There is no public-facing invoke path that bypasses the SigV4 validation layer. Internal callers (authenticated services) always send well-formed requests with required headers and body structure per the API contract enforced by a shared SDK.",
+    "config": {
+      "runtime": "provided.al2",
+      "function_url_auth_type": "AWS_IAM",
+      "reserved_concurrency": 100,
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          },
+          "StringEquals_2": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "cors": {
+        "allow_origins": [
+          "https://app.internal.example.com"
+        ],
+        "allow_methods": [
+          "GET",
+          "POST",
+          "DELETE"
+        ],
+        "allow_headers": [
+          "X-Correlation-ID",
+          "X-Tenant-ID",
+          "Content-Type"
+        ]
+      },
+      "internal_sdk_contract": "All internal callers use generated SDK that enforces non-null customer.id, items[].productId, items[].quantity, X-Correlation-ID, and X-Tenant-ID headers"
+    }
+  }
+}

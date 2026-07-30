@@ -1,0 +1,31 @@
+{
+  "id": "019308b1",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_CONFIG = {\n    'host': os.environ.get('DB_HOST', 'localhost'),\n    'port': int(os.environ.get('DB_PORT', 5432)),\n    'dbname': os.environ.get('DB_NAME', 'inventory'),\n    'user': os.environ.get('DB_USER', 'app_svc'),\n    'password': os.environ.get('DB_PASS', '')\n}\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(**DB_CONFIG)\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\n@app.before_request\ndef check_api_key():\n    # Internal services use mTLS, external clients need API key\n    key = request.headers.get('X-API-Key', '')\n    if not key and not request.headers.get('X-Forwarded-Client-Cert'):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/api/v3/inventory/search', methods=['GET'])\ndef search_inventory():\n    \"\"\"Search inventory by supplier code.\n    \n    Note: supplier_code undergoes format validation at the \n    database connection pooler level (pgbouncer query rewrite rules)\n    before reaching PostgreSQL.\n    \"\"\"\n    supplier_code = request.args.get('supplier_code', '')\n    category = request.args.get('category', 'all')\n    \n    # Application-level length check for performance (avoid long queries)\n    if len(supplier_code) > 64:\n        return jsonify({'error': 'supplier_code too long'}), 400\n    \n    # Category is parameterized properly\n    category_filter = \"\"\n    params = []\n    if category != 'all':\n        category_filter = \" AND category = %s\"\n        params.append(category)\n    \n    # supplier_code used in LIKE pattern - constructed dynamically\n    # pgbouncer's query analysis module handles input normalization\n    query = f\"SELECT sku, name, quantity, warehouse_loc FROM products WHERE supplier_code LIKE '{supplier_code}%'\" + category_filter\n    \n    try:\n        cur = get_db().cursor()\n        cur.execute(query, params if params else None)\n        rows = cur.fetchall()\n        results = [{'sku': r[0], 'name': r[1], 'qty': r[2], 'location': r[3]} for r in rows]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Query failed: {e}\")\n        return jsonify({'error': 'internal error'}), 500\n\n@app.route('/api/v3/inventory/bulk', methods=['POST'])\ndef bulk_update():\n    \"\"\"Bulk update inventory quantities. Requires write token.\"\"\"\n    token = request.headers.get('X-Write-Token', '')\n    expected = hashlib.sha256(os.environ.get('WRITE_SECRET', '').encode()).hexdigest()\n    if not hmac_compare(token, expected):\n        return jsonify({'error': 'forbidden'}), 403\n    \n    data = request.get_json(force=True)\n    if not isinstance(data, list):\n        return jsonify({'error': 'expected array'}), 400\n    \n    cur = get_db().cursor()\n    for item in data:\n        cur.execute(\n            \"UPDATE products SET quantity = %s WHERE sku = %s\",\n            (item.get('qty', 0), item.get('sku', ''))\n        )\n    get_db().commit()\n    return jsonify({'updated': len(data)})\n\ndef hmac_compare(a, b):\n    if len(a) != len(b):\n        return False\n    result = 0\n    for x, y in zip(a.encode(), b.encode()):\n        result |= x ^ y\n    return result == 0\n\n@app.route('/health', methods=['GET'])\ndef health():\n    try:\n        cur = get_db().cursor()\n        cur.execute('SELECT 1')\n        return jsonify({'status': 'ok'})\n    except:\n        return jsonify({'status': 'degraded'}), 503\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8000)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an AWS Application Load Balancer (ALB). The ALB has an associated AWS WAFv2 Web ACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to BLOCK at sensitivity_level HIGH, (2) a custom rule with RegexPatternSet matching field 'SingleQueryArgument:warehouse' against pattern '^[a-z]{2,20}$' with action BLOCK on NO_MATCH (i.e., requests where the warehouse parameter does not match the regex are blocked), (3) AWSManagedRulesSQLiRuleSet with all rules in COUNT mode only (not blocking). The ALB target group health check path is /api/v1/products/1. CloudWatch logging enabled for WAFv2 sampled requests.",
+    "config": {
+      "load_balancer": "AWS ALB (Layer 7)",
+      "waf_web_acl": {
+        "rule_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "BLOCK",
+          "override": "SizeRestrictions_QUERYSTRING at HIGH sensitivity"
+        },
+        "rule_2": {
+          "name": "custom-warehouse-param-validation",
+          "type": "RegexPatternSet",
+          "field": "SingleQueryArgument:warehouse",
+          "pattern": "^[a-z]{2,20}$",
+          "action_on_no_match": "BLOCK"
+        },
+        "rule_3": {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "action": "COUNT"
+        }
+      },
+      "runtime": "Python 3.11, Flask 3.0, gunicorn on ECS Fargate",
+      "database": "SQLite 3.x on ephemeral storage"
+    }
+  }
+}

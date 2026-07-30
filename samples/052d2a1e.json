@@ -1,0 +1,95 @@
+{
+  "id": "052d2a1e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"ReportServlet\");\n    private static final String DB_URL = \"jdbc:postgresql://db-primary:5432/analytics\";\n    private static final String DB_USER = \"report_svc\";\n    private static final String DB_PASS = System.getenv(\"DB_PASSWORD\");\n\n    // Connection pool - reuses connections for performance\n    private Connection getConnection() throws SQLException {\n        Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n        conn.setAutoCommit(false);\n        return conn;\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String action = req.getParameter(\"action\");\n        if (\"export\".equals(action)) {\n            handleExport(req, resp);\n        } else if (\"summary\".equals(action)) {\n            handleSummary(req, resp);\n        } else {\n            resp.sendError(400, \"Unknown action\");\n        }\n    }\n\n    private void handleExport(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String format = req.getParameter(\"fmt\");\n\n        // Build query with user-supplied department filter\n        String query = \"SELECT employee_id, full_name, salary, ssn, department, \" +\n                       \"performance_rating FROM hr_records WHERE department = '\" +\n                       department + \"' AND hire_date BETWEEN '\" + startDate +\n                       \"' AND '\" + endDate + \"' ORDER BY employee_id\";\n\n        log.info(\"Export query for dept: \" + department);\n\n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"text/csv\");\n            resp.setHeader(\"Content-Disposition\", \"attachment; filename=report.csv\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"employee_id,full_name,salary,ssn,department,rating\");\n\n            while (rs.next()) {\n                out.printf(\"%d,%s,%s,%s,%s,%s%n\",\n                    rs.getInt(1), rs.getString(2), rs.getBigDecimal(3),\n                    rs.getString(4), rs.getString(5), rs.getString(6));\n            }\n            conn.commit();\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed: \" + e.getMessage());\n        }\n    }\n\n    private void handleSummary(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String groupBy = req.getParameter(\"group\");\n        // Only allow known groupings\n        if (!\"department\".equals(groupBy) && !\"quarter\".equals(groupBy)) {\n            resp.sendError(400, \"Invalid grouping\");\n            return;\n        }\n        String query = \"SELECT \" + groupBy + \", COUNT(*), AVG(salary) FROM hr_records GROUP BY \" + groupBy;\n\n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            JSONArray arr = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"group\", rs.getString(1));\n                row.put(\"count\", rs.getInt(2));\n                row.put(\"avg_salary\", rs.getDouble(3));\n                arr.put(row);\n            }\n            resp.getWriter().write(arr.toString());\n            conn.commit();\n        } catch (SQLException e) {\n            resp.sendError(500, \"Summary failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with Istio 1.20 service mesh. The microservice runs in namespace 'payments' with automatic sidecar injection (istio-injection=enabled). An Istio AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is not 'payments'. Additionally, a second AuthorizationPolicy with ALLOW action restricts /debug/* paths to only principals matching cluster.local/ns/payments/sa/debug-operator. The Envoy sidecar operates in STRICT mTLS mode via a PeerAuthentication resource (spec.mtls.mode: STRICT). Note: the AuthorizationPolicy uses a 'rules' field with 'from' source matching, which in Istio 1.20 evaluates DENY policies before ALLOW policies. The sidecar intercepts all inbound traffic on port 8080 via iptables REDIRECT rules injected by istio-init.",
+    "config": {
+      "namespace": "payments",
+      "istio_version": "1.20",
+      "istio_injection": "enabled",
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "payments"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy_deny": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "payments"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "payments"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "authorization_policy_allow_debug": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "restrict-debug-endpoint",
+          "namespace": "payments"
+        },
+        "spec": {
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/payments/sa/debug-operator"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/debug/*"
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/health",
+                      "/metrics"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

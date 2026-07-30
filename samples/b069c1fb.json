@@ -1,0 +1,62 @@
+{
+  "id": "b069c1fb",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tconnStr := fmt.Sprintf(\"host=%s port=%s user=%s password=%s dbname=%s sslmode=require\",\n\t\tos.Getenv(\"DB_HOST\"), os.Getenv(\"DB_PORT\"),\n\t\tos.Getenv(\"DB_USER\"), os.Getenv(\"DB_PASS\"), os.Getenv(\"DB_NAME\"))\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query with filters\n\tquery := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE category = '%s'\", category)\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= %s\", maxPrice)\n\t}\n\n\t// Apply sorting - only allow known columns\n\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif sortBy != \"\" && allowedSorts[strings.ToLower(sortBy)] {\n\t\tquery += fmt.Sprintf(\" ORDER BY %s\", sortBy)\n\t} else {\n\t\tquery += \" ORDER BY id\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\t// Note: not escaping JSON properly - potential XSS but not our focus\n\t\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/products/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Printf(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Terraform provider runs inside a Kubernetes pod in a cluster where namespace 'ci-runners' has label pod-security.kubernetes.io/enforce: restricted (PSA restricted profile). The cluster also retains a legacy PodSecurityPolicy object 'psp-ci-restricted' (still evaluated by the in-tree admission controller on this 1.24 cluster where the feature gate PodSecurity is enabled alongside PSP for dual-enforcement during migration). The PSP specifies: privileged=false, allowedHostPaths=[] (empty, blocking all hostPath), runAsUser=MustRunAsNonRoot, volumes=[configMap,emptyDir,projected,secret,persistentVolumeClaim]. The restricted PSA profile independently rejects any pod spec with hostPath volumes or privileged=true or runAsUser=0. The runner pod uses an emptyDir for /tmp (pod-local, not shared with host).",
+    "config": {
+      "kubernetes_version": "1.24",
+      "feature_gates": {
+        "PodSecurity": true,
+        "PodSecurityPolicy": true
+      },
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.24",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "pod_security_policy": {
+        "name": "psp-ci-restricted",
+        "spec": {
+          "privileged": false,
+          "allowedHostPaths": [],
+          "volumes": [
+            "configMap",
+            "emptyDir",
+            "projected",
+            "secret",
+            "persistentVolumeClaim"
+          ],
+          "runAsUser": {
+            "rule": "MustRunAsNonRoot"
+          },
+          "seLinux": {
+            "rule": "RunAsAny"
+          },
+          "fsGroup": {
+            "rule": "RunAsAny"
+          },
+          "supplementalGroups": {
+            "rule": "RunAsAny"
+          }
+        }
+      },
+      "runner_pod_volumes": [
+        {
+          "name": "tmp-local",
+          "emptyDir": {
+            "sizeLimit": "512Mi"
+          }
+        }
+      ],
+      "runner_pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      }
+    }
+  }
+}

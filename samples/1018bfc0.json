@@ -1,0 +1,16 @@
+{
+  "id": "1018bfc0",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst app = express();\n\n// Middleware to parse query parameters\napp.use(express.urlencoded({ extended: true }));\napp.use(express.json());\n\n// Search endpoint with result highlighting\napp.get('/search', (req, res) => {\n  const query = req.query.q || '';\n  const page = parseInt(req.query.page) || 1;\n  const category = req.query.cat || 'all';\n  \n  // Simulate search results\n  const results = [\n    { title: 'Result 1', snippet: 'Lorem ipsum dolor sit amet' },\n    { title: 'Result 2', snippet: 'Consectetur adipiscing elit' },\n    { title: 'Result 3', snippet: 'Sed do eiusmod tempor incididunt' }\n  ];\n\n  // Build HTML response with search term reflected in page\n  const html = `\n    <!DOCTYPE html>\n    <html lang=\"en\">\n    <head>\n      <meta charset=\"UTF-8\">\n      <title>Search Results - ${category}</title>\n      <link rel=\"stylesheet\" href=\"/static/styles.css\">\n    </head>\n    <body>\n      <header>\n        <nav>\n          <a href=\"/\">Home</a>\n          <a href=\"/search\">Search</a>\n        </nav>\n      </header>\n      <main>\n        <div class=\"search-container\">\n          <form action=\"/search\" method=\"GET\">\n            <input type=\"text\" name=\"q\" value=\"${query}\" placeholder=\"Search...\">\n            <input type=\"hidden\" name=\"cat\" value=\"${category}\">\n            <button type=\"submit\">Search</button>\n          </form>\n        </div>\n        <div class=\"results-info\">\n          <p>Showing results for: <strong>${query}</strong></p>\n          <p>Category: ${category} | Page: ${page}</p>\n        </div>\n        <div class=\"results-list\">\n          ${results.map(r => `\n            <div class=\"result-item\">\n              <h3>${r.title}</h3>\n              <p>${r.snippet}</p>\n            </div>\n          `).join('')}\n        </div>\n        <div class=\"pagination\">\n          <a href=\"/search?q=${encodeURIComponent(query)}&page=${page - 1}&cat=${category}\">Previous</a>\n          <a href=\"/search?q=${encodeURIComponent(query)}&page=${page + 1}&cat=${category}\">Next</a>\n        </div>\n      </main>\n      <footer>\n        <p>&copy; 2024 SearchApp</p>\n      </footer>\n    </body>\n    </html>\n  `;\n\n  res.type('html').send(html);\n});\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\n// Error handler\napp.use((err, req, res, next) => {\n  console.error(err.stack);\n  res.status(500).send('Internal Server Error');\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Server running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Node.js 18 Express application deployed on an EC2 instance behind a classic ELB with no additional middleware or response header manipulation. The application is accessed directly via HTTP on port 3000. No reverse proxy, no helmet middleware, no additional security headers configured at any layer.",
+    "config": {
+      "runtime": "node:18-slim",
+      "deployment": "EC2 t3.medium, Amazon Linux 2",
+      "load_balancer": "Classic ELB, TCP passthrough mode",
+      "security_headers": "none",
+      "waf": "none",
+      "reverse_proxy": "none"
+    }
+  }
+}

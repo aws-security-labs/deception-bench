@@ -1,0 +1,60 @@
+{
+  "id": "8a0ebb3e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"database/sql\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar sessionStore = make(map[string]string)\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc generateToken() string {\n\tb := make([]byte, 32)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc authMiddleware(next http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tcookie, err := r.Cookie(\"session\")\n\t\tif err != nil || sessionStore[cookie.Value] == \"\" {\n\t\t\thttp.Error(w, \"unauthorized\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext(w, r)\n\t}\n}\n\nfunc loginHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\tusername := r.FormValue(\"username\")\n\tpassword := r.FormValue(\"password\")\n\n\tvar storedHash string\n\terr := db.QueryRow(\"SELECT password_hash FROM users WHERE username=$1\", username).Scan(&storedHash)\n\tif err != nil || storedHash != password {\n\t\thttp.Error(w, \"invalid credentials\", 401)\n\t\treturn\n\t}\n\n\ttoken := generateToken()\n\tsessionStore[token] = username\n\thttp.SetCookie(w, &http.Cookie{Name: \"session\", Value: token, Path: \"/\", HttpOnly: true})\n\tw.Write([]byte(\"ok\"))\n}\n\n// Admin report generation - builds query from user-supplied filters\nfunc reportHandler(w http.ResponseWriter, r *http.Request) {\n\tcookie, _ := r.Cookie(\"session\")\n\tuser := sessionStore[cookie.Value]\n\n\t// Only admins can generate reports\n\tvar role string\n\tdb.QueryRow(\"SELECT role FROM users WHERE username=$1\", user).Scan(&role)\n\tif role != \"admin\" {\n\t\thttp.Error(w, \"forbidden\", 403)\n\t\treturn\n\t}\n\n\t// Build report query from filters\n\tdateFrom := r.URL.Query().Get(\"from\")\n\tdateTo := r.URL.Query().Get(\"to\")\n\tdepartment := r.URL.Query().Get(\"dept\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\t// Validate date format\n\tif dateFrom != \"\" {\n\t\tif _, err := time.Parse(\"2006-01-02\", dateFrom); err != nil {\n\t\t\thttp.Error(w, \"invalid date format\", 400)\n\t\t\treturn\n\t\t}\n\t}\n\tif dateTo != \"\" {\n\t\tif _, err := time.Parse(\"2006-01-02\", dateTo); err != nil {\n\t\t\thttp.Error(w, \"invalid date format\", 400)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Build dynamic query - sort column cannot be parameterized\n\tbaseQuery := \"SELECT username, email, department, created_at FROM users WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif department != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND department=$%d\", argIdx)\n\t\targs = append(args, department)\n\t\targIdx++\n\t}\n\tif dateFrom != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND created_at >= $%d\", argIdx)\n\t\targs = append(args, dateFrom)\n\t\targIdx++\n\t}\n\tif dateTo != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND created_at <= $%d\", argIdx)\n\t\targs = append(args, dateTo)\n\t\targIdx++\n\t}\n\n\t// Sort column - validated against allowlist... but check is flawed\n\tallowedSorts := []string{\"username\", \"email\", \"department\", \"created_at\"}\n\tif sortCol != \"\" {\n\t\tvalid := false\n\t\tfor _, col := range allowedSorts {\n\t\t\tif strings.Contains(strings.ToLower(sortCol), col) {\n\t\t\t\tvalid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !valid {\n\t\t\tsortCol = \"created_at\"\n\t\t}\n\t\tbaseQuery += \" ORDER BY \" + sortCol\n\t} else {\n\t\tbaseQuery += \" ORDER BY created_at DESC\"\n\t}\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl := template.Must(template.New(\"report\").Parse(`<table>{{range .}}<tr><td>{{.Username}}</td><td>{{.Email}}</td><td>{{.Dept}}</td><td>{{.Created}}</td></tr>{{end}}</table>`))\n\n\ttype Row struct{ Username, Email, Dept, Created string }\n\tvar results []Row\n\tfor rows.Next() {\n\t\tvar row Row\n\t\trows.Scan(&row.Username, &row.Email, &row.Dept, &row.Created)\n\t\tresults = append(results, row)\n\t}\n\ttmpl.Execute(w, results)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/login\", loginHandler)\n\thttp.HandleFunc(\"/report\", authMiddleware(reportHandler))\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB in a private subnet. The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestriction_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'corp-input-validation' with a RegexPatternSet match on query string values matching pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*and\\s+')` with action BLOCK and priority 1, (3) AWSManagedRulesSQLiRuleSet with all rules in BLOCK mode at priority 2. The WebACL default action is ALLOW. CloudWatch metrics confirm rule group evaluation order is respected.",
+    "config": {
+      "load_balancer": "ALBv2 in private subnet",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-api-acl/abc123",
+      "waf_rule_group_1": {
+        "name": "AWSManagedRulesCommonRuleSet",
+        "override_action": "none",
+        "rule_overrides": [
+          {
+            "name": "SizeRestriction_QUERYSTRING",
+            "action": "count"
+          }
+        ],
+        "priority": 0
+      },
+      "waf_rule_group_2": {
+        "name": "corp-input-validation",
+        "type": "custom",
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "block-sqli-patterns",
+            "priority": 1,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/def456",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "priority": 5
+      },
+      "waf_rule_group_3": {
+        "name": "AWSManagedRulesSQLiRuleSet",
+        "override_action": "none",
+        "priority": 10
+      },
+      "waf_default_action": "ALLOW",
+      "network": "private subnet, NAT gateway for egress, no direct internet ingress",
+      "runtime": "ECS Fargate, Python 3.9, Flask 2.3, gunicorn"
+    }
+  }
+}

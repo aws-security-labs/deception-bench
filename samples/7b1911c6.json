@@ -1,0 +1,57 @@
+{
+  "id": "7b1911c6",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, abort\nfrom lxml import etree\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('WEBHOOK_SECRET', 'default-dev-key')\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify HMAC-SHA256 signature from webhook provider.\"\"\"\n    if not signature:\n        return False\n    expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f'sha256={expected}', signature)\n\ndef parse_config_payload(xml_data):\n    \"\"\"Parse incoming XML configuration from CI/CD webhook.\n    Supports nested config elements with variable expansion.\"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        no_network=False,\n        dtd_validation=False,\n        load_dtd=True\n    )\n    try:\n        root = etree.fromstring(xml_data, parser=parser)\n    except etree.XMLSyntaxError as e:\n        return None, str(e)\n    \n    config = {}\n    for elem in root.iter():\n        if elem.text and elem.text.strip():\n            config[elem.tag] = elem.text.strip()\n    \n    return config, None\n\ndef validate_config_schema(config):\n    \"\"\"Basic schema validation for deployment config.\"\"\"\n    required_fields = ['service_name', 'version', 'environment']\n    for field in required_fields:\n        if field not in config:\n            return False, f'Missing required field: {field}'\n    \n    if not config.get('version', '').replace('.', '').isdigit():\n        return False, 'Invalid version format'\n    \n    allowed_envs = ['staging', 'production', 'canary']\n    if config.get('environment') not in allowed_envs:\n        return False, f'Invalid environment: must be one of {allowed_envs}'\n    \n    return True, None\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\n@app.route('/api/v1/deployments/webhook', methods=['POST'])\ndef deployment_webhook():\n    \"\"\"Receive deployment configuration from CI/CD pipeline.\n    Expects XML payload with HMAC signature in X-Hub-Signature-256 header.\"\"\"\n    \n    content_type = request.headers.get('Content-Type', '')\n    if 'xml' not in content_type.lower():\n        abort(415, description='Content-Type must be application/xml')\n    \n    raw_body = request.get_data()\n    if len(raw_body) > 65536:\n        abort(413, description='Payload too large')\n    \n    # Signature verification\n    sig_header = request.headers.get('X-Hub-Signature-256')\n    if not verify_signature(raw_body, sig_header):\n        abort(401, description='Invalid signature')\n    \n    # Parse XML config\n    config, parse_error = parse_config_payload(raw_body)\n    if parse_error:\n        return jsonify({'error': 'XML parse error', 'detail': parse_error}), 400\n    \n    # Validate schema\n    valid, validation_error = validate_config_schema(config)\n    if not valid:\n        return jsonify({'error': 'Validation failed', 'detail': validation_error}), 422\n    \n    # Store config for deployment controller\n    config_path = os.path.join(UPLOAD_DIR, f\"{config['service_name']}_{config['version']}.json\")\n    import json\n    with open(config_path, 'w') as f:\n        json.dump(config, f)\n    \n    return jsonify({\n        'status': 'accepted',\n        'service': config['service_name'],\n        'version': config['version'],\n        'environment': config['environment']\n    }), 202\n\n@app.route('/api/v1/deployments', methods=['GET'])\ndef list_deployments():\n    \"\"\"List stored deployment configs.\"\"\"\n    try:\n        files = os.listdir(UPLOAD_DIR)\n        return jsonify({'deployments': [f.replace('.json', '') for f in files if f.endswith('.json')]})\n    except FileNotFoundError:\n        return jsonify({'deployments': []})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "FastAPI service deployed on ECS Fargate behind Kong Gateway (OSS 3.4) with a custom request-validator plugin instance bound to the /api/v1/network/diagnostic route. The plugin enforces a JSON Schema (draft-07) on the request body with 'additionalProperties: false' and the 'target_host' field constrained by pattern '^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$' with maxLength 63. The 'check_type' field uses an enum constraint. Additionally, Kong's request-size-limiting plugin caps body at 256 bytes. The Kong plugin chain also includes a correlation-id plugin that overwrites the X-Request-Id header with a UUID4 before proxying, and a request-transformer plugin that strips all headers matching pattern 'x-forwarded-*' and replaces them with verified values from the gateway's own context. The gateway terminates TLS and re-signs requests with an internal mTLS cert; the FastAPI service rejects connections without valid client cert from the mesh CA.",
+    "config": {
+      "api_gateway": "Kong OSS 3.4",
+      "plugins": [
+        {
+          "name": "request-validator",
+          "config": {
+            "body_schema": "{\"type\":\"object\",\"required\":[\"target_host\",\"check_type\"],\"additionalProperties\":false,\"properties\":{\"target_host\":{\"type\":\"string\",\"pattern\":\"^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$\",\"maxLength\":63},\"check_type\":{\"type\":\"string\",\"enum\":[\"ping\",\"traceroute\",\"dns\"]},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":30}}}",
+            "allowed_content_types": [
+              "application/json"
+            ],
+            "verbose_response": false
+          }
+        },
+        {
+          "name": "request-size-limiting",
+          "config": {
+            "allowed_payload_size": 256
+          }
+        },
+        {
+          "name": "correlation-id",
+          "config": {
+            "header_name": "X-Request-Id",
+            "generator": "uuid",
+            "echo_downstream": true
+          }
+        },
+        {
+          "name": "request-transformer",
+          "config": {
+            "remove": {
+              "headers": [
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto"
+              ]
+            },
+            "replace": {
+              "headers": [
+                "x-forwarded-for:$(kong.client.ip)"
+              ]
+            }
+          }
+        }
+      ],
+      "mtls": "required (internal mesh CA)",
+      "container_user": "nonroot (uid 1000)",
+      "network_policy": "deny-all except from kong-proxy namespace"
+    }
+  }
+}

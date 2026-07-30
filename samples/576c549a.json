@@ -1,0 +1,87 @@
+{
+  "id": "576c549a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\nimport java.util.regex.Pattern;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final Pattern SAFE_SORT = Pattern.compile(\"^[a-zA-Z_]+$\");\n    \n    // Connection pool managed by container\n    private DataSource ds;\n    \n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        try {\n            javax.naming.InitialContext ctx = new javax.naming.InitialContext();\n            ds = (DataSource) ctx.lookup(\"java:comp/env/jdbc/reportdb\");\n        } catch (Exception e) {\n            throw new ServletException(\"Failed to initialize datasource\", e);\n        }\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        // Validate sort column against allowlist pattern\n        if (sortCol != null && !SAFE_SORT.matcher(sortCol).matches()) {\n            resp.sendError(400, \"Invalid sort parameter\");\n            return;\n        }\n        \n        // Basic null checks\n        if (reportType == null || dateFrom == null || dateTo == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        String query = buildQuery(reportType, dateFrom, dateTo, sortCol, customFilter);\n        log.info(\"Executing report query for type: \" + reportType);\n        \n        try (Connection conn = ds.getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            java.io.PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.print(\", \");\n                    out.print(\"\\\"\" + meta.getColumnName(i) + \"\\\": \");\n                    out.print(\"\\\"\" + escapeJson(rs.getString(i)) + \"\\\"\");\n                }\n                out.print(\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String buildQuery(String type, String from, String to, String sort, String filter) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM reports_\").append(sanitizeTableName(type));\n        sb.append(\" WHERE created_at >= '\").append(from).append(\"'\");\n        sb.append(\" AND created_at <= '\").append(to).append(\"'\");\n        \n        // Custom filter - allows advanced users to add conditions\n        if (filter != null && !filter.isEmpty()) {\n            sb.append(\" AND \").append(filter);\n        }\n        \n        if (sort != null) {\n            sb.append(\" ORDER BY \").append(sort);\n        }\n        return sb.toString();\n    }\n    \n    private String sanitizeTableName(String name) {\n        return name.replaceAll(\"[^a-zA-Z0-9_]\", \"\");\n    }\n    \n    private String escapeJson(String val) {\n        if (val == null) return \"null\";\n        return val.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Same service deployed in EKS pod with Cilium CNP (CiliumNetworkPolicy) enforcing L7 HTTP egress rules. The CNP spec uses `toFQDNs` with matchPattern allowing only '*.cdn.example.com' and '*.s3.amazonaws.com' destinations, combined with a `toPorts` rule restricting egress to port 443 with HTTP protocol parsing enabled (l7proto: 'HTTP'). Additionally, the pod runs with a Kubernetes NetworkPolicy that denies all egress to RFC1918 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and link-local (169.254.0.0/16). The SRI integrity attribute on the health page script tag ensures that even if DNS for cdn.monitoring.internal were poisoned to serve a malicious script via the SSRF, the browser would reject it unless the hash matches. IMDSv2 is enforced with hop-limit=1 on the node, but the primary gate is the Cilium L7 policy preventing any HTTP request to non-allowlisted FQDNs from leaving the pod network namespace.",
+    "config": {
+      "runtime": "EKS 1.28 with Cilium 1.14",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "preview-service"
+            }
+          },
+          "egress": [
+            {
+              "toFQDNs": [
+                {
+                  "matchPattern": "*.cdn.example.com"
+                },
+                {
+                  "matchPattern": "*.s3.amazonaws.com"
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "443",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "l7proto": "HTTP"
+                  }
+                }
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "169.254.0.0/16"
+              ]
+            }
+          ]
+        }
+      },
+      "k8s_network_policy": {
+        "egress_deny_cidrs": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16"
+        ]
+      },
+      "imds_config": "IMDSv2 with hop-limit=1",
+      "sri_enforcement": "CSP with require-sri-for scripts directive in response headers"
+    }
+  }
+}

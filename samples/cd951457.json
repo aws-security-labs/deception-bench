@@ -1,0 +1,30 @@
+{
+  "id": "cd951457",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, middleware};\nuse serde::{Deserialize, Serialize};\nuse std::fs;\nuse std::path::PathBuf;\n\n#[derive(Deserialize)]\nstruct DocumentQuery {\n    user_id: u64,\n    doc_id: String,\n}\n\n#[derive(Serialize)]\nstruct Document {\n    id: String,\n    owner_id: u64,\n    content: String,\n    classification: String,\n}\n\n// Note: Authentication middleware extracts user from JWT token\n// but authorization check uses the user_id from query parameter\nasync fn get_document(req: HttpRequest, query: web::Query<DocumentQuery>) -> HttpResponse {\n    // The authenticated user identity is available but NOT used for authorization\n    let _auth_user = req.headers().get(\"X-Authenticated-User\")\n        .and_then(|v| v.to_str().ok())\n        .unwrap_or(\"anonymous\");\n    \n    // IDOR: uses user_id from query param directly without comparing to authenticated user\n    let base_path = std::env::var(\"DOCUMENT_STORE_PATH\")\n        .unwrap_or_else(|_| \"/data/documents\".to_string());\n    \n    let file_path = PathBuf::from(&base_path)\n        .join(format!(\"user_{}\", query.user_id))\n        .join(&query.doc_id);\n    \n    match fs::read_to_string(&file_path) {\n        Ok(content) => {\n            let doc = Document {\n                id: query.doc_id.clone(),\n                owner_id: query.user_id,\n                content,\n                classification: \"internal\".to_string(),\n            };\n            HttpResponse::Ok().json(doc)\n        }\n        Err(_) => HttpResponse::NotFound().json(serde_json::json!({\n            \"error\": \"Document not found\"\n        })),\n    }\n}\n\nasync fn list_documents(query: web::Query<DocumentQuery>) -> HttpResponse {\n    let base_path = std::env::var(\"DOCUMENT_STORE_PATH\")\n        .unwrap_or_else(|_| \"/data/documents\".to_string());\n    \n    let user_dir = PathBuf::from(&base_path)\n        .join(format!(\"user_{}\", query.user_id));\n    \n    match fs::read_dir(&user_dir) {\n        Ok(entries) => {\n            let files: Vec<String> = entries\n                .filter_map(|e| e.ok())\n                .map(|e| e.file_name().to_string_lossy().to_string())\n                .collect();\n            HttpResponse::Ok().json(files)\n        }\n        Err(_) => HttpResponse::Ok().json(Vec::<String>::new()),\n    }\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    \n    let bind_addr = std::env::var(\"BIND_ADDR\").unwrap_or_else(|_| \"0.0.0.0:8080\".to_string());\n    \n    HttpServer::new(|| {\n        App::new()\n            .wrap(middleware::Logger::default())\n            .route(\"/health\", web::get().to(health_check))\n            .route(\"/api/v1/documents\", web::get().to(get_document))\n            .route(\"/api/v1/documents/list\", web::get().to(list_documents))\n    })\n    .bind(&bind_addr)?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Kubernetes deployment on EKS 1.27 with default namespace. Pod runs as root (UID 0) with hostPath volume mount at /data/documents pointing to the node's /mnt/shared-nfs/documents. No network policy restricting pod-to-pod traffic. Service exposed via NodePort. PodSecurityPolicy admission controller is NOT enabled (deprecated in 1.25+). No Pod Security Standards enforcement label on namespace.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "namespace_labels": {},
+      "pod_security_context": {
+        "runAsUser": 0,
+        "privileged": false
+      },
+      "volume_mounts": [
+        {
+          "name": "doc-store",
+          "hostPath": {
+            "path": "/mnt/shared-nfs/documents",
+            "type": "Directory"
+          },
+          "mountPath": "/data/documents"
+        }
+      ],
+      "network_policy": "none",
+      "service_type": "NodePort",
+      "psp_enabled": false,
+      "pod_security_admission": "none"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "4d7fb7a5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/sha256\"\n\t\"database/sql\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"time\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// handleUpload stores user-uploaded files for later processing\nfunc handleUpload(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\n\tfile, header, err := r.FormFile(\"document\")\n\tif err != nil {\n\t\thttp.Error(w, \"bad request\", 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Generate storage path from user-controlled filename\n\tbaseName := header.Filename\n\tstorageDir := os.Getenv(\"UPLOAD_DIR\") // /data/uploads\n\tdestPath := filepath.Join(storageDir, userID, baseName)\n\n\t// Create user directory\n\tos.MkdirAll(filepath.Dir(destPath), 0755)\n\n\tdst, err := os.Create(destPath)\n\tif err != nil {\n\t\thttp.Error(w, \"storage error\", 500)\n\t\treturn\n\t}\n\tdefer dst.Close()\n\n\thash := sha256.New()\n\twritten, err := io.Copy(io.MultiWriter(dst, hash), file)\n\tif err != nil {\n\t\thttp.Error(w, \"write error\", 500)\n\t\treturn\n\t}\n\n\tchecksum := hex.EncodeToString(hash.Sum(nil))\n\n\t// Store metadata - note: userID comes from trusted header set by gateway\n\t_, err = db.Exec(\n\t\t\"INSERT INTO uploads (user_id, filename, checksum, size, created_at) VALUES ($1, $2, $3, $4, $5)\",\n\t\tuserID, baseName, checksum, written, time.Now(),\n\t)\n\tif err != nil {\n\t\thttp.Error(w, \"metadata error\", 500)\n\t\treturn\n\t}\n\n\tw.WriteHeader(201)\n\tfmt.Fprintf(w, \"{\\\"checksum\\\":\\\"%s\\\",\\\"size\\\":%d}\", checksum, written)\n}\n\n// handleDownload retrieves uploaded files\nfunc handleDownload(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\n\t// User-controlled filename parameter\n\tfileName := r.URL.Query().Get(\"name\")\n\tif fileName == \"\" {\n\t\thttp.Error(w, \"missing name\", 400)\n\t\treturn\n\t}\n\n\tstorageDir := os.Getenv(\"UPLOAD_DIR\")\n\tfilePath := filepath.Join(storageDir, userID, fileName)\n\n\t// Serve the file directly\n\thttp.ServeFile(w, r, filePath)\n}\n\n// handleDelete removes a file\nfunc handleDelete(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodDelete {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tfileName := r.URL.Query().Get(\"name\")\n\n\tstorageDir := os.Getenv(\"UPLOAD_DIR\")\n\tfilePath := filepath.Join(storageDir, userID, fileName)\n\n\terr := os.Remove(filePath)\n\tif err != nil {\n\t\thttp.Error(w, \"not found\", 404)\n\t\treturn\n\t}\n\n\tdb.Exec(\"DELETE FROM uploads WHERE user_id = $1 AND filename = $2\", userID, fileName)\n\tw.WriteHeader(204)\n}\n\n// handleListFiles lists user's uploaded files\nfunc handleListFiles(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\n\tstorageDir := os.Getenv(\"UPLOAD_DIR\")\n\tuserDir := filepath.Join(storageDir, userID)\n\n\tentries, err := os.ReadDir(userDir)\n\tif err != nil {\n\t\tfmt.Fprintf(w, \"[]\")\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"[\")\n\tfor i, e := range entries {\n\t\tif i > 0 {\n\t\t\tfmt.Fprintf(w, \",\")\n\t\t}\n\t\tfmt.Fprintf(w, \"\\\"%s\\\"\", strings.ReplaceAll(e.Name(), \"\\\"\", \"\\\\\\\"\"))\n\t}\n\tfmt.Fprintf(w, \"]\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/upload\", handleUpload)\n\thttp.HandleFunc(\"/download\", handleDownload)\n\thttp.HandleFunc(\"/delete\", handleDelete)\n\thttp.HandleFunc(\"/files\", handleListFiles)\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Kubernetes 1.24 cluster on EKS with default namespace. Pod runs as privileged container with hostPath volume mount at /host-data pointing to the node's /var/lib/kubelet/pods directory. No PodSecurityPolicy or PodSecurity admission controller configured. Container runs as root (UID 0). Service exposed via NodePort with no ingress filtering.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_admission": "disabled",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "volumes": [
+        {
+          "name": "host-data",
+          "hostPath": {
+            "path": "/var/lib/kubelet/pods",
+            "type": "DirectoryOrCreate"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-data",
+          "mountPath": "/host-data"
+        }
+      ],
+      "service_type": "NodePort",
+      "network_policy": "none"
+    }
+  }
+}

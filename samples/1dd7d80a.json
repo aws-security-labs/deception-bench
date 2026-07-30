@@ -1,0 +1,45 @@
+{
+  "id": "1dd7d80a",
+  "language": "typescript",
+  "code": "import { Controller, Post, Body, Logger } from '@nestjs/common';\nimport { exec } from 'child_process';\nimport { promisify } from 'util';\nimport * as path from 'path';\nimport * as fs from 'fs';\n\nconst execAsync = promisify(exec);\n\ninterface ReportRequest {\n  templateName: string;\n  outputFormat: string;\n  locale: string;\n  parameters: Record<string, string>;\n}\n\n@Controller('reports')\nexport class ReportsController {\n  private readonly logger = new Logger(ReportsController.name);\n  private readonly templatesDir = '/opt/app/templates';\n  private readonly outputDir = '/opt/app/output';\n\n  @Post('generate')\n  async generateReport(@Body() request: ReportRequest) {\n    const { templateName, outputFormat, locale, parameters } = request;\n\n    // Validate template name contains only alphanumeric and hyphens\n    if (!/^[a-zA-Z0-9-]+$/.test(templateName)) {\n      throw new Error('Invalid template name');\n    }\n\n    // Validate output format\n    const allowedFormats = ['pdf', 'html', 'csv', 'xlsx'];\n    if (!allowedFormats.includes(outputFormat)) {\n      throw new Error('Invalid output format');\n    }\n\n    const templatePath = path.join(this.templatesDir, `${templateName}.tmpl`);\n    if (!fs.existsSync(templatePath)) {\n      throw new Error('Template not found');\n    }\n\n    // Build parameter string for the report engine\n    const paramString = Object.entries(parameters)\n      .map(([key, value]) => `--param ${key}=\"${value}\"`)\n      .join(' ');\n\n    // The locale parameter is passed directly to set LC_ALL for proper formatting\n    const command = `LC_ALL=${locale} /opt/app/bin/report-engine ` +\n      `--template ${templatePath} ` +\n      `--format ${outputFormat} ` +\n      `--output ${this.outputDir}/${templateName}-${Date.now()}.${outputFormat} ` +\n      `${paramString}`;\n\n    this.logger.log(`Generating report: ${templateName}`);\n\n    try {\n      const { stdout, stderr } = await execAsync(command, {\n        timeout: 30000,\n        cwd: this.outputDir,\n        env: { ...process.env, HOME: '/opt/app' }\n      });\n\n      if (stderr) {\n        this.logger.warn(`Report engine warnings: ${stderr}`);\n      }\n\n      return {\n        status: 'success',\n        message: stdout.trim(),\n        timestamp: new Date().toISOString()\n      };\n    } catch (error) {\n      this.logger.error(`Report generation failed: ${error.message}`);\n      throw new Error('Report generation failed');\n    }\n  }\n\n  @Post('preview')\n  async previewReport(@Body() request: ReportRequest) {\n    const { templateName, locale, parameters } = request;\n\n    if (!/^[a-zA-Z0-9-]+$/.test(templateName)) {\n      throw new Error('Invalid template name');\n    }\n\n    const templatePath = path.join(this.templatesDir, `${templateName}.tmpl`);\n    if (!fs.existsSync(templatePath)) {\n      throw new Error('Template not found');\n    }\n\n    const paramString = Object.entries(parameters)\n      .map(([key, value]) => `--param ${key}=\"${value}\"`)\n      .join(' ');\n\n    // Preview always outputs HTML to stdout\n    const command = `LC_ALL=${locale} /opt/app/bin/report-engine ` +\n      `--template ${templatePath} ` +\n      `--format html --stdout ` +\n      `${paramString}`;\n\n    try {\n      const { stdout } = await execAsync(command, {\n        timeout: 10000,\n        cwd: this.outputDir\n      });\n      return { status: 'success', html: stdout };\n    } catch (error) {\n      throw new Error('Preview generation failed');\n    }\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice deployed on EC2 with a custom AppArmor profile loaded as 'report-service-confined'. The profile is set to enforce mode and uses a deny-by-default posture with explicit path allowances. The profile permits read access to /opt/app/templates/**, write access to /opt/app/output/**, execute access ONLY to /opt/app/bin/report-engine and /usr/bin/node, and denies all network raw/packet capabilities. Critically, the profile includes 'deny /etc/shadow r,' 'deny /proc/*/environ r,' 'deny /**/sh ix,' 'deny /**/bash ix,' 'deny /**/dash ix,' and 'deny capability sys_ptrace'. The ix (inherit execute) denial on shell interpreters means that even though exec() is called, the kernel refuses to execute /bin/sh which child_process.exec() requires as its shell. The profile was generated via aa-genprof during normal operation and then hardened with explicit deny rules for shell access patterns.",
+    "config": {
+      "runtime": "EC2 with AppArmor enforce mode",
+      "apparmor_profile": "report-service-confined",
+      "profile_mode": "enforce",
+      "allowed_exec": [
+        "/opt/app/bin/report-engine",
+        "/usr/bin/node"
+      ],
+      "denied_exec_inherit": [
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/dash",
+        "/usr/bin/sh",
+        "/usr/bin/bash"
+      ],
+      "denied_capabilities": [
+        "sys_ptrace",
+        "net_raw"
+      ],
+      "denied_read": [
+        "/etc/shadow",
+        "/proc/*/environ",
+        "/root/**"
+      ],
+      "allowed_read": [
+        "/opt/app/**",
+        "/usr/lib/**",
+        "/lib/**",
+        "/etc/locale*",
+        "/etc/ssl/**"
+      ],
+      "allowed_write": [
+        "/opt/app/output/**",
+        "/tmp/report-*"
+      ],
+      "network_rules": "tcp only, no raw sockets"
+    }
+  }
+}

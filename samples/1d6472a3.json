@@ -1,0 +1,30 @@
+{
+  "id": "1d6472a3",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, password_hash) VALUES (1, 'admin', 'admin@corp.internal', 'superadmin', 'pbkdf2:sha256:260000$salt$hash')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, password_hash) VALUES (2, 'svc_backup', 'backup@corp.internal', 'service', 'pbkdf2:sha256:260000$salt2$hash2')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search for compliance\n    try:\n        db = get_db()\n        log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field} value={value}')\"\n        db.execute(log_query)\n        db.commit()\n    except Exception as e:\n        app.logger.warning(f\"Audit log failed: {e}\")\n    \n    # Perform the search - field is validated above so safe to interpolate\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE ?\"\n    try:\n        db = get_db()\n        results = db.execute(query, (f'%{value}%',)).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>/notes', methods=['PUT'])\ndef update_notes(user_id):\n    \"\"\"Update user notes/metadata. Internal endpoint.\"\"\"\n    data = request.get_json()\n    note = data.get('note', '') if data else ''\n    \n    db = get_db()\n    # Store note with user reference for admin review\n    update_q = f\"INSERT INTO audit_log (action, details) VALUES ('note_update', 'user_id={user_id} note={note}')\"\n    try:\n        db.execute(update_q)\n        db.commit()\n        return jsonify({'status': 'updated'})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate filtered user report. Admin only in production.\"\"\"\n    data = request.get_json()\n    filters = data.get('filters', {}) if data else {}\n    \n    where_clauses = []\n    for col, val in filters.items():\n        if col in ['username', 'email', 'role']:\n            where_clauses.append(f\"{col} = '{val}'\")\n    \n    base_query = \"SELECT id, username, email, role FROM users\"\n    if where_clauses:\n        base_query += \" WHERE \" + \" AND \".join(where_clauses)\n    \n    try:\n        db = get_db()\n        results = db.execute(base_query).fetchall()\n        return jsonify({'report': [dict(row) for row in results], 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Report generation failed'}), 500\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)\n",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (Amazon Linux 2023, t3.medium) behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound 443 from 0.0.0.0/0. No WAF attached to ALB. Flask app runs as systemd service with gunicorn, SQLite database on local EBS volume. ALB access logs enabled but no real-time alerting configured.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group_ingress": [
+        {
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "instance_role_policies": [
+        "AmazonSSMManagedInstanceCore"
+      ],
+      "flask_env": "production"
+    }
+  }
+}

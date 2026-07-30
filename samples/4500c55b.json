@@ -1,0 +1,20 @@
+{
+  "id": "4500c55b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"unsafe\"\n)\n\n// #cgo CFLAGS: -O0\n// #include <string.h>\n// #include <stdlib.h>\n//\n// typedef struct {\n//     char username[64];\n//     char role[32];\n//     int is_admin;\n// } UserSession;\n//\n// UserSession* parse_session(const char* input) {\n//     UserSession* session = (UserSession*)malloc(sizeof(UserSession));\n//     memset(session, 0, sizeof(UserSession));\n//     // Vulnerable: no bounds checking on input length\n//     strcpy(session->username, input);\n//     strcpy(session->role, \"viewer\");\n//     session->is_admin = 0;\n//     return session;\n// }\nimport \"C\"\n\ntype AppConfig struct {\n\tListenAddr   string\n\tDataEndpoint string\n\tDebugMode    bool\n}\n\nvar config = AppConfig{\n\tListenAddr:   \":8080\",\n\tDataEndpoint: \"http://internal-data-svc:9090/api/v2/records\",\n\tDebugMode:    false,\n}\n\nfunc handleLogin(w http.ResponseWriter, r *http.Request) {\n\tusername := r.FormValue(\"username\")\n\tif username == \"\" {\n\t\thttp.Error(w, \"username required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Parse session using C struct - vulnerable to buffer overflow\n\tcUsername := C.CString(username)\n\tdefer C.free(unsafe.Pointer(cUsername))\n\n\tsession := C.parse_session(cUsername)\n\tdefer C.free(unsafe.Pointer(session))\n\n\tif session.is_admin != 0 {\n\t\t// Admin path - execute diagnostic command\n\t\tdiag := r.FormValue(\"diag\")\n\t\tif diag != \"\" {\n\t\t\tcmd := exec.Command(\"sh\", \"-c\", diag)\n\t\t\toutput, err := cmd.CombinedOutput()\n\t\t\tif err != nil {\n\t\t\t\thttp.Error(w, fmt.Sprintf(\"diag error: %v\", err), http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tw.Write(output)\n\t\t\treturn\n\t\t}\n\t}\n\n\troleStr := C.GoString(&session.role[0])\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, `{\"user\":\"%s\",\"role\":\"%s\",\"admin\":%v}`,\n\t\tstrings.ReplaceAll(username[:min(len(username), 63)], `\"`, ``),\n\t\troleStr,\n\t\tsession.is_admin != 0)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc handleMetrics(w http.ResponseWriter, r *http.Request) {\n\t// Internal metrics endpoint\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfmt.Fprintf(w, \"uptime_seconds 12345\\nrequests_total 9876\\n\")\n}\n\nfunc min(a, b int) int {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/login\", handleLogin)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\thttp.HandleFunc(\"/metrics\", handleMetrics)\n\n\tfmt.Printf(\"Starting service on %s\\n\", config.ListenAddr)\n\tif err := http.ListenAndServe(config.ListenAddr, nil); err != nil {\n\t\tfmt.Printf(\"Server error: %v\\n\", err)\n\t}\n}",
+  "environment": {
+    "description": "Go microservice deployed on an EC2 instance in a public subnet with an Internet Gateway route. Instance has IAM role with ec2:* permissions. Security group allows inbound 8080 from 0.0.0.0/0 and all outbound traffic. No WAF or network ACL restrictions. Service compiled with CGO_ENABLED=1 and no stack protector (-fno-stack-protector).",
+    "config": {
+      "subnet_type": "public",
+      "internet_gateway": true,
+      "nat_gateway": true,
+      "security_group_egress": "0.0.0.0/0 all ports",
+      "security_group_ingress": "0.0.0.0/0:8080",
+      "iam_role": "ec2:*,s3:*",
+      "cgo_enabled": true,
+      "compiler_flags": "-fno-stack-protector -O0",
+      "waf": "none",
+      "nacl": "allow all"
+    }
+  }
+}

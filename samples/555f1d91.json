@@ -1,0 +1,82 @@
+{
+  "id": "555f1d91",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        if (sessionToken == null || !validateSession(sessionToken)) {\n            resp.sendError(403, \"Unauthorized\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n\n        // Input length check\n        if (department != null && department.length() > 64) {\n            resp.sendError(400, \"Invalid department parameter\");\n            return;\n        }\n\n        // Basic character filter - blocks common attack chars\n        if (department != null && department.matches(\".*[;\\\\-\\\\-\\\\/\\\\*].*\")) {\n            log.warning(\"Suspicious chars in dept param: \" + department);\n            resp.sendError(400, \"Invalid characters\");\n            return;\n        }\n\n        resp.setContentType(\"application/json\");\n        resp.setCharacterEncoding(\"UTF-8\");\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = buildQuery(reportType, dateRange, department);\n            log.info(\"Executing report query for type=\" + reportType);\n\n            try (Statement stmt = conn.createStatement();\n                 ResultSet rs = stmt.executeQuery(query)) {\n                StringBuilder json = new StringBuilder(\"[\\n\");\n                ResultSetMetaData meta = rs.getMetaData();\n                int cols = meta.getColumnCount();\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) json.append(\",\\n\");\n                    json.append(\"  {\");\n                    for (int i = 1; i <= cols; i++) {\n                        if (i > 1) json.append(\", \");\n                        json.append(\"\\\"\").append(meta.getColumnName(i))\n                           .append(\"\\\": \\\"\").append(rs.getString(i)).append(\"\\\"\");\n                    }\n                    json.append(\"}\");\n                    first = false;\n                }\n                json.append(\"\\n]\");\n                resp.getWriter().write(json.toString());\n            }\n        } catch (SQLException e) {\n            log.severe(\"DB error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n\n    private String buildQuery(String reportType, String dateRange, String department) {\n        String baseQuery;\n        if (\"summary\".equals(reportType)) {\n            baseQuery = \"SELECT dept_name, COUNT(*) as cnt, SUM(amount) as total FROM transactions\";\n        } else {\n            baseQuery = \"SELECT id, dept_name, amount, tx_date, description FROM transactions\";\n        }\n\n        StringBuilder where = new StringBuilder(\" WHERE 1=1\");\n        if (dateRange != null) {\n            switch (dateRange) {\n                case \"7d\": where.append(\" AND tx_date >= CURRENT_DATE - INTERVAL '7 days'\"); break;\n                case \"30d\": where.append(\" AND tx_date >= CURRENT_DATE - INTERVAL '30 days'\"); break;\n                case \"90d\": where.append(\" AND tx_date >= CURRENT_DATE - INTERVAL '90 days'\"); break;\n                default: where.append(\" AND tx_date >= CURRENT_DATE - INTERVAL '30 days'\"); break;\n            }\n        }\n\n        if (department != null && !department.isEmpty()) {\n            where.append(\" AND dept_name = '\" + department + \"'\");\n        }\n\n        if (\"summary\".equals(reportType)) {\n            where.append(\" GROUP BY dept_name ORDER BY total DESC\");\n        } else {\n            where.append(\" ORDER BY tx_date DESC LIMIT 500\");\n        }\n\n        return baseQuery + where.toString();\n    }\n\n    private boolean validateSession(String token) {\n        // Validates against session store\n        return token != null && token.length() == 64 && token.matches(\"[a-f0-9]+\");\n    }\n}",
+  "environment": {
+    "description": "Same application deployed in a Kubernetes cluster (EKS 1.29) in namespace 'admin-plane'. Istio 1.21 sidecar injected (istio-proxy envoy). A PeerAuthentication resource enforces STRICT mTLS for the namespace. An AuthorizationPolicy resource scoped to the admin-plane namespace specifies: action ALLOW with source principals matching 'cluster.local/ns/api-gateway/sa/gateway-sa' only. A second AuthorizationPolicy with action DENY is applied for any source NOT matching the gateway service account. The api-gateway namespace runs an Envoy-based ingress that performs Origin header validation (checking against allowlist 'https://admin.internal.corp') before proxying WebSocket upgrade requests. External traffic cannot reach the admin-plane pods directly because the Kubernetes NetworkPolicy restricts ingress to pods with label 'app=api-gateway' in namespace 'api-gateway' only. The combination means: (1) only the gateway SA can reach the pod via mTLS, (2) the gateway validates Origin before forwarding, (3) NetworkPolicy blocks any non-gateway pod communication.",
+    "config": {
+      "runtime": "dotnet8-linux-x64",
+      "deployment": "EKS 1.29, namespace admin-plane, Istio 1.21 sidecar",
+      "istio_peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "admin-plane"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "istio_authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "allow-gateway-only",
+          "namespace": "admin-plane"
+        },
+        "spec": {
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/api-gateway/sa/gateway-sa"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "deny-cross-ns",
+          "namespace": "admin-plane"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Ingress"
+          ],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "name": "api-gateway"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "api-gateway"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "gateway_origin_check": "Envoy route config with lua filter validating Origin header against 'https://admin.internal.corp' before WebSocket upgrade"
+    }
+  }
+}

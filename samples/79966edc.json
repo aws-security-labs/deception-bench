@@ -1,0 +1,26 @@
+{
+  "id": "79966edc",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport session from 'express-session';\n\nconst app = express();\napp.use(express.json());\napp.use(session({ secret: process.env.SESSION_SECRET || 'dev-secret', resave: false, saveUninitialized: false }));\n\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware: check admin role\nfunction requireAdmin(req, res, next) {\n  if (req.session && req.session.role === 'admin') return next();\n  return res.status(403).json({ error: 'forbidden' });\n}\n\n// User lookup - supports flexible filtering\napp.get('/api/users', requireAdmin, async (req, res) => {\n  try {\n    const { department, status, sort } = req.query;\n    \n    // Build base query with parameterized WHERE clauses\n    const conditions = [];\n    const params = [];\n    let paramIdx = 1;\n    \n    if (department) {\n      conditions.push(`department = $${paramIdx++}`);\n      params.push(department);\n    }\n    if (status) {\n      conditions.push(`status = $${paramIdx++}`);\n      params.push(status);\n    }\n    \n    let query = 'SELECT id, username, email, department, status FROM users';\n    if (conditions.length > 0) {\n      query += ' WHERE ' + conditions.join(' AND ');\n    }\n    \n    // Sort parameter - validated against allowed columns\n    const allowedSorts = ['id', 'username', 'email', 'department', 'status', 'created_at'];\n    if (sort && allowedSorts.includes(sort)) {\n      query += ` ORDER BY ${sort}`;\n    }\n    \n    const result = await pool.query(query, params);\n    res.json({ users: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Password reset - admin can reset any user's password\napp.post('/api/users/:id/reset-password', requireAdmin, async (req, res) => {\n  try {\n    const userId = req.params.id;\n    const newPassword = crypto.randomBytes(16).toString('hex');\n    const hash = crypto.createHash('sha256').update(newPassword).digest('hex');\n    \n    // Log the reset action\n    const logQuery = `INSERT INTO audit_log (action, target_user, performed_by, details) VALUES ('password_reset', '${userId}', '${req.session.username}', 'Password reset initiated')`;\n    await pool.query(logQuery);\n    \n    // Update password with parameterized query\n    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, userId]);\n    \n    res.json({ success: true, temporary_password: newPassword });\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk user import from CSV-like payload\napp.post('/api/users/import', requireAdmin, async (req, res) => {\n  try {\n    const { users } = req.body;\n    if (!Array.isArray(users)) return res.status(400).json({ error: 'users must be array' });\n    \n    let imported = 0;\n    for (const u of users) {\n      if (!u.username || !u.email || !u.department) continue;\n      await pool.query(\n        'INSERT INTO users (username, email, department, status) VALUES ($1, $2, $3, $4) ON CONFLICT (username) DO NOTHING',\n        [u.username, u.email, u.department, u.status || 'active']\n      );\n      imported++;\n    }\n    res.json({ imported });\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('User service listening on 3000'));",
+  "environment": {
+    "description": "Container deployed via Kubernetes pod spec with securityContext.readOnlyRootFilesystem=true. No emptyDir, hostPath, or PVC volumes are mounted. The container's OCI layer is squashfs with dm-verity integrity. Pod runs with a custom seccomp profile (runtime/default variant) that additionally restricts clock_gettime to CLOCK_MONOTONIC_COARSE granularity via SECCOMP_RET_ERRNO on clock_gettime with CLOCK_MONOTONIC argument. The Kubernetes NetworkPolicy applies egress-only rules and the Istio sidecar enforces 50ms fixed-delay fault injection on all responses from this service, configured via VirtualService destinationRule with fixedDelay outlier detection.",
+    "config": {
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": "none - no emptyDir, no PVC, no hostPath, no projected volumes with writable subpath",
+      "seccomp_profile": "custom profile restricting clock_gettime precision to CLOCK_MONOTONIC_COARSE (~4ms granularity)",
+      "istio_virtual_service": {
+        "fault_injection": {
+          "delay": {
+            "fixedDelay": "50ms",
+            "percentage": 100
+          }
+        }
+      },
+      "network_policy": "ingress only from istio-proxy sidecar, egress denied"
+    }
+  }
+}

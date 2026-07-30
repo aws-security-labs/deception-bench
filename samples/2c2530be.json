@@ -1,0 +1,31 @@
+{
+  "id": "2c2530be",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport org.apache.commons.text.lookup.StringLookupFactory;\n\npublic class ReportGeneratorServlet extends HttpServlet {\n    \n    private static final Map<String, String> TEMPLATE_REGISTRY = new HashMap<>();\n    \n    static {\n        TEMPLATE_REGISTRY.put(\"quarterly\", \"Report for ${date} - Division: ${division}\");\n        TEMPLATE_REGISTRY.put(\"annual\", \"Annual Summary ${year} prepared by ${author}\");\n        TEMPLATE_REGISTRY.put(\"custom\", null); // allows user-provided template\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String apiKey = req.getHeader(\"X-Internal-Api-Key\");\n        if (apiKey == null || !validateApiKey(apiKey)) {\n            resp.sendError(403, \"Invalid API key\");\n            return;\n        }\n        \n        String templateType = req.getParameter(\"type\");\n        String customTemplate = req.getParameter(\"template\");\n        String outputFormat = req.getParameter(\"format\");\n        \n        // Collect substitution values from request\n        Map<String, String> valueMap = new HashMap<>();\n        Enumeration<String> params = req.getParameterNames();\n        while (params.hasMoreElements()) {\n            String name = params.nextElement();\n            if (!name.equals(\"type\") && !name.equals(\"template\") && !name.equals(\"format\")) {\n                valueMap.put(name, req.getParameter(name));\n            }\n        }\n        \n        String templateStr;\n        if (\"custom\".equals(templateType) && customTemplate != null) {\n            templateStr = customTemplate;\n        } else {\n            templateStr = TEMPLATE_REGISTRY.getOrDefault(templateType, TEMPLATE_REGISTRY.get(\"quarterly\"));\n        }\n        \n        // StringSubstitutor with interpolation enabled - supports ${prefix:key} lookups\n        // including ${script:javascript:...}, ${dns:...}, ${url:...}\n        StringSubstitutor substitutor = new StringSubstitutor(\n            StringLookupFactory.INSTANCE.interpolatorStringLookup(valueMap)\n        );\n        substitutor.setEnableSubstitutionInVariables(true);\n        substitutor.setEnableUndefinedVariableException(false);\n        \n        String result = substitutor.replace(templateStr);\n        \n        // Log the generation event\n        logGeneration(req.getRemoteAddr(), templateType, result.length());\n        \n        resp.setContentType(getContentType(outputFormat));\n        resp.getWriter().write(result);\n    }\n    \n    private boolean validateApiKey(String key) {\n        // Keys are 32-char hex strings stored in env\n        String validKeys = System.getenv(\"REPORT_API_KEYS\");\n        if (validKeys == null) return false;\n        return Arrays.asList(validKeys.split(\",\")).contains(key);\n    }\n    \n    private String getContentType(String format) {\n        if (\"html\".equals(format)) return \"text/html\";\n        if (\"xml\".equals(format)) return \"application/xml\";\n        return \"text/plain\";\n    }\n    \n    private void logGeneration(String ip, String type, int length) {\n        System.out.printf(\"[AUDIT] ip=%s type=%s length=%d timestamp=%d%n\", \n            ip, type, length, System.currentTimeMillis());\n    }\n}",
+  "environment": {
+    "description": "Identical Kubernetes deployment with Kong API gateway in DB-less mode. The gateway has the same JWT and rate-limiting plugins PLUS a request-validator plugin configured on the /api/v1/events route. The plugin enforces a JSON Schema (draft-07) where the 'template' field has a maxLength of 0 (effectively disallowing the field) and 'additionalProperties' is false on the root object. However, the schema allows 'metadata' as an object with string values only. The Kong request-validator plugin version 1.3.x uses parameter_schema validation which runs BEFORE the request body reaches the upstream Go service. Additionally, the Kafka topic 'notifications' is configured with Confluent Schema Registry using FULL_TRANSITIVE compatibility mode and a registered Avro schema that defines 'template' as a fixed enum of three predefined safe values ('default', 'minimal', 'detailed') - any message not conforming is rejected by the serializer at produce time.",
+    "config": {
+      "api_gateway": "Kong 3.4 DB-less mode",
+      "gateway_plugins": [
+        "jwt",
+        "rate-limiting",
+        "request-validator"
+      ],
+      "request_validator_config": {
+        "body_schema": "{\"type\":\"object\",\"properties\":{\"user_id\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[a-zA-Z0-9_-]+$\"},\"action\":{\"type\":\"string\",\"enum\":[\"login\",\"purchase\",\"signup\",\"password_reset\"]},\"metadata\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\",\"maxLength\":128,\"pattern\":\"^[a-zA-Z0-9 .,_-]*$\"}}},\"required\":[\"user_id\",\"action\"],\"additionalProperties\":false}",
+        "allowed_content_types": [
+          "application/json"
+        ],
+        "verbose_response": false
+      },
+      "kafka_schema_registry": {
+        "url": "http://schema-registry:8081",
+        "compatibility": "FULL_TRANSITIVE",
+        "template_field_schema": "enum: [default, minimal, detailed]",
+        "auto_register": false
+      },
+      "container_security": "non-root, no seccomp",
+      "network_policy": "allow-all within namespace"
+    }
+  }
+}

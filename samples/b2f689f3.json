@@ -1,0 +1,38 @@
+{
+  "id": "b2f689f3",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware to extract tenant context\nfunction tenantContext(req, res, next) {\n  req.tenantId = req.headers['x-tenant-id'] || 'default';\n  next();\n}\n\napp.use(tenantContext);\n\n// User search endpoint - supports flexible querying\napp.get('/api/v2/users/search', async (req, res) => {\n  try {\n    const { field, value, limit } = req.query;\n    \n    // Validate field against allowed columns\n    const allowedFields = ['username', 'email', 'display_name', 'department', 'status'];\n    if (!allowedFields.includes(field)) {\n      return res.status(400).json({ error: 'Invalid search field' });\n    }\n    \n    // Build query with parameterized field but direct value interpolation\n    // for LIKE pattern support (pg doesn't support parameterized LIKE well with wildcards)\n    const sanitizedValue = value.replace(/'/g, \"''\");\n    const queryLimit = Math.min(parseInt(limit) || 25, 100);\n    \n    const query = `SELECT id, username, email, display_name, department, status, created_at \n                   FROM tenant_users \n                   WHERE tenant_id = $1 \n                   AND ${field} ILIKE '%${sanitizedValue}%'\n                   ORDER BY created_at DESC \n                   LIMIT ${queryLimit}`;\n    \n    const result = await pool.query(query, [req.tenantId]);\n    \n    res.json({\n      count: result.rows.length,\n      users: result.rows\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/users/export', async (req, res) => {\n  try {\n    const { format, filters } = req.body;\n    const tenantId = req.tenantId;\n    \n    let whereClause = 'WHERE tenant_id = $1';\n    const params = [tenantId];\n    \n    if (filters && filters.department) {\n      params.push(filters.department);\n      whereClause += ` AND department = $${params.length}`;\n    }\n    \n    const result = await pool.query(\n      `SELECT id, username, email, display_name, department, status FROM tenant_users ${whereClause}`,\n      params\n    );\n    \n    const exportId = crypto.randomUUID();\n    res.json({ exportId, recordCount: result.rows.length, format: format || 'json' });\n  } catch (err) {\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\n// Health check\napp.get('/healthz', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(parseInt(process.env.PORT || '3000'), '0.0.0.0', () => {\n  console.log(`User service listening on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same EC2 instance (m5.large) on Amazon Linux 2 in private subnet subnet-0e4f5a6b with no public IP. Traffic routed through internal ALB (arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/legacy-portal-alb/a1b2c3d4e5f6) with listener rule priority 1 forwarding only paths matching /api/login and / to target group. ALB access logs enabled to S3. The ALB listener has an additional rule at priority 5 that returns fixed 403 for any request where path pattern matches /api/debug/*. Instance security group sg-0xab only allows inbound from ALB security group sg-0xcd on port 8080. VPC endpoint policy for EC2 metadata service (IMDS) configured with HttpPutResponseHopLimit=1 and IMDSv2 required. Additionally, the application's static assets are served through CloudFront distribution (E1A2B3C4D5E6F7) with origin access identity, and all script tags in the HTML response include SRI hashes validated by the browser - meaning even if an attacker could somehow inject or modify the JavaScript bundles served from /static/*, the browser would refuse to execute them unless the content matches the integrity hash. The CloudFront distribution has a response headers policy that sets Content-Security-Policy: script-src 'self' with require-sri-for directives.",
+    "config": {
+      "subnet_type": "private",
+      "public_ip": false,
+      "alb_path_rules": [
+        {
+          "priority": 1,
+          "path_pattern": [
+            "/api/login",
+            "/"
+          ],
+          "action": "forward"
+        },
+        {
+          "priority": 5,
+          "path_pattern": [
+            "/api/debug/*"
+          ],
+          "action": "fixed-response-403"
+        }
+      ],
+      "security_group_ingress": "sg-0xcd:8080",
+      "imds_config": {
+        "HttpPutResponseHopLimit": 1,
+        "HttpTokens": "required"
+      },
+      "cloudfront_distribution": "E1A2B3C4D5E6F7",
+      "cloudfront_csp": "script-src 'self'; require-sri-for script",
+      "sri_enforced": true,
+      "alb_access_logs": true
+    }
+  }
+}

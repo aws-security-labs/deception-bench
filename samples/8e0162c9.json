@@ -1,0 +1,48 @@
+{
+  "id": "8e0162c9",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('APP_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(key):\n    \"\"\"Verify API key using constant-time comparison\"\"\"\n    if not key:\n        return None\n    db = get_db()\n    # Lookup user by api_key prefix for performance\n    prefix = key[:8]\n    row = db.execute('SELECT * FROM users WHERE substr(api_key,1,8) = ?', (prefix,)).fetchone()\n    if row and hmac.compare_digest(row['api_key'], key):\n        return row\n    return None\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    api_key = request.headers.get('X-API-Key')\n    caller = verify_api_key(api_key)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    username = request.args.get('username', '')\n    role_filter = request.args.get('role', '')\n    \n    # Build search query with filters\n    query = \"SELECT id, username, email, role FROM users WHERE 1=1\"\n    \n    if username:\n        query += f\" AND username LIKE '%{username}%'\"\n    \n    if role_filter:\n        query += f\" AND role = '{role_filter}'\"\n    \n    # Log the search action\n    db = get_db()\n    db.execute('INSERT INTO audit_log (action, username) VALUES (?, ?)',\n               (f'search:{username}', caller['username']))\n    db.commit()\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except sqlite3.OperationalError as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 400\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    api_key = request.headers.get('X-API-Key')\n    caller = verify_api_key(api_key)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    row = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not row:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(row))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    api_key = request.headers.get('X-API-Key')\n    caller = verify_api_key(api_key)\n    if not caller or caller['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    \n    data = request.get_json()\n    username = data.get('username')\n    password = data.get('password')\n    email = data.get('email', '')\n    \n    if not username or not password:\n        return jsonify({'error': 'missing fields'}), 400\n    \n    password_hash = hashlib.sha256(password.encode()).hexdigest()\n    new_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, email, api_key) VALUES (?, ?, ?, ?)',\n                   (username, password_hash, email, new_key))\n        db.commit()\n        return jsonify({'api_key': new_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'user exists'}), 409\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on EC2 behind ALB. The ALB target group has a connection-draining timeout of 30s. An AWS WAF WebACL is associated with the ALB containing three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 1 with SizeRestriction_QUERYSTRING rule action override to Count, (2) a custom rule group 'internal-api-geo-restrict' at priority 2 that blocks requests not originating from RFC1918 source IPs (using IP set condition on X-Forwarded-For), (3) AWSManagedRulesSQLiRuleSet at priority 3 in default action mode. The custom geo-restrict rule uses a forwarded-IP header configuration inspecting the rightmost X-Forwarded-For address appended by the ALB. CloudWatch metrics enabled for sampled requests.",
+    "config": {
+      "alb": "internet-facing, listener 443 -> target group port 8080, WebACL associated",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestriction_QUERYSTRING",
+                "action": "count"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "internal-api-geo-restrict",
+            "type": "custom-ip-set",
+            "description": "IP set matching RFC1918 ranges on XFF rightmost, action BLOCK if NOT in set",
+            "ip_set": [
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16"
+            ],
+            "header_config": "forwarded_ip, X-Forwarded-For, LAST",
+            "action_on_no_match": "block"
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "override_action": "none"
+          }
+        ],
+        "default_action": "allow"
+      },
+      "security_group": "inbound 443/tcp from 0.0.0.0/0",
+      "instance": "t3.medium, Amazon Linux 2, gunicorn --workers 4 --bind 0.0.0.0:8080",
+      "network": "public subnet, IGW attached"
+    }
+  }
+}

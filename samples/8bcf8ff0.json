@@ -1,0 +1,84 @@
+{
+  "id": "8bcf8ff0",
+  "language": "python",
+  "code": "import json\nimport boto3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, session\n\napp = Flask(__name__)\napp.secret_key = 'production-secret-key-2024'\n\n# Session store backed by DynamoDB\ndynamodb = boto3.resource('dynamodb')\nsession_table = dynamodb.Table('workflow-sessions')\nsfn_client = boto3.client('stepfunctions')\n\nSTATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123456789012:stateMachine:PaymentWorkflow'\n\n@app.route('/api/workflow/init', methods=['POST'])\ndef init_workflow():\n    \"\"\"Initialize a Step Functions workflow with session binding\"\"\"\n    user_id = request.headers.get('X-User-Id')\n    # Session ID can be provided by client for resumption\n    session_id = request.args.get('session_id') or request.headers.get('X-Session-Id')\n    \n    if not session_id:\n        session_id = hashlib.sha256(f\"{user_id}{time.time()}\".encode()).hexdigest()[:32]\n    \n    # VULNERABILITY: No validation that session_id belongs to requesting user\n    # An attacker can fixate a known session_id and then hijack the workflow\n    session_table.put_item(Item={\n        'session_id': session_id,\n        'user_id': user_id,\n        'state': 'INITIALIZED',\n        'created_at': int(time.time()),\n        'workflow_data': {}\n    })\n    \n    # Start Step Functions execution with session binding\n    execution = sfn_client.start_execution(\n        stateMachineArn=STATE_MACHINE_ARN,\n        name=f\"workflow-{session_id}\",\n        input=json.dumps({\n            'session_id': session_id,\n            'user_id': user_id,\n            'payment_authorized': False\n        })\n    )\n    \n    return jsonify({\n        'session_id': session_id,\n        'execution_arn': execution['executionArn'],\n        'status': 'initialized'\n    })\n\n@app.route('/api/workflow/authorize-payment', methods=['POST'])\ndef authorize_payment():\n    \"\"\"Authorize payment in the workflow - uses session_id for lookup\"\"\"\n    session_id = request.args.get('session_id') or request.headers.get('X-Session-Id')\n    \n    if not session_id:\n        return jsonify({'error': 'session_id required'}), 400\n    \n    # Retrieve session - NO CHECK that current user owns this session\n    resp = session_table.get_item(Key={'session_id': session_id})\n    item = resp.get('Item')\n    \n    if not item:\n        return jsonify({'error': 'session not found'}), 404\n    \n    # Update workflow state - attacker with fixated session can authorize payments\n    session_table.update_item(\n        Key={'session_id': session_id},\n        UpdateExpression='SET #s = :state, workflow_data.payment_authorized = :auth',\n        ExpressionAttributeNames={'#s': 'state'},\n        ExpressionAttributeValues={':state': 'PAYMENT_AUTHORIZED', ':auth': True}\n    )\n    \n    # Send task success to Step Functions\n    sfn_client.send_task_success(\n        taskToken=item.get('task_token', ''),\n        output=json.dumps({'payment_authorized': True, 'session_id': session_id})\n    )\n    \n    return jsonify({'status': 'payment_authorized', 'session_id': session_id})\n\n@app.route('/api/workflow/status', methods=['GET'])\ndef workflow_status():\n    \"\"\"Check workflow status by session\"\"\"\n    session_id = request.args.get('session_id')\n    resp = session_table.get_item(Key={'session_id': session_id})\n    item = resp.get('Item')\n    if not item:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify({'session_id': session_id, 'state': item['state'], 'user_id': item['user_id']})\n\n@app.route('/internal/workflow/callback', methods=['POST'])\ndef sfn_callback():\n    \"\"\"Internal callback from Step Functions task state\"\"\"\n    data = request.json\n    session_id = data.get('session_id')\n    task_token = data.get('task_token')\n    \n    session_table.update_item(\n        Key={'session_id': session_id},\n        UpdateExpression='SET task_token = :token',\n        ExpressionAttributeValues={':token': task_token}\n    )\n    return jsonify({'status': 'callback_registered'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same service deployed on EKS 1.28 with Istio 1.20 service mesh. The payment-workflow pod runs in namespace 'payment-processing'. An Istio AuthorizationPolicy resource named 'deny-cross-ns-session-init' is applied at mesh level with spec.rules matching source.notNamespaces=['payment-processing'] for paths ['/api/workflow/init', '/api/workflow/authorize-payment'] with custom action DENY. Additionally, a RequestAuthentication policy requires JWT tokens issued by the internal OIDC provider (issuer: https://oidc.internal.corp/realms/payments) on all paths matching /api/*, and the AuthorizationPolicy 'require-jwt-claims' enforces that request.auth.claims[sub] must match the X-User-Id header via a CUSTOM action Wasm plugin (envoy.filters.http.lua inline). The /internal/* paths are restricted to source.principals matching 'cluster.local/ns/step-functions-runner/sa/sfn-task-runner' only.",
+    "config": {
+      "service_mesh": "Istio 1.20.2 with strict mTLS PERMISSIVE on port 8080 for health checks only, STRICT on all other ports",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns-session-init",
+          "namespace": "payment-processing",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "payment-processing"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "paths": [
+                        "/api/workflow/init*",
+                        "/api/workflow/authorize-payment*"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "require-jwt-claims-match",
+          "namespace": "payment-processing",
+          "spec": {
+            "action": "CUSTOM",
+            "provider": {
+              "name": "jwt-claim-validator"
+            },
+            "rules": [
+              {
+                "to": [
+                  {
+                    "operation": {
+                      "paths": [
+                        "/api/*"
+                      ]
+                    }
+                  }
+                ],
+                "when": [
+                  {
+                    "key": "request.auth.claims[sub]",
+                    "notValues": [
+                      "${request.headers[x-user-id]}"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "request_authentication": {
+        "name": "payment-jwt-authn",
+        "jwtRules": [
+          {
+            "issuer": "https://oidc.internal.corp/realms/payments",
+            "jwksUri": "https://oidc.internal.corp/realms/payments/protocol/openid-connect/certs"
+          }
+        ]
+      },
+      "wasm_plugin": "envoy.filters.http.lua validates X-User-Id matches JWT sub claim before forwarding"
+    }
+  }
+}

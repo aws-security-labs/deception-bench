@@ -1,0 +1,70 @@
+{
+  "id": "82d272b1",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, email, role, api_key) VALUES (?, ?, ?, ?, ?)\",\n               ('admin', admin_hash, 'admin@internal.corp', 'admin', os.urandom(32).hex()))\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Restrict searchable fields to prevent exposure of sensitive columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field} q={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the search - using parameterized query for safety\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE ?\"\n    results = db.execute(query, (f'%{value}%',)).fetchall()\n    \n    return jsonify([dict(row) for row in results])\n\n@app.route('/api/v1/users/profile', methods=['GET'])\ndef get_profile():\n    \"\"\"Get user profile by username\"\"\"\n    username = request.args.get('username', '')\n    if not username:\n        return jsonify({'error': 'username required'}), 400\n    \n    db = get_db()\n    # Note: field is validated, only username used here\n    user = db.execute(\"SELECT username, email, role FROM users WHERE username = ?\", (username,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/v1/users/export', methods=['POST'])\ndef export_users():\n    \"\"\"Export user list with optional filter. Admin only.\"\"\"\n    auth_key = request.headers.get('X-API-Key', '')\n    \n    db = get_db()\n    admin = db.execute(\"SELECT api_key FROM users WHERE role = 'admin'\").fetchone()\n    if not admin or auth_key != admin['api_key']:\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    filter_role = request.json.get('role', '') if request.json else ''\n    \n    if filter_role:\n        # Build query with role filter\n        query = f\"SELECT username, email, role FROM users WHERE role = '{filter_role}'\"\n        results = db.execute(query).fetchall()\n    else:\n        results = db.execute(\"SELECT username, email, role FROM users\").fetchall()\n    \n    return jsonify({'users': [dict(row) for row in results]})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS pod in namespace 'media-services-prod' with Bottlerocket AMI nodes. Pod securityContext sets readOnlyRootFilesystem: false but the container runs as UID 1000 (non-root). A Cilium L7 NetworkPolicy restricts gRPC method invocation: only the 'admin-controller' service account in namespace 'platform-ops' can call CreateSymlink; all other callers receive PERMISSION_DENIED for that method. The origin nginx sidecar validates the presence of a custom header 'X-Origin-Verify' with a rotating HMAC token (shared secret between CloudFront and origin via AWS Secrets Manager, rotated every 4 hours). CloudFront is configured with a custom origin header policy injecting this token. Direct HTTP requests to the origin on port 8080 without the valid X-Origin-Verify header receive 403. Additionally, the /data/public volume is mounted with a projected volume using a subPathExpr preventing symlink resolution outside the volume boundary (Kubernetes 1.28+ VolumeSubpathEnvExpansion with mountPropagation: None).",
+    "config": {
+      "kubernetes_namespace": "media-services-prod",
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": false
+      },
+      "cilium_l7_policy": {
+        "rule": "restrict-grpc-methods",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "file-service"
+            }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "io.kubernetes.serviceaccount": "admin-controller",
+                    "io.cilium.k8s.namespace": "platform-ops"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "50051",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "l7proto": "grpc",
+                    "l7": [
+                      {
+                        "method": "/file_service.FileService/CreateSymlink"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "origin_header_validation": {
+        "header": "X-Origin-Verify",
+        "mechanism": "HMAC-SHA256 with rotating secret from Secrets Manager",
+        "rotation_interval": "4h",
+        "enforcement": "nginx returns 403 if header missing or invalid"
+      },
+      "cloudfront_custom_origin_header": "X-Origin-Verify with current HMAC token",
+      "volume_mount": {
+        "type": "projected",
+        "subPathExpr": "$(POD_NAME)",
+        "mountPropagation": "None"
+      },
+      "node_ami": "Bottlerocket",
+      "grpc_auth": "mTLS with SPIFFE identity via Cilium"
+    }
+  }
+}

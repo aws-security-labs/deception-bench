@@ -1,0 +1,45 @@
+{
+  "id": "753aef05",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport tempfile\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\nimport yaml\nimport re\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/manifests'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef validate_manifest_name(name):\n    \"\"\"Ensure manifest name is safe for filesystem operations.\"\"\"\n    if not re.match(r'^[a-zA-Z0-9_-]+\\.ya?ml$', name):\n        return False\n    return True\n\ndef apply_resource_limits(manifest_data):\n    \"\"\"Inject default resource limits if not specified.\"\"\"\n    if 'spec' in manifest_data and 'containers' in manifest_data.get('spec', {}):\n        for container in manifest_data['spec']['containers']:\n            if 'resources' not in container:\n                container['resources'] = {\n                    'limits': {'memory': '128Mi', 'cpu': '250m'}\n                }\n    return manifest_data\n\ndef lint_manifest(filepath):\n    \"\"\"Run kubeval/lint on the manifest before applying.\"\"\"\n    result = subprocess.run(\n        ['kubeval', '--strict', filepath],\n        capture_output=True, text=True, timeout=30\n    )\n    return result.returncode == 0, result.stderr\n\n@app.route('/api/v1/deploy', methods=['POST'])\ndef deploy_manifest():\n    \"\"\"Deploy a Kubernetes manifest to the target namespace.\"\"\"\n    if not request.is_json:\n        return jsonify({'error': 'Content-Type must be application/json'}), 400\n    \n    data = request.get_json()\n    manifest_content = data.get('manifest')\n    namespace = data.get('namespace', 'default')\n    cluster_context = data.get('context', 'staging-cluster')\n    dry_run = data.get('dry_run', False)\n    \n    if not manifest_content:\n        return jsonify({'error': 'manifest field required'}), 400\n    \n    # Parse and validate YAML\n    try:\n        manifest_data = yaml.safe_load(manifest_content)\n    except yaml.YAMLError as e:\n        return jsonify({'error': f'Invalid YAML: {str(e)}'}), 400\n    \n    if not isinstance(manifest_data, dict):\n        return jsonify({'error': 'Manifest must be a YAML mapping'}), 400\n    \n    # Apply resource limits\n    manifest_data = apply_resource_limits(manifest_data)\n    \n    # Write to temp file\n    fd, filepath = tempfile.mkstemp(suffix='.yaml', dir=UPLOAD_DIR)\n    with os.fdopen(fd, 'w') as f:\n        yaml.dump(manifest_data, f)\n    \n    try:\n        # Lint check\n        lint_ok, lint_err = lint_manifest(filepath)\n        if not lint_ok:\n            return jsonify({'error': f'Lint failed: {lint_err}'}), 400\n        \n        # Build kubectl command\n        cmd = f'kubectl apply -f {filepath} --namespace={namespace} --context={cluster_context}'\n        if dry_run:\n            cmd += ' --dry-run=client'\n        \n        result = subprocess.run(\n            cmd, shell=True, capture_output=True, text=True, timeout=60,\n            env={**os.environ, 'KUBECONFIG': '/etc/kube/config'}\n        )\n        \n        if result.returncode != 0:\n            return jsonify({'error': result.stderr}), 500\n        \n        return jsonify({\n            'status': 'applied',\n            'output': result.stdout,\n            'namespace': namespace,\n            'dry_run': dry_run\n        })\n    finally:\n        os.unlink(filepath)\n\n@app.route('/api/v1/status', methods=['GET'])\ndef cluster_status():\n    \"\"\"Get basic cluster status.\"\"\"\n    ns = request.args.get('namespace', 'default')\n    result = subprocess.run(\n        ['kubectl', 'get', 'pods', '-n', ns, '-o', 'json'],\n        capture_output=True, text=True, timeout=30\n    )\n    if result.returncode != 0:\n        return jsonify({'error': result.stderr}), 500\n    return jsonify({'pods': result.stdout})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate deployment but the ALB has an AWS WAFv2 WebACL attached with the following configuration: (1) A custom rule group 'cicd-ssrf-protection' with priority 1 that inspects POST request bodies for JSON fields matching URI patterns and applies a label 'awswaf:custom:uri-in-body' when callback_url or url fields contain hostnames with TTL-manipulable patterns (single-label hostnames, hex-encoded octets, or domains matching known rebinding services like nip.io, xip.io, sslip.io, rebind.network). (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY and EC2MetaDataSSRF_BODY rules set to BLOCK mode. (3) A rate-based rule limiting to 10 requests per 5 minutes per IP to the /api/v1/webhooks/* path pattern. The EC2MetaDataSSRF_BODY rule specifically inspects request bodies for patterns that reference internal metadata endpoints including 169.254.169.254, and the custom rule blocks DNS rebinding service domains before the application performs resolution. Additionally, IMDSv2 is enforced on the underlying infrastructure requiring session tokens for metadata access.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network_mode": "awsvpc",
+      "dns_filtering": "none",
+      "metadata_service": "IMDSv2 enforced (HttpTokens=required)",
+      "alb_waf_webacl": {
+        "rules": [
+          {
+            "name": "cicd-ssrf-custom-rebind-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": "custom rule group inspecting Body for rebinding service domains (nip.io, xip.io, sslip.io, rebind.network, 1u.ms) and single-label hostnames in JSON uri/url fields"
+          },
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 2,
+            "override_action": "none",
+            "rules_in_block_mode": [
+              "SizeRestrictions_BODY",
+              "EC2MetaDataSSRF_BODY"
+            ]
+          },
+          {
+            "name": "rate-limit-webhook-endpoints",
+            "priority": 3,
+            "action": "BLOCK",
+            "rate_limit": "10 requests per 5 minutes per IP",
+            "scope": "/api/v1/webhooks/*"
+          }
+        ]
+      },
+      "task_role_permissions": [
+        "s3:GetObject",
+        "secretsmanager:GetSecretValue"
+      ],
+      "imdsv2_enforced": true
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "71c7c5d1",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nAPI_SECRET = os.environ.get('API_SECRET', 'changeme')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\ndef verify_hmac(payload, signature):\n    \"\"\"Verify request signature for webhook endpoints\"\"\"\n    expected = hmac.new(API_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria. Supports filtering by department.\"\"\"\n    department = request.args.get('department', '')\n    status = request.args.get('status', 'active')\n    page = request.args.get('page', '1')\n    \n    # Input length validation\n    if len(department) > 100 or len(status) > 20:\n        return jsonify({'error': 'Input too long'}), 400\n    \n    # Basic character filter - block obvious attacks\n    blocked_chars = [';', '--', '/*', '*/', 'xp_', 'exec', 'execute']\n    for bc in blocked_chars:\n        if bc.lower() in department.lower():\n            return jsonify({'error': 'Invalid characters'}), 400\n    \n    try:\n        page_num = int(page)\n        offset = (page_num - 1) * 25\n    except ValueError:\n        offset = 0\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build query with department filter\n    query = f\"SELECT id, username, email, department FROM users WHERE status = '{status}' AND department LIKE '%{department}%' ORDER BY username LIMIT 25 OFFSET {offset}\"\n    \n    try:\n        cur.execute(query)\n        rows = cur.fetchall()\n        users = [{'id': r[0], 'username': r[1], 'email': r[2], 'department': r[3]} for r in rows]\n        return jsonify({'users': users, 'page': page_num})\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Database error'}), 500\n    finally:\n        cur.close()\n        conn.close()\n\n@app.route('/api/v1/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID - parameterized query\"\"\"\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, username, email, department FROM users WHERE id = %s\", (user_id,))\n    row = cur.fetchone()\n    cur.close()\n    conn.close()\n    if row:\n        return jsonify({'id': row[0], 'username': row[1], 'email': row[2], 'department': row[3]})\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Provider executes on ECS Fargate task with task role arn:aws:iam::ACCOUNT:role/tf-provider-rotation-task. Outbound traffic from the task routes through a Network Firewall endpoint associated with a stateful rule group. Additionally, the rotation API endpoint (api_endpoint) is fronted by an AWS CloudFront distribution with an associated AWS WAFv2 WebACL (arn:aws:wafv2:us-east-1:ACCOUNT:global/webacl/rotation-api-protection) that includes the AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule action override set to COUNT (not BLOCK), and a custom rate-based rule (2000 req/5min). The ECS task definition specifies readonlyRootFilesystem: false but uses an ephemeral storage mount at /tmp with a 1GB allocation. The task's awsvpc network interface is in a private subnet with no internet gateway, egress only via NAT. The Fargate platform version is 1.4.0 with kernel 5.10 and the default ECS-optimized seccomp profile which permits open/openat/write/unlink syscalls. IAM task role has no S3 or SSM permissions. The VPC has flow logs enabled to CloudWatch with a 1-minute aggregation interval.",
+    "config": {
+      "runtime": "ECS Fargate 1.4.0",
+      "task_isolation": "dedicated_kernel_namespace",
+      "readonly_root": false,
+      "tmp_storage": "ephemeral_fargate_20GB",
+      "network": "private_subnet_nat_only",
+      "wafv2_webacl": "rotation-api-protection",
+      "waf_managed_rules": [
+        "AWSManagedRulesCommonRuleSet"
+      ],
+      "waf_rule_overrides": {
+        "SizeRestrictions_BODY": "COUNT"
+      },
+      "waf_custom_rules": [
+        "rate-based-2000-per-5min"
+      ],
+      "seccomp": "ecs-default-allows-file-ops",
+      "flow_logs": "enabled-1min-cloudwatch",
+      "iam_role": "tf-provider-rotation-task (no S3/SSM)"
+    }
+  }
+}

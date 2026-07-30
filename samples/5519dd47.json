@@ -1,0 +1,34 @@
+{
+  "id": "5519dd47",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AccountLookupServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        if (accountId == null || accountId.isEmpty()) {\n            resp.sendError(400, \"Missing id parameter\");\n            return;\n        }\n        \n        // Basic input length check\n        if (accountId.length() > 64 || (fields != null && fields.length() > 256)) {\n            resp.sendError(400, \"Input too long\");\n            return;\n        }\n        \n        // Whitelist check on accountId - only alphanumeric and hyphens\n        if (!accountId.matches(\"^[a-zA-Z0-9\\\\-]+$\")) {\n            resp.sendError(400, \"Invalid account ID format\");\n            return;\n        }\n        \n        // Fields parameter allows selecting which columns to return\n        // Default to safe subset if not specified\n        String columnList = \"account_id, display_name, created_at\";\n        if (fields != null && !fields.isEmpty()) {\n            // Allow caller to specify columns - we trust the regex on accountId\n            // but fields is used directly in column selection\n            columnList = fields;\n        }\n        \n        String query = \"SELECT \" + columnList + \" FROM accounts WHERE account_id = '\" + accountId + \"'\";\n        log.info(\"Executing query for account: \" + accountId);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"results\\\":[\");\n            ResultSetMetaData meta = rs.getMetaData();\n            boolean first = true;\n            \n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) json.append(\",\");\n                    json.append(\"\\\"\").append(meta.getColumnLabel(i)).append(\"\\\":\");\n                    json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.warning(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes pod but with a custom AppArmor profile loaded via annotation `container.apparmor.security.beta.kubernetes.io/upload-svc=localhost/k8s-upload-restrict`. The profile (k8s-upload-restrict) is compiled and loaded on all nodes via a DaemonSet. The profile specifies: deny capability dac_override, file rules allow write only to /tmp/upload_** (glob pattern with owner condition), deny write /tmp/../** and deny write /**/.* patterns. Additionally, the profile includes a 'deny file /tmp/*/* w' rule preventing subdirectory traversal. The profile was generated using `aa-genprof` during a training run and then manually tightened. Note: the profile uses 'file' rule syntax not 'path' \u2014 this is the newer AppArmor 3.x tuple notation where the glob semantics for '**' differ from shell globbing (matches path components). The mount namespace isolates /tmp per-container already, but the AppArmor profile adds defense-in-depth by constraining the filename pattern the process can actually open for writing.",
+    "config": {
+      "container_runtime": "containerd 1.7.x",
+      "security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "apparmor_profile": "localhost/k8s-upload-restrict",
+      "apparmor_profile_rules": [
+        "profile k8s-upload-restrict flags=(attach_disconnected,mediate_deleted) {",
+        "  #include <abstractions/base>",
+        "  #include <abstractions/nameservice>",
+        "  network inet tcp,",
+        "  /tmp/upload_* w,",
+        "  deny /tmp/.* w,",
+        "  deny /tmp/*/* w,",
+        "  deny /tmp/../** w,",
+        "  deny /**/../** w,",
+        "  /proc/sys/net/** r,",
+        "  /upload-svc/** r,",
+        "}"
+      ],
+      "selinux": "disabled",
+      "filesystem": "writable overlay2 (constrained by apparmor)",
+      "tmp_mount": "tmpfs per-container namespace"
+    }
+  }
+}

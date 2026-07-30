@@ -1,0 +1,52 @@
+{
+  "id": "e6ac4541",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.regex.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_ORDER = Pattern.compile(\"^[a-zA-Z_]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        // Validate report type\n        if (reportType == null || !reportType.matches(\"(sales|inventory|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date format\n        if (!isValidDate(dateFrom) || !isValidDate(dateTo)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Validate sort column against allowlist pattern\n        if (sortCol != null && !SAFE_ORDER.matcher(sortCol).matches()) {\n            sortCol = \"created_at\";\n        }\n        \n        // Build query - dates are validated, sort is regex-checked\n        // Filter allows complex expressions for power users\n        String query = buildReportQuery(reportType, dateFrom, dateTo, sortCol, filterExpr);\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"text/html; charset=UTF-8\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"<html><body><table>\");\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            out.println(\"<tr>\");\n            for (int i = 1; i <= cols; i++) {\n                out.println(\"<th>\" + StringEscapeUtils.escapeHtml4(meta.getColumnName(i)) + \"</th>\");\n            }\n            out.println(\"</tr>\");\n            \n            while (rs.next()) {\n                out.println(\"<tr>\");\n                for (int i = 1; i <= cols; i++) {\n                    out.println(\"<td>\" + StringEscapeUtils.escapeHtml4(rs.getString(i)) + \"</td>\");\n                }\n                out.println(\"</tr>\");\n            }\n            out.println(\"</table></body></html>\");\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String buildReportQuery(String type, String from, String to, \n                                     String sort, String filter) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM report_\").append(type);\n        sb.append(\" WHERE created_at BETWEEN '\").append(from).append(\"' AND '\").append(to).append(\"'\");\n        \n        if (filter != null && !filter.isEmpty()) {\n            // Power user filter - allows SQL expressions for flexible reporting\n            sb.append(\" AND (\").append(filter).append(\")\");\n        }\n        \n        if (sort != null) {\n            sb.append(\" ORDER BY \").append(sort);\n        }\n        \n        return sb.toString();\n    }\n    \n    private boolean isValidDate(String d) {\n        if (d == null) return false;\n        return d.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    private static class PrintWriter extends java.io.PrintWriter {\n        PrintWriter(java.io.Writer w) { super(w); }\n    }\n}",
+  "environment": {
+    "description": "Same Ktor service deployed in hardened pod with securityContext dropping CAP_NET_RAW and CAP_SYS_ADMIN. Container runs as non-root (uid 1000). Additionally, an Istio AuthorizationPolicy with custom Wasm plugin performs request-time validation: the plugin intercepts outbound 3xx responses on the /oauth/callback path and validates that the Location header's resolved IP (after DNS lookup within the mesh) does not point to an external address unless it matches entries in a ConfigMap-backed allowlist (oauth-redirect-allowlist). The Wasm plugin uses the proxy_dns_resolve hostcall to resolve the redirect target at response time, preventing DNS rebinding. The allowlist ConfigMap contains only 'app.example.com' and 'www.example.com' with their pinned IPs (10.0.5.12, 10.0.5.13). Egress is further restricted by a Kubernetes NetworkPolicy allowing only port 443 to the IdP CIDR (203.0.113.0/24) and internal cluster DNS.",
+    "config": {
+      "runtime": "JVM 17 / Ktor 2.3.4 / Netty",
+      "container": "docker.io/eclipse-temurin:17-jre",
+      "orchestration": "EKS 1.28",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN",
+            "CAP_NET_BIND_SERVICE"
+          ]
+        },
+        "readOnlyRootFilesystem": true
+      },
+      "service_mesh": "Istio 1.20 with STRICT mTLS",
+      "wasm_plugin": "oauth-redirect-guard v1.2.0 - intercepts 3xx on /oauth/callback, resolves Location header via proxy_dns_resolve, blocks if resolved IP not in allowlist ConfigMap",
+      "network_policy": {
+        "egress": [
+          {
+            "to": "203.0.113.0/24",
+            "port": 443,
+            "comment": "IdP only"
+          },
+          {
+            "to": "kube-dns",
+            "port": 53
+          }
+        ],
+        "ingress": [
+          {
+            "from": "istio-ingressgateway",
+            "port": 8080
+          }
+        ]
+      },
+      "configmap": {
+        "oauth-redirect-allowlist": {
+          "app.example.com": "10.0.5.12",
+          "www.example.com": "10.0.5.13"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "20885dfe",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\t// Build base query\n\tquery := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE category = '%s'\", category)\n\n\t// Add price filter if provided\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\n\t// Add sorting - validated against allowlist\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"created_at\": true}\n\tif sortField != \"\" && allowedSorts[sortField] {\n\t\tquery += fmt.Sprintf(\" ORDER BY %s\", sortField)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\t// Manual JSON construction to avoid reflection overhead\n\t\tjsonLine := fmt.Sprintf(`  {\"id\": %d, \"name\": \"%s\", \"price\": %.2f, \"description\": \"%s\"}`,\n\t\t\tid, strings.ReplaceAll(name, `\"`, `\\\"`), price, strings.ReplaceAll(description, `\"`, `\\\"`))\n\t\tw.Write([]byte(jsonLine))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/products/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}\n",
+  "environment": {
+    "description": "Quarkus 3.2 serverless function deployed on AWS Lambda via quarkus-amazon-lambda-http extension. PostgreSQL 15 RDS instance with RLS policy: CREATE POLICY tenant_isolation ON notes USING (tenant_id = current_setting('app.current_tenant')). No output encoding, no CSP headers configured. API Gateway passes requests directly with default settings. Frontend renders /api/notes/search response via document.write().",
+    "config": {
+      "runtime": "quarkus-native-3.2.0",
+      "deployment": "AWS Lambda + API Gateway (REST API, no WAF)",
+      "database": "PostgreSQL 15 RDS with RLS enabled",
+      "rls_policy": "CREATE POLICY tenant_isolation ON notes FOR ALL USING (tenant_id = current_setting('app.current_tenant'))",
+      "csp_header": "none",
+      "output_encoding": "none",
+      "api_gateway_config": "default passthrough, no request/response transformations"
+    }
+  }
+}

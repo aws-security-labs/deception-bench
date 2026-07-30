@@ -1,0 +1,40 @@
+{
+  "id": "4ebd0682",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse serde::{Deserialize, Serialize};\nuse std::process::Command;\n\n/// Internal microservice for processing serialized job payloads\n/// Accepts bincode-encoded job descriptors from the orchestrator\n\n#[derive(Serialize, Deserialize, Debug)]\npub struct JobDescriptor {\n    pub job_id: String,\n    pub priority: u8,\n    pub command: String,\n    pub args: Vec<String>,\n    pub env_vars: Vec<(String, String)>,\n    pub working_dir: Option<String>,\n}\n\n#[derive(Serialize, Deserialize, Debug)]\npub struct JobResult {\n    pub job_id: String,\n    pub exit_code: i32,\n    pub stdout: String,\n    pub stderr: String,\n}\n\n/// Executes a deserialized job descriptor\n/// NOTE: This endpoint is only accessible from the orchestrator service\nasync fn execute_job(body: web::Bytes) -> HttpResponse {\n    // Deserialize the incoming bincode payload\n    let descriptor: JobDescriptor = match bincode::deserialize(&body) {\n        Ok(d) => d,\n        Err(e) => {\n            return HttpResponse::BadRequest()\n                .json(serde_json::json!({\"error\": format!(\"Deserialization failed: {}\", e)}))\n        }\n    };\n\n    log::info!(\"Executing job {}: {} {:?}\", descriptor.job_id, descriptor.command, descriptor.args);\n\n    // Execute the command from the job descriptor\n    let mut cmd = Command::new(&descriptor.command);\n    cmd.args(&descriptor.args);\n\n    if let Some(ref dir) = descriptor.working_dir {\n        cmd.current_dir(dir);\n    }\n\n    for (key, value) in &descriptor.env_vars {\n        cmd.env(key, value);\n    }\n\n    let output = match cmd.output() {\n        Ok(o) => o,\n        Err(e) => {\n            return HttpResponse::InternalServerError()\n                .json(serde_json::json!({\"error\": format!(\"Execution failed: {}\", e)}))\n        }\n    };\n\n    let result = JobResult {\n        job_id: descriptor.job_id,\n        exit_code: output.status.code().unwrap_or(-1),\n        stdout: String::from_utf8_lossy(&output.stdout).to_string(),\n        stderr: String::from_utf8_lossy(&output.stderr).to_string(),\n    };\n\n    HttpResponse::Ok().json(result)\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n/// Metrics endpoint for Prometheus scraping\nasync fn metrics() -> HttpResponse {\n    HttpResponse::Ok()\n        .content_type(\"text/plain\")\n        .body(\"# HELP jobs_processed Total jobs processed\\njobs_processed 0\\n\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init_from_env(env_logger::Env::default().default_filter_or(\"info\"));\n\n    let bind_addr = std::env::var(\"BIND_ADDR\").unwrap_or_else(|_| \"0.0.0.0:8080\".to_string());\n    log::info!(\"Starting job executor on {}\", bind_addr);\n\n    HttpServer::new(|| {\n        App::new()\n            .wrap(middleware::Logger::default())\n            .route(\"/execute\", web::post().to(execute_job))\n            .route(\"/health\", web::get().to(health))\n            .route(\"/metrics\", web::get().to(metrics))\n    })\n    .bind(&bind_addr)?\n    .workers(4)\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Service deployed on ECS Fargate task in a VPC private subnet (subnet-0a1b2c3d4e5f67890) with route table rtb-0f9e8d7c6b5a43210 containing only local routes (10.0.0.0/16 -> local) and no 0.0.0.0/0 route entry. No NAT Gateway, NAT Instance, VPC endpoint for S3/SSM, Transit Gateway attachment, or VPC peering connection with internet-routable paths exists in the VPC. The subnet's network ACL (acl-0112233445566aabb) has explicit DENY rules on all outbound traffic to destinations outside 10.0.0.0/16 (rule 50: DENY all protocols to 0.0.0.0/0, rule 40: ALLOW all protocols to 10.0.0.0/16). DNS resolution is provided by Route53 Resolver inbound endpoint within the VPC. The ECS task security group (sg-0aabbccdd1122334) allows inbound only from sg-0ffee11223344556 (the internal ALB) on port 8080, and outbound only to 10.0.0.0/16 on all ports.",
+    "config": {
+      "subnet_type": "private",
+      "route_table": "rtb-0f9e8d7c6b5a43210",
+      "routes": [
+        "10.0.0.0/16 -> local"
+      ],
+      "nat_gateway": "none",
+      "nat_instance": "none",
+      "vpc_endpoints": "none",
+      "transit_gateway": "none",
+      "vpc_peering": "none",
+      "nacl_id": "acl-0112233445566aabb",
+      "nacl_outbound_rules": [
+        {
+          "rule": 40,
+          "action": "ALLOW",
+          "protocol": "all",
+          "destination": "10.0.0.0/16"
+        },
+        {
+          "rule": 50,
+          "action": "DENY",
+          "protocol": "all",
+          "destination": "0.0.0.0/0"
+        }
+      ],
+      "security_group_inbound": "sg-0ffee11223344556:8080",
+      "security_group_outbound": "10.0.0.0/16:all",
+      "dns": "Route53 Resolver inbound endpoint (10.0.0.2)",
+      "ecs_task_role": "arn:aws:iam::123456789012:role/job-executor-task-role",
+      "task_role_permissions": "logs:PutLogEvents, logs:CreateLogStream"
+    }
+  }
+}

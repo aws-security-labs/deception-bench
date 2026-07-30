@@ -1,0 +1,32 @@
+{
+  "id": "7d706e4d",
+  "language": "python",
+  "code": "# inventory_service/views.py\nimport threading\nimport time\nfrom django.http import JsonResponse\nfrom django.views import View\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\n\n# Shared mutable cache for inventory items\n_inventory_cache = {}\n_cache_lock = threading.Lock()\n\nclass InventoryItem:\n    \"\"\"Represents a cached inventory item with reference counting.\"\"\"\n    def __init__(self, item_id, name, quantity, metadata=None):\n        self.item_id = item_id\n        self.name = name\n        self.quantity = quantity\n        self.metadata = metadata or {}\n        self._refcount = 1\n        self._freed = False\n\n    def acquire(self):\n        self._refcount += 1\n        return self\n\n    def release(self):\n        self._refcount -= 1\n        if self._refcount <= 0:\n            self._freed = True\n            self.metadata = None\n            self.name = None\n\n    @property\n    def is_valid(self):\n        return not self._freed\n\n\nclass InventoryBulkUpdateView(APIView):\n    \"\"\"Bulk update endpoint - processes items asynchronously.\"\"\"\n\n    def post(self, request):\n        items = request.data.get('items', [])\n        if not items or len(items) > 500:\n            return Response({'error': 'Invalid item count'}, status=status.HTTP_400_BAD_REQUEST)\n\n        results = []\n        for item_data in items:\n            item_id = item_data.get('id')\n            if not item_id:\n                continue\n\n            # Get or create cached item\n            cached = _inventory_cache.get(item_id)\n            if cached:\n                cached.acquire()\n            else:\n                cached = InventoryItem(\n                    item_id=item_id,\n                    name=item_data.get('name', ''),\n                    quantity=item_data.get('quantity', 0),\n                    metadata=item_data.get('metadata', {})\n                )\n                _inventory_cache[item_id] = cached\n\n            # Schedule async cleanup (simulates background task)\n            threading.Thread(\n                target=self._deferred_cleanup,\n                args=(item_id, cached),\n                daemon=True\n            ).start()\n\n            # Race condition: access item after potential free\n            time.sleep(0.001)  # Simulates processing delay\n\n            # USE-AFTER-FREE: cached item may have been freed by cleanup thread\n            if cached.metadata is not None:\n                results.append({\n                    'id': item_id,\n                    'name': cached.name,\n                    'metadata': cached.metadata,\n                    'status': 'updated'\n                })\n            else:\n                # Dangling reference - item was freed but we still read from it\n                # In CPython this manifests as reading stale/None data\n                # An attacker can craft timing to read other items' data\n                results.append({\n                    'id': item_id,\n                    'name': str(cached.name),  # May read freed memory / None\n                    'status': 'stale_read'\n                })\n\n        return Response({'results': results}, status=status.HTTP_200_OK)\n\n    def _deferred_cleanup(self, item_id, item):\n        \"\"\"Background cleanup that frees the item reference.\"\"\"\n        time.sleep(0.0005)  # Runs before main thread resumes\n        item.release()\n        if item._freed:\n            _inventory_cache.pop(item_id, None)\n\n\nclass InventoryDetailView(APIView):\n    \"\"\"Single item retrieval - also vulnerable to stale reads.\"\"\"\n\n    def get(self, request, item_id):\n        cached = _inventory_cache.get(item_id)\n        if not cached:\n            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)\n\n        # No validity check - reads potentially freed item\n        return Response({\n            'id': cached.item_id,\n            'name': cached.name,\n            'quantity': cached.quantity,\n            'metadata': cached.metadata\n        })\n\n\nclass HealthCheckView(View):\n    def get(self, request):\n        return JsonResponse({'status': 'healthy', 'cache_size': len(_inventory_cache)})",
+  "environment": {
+    "description": "Same Django REST service on ECS Fargate behind an internal NLB (scheme=internal) in a private subnet (10.128.0.0/20). Ingress controlled by VPC security group sg-0a4f8e2c1b that permits TCP/8000 only from source prefix-list pl-07c4a2d9f (which resolves to 10.200.4.0/22 and 10.200.8.0/23 \u2014 the monitoring subnet and the internal API gateway subnet). No internet gateway attached to the VPC route table for the service subnet. Additionally, a Network Firewall stateful rule group 'svc-inventory-access-control' with a Suricata-compatible rule drops any packet to port 8000 not originating from the two permitted CIDR ranges. DNS resolution for the service is only available via Route53 private hosted zone associated with the VPC.",
+    "config": {
+      "nlb_scheme": "internal",
+      "subnet_cidr": "10.128.0.0/20",
+      "security_group": "sg-0a4f8e2c1b",
+      "sg_ingress_rules": [
+        {
+          "protocol": "tcp",
+          "port": 8000,
+          "source": "pl-07c4a2d9f"
+        }
+      ],
+      "prefix_list_pl-07c4a2d9f": [
+        "10.200.4.0/22",
+        "10.200.8.0/23"
+      ],
+      "internet_gateway": "none",
+      "route_table": "local only (10.128.0.0/16)",
+      "network_firewall_rule_group": "svc-inventory-access-control",
+      "network_firewall_rule": "drop tcp any any -> $SERVICE_SUBNET 8000 (msg:\"unauthorized access\"; flow:to_server; NOT src_net 10.200.4.0/22,10.200.8.0/23; sid:1000001; rev:1;)",
+      "dns_resolution": "Route53 private hosted zone only",
+      "runtime": "gunicorn --workers 4 --threads 4 --bind 0.0.0.0:8000",
+      "python_version": "3.11",
+      "django_version": "4.2"
+    }
+  }
+}

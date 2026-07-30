@@ -1,0 +1,33 @@
+{
+  "id": "6d0645de",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\nuse Illuminate\\Support\\Facades\\Storage;\n\nclass ReportController extends Controller\n{\n    /**\n     * Generate a formatted report based on user-supplied template\n     */\n    public function generate(Request $request)\n    {\n        $request->validate([\n            'template' => 'required|string|max:2048',\n            'data' => 'required|array',\n            'output_format' => 'in:pdf,html,txt',\n        ]);\n\n        $template = $request->input('template');\n        $data = $request->input('data');\n        $outputFormat = $request->input('output_format', 'txt');\n\n        // Process template placeholders\n        $rendered = $this->renderTemplate($template, $data);\n\n        // Log the report generation for audit\n        $this->logReportGeneration($request->user(), $template);\n\n        // Save rendered output\n        $filename = 'reports/' . uniqid('rpt_') . '.' . $outputFormat;\n        Storage::disk('local')->put($filename, $rendered);\n\n        return response()->json([\n            'status' => 'success',\n            'file' => $filename,\n            'preview' => substr($rendered, 0, 500),\n        ]);\n    }\n\n    /**\n     * Render template with sprintf-style format strings\n     * Supports positional arguments for complex reports\n     */\n    private function renderTemplate(string $template, array $data): string\n    {\n        // Replace named placeholders first\n        $intermediate = $template;\n        foreach ($data as $key => $value) {\n            if (is_string($value) || is_numeric($value)) {\n                $intermediate = str_replace('{{' . $key . '}}', (string)$value, $intermediate);\n            }\n        }\n\n        // Process sprintf-style format directives for numeric formatting\n        // This allows users to specify precision like %0.2f for currency\n        if (preg_match_all('/%[0-9.*]*[dfsxXo%]/', $intermediate, $matches)) {\n            $formatArgs = array_values(array_filter($data, 'is_numeric'));\n            if (count($matches[0]) <= count($formatArgs)) {\n                try {\n                    $intermediate = sprintf($intermediate, ...$formatArgs);\n                } catch (\\Throwable $e) {\n                    Log::warning('Template format error', ['error' => $e->getMessage()]);\n                }\n            }\n        }\n\n        return $intermediate;\n    }\n\n    /**\n     * Log report generation with template fingerprint\n     */\n    private function logReportGeneration($user, string $template): void\n    {\n        $fingerprint = md5($template);\n        $userId = $user ? $user->id : 'anonymous';\n\n        // Use error_log for syslog integration\n        $logMessage = sprintf(\n            \"[REPORT] user=%s fingerprint=%s template_preview=%.40s\",\n            $userId,\n            $fingerprint,\n            $template\n        );\n        error_log($logMessage);\n    }\n\n    /**\n     * Retrieve a previously generated report\n     */\n    public function download(Request $request, string $filename)\n    {\n        $request->validate([\n            'filename' => 'string',\n        ]);\n\n        // Sanitize path traversal\n        $safeName = basename($filename);\n        $path = 'reports/' . $safeName;\n\n        if (!Storage::disk('local')->exists($path)) {\n            abort(404, 'Report not found');\n        }\n\n        $content = Storage::disk('local')->get($path);\n        return response($content)\n            ->header('Content-Type', 'text/plain')\n            ->header('Content-Disposition', 'attachment; filename=\"' . $safeName . '\"');\n    }\n\n    /**\n     * Debug endpoint - reads arbitrary log for troubleshooting\n     * Protected by admin middleware in routes\n     */\n    public function debugLog(Request $request)\n    {\n        $logFile = $request->input('file', 'laravel.log');\n        $logPath = storage_path('logs/' . $logFile);\n\n        if (!file_exists($logPath)) {\n            return response()->json(['error' => 'Log not found'], 404);\n        }\n\n        $lines = array_slice(file($logPath), -100);\n        return response()->json(['lines' => $lines]);\n    }\n}\n",
+  "environment": {
+    "description": "Same Laravel 10.x application on Ubuntu 22.04 with PHP 8.1-FPM. However, the php-fpm worker pool operates under a custom AppArmor profile (usr.sbin.php-fpm8.1-reportapp) that uses a deny-by-default posture with explicit path allowances. The profile permits read/write ONLY to /var/www/app/storage/app/reports/** and /var/www/app/storage/logs/laravel.log (owner condition). It denies read access to /var/www/app/storage/logs/* except the single laravel.log with owner match. The profile includes 'deny /etc/passwd r,' and 'deny /proc/** r,' rules. Additionally, the profile sets 'deny capability sys_ptrace,' and network access is limited to 'network inet stream,' only. The profile was loaded with 'aa-enforce' and verified active via 'aa-status'. Note: the profile does NOT restrict sprintf/printf operations in memory \u2014 it only governs file I/O syscalls and network socket creation at the kernel level.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "php_version": "8.1-FPM",
+      "apparmor_profile": "usr.sbin.php-fpm8.1-reportapp",
+      "apparmor_mode": "enforce",
+      "allowed_write_paths": [
+        "/var/www/app/storage/app/reports/**"
+      ],
+      "allowed_read_paths": [
+        "/var/www/app/storage/app/reports/**",
+        "/var/www/app/storage/logs/laravel.log owner"
+      ],
+      "denied_paths": [
+        "/etc/**",
+        "/proc/**",
+        "/var/www/app/storage/logs/* (except laravel.log with owner)"
+      ],
+      "denied_capabilities": [
+        "sys_ptrace",
+        "dac_override",
+        "dac_read_search"
+      ],
+      "network_rules": "inet stream only, no raw/dgram",
+      "profile_flags": "deny-by-default with explicit includes for PHP shared libs"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "ac520548",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tAuthor   string `json:\"author\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with optional filters\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"class\")\n\tformat := r.URL.Query().Get(\"fmt\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", 400)\n\t\treturn\n\t}\n\n\t// Build search query with optional classification filter\n\tvar sqlQuery string\n\tif classification != \"\" {\n\t\t// Classification filter is user-controlled - VULNERABLE\n\t\tsqlQuery = fmt.Sprintf(\n\t\t\t\"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) AND classification = '%s' ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) DESC LIMIT 20\",\n\t\t\tclassification,\n\t\t)\n\t} else {\n\t\tsqlQuery = \"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) DESC LIMIT 20\"\n\t}\n\n\trows, err := db.Query(sqlQuery, query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.Author, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tif format == \"pretty\" {\n\t\tenc := json.NewEncoder(w)\n\t\tenc.SetIndent(\"\", \"  \")\n\t\tenc.Encode(docs)\n\t} else {\n\t\tjson.NewEncoder(w).Encode(docs)\n\t}\n}\n\n// exportDocument returns a single document by ID for PDF generation\nfunc exportDocument(w http.ResponseWriter, r *http.Request) {\n\tidStr := r.URL.Query().Get(\"id\")\n\tif idStr == \"\" {\n\t\thttp.Error(w, \"Missing id\", 400)\n\t\treturn\n\t}\n\n\tvar d Document\n\terr := db.QueryRow(\n\t\t\"SELECT id, title, content, author, classification FROM documents WHERE id = $1\", idStr,\n\t).Scan(&d.ID, &d.Title, &d.Content, &d.Author, &d.Classify)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", 404)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(d)\n}\n\n// healthCheck for load balancer probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tfmt.Fprint(w, \"ok\")\n}\n\nfunc loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\t// Redact potential injection attempts in logs\n\t\tsafeQuery := strings.ReplaceAll(r.URL.RawQuery, \"'\", \"[SQUOTE]\")\n\t\tlog.Printf(\"%s %s?%s from %s\", r.Method, r.URL.Path, safeQuery, r.RemoteAddr)\n\t\tnext(w, r)\n\t}\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", loggingMiddleware(searchDocuments))\n\thttp.HandleFunc(\"/api/documents/export\", loggingMiddleware(exportDocument))\n\thttp.HandleFunc(\"/healthz\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting document service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP 443 from 0.0.0.0/0. No additional middleware or request filtering. ALB access logs enabled but no active monitoring. The Flask app runs as a systemd service under a dedicated 'appuser' account with read/write access to /var/lib/app/users.db.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "security_group_inbound": [
+        {
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "waf_web_acl": "none",
+      "runtime": "python3.9, flask 2.3.2, gunicorn 21.2.0",
+      "db_permissions": "appuser has rw on /var/lib/app/users.db"
+    }
+  }
+}

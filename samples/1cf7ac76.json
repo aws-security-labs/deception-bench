@@ -1,0 +1,46 @@
+{
+  "id": "1cf7ac76",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class AssetInventoryServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(AssetInventoryServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"INVENTORY_DB_URL\");\n    private static final String DB_USER = System.getenv(\"INVENTORY_DB_USER\");\n    private static final String DB_PASS = System.getenv(\"INVENTORY_DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String assetType = req.getParameter(\"type\");\n        String location = req.getParameter(\"location\");\n        String sortField = req.getParameter(\"sort\");\n        String tenantId = req.getHeader(\"X-Tenant-ID\");\n\n        // Validate tenant header presence\n        if (tenantId == null || tenantId.isEmpty()) {\n            resp.sendError(403, \"Missing tenant context\");\n            return;\n        }\n\n        // Basic input sanitization for type and location\n        if (assetType != null && !assetType.matches(\"[a-zA-Z0-9_-]+\")) {\n            resp.sendError(400, \"Invalid asset type format\");\n            return;\n        }\n        if (location != null && !location.matches(\"[a-zA-Z0-9_/ -]+\")) {\n            resp.sendError(400, \"Invalid location format\");\n            return;\n        }\n\n        // Build query - sort field is validated against allowlist... partially\n        String baseQuery = \"SELECT asset_id, asset_name, asset_type, location, status, last_scan_date \" +\n                          \"FROM asset_inventory WHERE tenant_id = '\" + tenantId + \"'\";\n\n        if (assetType != null) {\n            baseQuery += \" AND asset_type = '\" + assetType + \"'\";\n        }\n        if (location != null) {\n            baseQuery += \" AND location = '\" + location + \"'\";\n        }\n\n        // Sort field handling - developer assumed header validation upstream\n        if (sortField != null && !sortField.isEmpty()) {\n            // Note: sort field comes from query param, not validated with regex above\n            baseQuery += \" ORDER BY \" + sortField;\n        } else {\n            baseQuery += \" ORDER BY last_scan_date DESC\";\n        }\n\n        baseQuery += \" LIMIT 100\";\n\n        logger.info(\"Asset query for tenant \" + tenantId + \": type=\" + assetType + \", loc=\" + location);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(baseQuery)) {\n\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject asset = new JSONObject();\n                asset.put(\"id\", rs.getString(\"asset_id\"));\n                asset.put(\"name\", rs.getString(\"asset_name\"));\n                asset.put(\"type\", rs.getString(\"asset_type\"));\n                asset.put(\"location\", rs.getString(\"location\"));\n                asset.put(\"status\", rs.getString(\"status\"));\n                asset.put(\"lastScan\", rs.getString(\"last_scan_date\"));\n                results.put(asset);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n\n        } catch (SQLException e) {\n            logger.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Asset registration endpoint - uses PreparedStatement (safe)\n        String tenantId = req.getHeader(\"X-Tenant-ID\");\n        if (tenantId == null) { resp.sendError(403); return; }\n\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) body.append(line);\n\n        try {\n            JSONObject payload = new JSONObject(body.toString());\n            String insertSQL = \"INSERT INTO asset_inventory (tenant_id, asset_name, asset_type, location, status) VALUES (?, ?, ?, ?, ?)\";\n\n            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n                 PreparedStatement pstmt = conn.prepareStatement(insertSQL)) {\n                pstmt.setString(1, tenantId);\n                pstmt.setString(2, payload.getString(\"name\"));\n                pstmt.setString(3, payload.getString(\"type\"));\n                pstmt.setString(4, payload.getString(\"location\"));\n                pstmt.setString(5, \"active\");\n                pstmt.executeUpdate();\n            }\n            resp.setStatus(201);\n        } catch (Exception e) {\n            resp.sendError(400, \"Invalid payload\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function in VPC (subnet-0e5f6a7b) with Step Functions state machine 'DataPipelineOrchestrator-prod'. S3 access is routed through a Gateway VPC Endpoint (vpce-0x9y8z7w6v) with an endpoint policy that includes a condition restricting requests: the policy allows s3:PutObject and s3:GetObject ONLY when aws:Referer header matches the internal tracking token AND the s3:prefix condition key starts with 'configs/' or 'baselines/' for the specific bucket. Additionally, the VPC has no NAT gateway and no internet gateway attached \u2014 all outbound traffic is restricted to VPC endpoints only (S3 gateway endpoint, DynamoDB endpoint, and STS interface endpoint). Security group on Lambda ENI allows egress only to the S3 prefix list (pl-63a5400a) and the internal ALB CIDR (10.0.0.0/16). DNS resolution for external domains fails as there is no Route53 resolver outbound endpoint configured for non-internal zones.",
+    "config": {
+      "vpc_id": "vpc-0def789abc012",
+      "subnet": "subnet-0e5f6a7b",
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "s3_vpc_endpoint": "vpce-0x9y8z7w6v",
+      "s3_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": [
+          "s3:PutObject",
+          "s3:GetObject"
+        ],
+        "Resource": "arn:aws:s3:::pipeline-results-prod/*",
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "configs/*",
+              "baselines/*"
+            ]
+          }
+        }
+      },
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "10.0.0.0/16"
+        }
+      ],
+      "route53_resolver": "internal-zones-only",
+      "dns_resolution": "private-hosted-zones-only"
+    }
+  }
+}

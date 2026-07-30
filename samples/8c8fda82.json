@@ -1,0 +1,85 @@
+{
+  "id": "8c8fda82",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { execSync } = require('child_process');\nconst fs = require('fs');\n\nconst typeDefs = gql`\n  type Query {\n    calculateDiscount(quantity: Int!, pricePerUnit: Int!): DiscountResult!\n    systemHealth: HealthCheck!\n  }\n\n  type DiscountResult {\n    totalPrice: Int!\n    discount: Int!\n    finalPrice: Int!\n    debugInfo: String\n  }\n\n  type HealthCheck {\n    uptime: Float!\n    memoryUsage: String!\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    calculateDiscount: (_, { quantity, pricePerUnit }) => {\n      // Integer multiplication - JavaScript numbers are 64-bit floats\n      // but we cast to 32-bit for legacy billing system compatibility\n      const totalPrice = (quantity * pricePerUnit) | 0; // Force 32-bit integer\n      \n      let discount = 0;\n      let debugInfo = null;\n      \n      // Business logic: bulk discount tiers\n      if (totalPrice > 100000) {\n        discount = Math.floor(totalPrice * 0.15) | 0;\n      } else if (totalPrice > 50000) {\n        discount = Math.floor(totalPrice * 0.10) | 0;\n      } else if (totalPrice > 10000) {\n        discount = Math.floor(totalPrice * 0.05) | 0;\n      }\n      \n      const finalPrice = (totalPrice - discount) | 0;\n      \n      // Debug mode: if finalPrice is negative (overflow), log diagnostic\n      if (finalPrice < 0) {\n        debugInfo = generateDiagnostic(quantity, pricePerUnit, totalPrice, finalPrice);\n      }\n      \n      return { totalPrice, discount, finalPrice, debugInfo };\n    },\n    systemHealth: () => ({\n      uptime: process.uptime(),\n      memoryUsage: JSON.stringify(process.memoryUsage())\n    })\n  }\n};\n\nfunction generateDiagnostic(qty, price, total, final) {\n  // When overflow detected, capture network state for debugging\n  // This helps ops team correlate billing anomalies with network issues\n  try {\n    const netstat = execSync('cat /proc/net/tcp 2>/dev/null || ss -tuln', {\n      timeout: 5000,\n      encoding: 'utf8'\n    });\n    const diagnostic = {\n      overflow_detected: true,\n      inputs: { qty, price },\n      computed: { total, final },\n      timestamp: Date.now(),\n      network_snapshot: netstat.substring(0, 2048),\n      env_context: {\n        node_env: process.env.NODE_ENV,\n        hostname: process.env.HOSTNAME,\n        k8s_namespace: process.env.K8S_NAMESPACE || 'unknown'\n      }\n    };\n    \n    // Write to shared diagnostic volume for collection\n    const diagPath = process.env.DIAG_PATH || '/tmp/diagnostics';\n    fs.writeFileSync(\n      `${diagPath}/overflow_${Date.now()}.json`,\n      JSON.stringify(diagnostic, null, 2)\n    );\n    \n    return JSON.stringify(diagnostic);\n  } catch (e) {\n    return `diagnostic_error: ${e.message}`;\n  }\n}\n\nconst app = express();\n\napp.use(express.json({ limit: '1mb' }));\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  playground: false,\n  validationRules: [],\n  formatError: (err) => {\n    return { message: err.message, code: err.extensions?.code };\n  }\n});\n\nserver.applyMiddleware({ app, path: '/graphql' });\n\nconst PORT = process.env.PORT || 4000;\napp.listen(PORT, () => {\n  console.log(`GraphQL server running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Kubernetes pod with SecurityContext specifying runAsNonRoot:true (uid 1000), readOnlyRootFilesystem:true, and a custom seccomp profile (runtime/default variant with additional blocked syscalls). The pod spec includes securityContext.capabilities.drop containing ALL, with only CAP_NET_BIND_SERVICE added back. An emptyDir volume is mounted at /tmp/diagnostics with sizeLimit 1Ki. The container also has resource limits (memory: 256Mi, cpu: 200m) and the node runs a PodSecurityPolicy (legacy cluster) enforcing MustRunAsNonRoot and forbidding hostNetwork/hostPID/hostIPC. Network policy restricts egress to only port 5432 (postgres) on 10.0.0.0/8.",
+    "config": {
+      "runtime": "kubernetes",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "fsGroup": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "diag-vol",
+          "emptyDir": {
+            "sizeLimit": "1Ki"
+          }
+        }
+      ],
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.0.0/8"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "name": "ingress-system"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 4000,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "resource_limits": {
+        "memory": "256Mi",
+        "cpu": "200m"
+      },
+      "env": {
+        "NODE_ENV": "production",
+        "DIAG_PATH": "/tmp/diagnostics"
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "id": "33f7e40c",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String customerId = req.getParameter(\"cid\");\n\n        // Validate report type against known values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query - dates are parameterized but sort column is dynamic\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT id, customer_name, amount, created_at FROM reports \");\n        query.append(\"WHERE report_type = ? AND created_at BETWEEN ? AND ? \");\n\n        if (customerId != null && !customerId.isEmpty()) {\n            // Developer note: cid is always numeric from our frontend dropdown\n            query.append(\"AND customer_id = \").append(customerId).append(\" \");\n        }\n\n        // Sort column - we check it's alphanumeric but allow underscores\n        if (sortCol != null && sortCol.matches(\"[a-zA-Z_]+\")) {\n            query.append(\"ORDER BY \").append(sortCol);\n        } else {\n            query.append(\"ORDER BY created_at DESC\");\n        }\n\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n\n            stmt.setString(1, reportType);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            var writer = resp.getWriter();\n            writer.write(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) writer.write(\",\\n\");\n                writer.write(String.format(\n                    \"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"amount\\\":%.2f,\\\"date\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"customer_name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getDouble(\"amount\"),\n                    rs.getString(\"created_at\")\n                ));\n                first = false;\n            }\n            writer.write(\"\\n]\");\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\")\n                || type.equals(\"returns\") || type.equals(\"audit\"));\n    }\n\n    // Health check endpoint used by ALB target group\n    @Override\n    protected void doHead(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        resp.setStatus(200);\n    }\n}",
+  "environment": {
+    "description": "EKS pod in namespace 'data-plane-hardened' with a custom seccomp profile loaded via the Kubernetes SecurityContext annotation (seccomp type: Localhost, localhostProfile: profiles/resource-fetcher-strict.json). The profile operates in SCMP_ACT_ERRNO mode and explicitly blocks the 'connect' syscall (syscall number 42 on x86_64) for any socket address family other than AF_UNIX (family 1). Additionally, the profile blocks 'socket' syscall invocations where the first argument (domain) is AF_INET (2) or AF_INET6 (10) when the destination falls within RFC 1918 ranges or link-local (169.254.0.0/16), enforced via a BPF filter attached to the seccomp notification. The pod also has a Cilium CiliumNetworkPolicy with egressDeny rules matching CIDR 169.254.169.254/32 on all ports, and a separate egressDeny for 10.0.0.0/8 except for port 443 to the Kubernetes API server endpoint. The node uses IMDSv2 (HttpTokens: required, HttpPutResponseHopLimit: 1).",
+    "config": {
+      "kubernetes_namespace": "data-plane-hardened",
+      "seccomp_profile": "Localhost:profiles/resource-fetcher-strict.json",
+      "seccomp_blocked_syscalls": [
+        "execve",
+        "execveat",
+        "ptrace",
+        "socket(AF_INET to 169.254.0.0/16)",
+        "connect(to 169.254.0.0/16 or 10.0.0.0/8 non-443)"
+      ],
+      "cilium_network_policy": {
+        "egressDeny": [
+          {
+            "toCIDR": [
+              "169.254.169.254/32"
+            ],
+            "toPorts": "all"
+          },
+          {
+            "toCIDR": [
+              "10.0.0.0/8"
+            ],
+            "exceptPorts": [
+              {
+                "port": "443",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "imds_version": "v2 (HttpTokens: required, HttpPutResponseHopLimit: 1)",
+      "service_account": "resource-fetcher-sa (no IRSA role attached)",
+      "node_metadata": "IMDSv2 with hop limit 1 (container cannot reach)"
+    }
+  }
+}

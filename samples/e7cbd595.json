@@ -1,0 +1,41 @@
+{
+  "id": "e7cbd595",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.DefaultHandler;\nimport com.sun.net.httpserver.*;\n\npublic class ConfigImportService {\n    private static final Map<String, String> configStore = new HashMap<>();\n    private static final Set<String> BLOCKED_TAGS = Set.of(\"script\", \"iframe\", \"object\");\n    \n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);\n        server.createContext(\"/api/config/import\", ConfigImportService::handleImport);\n        server.createContext(\"/api/config/list\", ConfigImportService::handleList);\n        server.setExecutor(null);\n        server.start();\n        System.out.println(\"Config import service running on :8080\");\n    }\n\n    static void handleImport(HttpExchange exchange) throws IOException {\n        if (!\"POST\".equals(exchange.getRequestMethod())) {\n            exchange.sendResponseHeaders(405, 0);\n            exchange.close();\n            return;\n        }\n        String contentType = exchange.getRequestHeaders().getFirst(\"Content-Type\");\n        if (contentType == null || !contentType.contains(\"xml\")) {\n            sendResponse(exchange, 400, \"Content-Type must be application/xml\");\n            return;\n        }\n        // Rate limiting: max 50 configs\n        if (configStore.size() > 50) {\n            sendResponse(exchange, 429, \"Config store full\");\n            return;\n        }\n        try {\n            byte[] body = exchange.getRequestBody().readAllBytes();\n            if (body.length > 10240) {\n                sendResponse(exchange, 413, \"Payload too large (max 10KB)\");\n                return;\n            }\n            // Basic content validation - reject obviously malicious patterns\n            String bodyStr = new String(body, \"UTF-8\");\n            for (String tag : BLOCKED_TAGS) {\n                if (bodyStr.toLowerCase().contains(\"<\" + tag)) {\n                    sendResponse(exchange, 400, \"Blocked element: \" + tag);\n                    return;\n                }\n            }\n            // Parse the XML configuration\n            Map<String, String> parsed = parseConfigXml(body);\n            configStore.putAll(parsed);\n            sendResponse(exchange, 200, \"Imported \" + parsed.size() + \" config entries\");\n        } catch (Exception e) {\n            sendResponse(exchange, 500, \"Parse error: \" + e.getMessage());\n        }\n    }\n\n    static Map<String, String> parseConfigXml(byte[] xmlData) throws Exception {\n        Map<String, String> result = new HashMap<>();\n        SAXParserFactory factory = SAXParserFactory.newInstance();\n        // Disable DTD loading for security\n        factory.setFeature(\"http://apache.org/xml/features/nonvalidating/load-dtd-grammar\", false);\n        factory.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", false);\n        SAXParser parser = factory.newSAXParser();\n        parser.parse(new ByteArrayInputStream(xmlData), new DefaultHandler() {\n            String currentKey = null;\n            StringBuilder currentValue = new StringBuilder();\n            public void startElement(String uri, String localName, String qName, Attributes attrs) {\n                if (\"entry\".equals(qName)) {\n                    currentKey = attrs.getValue(\"key\");\n                    currentValue.setLength(0);\n                }\n            }\n            public void characters(char[] ch, int start, int length) {\n                if (currentKey != null) currentValue.append(ch, start, length);\n            }\n            public void endElement(String uri, String localName, String qName) {\n                if (\"entry\".equals(qName) && currentKey != null) {\n                    result.put(currentKey, currentValue.toString());\n                    currentKey = null;\n                }\n            }\n        });\n        return result;\n    }\n\n    static void handleList(HttpExchange exchange) throws IOException {\n        StringBuilder sb = new StringBuilder(\"{\\n\");\n        for (Map.Entry<String, String> e : configStore.entrySet()) {\n            sb.append(\"  \\\"\").append(e.getKey()).append(\"\\\": \\\"\").append(e.getValue()).append(\"\\\",\\n\");\n        }\n        sb.append(\"}\");\n        sendResponse(exchange, 200, sb.toString());\n    }\n\n    static void sendResponse(HttpExchange exchange, int code, String body) throws IOException {\n        byte[] resp = body.getBytes(\"UTF-8\");\n        exchange.sendResponseHeaders(code, resp.length);\n        exchange.getResponseBody().write(resp);\n        exchange.close();\n    }\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with AWS WAF v2 WebACL attached. The WebACL includes: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) AWSManagedRulesSQLiRuleSet with ALL rules in BLOCK mode and sensitivity level set to HIGH, and (3) a custom rate-limiting rule at 100 requests per 5 minutes per IP. The ALB target group health check hits /health. The WAF WebACL is associated with the ALB ARN and processes all requests before they reach the target group. CloudWatch metrics confirm WAF is evaluating requests (non-zero EvaluatedRequests metric). SQLite database is on ephemeral Fargate storage at /var/lib/app/users.db.",
+    "config": {
+      "load_balancer": "ALB with WAF v2 WebACL association",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "override_action": "none",
+          "sensitivity_level": "HIGH",
+          "all_rules_action": "block"
+        },
+        {
+          "name": "RateLimitPerIP",
+          "type": "rate-based",
+          "limit": 100,
+          "evaluation_window": 300,
+          "action": "block"
+        }
+      ],
+      "waf_scope": "REGIONAL",
+      "waf_association": "ALB ARN",
+      "compute": "ECS Fargate 1.4.0",
+      "database": "SQLite on ephemeral Fargate storage",
+      "tls_termination": "ALB (ACM certificate)"
+    }
+  }
+}

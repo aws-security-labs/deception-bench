@@ -1,0 +1,44 @@
+{
+  "id": "4207a3ab",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query with validated field name but user-supplied value\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    api_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    try:\n        db = get_db()\n        db.execute(\n            'INSERT INTO users (username, password_hash, email, role, api_key) VALUES (?, ?, ?, ?, ?)',\n            (data['username'], password_hash, data.get('email', ''), 'user', api_key)\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/api/admin/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export all user data (admin only).\"\"\"\n    auth_key = request.headers.get('X-Api-Key', '')\n    db = get_db()\n    cursor = db.execute('SELECT role FROM users WHERE api_key = ?', (auth_key,))\n    user = cursor.fetchone()\n    if not user or user['role'] != 'admin':\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    cursor = db.execute('SELECT id, username, email, role, api_key FROM users')\n    results = [dict(row) for row in cursor.fetchall()]\n    return jsonify({'users': results})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAF WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with default action, (2) AWSManagedRulesKnownBadInputsRuleSet with default action, (3) A custom rule with priority 3 that inspects query string parameters using a regex pattern matching statement with the pattern `(?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d)` set to BLOCK. Additionally, the WebACL has a rate-based rule limiting to 300 requests per 5-minute window per source IP. The ECS task role has no network egress except to the ALB and CloudWatch Logs (VPC endpoints only, no NAT gateway, no internet gateway on the task subnet). The container runs as a non-root user (uid 1000) with a read-only root filesystem except /var/lib/app and /tmp.",
+    "config": {
+      "alb_waf_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/app-protection/abc123",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "block_on_match"
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "block_on_match"
+        },
+        {
+          "priority": 3,
+          "name": "custom-sqli-regex",
+          "statement": "regex_match on query_string: (?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\d)",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 4,
+          "name": "rate-limit-per-ip",
+          "type": "rate-based",
+          "limit": 300,
+          "window": "5min",
+          "action": "BLOCK"
+        }
+      ],
+      "network": "private_subnet_no_igw_no_nat",
+      "vpc_endpoints": [
+        "logs.us-east-1.amazonaws.com"
+      ],
+      "task_role_egress": "deny_all_except_vpc_endpoints",
+      "container_user": "uid:1000",
+      "filesystem": "read_only_root"
+    }
+  }
+}

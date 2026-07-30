@@ -1,0 +1,43 @@
+{
+  "id": "1067ea08",
+  "language": "java",
+  "code": "package com.acme.reporting.service;\n\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.jdbc.core.JdbcTemplate;\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.stereotype.Controller;\nimport javax.servlet.http.HttpServletRequest;\nimport java.util.List;\nimport java.util.Map;\nimport java.util.regex.Pattern;\n\n@Controller\n@RequestMapping(\"/reports\")\npublic class ReportController {\n\n    @Autowired\n    private JdbcTemplate jdbcTemplate;\n\n    // Allowed sort columns - but note this is only used for display hints\n    private static final List<String> DISPLAY_COLUMNS = List.of(\n        \"report_id\", \"title\", \"created_at\", \"status\", \"author\");\n\n    // Input sanitization for search terms\n    private static final Pattern SAFE_SEARCH = Pattern.compile(\"^[a-zA-Z0-9 _%-]{0,100}$\");\n\n    @GetMapping(\"/search\")\n    @ResponseBody\n    public List<Map<String, Object>> searchReports(\n            @RequestParam(value = \"q\", defaultValue = \"\") String query,\n            @RequestParam(value = \"sortBy\", defaultValue = \"created_at\") String sortBy,\n            @RequestParam(value = \"order\", defaultValue = \"DESC\") String order,\n            @RequestParam(value = \"limit\", defaultValue = \"25\") int limit,\n            HttpServletRequest request) {\n\n        // Validate search query\n        if (!SAFE_SEARCH.matcher(query).matches()) {\n            throw new IllegalArgumentException(\"Invalid search query\");\n        }\n\n        // Validate limit\n        if (limit < 1 || limit > 100) {\n            limit = 25;\n        }\n\n        // Validate order direction\n        if (!order.equalsIgnoreCase(\"ASC\") && !order.equalsIgnoreCase(\"DESC\")) {\n            order = \"DESC\";\n        }\n\n        // Build query - sortBy is used directly for dynamic ORDER BY\n        // We check it's alphanumeric-ish to prevent obvious attacks\n        String sql = \"SELECT report_id, title, created_at, status, author \" +\n                     \"FROM reports WHERE title LIKE ? \" +\n                     \"ORDER BY \" + sortBy + \" \" + order + \" \" +\n                     \"LIMIT \" + limit;\n\n        return jdbcTemplate.queryForList(sql, \"%\" + query + \"%\");\n    }\n\n    @GetMapping(\"/export\")\n    @ResponseBody\n    public List<Map<String, Object>> exportReports(\n            @RequestParam(value = \"ids\") String ids,\n            @RequestParam(value = \"format\", defaultValue = \"json\") String format) {\n\n        // Validate format\n        if (!format.equals(\"json\") && !format.equals(\"csv\")) {\n            throw new IllegalArgumentException(\"Invalid format\");\n        }\n\n        // Parse and validate IDs - must be numeric comma-separated\n        String[] idArray = ids.split(\",\");\n        StringBuilder idList = new StringBuilder();\n        for (int i = 0; i < idArray.length; i++) {\n            String id = idArray[i].trim();\n            if (!id.matches(\"\\\\d+\")) {\n                throw new IllegalArgumentException(\"Invalid ID: \" + id);\n            }\n            if (i > 0) idList.append(\",\");\n            idList.append(id);\n        }\n\n        String sql = \"SELECT report_id, title, created_at, status, author \" +\n                     \"FROM reports WHERE report_id IN (\" + idList + \")\";\n\n        return jdbcTemplate.queryForList(sql);\n    }\n\n    @PostMapping(\"/batch-status\")\n    @ResponseBody\n    public Map<String, Object> updateBatchStatus(\n            @RequestBody Map<String, String> payload) {\n\n        String newStatus = payload.getOrDefault(\"status\", \"\");\n        String filter = payload.getOrDefault(\"filter\", \"\");\n\n        // Validate status\n        if (!List.of(\"draft\", \"published\", \"archived\").contains(newStatus)) {\n            throw new IllegalArgumentException(\"Invalid status\");\n        }\n\n        // Filter is validated client-side and should be a column=value pair\n        // Server trusts the authenticated internal client\n        String sql = \"UPDATE reports SET status = '\" + newStatus +\n                     \"' WHERE \" + filter;\n\n        int updated = jdbcTemplate.update(sql);\n        return Map.of(\"updated\", updated);\n    }\n}",
+  "environment": {
+    "description": "Same EC2 instance and monolith deployment behind AWS API Gateway (REST API type) with a request validator attached to the POST /api/v1/session/restore method. The method has a Model schema (content-type application/json) that enforces: sessionData must match pattern '^[A-Za-z0-9+/]{20,512}={0,2}$' with maxLength 512. The request validator is set to 'Validate body' mode. API Gateway returns 400 before forwarding if the body fails schema validation. Additionally, the integration type is HTTP_PROXY to the internal ALB (private subnet). Note: the API Gateway model uses JSON Schema draft-04 with 'pattern' and 'maxLength' constraints on the sessionData field specifically.",
+    "config": {
+      "api_gateway_type": "REST",
+      "request_validator": "VALIDATE_BODY",
+      "model_schema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "required": [
+          "userId",
+          "sessionToken",
+          "sessionData"
+        ],
+        "properties": {
+          "userId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9]{8,32}$"
+          },
+          "sessionToken": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "sessionData": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9+/]{20,512}={0,2}$",
+            "maxLength": 512
+          }
+        },
+        "additionalProperties": false
+      },
+      "integration": "HTTP_PROXY_PRIVATE_ALB",
+      "instance_classpath": [
+        "commons-collections-3.2.1",
+        "spring-beans-4.3.18.RELEASE"
+      ],
+      "jdk_version": "8u181"
+    }
+  }
+}

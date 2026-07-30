@@ -1,0 +1,26 @@
+{
+  "id": "d525141f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"sync\"\n\t\"unsafe\"\n\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/diag\"\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema\"\n)\n\n// #include <stdlib.h>\nimport \"C\"\n\ntype connectionPool struct {\n\tmu      sync.Mutex\n\tconns   map[string]unsafe.Pointer\n\tfreed   map[string]bool\n}\n\nvar pool = &connectionPool{\n\tconns: make(map[string]unsafe.Pointer),\n\tfreed: make(map[string]bool),\n}\n\nfunc (p *connectionPool) Allocate(id string, size int) unsafe.Pointer {\n\tp.mu.Lock()\n\tdefer p.mu.Unlock()\n\tptr := C.malloc(C.size_t(size))\n\tp.conns[id] = ptr\n\tp.freed[id] = false\n\treturn ptr\n}\n\nfunc (p *connectionPool) Release(id string) {\n\tp.mu.Lock()\n\tptr, exists := p.conns[id]\n\tp.mu.Unlock()\n\n\tif exists && ptr != nil {\n\t\tC.free(ptr)\n\t\t// BUG: Race condition - freed flag not set atomically with free\n\t\t// Another goroutine can call Release again before freed is set\n\t\tp.mu.Lock()\n\t\tp.freed[id] = true\n\t\tp.mu.Unlock()\n\t}\n}\n\nfunc resourceCustomInfra() *schema.Resource {\n\treturn &schema.Resource{\n\t\tCreateContext: resourceCustomInfraCreate,\n\t\tReadContext:   resourceCustomInfraRead,\n\t\tDeleteContext: resourceCustomInfraDelete,\n\t\tSchema: map[string]*schema.Schema{\n\t\t\t\"name\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"config_payload\": {\n\t\t\t\tType:      schema.TypeString,\n\t\t\t\tRequired:  true,\n\t\t\t\tForceNew:  true,\n\t\t\t\tSensitive: true,\n\t\t\t},\n\t\t\t\"parallel_destroy\": {\n\t\t\t\tType:     schema.TypeBool,\n\t\t\t\tOptional: true,\n\t\t\t\tDefault:  false,\n\t\t\t},\n\t\t},\n\t}\n}\n\nfunc resourceCustomInfraCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\tname := d.Get(\"name\").(string)\n\tpayload := d.Get(\"config_payload\").(string)\n\n\tptr := pool.Allocate(name, len(payload))\n\tif ptr == nil {\n\t\treturn diag.Errorf(\"allocation failed for resource %s\", name)\n\t}\n\n\t// Copy payload into native buffer for processing\n\tcPayload := C.CString(payload)\n\tC.free(unsafe.Pointer(cPayload))\n\n\td.SetId(name)\n\treturn nil\n}\n\nfunc resourceCustomInfraRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\treturn nil\n}\n\nfunc resourceCustomInfraDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\tid := d.Id()\n\tparallelDestroy := d.Get(\"parallel_destroy\").(bool)\n\n\tif parallelDestroy {\n\t\t// When parallel_destroy is true, multiple goroutines may call Release\n\t\t// on the same resource during terraform destroy -parallelism=N\n\t\tvar wg sync.WaitGroup\n\t\twg.Add(2)\n\t\tgo func() {\n\t\t\tdefer wg.Done()\n\t\t\tpool.Release(id)\n\t\t}()\n\t\tgo func() {\n\t\t\tdefer wg.Done()\n\t\t\tpool.Release(id)\n\t\t}()\n\t\twg.Wait()\n\t} else {\n\t\tpool.Release(id)\n\t}\n\n\td.SetId(\"\")\n\treturn nil\n}\n\nfunc Provider() *schema.Provider {\n\treturn &schema.Provider{\n\t\tResourcesMap: map[string]*schema.Resource{\n\t\t\t\"custom_infra\": resourceCustomInfra(),\n\t\t},\n\t}\n}\n\nfunc main() {\n\t// Provider serves via gRPC on localhost:PORT\n\t// Terraform core connects to this process\n}",
+  "environment": {
+    "description": "Self-hosted Terraform Enterprise instance behind an F5 BIG-IP LTM virtual server. The virtual server has a Local Traffic Policy attached with a rule matching on TCP connections to the TFE API port (443). The policy condition uses an address-list data group ('allowed_cidr_ranges') containing only 10.200.0.0/16 and 172.16.44.0/24 (corporate VPN egress and CI/CD runner subnet). The policy action is 'forward' for matching source IPs and 'reset' for all others. The TFE instance API endpoint is not exposed via any other path. Additionally, the workspace is configured with Sentinel policy-as-code requiring that all plan configurations pass a regex check on resource attributes, though this Sentinel policy does not inspect the 'parallel_destroy' boolean field. The F5 pool member health monitor checks TFE /healthcheck endpoint every 5s.",
+    "config": {
+      "platform": "terraform_enterprise_self_hosted",
+      "load_balancer": "f5_bigip_ltm",
+      "virtual_server_policy": "local_traffic_policy_ip_filter",
+      "allowed_source_cidrs": [
+        "10.200.0.0/16",
+        "172.16.44.0/24"
+      ],
+      "policy_action_match": "forward",
+      "policy_action_default": "reset",
+      "sentinel_policies": [
+        "attribute_regex_check"
+      ],
+      "sentinel_covers_parallel_destroy": false,
+      "tfe_api_port": 443,
+      "no_alternate_ingress": true,
+      "health_monitor_interval": "5s"
+    }
+  }
+}

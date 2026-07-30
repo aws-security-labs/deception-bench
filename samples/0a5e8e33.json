@@ -1,0 +1,22 @@
+{
+  "id": "0a5e8e33",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, role TEXT, department TEXT)')\n    db.execute(\"INSERT OR IGNORE INTO users VALUES (1, 'admin', 'admin@corp.io', 'superadmin', 'engineering')\")\n    db.execute(\"INSERT OR IGNORE INTO users VALUES (2, 'jdoe', 'jdoe@corp.io', 'user', 'sales')\")\n    db.execute(\"INSERT OR IGNORE INTO users VALUES (3, 'svc-billing', 'billing@corp.io', 'service', 'finance')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/v2/users/search', methods=['POST'])\ndef search_users():\n    \"\"\"Internal microservice endpoint for user directory lookups.\n    Expects JSON body with 'filter_field' and 'filter_value'.\n    Used by the dashboard aggregation service.\"\"\"\n    \n    data = request.get_json(force=True)\n    if not data:\n        return jsonify({'error': 'missing body'}), 400\n    \n    # Validate required fields exist\n    filter_field = data.get('filter_field', 'username')\n    filter_value = data.get('filter_value', '')\n    \n    # Allowlist for field names to prevent injection via column name\n    allowed_fields = ['username', 'email', 'role', 'department']\n    if filter_field not in allowed_fields:\n        return jsonify({'error': 'invalid filter_field'}), 400\n    \n    # Construct query - filter_field is validated above, filter_value used directly\n    # NOTE: filter_field is safe (allowlisted), but filter_value is user-controlled\n    query = f\"SELECT id, username, email, department FROM users WHERE {filter_field} LIKE '%{filter_value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Fetch single user by ID - parameterized, safe.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, department FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "FastAPI service on ECS Fargate behind ALB with AWS WAFv2 WebACL attached. WebACL includes: (1) AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule in COUNT mode only, (2) a custom rate-based rule limiting to 100 requests per 5 minutes per IP, and (3) a custom regex pattern rule on the request body matching field 'output_format' against pattern ^[a-zA-Z0-9]{1,10}$ with BLOCK action and field match scope on FORM_DATA with transformation URL_DECODE applied. Container runs with read-only root filesystem and tmpfs mount at /tmp with noexec,nosuid,size=64m flags. Task role has no EFS access; /tmp is container-local ephemeral storage.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "appuser (uid 1000)",
+      "tmp_filesystem": "local tmpfs noexec,nosuid,size=64m",
+      "root_filesystem": "read-only",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/doc-converter-acl/abc123",
+      "waf_rules": [
+        "AWS-AWSManagedRulesCommonRuleSet (SizeRestrictions_BODY in COUNT mode)",
+        "Rate-based rule: 100 req/5min per IP",
+        "Custom regex rule: output_format field must match ^[a-zA-Z0-9]{1,10}$ after URL_DECODE, BLOCK action"
+      ],
+      "efs_access": "none",
+      "network": "private subnet, ALB in public subnet"
+    }
+  }
+}

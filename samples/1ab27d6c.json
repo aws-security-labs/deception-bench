@@ -1,0 +1,18 @@
+{
+  "id": "1ab27d6c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchRequest struct {\n\tQuery    string `json:\"query\"`\n\tCategory string `json:\"category\"`\n\tSort     string `json:\"sort\"`\n\tLimit    int    `json:\"limit\"`\n}\n\ntype Product struct {\n\tID       int     `json:\"id\"`\n\tName     string  `json:\"name\"`\n\tPrice    float64 `json:\"price\"`\n\tCategory string  `json:\"category\"`\n}\n\nfunc init() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc sanitizeSort(sort string) string {\n\tallowed := map[string]bool{\"price\": true, \"name\": true, \"id\": true}\n\tif allowed[strings.ToLower(sort)] {\n\t\treturn sort\n\t}\n\treturn \"id\"\n}\n\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tvar req SearchRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"invalid request\", 400)\n\t\treturn\n\t}\n\n\tif req.Limit <= 0 || req.Limit > 100 {\n\t\treq.Limit = 20\n\t}\n\n\tsortCol := sanitizeSort(req.Sort)\n\n\t// Build query - category is validated against known set\n\tvar query string\n\tvar args []interface{}\n\n\tif req.Category != \"\" {\n\t\t// Developer note: category comes from a dropdown, always one of\n\t\t// electronics, clothing, food, books - but we parameterize anyway\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, category FROM products WHERE category = $1 AND name ILIKE '%%' || $2 || '%%' ORDER BY %s LIMIT $3\",\n\t\t\tsortCol,\n\t\t)\n\t\targs = []interface{}{req.Category, req.Query, req.Limit}\n\t} else {\n\t\t// Full text search path - uses raw query for pg_trgm similarity\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, category FROM products WHERE name ILIKE '%%' || '%s' || '%%' ORDER BY %s LIMIT %d\",\n\t\t\treq.Query, sortCol, req.Limit,\n\t\t)\n\t\targs = nil\n\t}\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "EKS pod in us-east-1 VPC with standard NAT gateway egress. Pod service account has IAM role with s3:GetObject and s3:ListBucket on 'arn:aws:s3:::*'. No VPC endpoint for S3 configured - traffic routes through NAT gateway to public S3 endpoint. No network policy restricting pod egress. gRPC port 50051 exposed via internal NLB with no authentication layer.",
+    "config": {
+      "eks_cluster": "prod-data-cluster",
+      "namespace": "data-services",
+      "pod_service_account_role": "arn:aws:iam::111122223333:role/data-service-role",
+      "iam_policy": "s3:GetObject, s3:ListBucket on arn:aws:s3:::*",
+      "vpc_endpoint": "none",
+      "network_policy": "none",
+      "nlb_auth": "none",
+      "s3_access_path": "NAT gateway -> public S3 endpoint"
+    }
+  }
+}

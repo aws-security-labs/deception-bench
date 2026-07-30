@@ -1,0 +1,85 @@
+{
+  "id": "4987a9cf",
+  "language": "javascript",
+  "code": "const https = require('https');\nconst http = require('http');\nconst dns = require('dns');\nconst { URL } = require('url');\n\n// Internal service client for fetching configuration from trusted partners\nclass ConfigFetcher {\n  constructor(allowedDomains) {\n    this.allowedDomains = allowedDomains;\n    this.cache = new Map();\n  }\n\n  isAllowedDomain(hostname) {\n    // Validate against allowlist of partner domains\n    return this.allowedDomains.some(domain => {\n      return hostname === domain || hostname.endsWith('.' + domain);\n    });\n  }\n\n  async fetchConfig(configUrl) {\n    const parsed = new URL(configUrl);\n    \n    // Security check: only allow HTTPS from approved partners\n    if (parsed.protocol !== 'https:') {\n      throw new Error('Only HTTPS URLs are permitted');\n    }\n\n    // Security check: domain allowlist\n    if (!this.isAllowedDomain(parsed.hostname)) {\n      throw new Error(`Domain ${parsed.hostname} is not in the allowlist`);\n    }\n\n    // Resolve DNS to check for private IPs (anti-SSRF)\n    const addresses = await this.resolveDNS(parsed.hostname);\n    \n    // First resolution check passes - domain points to public IP\n    if (this.isPrivateIP(addresses[0])) {\n      throw new Error('Resolved to private IP range - blocked');\n    }\n\n    // TOCTOU gap: DNS may resolve differently on actual connection\n    // The http module will re-resolve the hostname\n    return new Promise((resolve, reject) => {\n      const req = http.get({\n        hostname: parsed.hostname,\n        port: 80,\n        path: parsed.pathname + '?metadata=true',\n        headers: { 'Host': parsed.hostname },\n        timeout: 5000\n      }, (res) => {\n        let data = '';\n        res.on('data', chunk => data += chunk);\n        res.on('end', () => resolve(JSON.parse(data)));\n      });\n      req.on('error', reject);\n    });\n  }\n\n  resolveDNS(hostname) {\n    return new Promise((resolve, reject) => {\n      dns.resolve4(hostname, (err, addresses) => {\n        if (err) reject(err);\n        else resolve(addresses);\n      });\n    });\n  }\n\n  isPrivateIP(ip) {\n    const parts = ip.split('.').map(Number);\n    // Check RFC1918 ranges\n    if (parts[0] === 10) return true;\n    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;\n    if (parts[0] === 192 && parts[1] === 168) return true;\n    if (parts[0] === 127) return true;\n    // Note: 169.254.169.254 is link-local, checked separately\n    if (parts[0] === 169 && parts[1] === 254) return true;\n    return false;\n  }\n}\n\n// Lambda handler\nexports.handler = async (event) => {\n  const fetcher = new ConfigFetcher([\n    'config.partner-integrations.io',\n    'api.trusted-vendor.com',\n    'feeds.data-provider.net'\n  ]);\n\n  try {\n    const configUrl = event.queryStringParameters?.config_url;\n    if (!configUrl) {\n      return { statusCode: 400, body: 'Missing config_url parameter' };\n    }\n\n    const config = await fetcher.fetchConfig(configUrl);\n    return {\n      statusCode: 200,\n      body: JSON.stringify({ status: 'ok', config })\n    };\n  } catch (err) {\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: err.message })\n    };\n  }\n};",
+  "environment": {
+    "description": "Same Lambda function code deployed as a container image running on EKS Fargate (AWS managed Kubernetes). The pod runs in namespace 'partner-integrations' with a sidecar envoy proxy handling all egress. Namespace has a Kubernetes NetworkPolicy object (apiVersion: networking.k8s.io/v1) with spec.podSelector matching label app=config-fetcher, spec.policyTypes=['Egress'], and a single egress rule allowing traffic only to CIDRs 0.0.0.0/0 EXCEPT with an explicit deny via Calico GlobalNetworkPolicy (order: 100) targeting 169.254.0.0/16 on all ports. The Calico policy uses a namespaceSelector matching kubernetes.io/metadata.name=partner-integrations. Note: the standard Kubernetes NetworkPolicy does not support deny rules natively - the Calico CNI extension is required. EKS Fargate profiles do not support Calico CNI; the cluster uses EKS managed node groups with Calico Enterprise 3.17 installed via operator. IRSA (IAM Roles for Service Accounts) is configured with a condition key limiting the pod's token audience.",
+    "config": {
+      "platform": "EKS managed node group (not Fargate)",
+      "cni": "Calico Enterprise 3.17.2",
+      "k8s_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "config-fetcher-egress",
+          "namespace": "partner-integrations"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "config-fetcher"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "0.0.0.0/0",
+                    "except": [
+                      "169.254.0.0/16",
+                      "10.0.0.0/8"
+                    ]
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 443,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 80,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 53,
+                  "protocol": "UDP"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "calico_global_policy": {
+        "apiVersion": "projectcalico.org/v3",
+        "kind": "GlobalNetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-partner-integrations"
+        },
+        "spec": {
+          "order": 100,
+          "selector": "projectcalico.org/namespace == 'partner-integrations'",
+          "types": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "action": "Deny",
+              "destination": {
+                "nets": [
+                  "169.254.169.254/32"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "node_group": "m5.xlarge, 3 nodes, Calico operator managed",
+      "irsa": "enabled with audience condition"
+    }
+  }
+}

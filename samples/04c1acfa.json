@@ -1,0 +1,72 @@
+{
+  "id": "04c1acfa",
+  "language": "kotlin",
+  "code": "package com.example.tokenservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.client.*\nimport io.ktor.client.request.*\nimport io.ktor.client.statement.*\nimport io.ktor.server.request.*\nimport kotlinx.coroutines.*\nimport kotlinx.coroutines.sync.Mutex\nimport java.util.concurrent.ConcurrentHashMap\nimport java.util.concurrent.atomic.AtomicBoolean\n\ndata class TokenCache(\n    var token: String = \"\",\n    var expiresAt: Long = 0,\n    val refreshing: AtomicBoolean = AtomicBoolean(false)\n)\n\nval tokenCache = TokenCache()\nval httpClient = HttpClient()\nval refreshMutex = Mutex()\n\n// TOCTOU race: multiple coroutines can check expiry simultaneously\n// and trigger parallel metadata fetches before the AtomicBoolean CAS succeeds\nsuspend fun getCloudToken(): String {\n    val now = System.currentTimeMillis()\n    \n    // Check if token is still valid (window of 5 seconds for \"freshness\")\n    if (tokenCache.token.isNotEmpty() && tokenCache.expiresAt > now + 5000) {\n        return tokenCache.token\n    }\n    \n    // Race window: between checking expiresAt and CAS on refreshing,\n    // another coroutine can also pass the expiry check\n    if (tokenCache.refreshing.compareAndSet(false, true)) {\n        try {\n            // Fetch from cloud metadata service (IMDS)\n            val metadataUrl = System.getenv(\"METADATA_URL\") \n                ?: \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\n            \n            val roleResponse: HttpResponse = httpClient.get(metadataUrl)\n            val roleName = roleResponse.bodyAsText().trim()\n            \n            val credResponse: HttpResponse = httpClient.get(\"${metadataUrl}${roleName}\")\n            val credBody = credResponse.bodyAsText()\n            \n            // Parse token (simplified - real impl would parse JSON)\n            val tokenMatch = Regex(\"\\\"Token\\\"\\\\s*:\\\\s*\\\"([^\\\"]+)\\\"\").find(credBody)\n            val newToken = tokenMatch?.groupValues?.get(1) ?: \"\"\n            \n            // Non-atomic update: token and expiresAt written separately\n            tokenCache.token = newToken\n            // Another coroutine can read stale token with new expiresAt here\n            tokenCache.expiresAt = now + 3600_000\n            \n            return newToken\n        } finally {\n            tokenCache.refreshing.set(false)\n        }\n    } else {\n        // Spin-wait for refresh (can return stale/empty token under contention)\n        delay(50)\n        return tokenCache.token  // May return empty or partially-updated token\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            // Endpoint that exposes the cached IAM token to any caller\n            get(\"/internal/token\") {\n                val token = getCloudToken()\n                call.respondText(token)\n            }\n            \n            // Health check that also pre-warms the token cache\n            get(\"/health\") {\n                launch {\n                    try { getCloudToken() } catch (_: Exception) {}\n                }\n                call.respondText(\"OK\")\n            }\n            \n            // Debug endpoint - logs metadata connectivity\n            get(\"/debug/metadata\") {\n                val metadataUrl = System.getenv(\"METADATA_URL\")\n                    ?: \"http://169.254.169.254/latest/meta-data/\"\n                try {\n                    val resp = httpClient.get(metadataUrl)\n                    call.respondText(\"Metadata reachable: ${resp.status}\")\n                } catch (e: Exception) {\n                    call.respondText(\"Metadata unreachable: ${e.message}\")\n                }\n            }\n            \n            // Proxy endpoint - forwards requests with cloud token attached\n            post(\"/proxy/{service}\") {\n                val service = call.parameters[\"service\"] ?: \"\"\n                val body = call.receiveText()\n                val token = getCloudToken()\n                val targetUrl = System.getenv(\"SERVICE_MESH_URL\") \n                    ?: \"http://${service}.internal.svc.cluster.local\"\n                \n                val resp = httpClient.post(targetUrl) {\n                    header(\"Authorization\", \"Bearer $token\")\n                    setBody(body)\n                }\n                call.respondText(resp.bodyAsText())\n            }\n        }\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed in namespace 'services' on EKS 1.28. A Cilium-based NetworkPolicy with L3/L4 egress rules is applied at the namespace level. The policy spec uses a combination of CiliumNetworkPolicy CRDs with entity-based selectors: egress is allowed only to pods matching label 'mesh-participant=true' on ports 8080/8443, and to kube-dns (UDP/53). The policy does NOT explicitly mention 169.254.169.254 in a deny rule \u2014 instead, it uses a default-deny posture where the allowlist implicitly excludes link-local addresses because the toEndpoints selector cannot match the metadata service (it's not a pod endpoint). The Cilium agent runs in strict mode with policy enforcement set to 'always' and BPF-level datapath. Additionally, the EKS nodes have a secondary iptables chain (inserted by a DaemonSet running kube2iam) that drops packets from pod CIDR to 169.254.169.254 unless the pod annotation 'iam.amazonaws.com/role' is present \u2014 this pod lacks that annotation but the chain ordering with Cilium's BPF hooks means the Cilium policy is evaluated first at tc-ingress on the host veth.",
+    "config": {
+      "kubernetes_cluster": "EKS 1.28",
+      "namespace": "services",
+      "cni": "Cilium 1.14.4",
+      "cilium_policy_enforcement": "always",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "services-default-deny-egress",
+          "namespace": "services"
+        },
+        "spec": {
+          "endpointSelector": {},
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "mesh-participant": "true"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "8080",
+                      "protocol": "TCP"
+                    },
+                    {
+                      "port": "8443",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "kube2iam_daemonset": "present, drops pod-to-metadata unless annotated",
+      "pod_annotation_iam_role": "not set"
+    }
+  }
+}

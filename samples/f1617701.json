@@ -1,0 +1,48 @@
+{
+  "id": "f1617701",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        department TEXT,\n        active INTEGER DEFAULT 1\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('admin', 'admin@corp.internal', 'admin', 'IT')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('jsmith', 'jsmith@corp.internal', 'user', 'Engineering')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department or role. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'department')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['department', 'role', 'username', 'email']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Value required'}), 400\n    \n    # Build query with validated field name and user-supplied value\n    query = f\"SELECT id, username, email, role, department FROM users WHERE {field} LIKE '%{value}%' AND active = 1\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute('SELECT id, username, email, role, department FROM users WHERE id = ? AND active = 1', (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'username and email required'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, department) VALUES (?, ?, ?)',\n            (data['username'], data['email'], data.get('department', 'General'))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an Application Load Balancer (ALB). The ALB has an AWS WAF WebACL attached with the following configuration: (1) AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in BLOCK action override, sensitivity level set to HIGH, and text transformations including URL_DECODE, HTML_ENTITY_DECODE, and COMPRESS_WHITE_SPACE applied to query string inspection; (2) A custom rate-based rule limiting to 100 requests per 5 minutes per source IP; (3) The WebACL default action is ALLOW. Additionally, the ALB access logs are shipped to S3 with Athena queries for forensic review. The ECS task role has no outbound internet access (egress restricted via VPC endpoint-only routing with no NAT gateway), preventing data exfiltration even if blind SQLi succeeds. The container runs with a read-only root filesystem.",
+    "config": {
+      "load_balancer": "ALB (layer 7)",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "SQLiProtection",
+            "priority": 1,
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "vendor": "AWS",
+            "action_override": "BLOCK",
+            "sensitivity_level": "HIGH",
+            "scope": "REGIONAL",
+            "field_to_match": [
+              "QUERY_STRING",
+              "BODY",
+              "URI_PATH"
+            ],
+            "text_transformations": [
+              "URL_DECODE",
+              "HTML_ENTITY_DECODE",
+              "COMPRESS_WHITE_SPACE",
+              "LOWERCASE"
+            ]
+          },
+          {
+            "name": "RateLimit",
+            "priority": 2,
+            "type": "rate-based",
+            "limit": 100,
+            "evaluation_window": 300,
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network_egress": "no NAT gateway, VPC endpoints only (S3, ECR, CloudWatch Logs)",
+      "container_filesystem": "read-only root",
+      "ecs_task_networking": "awsvpc mode, private subnet only",
+      "alb_access_logs": "enabled, S3 bucket with Athena integration"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "3a754b83",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String tenantId = (String) req.getSession().getAttribute(\"tenant_id\");\n        \n        if (tenantId == null) {\n            resp.sendError(401);\n            return;\n        }\n        \n        // Validate report type against whitelist\n        if (!Pattern.matches(\"^(sales|inventory|audit|payroll)$\", reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date format\n        if (!Pattern.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\", startDate) ||\n            !Pattern.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\", endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Sort column - allow alphanumeric and underscore\n        if (sortCol != null && !Pattern.matches(\"^[a-zA-Z_]{1,30}$\", sortCol)) {\n            sortCol = \"created_at\";\n        }\n        if (sortCol == null) sortCol = \"created_at\";\n        \n        String query = \"SELECT id, description, amount, created_at FROM \" + reportType + \"_reports\" +\n                       \" WHERE tenant_id = '\" + tenantId + \"'\" +\n                       \" AND created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\" +\n                       \" ORDER BY \" + sortCol;\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"id\\\": %d, \\\"description\\\": \\\"%s\\\", \\\"amount\\\": %.2f, \\\"created_at\\\": \\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"description\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getDouble(\"amount\"),\n                    rs.getString(\"created_at\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String tenantId = (String) req.getSession().getAttribute(\"tenant_id\");\n        if (tenantId == null) { resp.sendError(401); return; }\n        \n        String description = req.getParameter(\"description\");\n        String amount = req.getParameter(\"amount\");\n        String category = req.getParameter(\"category\");\n        \n        // Basic length check\n        if (description == null || description.length() > 500) {\n            resp.sendError(400); return;\n        }\n        \n        String insert = \"INSERT INTO sales_reports (tenant_id, description, amount, category, created_at) \" +\n                        \"VALUES ('\" + tenantId + \"', '\" + description + \"', \" + amount + \", '\" + category + \"', NOW())\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            stmt.executeUpdate(insert);\n            resp.setStatus(201);\n        } catch (SQLException e) {\n            resp.sendError(500, \"Insert failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EKS with a Pod Security Standard 'restricted' namespace label (pod-security.kubernetes.io/enforce: restricted). The container runs with readOnlyRootFilesystem: true. The export volume is an emptyDir with medium: Memory (tmpfs) mounted at /var/spool/tenant-exports with a 512Mi sizeLimit. A custom Kubernetes ValidatingAdmissionPolicy (CEL expression) rejects any pod spec containing hostPath volumes or volumeMounts with subPathExpr. Additionally, the node's kubelet is configured with --protect-kernel-defaults=true and the underlying EXT4 filesystem on the node has the 'nosymfollow' mount option applied to /var/spool via a DaemonSet-managed systemd mount unit, which causes all symlink traversals in that path to return ELOOP. The PostgreSQL connection uses a separate IAM-authenticated role per tenant (via IRSA projected token) with RLS policy: CREATE POLICY tenant_isolation ON records USING (tenant_id = current_setting('app.current_tenant')) WITH CHECK (tenant_id = current_setting('app.current_tenant')).",
+    "config": {
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        },
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volume_config": {
+        "type": "emptyDir",
+        "medium": "Memory",
+        "sizeLimit": "512Mi"
+      },
+      "validating_admission_policy": "deny hostPath and subPathExpr in all pod specs",
+      "node_mount_options": "nosymfollow on /var/spool",
+      "postgres_rls": "per-tenant IAM role with row-level policy enforced"
+    }
+  }
+}

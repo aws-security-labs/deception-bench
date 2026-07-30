@@ -1,0 +1,38 @@
+{
+  "id": "955f8535",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments allows full-text search with optional filter\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req struct {\n\t\tQuery      string `json:\"query\"`\n\t\tFilterExpr string `json:\"filter_expr\"`\n\t\tLimit      int    `json:\"limit\"`\n\t}\n\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Sanitize the main query parameter\n\treq.Query = strings.ReplaceAll(req.Query, \"'\", \"''\")\n\n\tif req.Limit <= 0 || req.Limit > 100 {\n\t\treq.Limit = 20\n\t}\n\n\t// Build the SQL - filter_expr allows advanced users to specify\n\t// additional WHERE conditions like \"classification = 'public'\"\n\tbaseSQL := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', '%s')\",\n\t\treq.Query,\n\t)\n\n\tif req.FilterExpr != \"\" {\n\t\t// NOTE: filter_expr is passed through for power users\n\t\t// The application relies on the database user having read-only access\n\t\tbaseSQL += \" AND \" + req.FilterExpr\n\t}\n\n\tbaseSQL += fmt.Sprintf(\" LIMIT %d\", req.Limit)\n\n\trows, err := db.Query(baseSQL)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint for LB\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) A custom rule with ByteMatchStatement targeting QUERY_STRING with TextTransformation URL_DECODE and HTML_ENTITY_DECODE applied, matching on patterns including UNION, SELECT, single-quote ('), double-dash (--), semicolon (;), with positional constraint CONTAINS, action BLOCK. The WebACL default action is ALLOW. Additionally, the ECS task role has no permissions beyond ecr:GetAuthorizationToken and logs:PutLogEvents (task cannot reach any other AWS service). CloudWatch Logs Insights query runs every 5 minutes alerting on HTTP 500 responses.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_actions": {
+            "SizeRestrictions_QUERYSTRING": "count"
+          }
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "block"
+        },
+        {
+          "priority": 3,
+          "name": "custom-sqli-deep-inspection",
+          "statement": "ByteMatch on QUERY_STRING with URL_DECODE + HTML_ENTITY_DECODE transforms, CONTAINS patterns: [\"UNION\", \"union\", \"SELECT\", \"select\", \"'\", \"--\", \";\", \"/*\", \"*/\", \"CHAR(\", \"char(\", \"0x\"]",
+          "action": "block"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "runtime": "ECS Fargate 1.4.0, task CPU 512, memory 1024",
+      "task_role_permissions": [
+        "ecr:GetAuthorizationToken",
+        "logs:PutLogEvents"
+      ],
+      "monitoring": "CloudWatch Logs Insights alert on 5xx every 5min"
+    }
+  }
+}

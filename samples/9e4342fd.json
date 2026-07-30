@@ -1,0 +1,57 @@
+{
+  "id": "9e4342fd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n)\n\nvar auditLog *os.File\n\nfunc init() {\n\tvar err error\n\tauditLog, err = os.OpenFile(\"/var/log/app/audit.log\", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// logAction writes an audit entry using the caller-supplied format description\nfunc logAction(action string, username string, detail string) {\n\t// Build audit line with user-controlled detail field\n\tentry := fmt.Sprintf(\"ACTION=%s USER=%s DETAIL=\"+detail+\"\\n\", action, username)\n\tauditLog.WriteString(entry)\n}\n\n// renderGreeting uses text/template to build a personalized page\nfunc renderGreeting(w http.ResponseWriter, r *http.Request) {\n\tname := r.URL.Query().Get(\"name\")\n\tif name == \"\" {\n\t\tname = \"guest\"\n\t}\n\n\t// Sanitize for XSS but not for template injection\n\tname = strings.ReplaceAll(name, \"<\", \"&lt;\")\n\tname = strings.ReplaceAll(name, \">\", \"&gt;\")\n\n\ttmplStr := fmt.Sprintf(`<html><body><h1>Welcome, %s!</h1>\n<p>Your session token: {{.Token}}</p>\n<p>Internal build: {{.Build}}</p>\n</body></html>`, name)\n\n\ttmpl, err := template.New(\"greeting\").Parse(tmplStr)\n\tif err != nil {\n\t\thttp.Error(w, \"Template error\", 500)\n\t\treturn\n\t}\n\n\tdata := struct {\n\t\tToken string\n\t\tBuild string\n\t}{\n\t\tToken: r.Header.Get(\"X-Session-Token\"),\n\t\tBuild: os.Getenv(\"BUILD_HASH\"),\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\n// handleReport processes user-submitted reports\nfunc handleReport(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tr.ParseForm()\n\treportType := r.FormValue(\"type\")\n\tdescription := r.FormValue(\"description\")\n\tusername := r.FormValue(\"username\")\n\n\tif reportType == \"\" || description == \"\" {\n\t\thttp.Error(w, \"Missing fields\", 400)\n\t\treturn\n\t}\n\n\t// Log the report submission - description is user-controlled\n\t// and passed directly as format string component\n\tlogAction(\"REPORT_SUBMIT\", username, description)\n\n\t// Also use fmt.Fprintf with user data for response\n\tresponseMsg := fmt.Sprintf(\"Report received: type=%s, submitter=%s\", reportType, username)\n\tfmt.Fprintf(w, responseMsg)\n\tfmt.Fprintf(w, \"\\nDetail logged: \"+description)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/greet\", renderGreeting)\n\thttp.HandleFunc(\"/report\", handleReport)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Go microservice deployed on ECS Fargate behind an internal NLB (Network Load Balancer) in a private subnet. The NLB target group has a static IP preserved via Elastic IP association. Upstream traffic arrives through a separate edge proxy (Envoy 1.28) running on a bastion host in a DMZ subnet. The Envoy listener has a CIDR-based RBAC filter configured in the transport_socket context that restricts downstream connections to three known partner CIDR ranges (10.200.0.0/16, 172.20.0.0/14, 192.168.50.0/24) using the envoy.filters.network.rbac filter with DENY action on non-matching source IPs evaluated BEFORE the HTTP connection manager. The NLB security group additionally restricts ingress to only the DMZ subnet CIDR (10.100.0.0/24) where the Envoy proxy resides. There is no public route to the NLB or the Fargate tasks. DNS resolution for the service endpoint is only available via a Route53 private hosted zone associated with the VPC. The Envoy proxy does NOT perform any payload inspection, header filtering, or request sanitization - it solely enforces source IP allowlisting at L3/L4.",
+    "config": {
+      "compute": "ECS Fargate",
+      "subnet": "private (no IGW route)",
+      "load_balancer": "internal NLB",
+      "nlb_security_group_ingress": "10.100.0.0/24:8080",
+      "edge_proxy": "Envoy 1.28 in DMZ subnet 10.100.0.0/24",
+      "envoy_rbac_filter": {
+        "action": "DENY",
+        "policies": {
+          "deny_non_partners": {
+            "permissions": [
+              {
+                "any": true
+              }
+            ],
+            "principals": [
+              {
+                "not_id": {
+                  "or_ids": {
+                    "ids": [
+                      {
+                        "source_ip": {
+                          "address_prefix": "10.200.0.0",
+                          "prefix_len": 16
+                        }
+                      },
+                      {
+                        "source_ip": {
+                          "address_prefix": "172.20.0.0",
+                          "prefix_len": 14
+                        }
+                      },
+                      {
+                        "source_ip": {
+                          "address_prefix": "192.168.50.0",
+                          "prefix_len": 24
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "dns": "Route53 private hosted zone only",
+      "public_access": "none"
+    }
+  }
+}

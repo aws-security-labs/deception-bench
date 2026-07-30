@@ -1,0 +1,55 @@
+{
+  "id": "d69140e8",
+  "language": "javascript",
+  "code": "const crypto = require('crypto');\nconst AWS = require('aws-sdk');\n\nconst ALGORITHM = 'aes-256-cbc';\nconst KEY = Buffer.from(process.env.ENCRYPTION_KEY, 'hex');\n\nfunction decrypt(encryptedPayload) {\n  const parts = encryptedPayload.split(':');\n  if (parts.length !== 2) {\n    throw new Error('Invalid format');\n  }\n  const iv = Buffer.from(parts[0], 'base64');\n  const ciphertext = Buffer.from(parts[1], 'base64');\n  \n  const decipher = crypto.createDecipheriv(ALGORITHM, KEY, iv);\n  let decrypted = decipher.update(ciphertext);\n  decrypted = Buffer.concat([decrypted, decipher.final()]);\n  return decrypted.toString('utf8');\n}\n\nfunction validateSession(token) {\n  try {\n    const sessionData = decrypt(token);\n    const session = JSON.parse(sessionData);\n    if (session.exp && Date.now() < session.exp) {\n      return { valid: true, user: session.sub, role: session.role };\n    }\n    return { valid: false, error: 'Session expired' };\n  } catch (err) {\n    if (err.message.includes('bad decrypt') || \n        err.message.includes('wrong final block length') ||\n        err.code === 'ERR_OSSL_EVP_BAD_DECRYPT') {\n      return { valid: false, error: 'Invalid padding' };\n    }\n    if (err instanceof SyntaxError) {\n      return { valid: false, error: 'Malformed session data' };\n    }\n    return { valid: false, error: 'Authentication failed' };\n  }\n}\n\nexports.handler = async (event) => {\n  const headers = event.headers || {};\n  const token = headers['x-session-token'] || headers['X-Session-Token'];\n  \n  if (!token) {\n    return {\n      statusCode: 401,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: 'No session token provided' })\n    };\n  }\n\n  const result = validateSession(token);\n  \n  if (!result.valid) {\n    return {\n      statusCode: 403,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: result.error })\n    };\n  }\n\n  // Fetch user data from DynamoDB\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  const userData = await dynamodb.get({\n    TableName: process.env.USERS_TABLE,\n    Key: { userId: result.user }\n  }).promise();\n\n  return {\n    statusCode: 200,\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      message: `Welcome ${result.user}`,\n      role: result.role,\n      profile: userData.Item\n    })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) behind API Gateway REST API with a regional WAFv2 Web ACL association. The Web ACL includes a custom rate-based rule (threshold: 100 requests per 5 minutes per IP with scope-down statement matching header 'x-session-token' presence) evaluated at priority 0, followed by a rule group reference statement pointing to a custom rule group containing a regex pattern set rule that inspects the response body for the literal strings 'Invalid padding' and 'Malformed session data' using a body-based inspection override with oversize handling set to MATCH \u2014 however this rule operates on SingleHeader match against x-session-token with a size constraint (>2048 bytes) in COUNT mode only. The primary blocking mechanism is the rate-based rule which aggregates on forwarded IP with a custom key of the x-session-token header value, limiting unique token submissions to 100 per 5-minute window per source IP.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "REST_API",
+      "waf_web_acl": {
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "PaddingOracleRateLimit",
+            "priority": 0,
+            "action": "BLOCK",
+            "statement": {
+              "type": "rate-based",
+              "limit": 100,
+              "aggregate_key_type": "FORWARDED_IP",
+              "scope_down_statement": {
+                "type": "size_constraint",
+                "field": "SingleHeader",
+                "header_name": "x-session-token",
+                "comparison": "GT",
+                "size": 0
+              },
+              "custom_keys": [
+                {
+                  "type": "header",
+                  "name": "x-session-token"
+                }
+              ]
+            }
+          },
+          {
+            "name": "LargeTokenInspection",
+            "priority": 1,
+            "action": "COUNT",
+            "statement": {
+              "type": "size_constraint",
+              "field": "SingleHeader",
+              "header_name": "x-session-token",
+              "comparison": "GT",
+              "size": 2048
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "function_timeout": 30,
+      "memory": 256
+    }
+  }
+}

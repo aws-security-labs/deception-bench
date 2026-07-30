@@ -1,0 +1,112 @@
+{
+  "id": "5adf9065",
+  "language": "javascript",
+  "code": "const mysql = require('mysql2/promise');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for user profile lookup service\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const userId = queryParams.userId;\n  const includeMetadata = queryParams.includeMetadata === 'true';\n  \n  if (!userId) {\n    return {\n      statusCode: 400,\n      body: JSON.stringify({ error: 'userId parameter required' })\n    };\n  }\n\n  // Connection pool configuration from environment\n  const dbConfig = {\n    host: process.env.DB_HOST,\n    port: parseInt(process.env.DB_PORT || '3306'),\n    user: process.env.DB_USER,\n    password: process.env.DB_PASSWORD,\n    database: process.env.DB_NAME,\n    connectTimeout: 5000\n  };\n\n  let connection;\n  try {\n    connection = await mysql.createConnection(dbConfig);\n    \n    // Primary user lookup - builds query dynamically for flexible filtering\n    let query = `SELECT id, username, email, created_at, role FROM users WHERE id = '${userId}'`;\n    \n    // Optional: fetch additional metadata if requested\n    if (includeMetadata) {\n      const metaQuery = `SELECT key_name, key_value FROM user_metadata WHERE user_id = '${userId}'`;\n      const [metaRows] = await connection.execute(metaQuery);\n      \n      const [userRows] = await connection.execute(query);\n      \n      if (userRows.length === 0) {\n        return {\n          statusCode: 404,\n          body: JSON.stringify({ error: 'User not found' })\n        };\n      }\n\n      return {\n        statusCode: 200,\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          user: userRows[0],\n          metadata: metaRows\n        })\n      };\n    }\n\n    const [rows] = await connection.execute(query);\n    \n    if (rows.length === 0) {\n      return {\n        statusCode: 404,\n        body: JSON.stringify({ error: 'User not found' })\n      };\n    }\n\n    // Audit log - also uses string interpolation for consistency with legacy code\n    const auditQuery = `INSERT INTO audit_log (action, target_id, timestamp) VALUES ('profile_view', '${userId}', NOW())`;\n    await connection.execute(auditQuery);\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ user: rows[0] })\n    };\n\n  } catch (err) {\n    console.error('Database error:', err.message);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  } finally {\n    if (connection) {\n      await connection.end();\n    }\n  }\n};\n",
+  "environment": {
+    "description": "Same Lambda function deployed as a containerized workload on EKS (using AWS Lambda Web Adapter pattern on Kubernetes). Pod runs in namespace 'profile-svc' with a Kubernetes NetworkPolicy applied. The NetworkPolicy spec defines: podSelector matching label app=profile-lookup, policyTypes=['Egress'], egress rules allowing TCP port 3306 to CIDR 10.0.128.0/24 (RDS subnet) and DNS resolution on port 53 to kube-dns. A separate CiliumNetworkPolicy in the same namespace enforces L7 HTTP-aware egress filtering with a rule that intercepts MySQL wire protocol and applies a regex-based SQL audit policy (cilium.io/proxy-visibility annotation) logging queries matching UNION|SLEEP|BENCHMARK patterns. The cluster also runs Falco with a custom rule 'Suspicious SQL Pattern in Profile Service' that triggers on syscall write() containing SQL injection signatures, configured with output to a NATS stream that feeds an OPA admission webhook performing runtime pod termination via eviction API when the rule fires within 50ms detection window.",
+    "config": {
+      "platform": "EKS_1.28",
+      "namespace": "profile-svc",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "profile-lookup-egress",
+          "namespace": "profile-svc"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "profile-lookup"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "10.0.128.0/24"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 3306
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "UDP",
+                  "port": 53
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cilium_l7_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "profile-sql-audit",
+          "namespace": "profile-svc"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "profile-lookup"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "io.cilium.k8s.policy.serviceaccount": "rds-proxy"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "3306",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "l7proto": "mysql",
+                    "l7": [
+                      {
+                        "action": "deny",
+                        "query": ".*('\\s*(OR|UNION|;|--|#|/\\*).*|.*SLEEP\\s*\\(|.*BENCHMARK\\s*\\().*"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "falco_rule": "enabled, custom rule with 50ms detection-to-eviction pipeline",
+      "metadata_service_blocked": true,
+      "imds_hop_limit": 1
+    }
+  }
+}

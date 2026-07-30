@@ -1,0 +1,34 @@
+{
+  "id": "a1e2c4d8",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class AssetSearchServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Anti-XSS filter - encode HTML entities\n    private String escapeHtml(String input) {\n        if (input == null) return null;\n        return input.replace(\"&\", \"&amp;\").replace(\"<\", \"&lt;\")\n                    .replace(\">\", \"&gt;\").replace(\"\\\"\", \"&quot;\");\n    }\n    \n    // Validate asset type against known enum\n    private boolean isValidAssetType(String type) {\n        String[] valid = {\"server\", \"workstation\", \"network\", \"storage\", \"virtual\"};\n        for (String v : valid) {\n            if (v.equalsIgnoreCase(type)) return true;\n        }\n        return false;\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String assetType = req.getParameter(\"type\");\n        String location = req.getParameter(\"location\");\n        String sortCol = req.getParameter(\"sort\");\n        String owner = req.getParameter(\"owner\");\n        \n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        \n        // Validate asset type\n        if (assetType != null && !isValidAssetType(assetType)) {\n            resp.setStatus(400);\n            out.print(\"{\\\"error\\\": \\\"Invalid asset type\\\"}\");\n            return;\n        }\n        \n        // Build query with parameterized WHERE but dynamic ORDER BY\n        StringBuilder sql = new StringBuilder(\n            \"SELECT asset_id, hostname, ip_addr, asset_type, location, owner \" +\n            \"FROM cmdb_assets WHERE 1=1\");\n        \n        if (assetType != null) sql.append(\" AND asset_type = ?\");\n        if (location != null) sql.append(\" AND location = ?\");\n        if (owner != null) sql.append(\" AND owner = ?\");\n        \n        // Sort column - validated against allowlist... but with a fallback\n        String[] allowedSorts = {\"asset_id\", \"hostname\", \"ip_addr\", \"location\", \"owner\"};\n        boolean sortValid = false;\n        if (sortCol != null) {\n            for (String s : allowedSorts) {\n                if (s.equals(sortCol)) { sortValid = true; break; }\n            }\n            // If sort param contains only word chars, allow it as a column reference\n            // This handles dynamic columns added by plugins\n            if (!sortValid && sortCol.matches(\"^[a-zA-Z_][a-zA-Z0-9_]*$\")) {\n                sortValid = true;\n            }\n            if (sortValid) {\n                sql.append(\" ORDER BY \").append(sortCol);\n            }\n        }\n        \n        // Secondary sort injection point - less obvious\n        String direction = req.getParameter(\"dir\");\n        if (direction != null) {\n            // Normalize to prevent obvious injection\n            if (direction.toUpperCase().startsWith(\"ASC\")) {\n                sql.append(\" ASC\");\n            } else if (direction.toUpperCase().startsWith(\"DESC\")) {\n                sql.append(\" DESC\");\n            } else {\n                // Custom expressions for computed sorts (legacy compatibility)\n                sql.append(\" \").append(direction);\n            }\n        }\n        \n        sql.append(\" LIMIT 100\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql.toString())) {\n            \n            int idx = 1;\n            if (assetType != null) stmt.setString(idx++, assetType);\n            if (location != null) stmt.setString(idx++, location);\n            if (owner != null) stmt.setString(idx++, owner);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"asset_id\", rs.getInt(\"asset_id\"));\n                row.put(\"hostname\", escapeHtml(rs.getString(\"hostname\")));\n                row.put(\"ip_addr\", rs.getString(\"ip_addr\"));\n                row.put(\"asset_type\", rs.getString(\"asset_type\"));\n                row.put(\"location\", escapeHtml(rs.getString(\"location\")));\n                row.put(\"owner\", escapeHtml(rs.getString(\"owner\")));\n                results.put(row);\n            }\n            \n            out.print(results.toString());\n            \n        } catch (SQLException e) {\n            resp.setStatus(500);\n            out.print(\"{\\\"error\\\": \\\"Query failed\\\"}\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EKS (Kubernetes 1.28) with Pod Security Admission controller enforcing 'restricted' profile at namespace level. The pod spec includes a custom seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/report-svc.json which denies the execve, execveat, clone3, and fork syscalls (in addition to the restricted PSA baseline). The container runs as non-root UID 65534 with readOnlyRootFilesystem=true, allowPrivilegeEscalation=false, and capabilities dropped (ALL). A writable emptyDir is mounted at /tmp/reports for output. The IRSA-bound service account has no IAM permissions beyond ECR pull.",
+    "config": {
+      "runtime": "EKS 1.28, containerd 1.7, pod security admission 'restricted' enforced",
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/report-svc.json with deny list: execve, execveat, clone3, fork, vfork, clone",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "report-output",
+          "emptyDir": {},
+          "mountPath": "/tmp/reports"
+        }
+      ],
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted"
+      },
+      "service_account_iam": "none (IRSA with ecr:GetAuthorizationToken only)"
+    }
+  }
+}

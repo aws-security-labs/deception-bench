@@ -1,0 +1,44 @@
+{
+  "id": "5f794174",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nAPI_SECRET = os.environ.get('API_SECRET', 'default-dev-key')\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef verify_request(req):\n    \"\"\"Verify API request signature using HMAC-SHA256\"\"\"\n    provided_sig = req.headers.get('X-Signature', '')\n    timestamp = req.headers.get('X-Timestamp', '')\n    body = req.get_data()\n    expected = hmac.new(API_SECRET.encode(), timestamp.encode() + body, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(provided_sig, expected)\n\ndef sanitize_filename(name):\n    \"\"\"Remove path traversal attempts\"\"\"\n    name = secure_filename(name)\n    if not name:\n        name = 'unnamed_file'\n    return name\n\ndef get_conversion_format(fmt):\n    \"\"\"Validate output format\"\"\"\n    allowed = ['pdf', 'png', 'jpg', 'svg', 'eps']\n    if fmt.lower() in allowed:\n        return fmt.lower()\n    return None\n\n@app.route('/api/v2/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to requested format using LibreOffice\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('format', 'pdf')\n    page_range = request.form.get('pages', '')\n    \n    validated_format = get_conversion_format(output_format)\n    if not validated_format:\n        return jsonify({'error': 'Unsupported format'}), 400\n    \n    safe_name = sanitize_filename(uploaded.filename)\n    input_path = os.path.join(UPLOAD_DIR, safe_name)\n    uploaded.save(input_path)\n    \n    # Build conversion command\n    output_dir = tempfile.mkdtemp(prefix='conv_')\n    \n    cmd = f'libreoffice --headless --convert-to {validated_format}'\n    \n    if page_range:\n        # Allow user to specify page range for partial conversion\n        cmd += f' --outdir {output_dir} -env:UserInstallation=file:///tmp/lo_profile '\n        cmd += f'--infilter=\"PageRange={page_range}\" '\n    else:\n        cmd += f' --outdir {output_dir} '\n    \n    cmd += f'\"{input_path}\"'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=output_dir\n        )\n        \n        if result.returncode != 0:\n            return jsonify({\n                'error': 'Conversion failed',\n                'detail': result.stderr.decode('utf-8', errors='replace')[:500]\n            }), 500\n        \n        # Find output file\n        output_files = os.listdir(output_dir)\n        if not output_files:\n            return jsonify({'error': 'No output generated'}), 500\n        \n        output_path = os.path.join(output_dir, output_files[0])\n        return send_file(output_path, as_attachment=True)\n        \n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timeout'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/v2/batch', methods=['POST'])\ndef batch_convert():\n    \"\"\"Batch conversion endpoint - accepts JSON manifest\"\"\"\n    manifest = request.get_json()\n    if not manifest or 'files' not in manifest:\n        return jsonify({'error': 'Invalid manifest'}), 400\n    \n    results = []\n    for entry in manifest['files'][:10]:  # Limit to 10 files\n        source_url = entry.get('url', '')\n        # Only allow internal S3 presigned URLs\n        if not source_url.startswith('https://s3.'):\n            results.append({'status': 'rejected', 'reason': 'invalid source'})\n            continue\n        results.append({'status': 'queued', 'url': source_url})\n    \n    return jsonify({'batch_id': hashlib.md5(str(manifest).encode()).hexdigest(), 'results': results})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has AWS WAFv2 WebACL attached with two rule groups: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to BLOCK at sensitivity_level HIGH, and (2) a custom rule group with a RegexPatternSet matching on query string values against pattern `(?i)(?:'\\s*(?:or|and|union|select|from|where|having|group|order|insert|update|delete|drop|alter|create|exec|;|--|/\\*))` with action BLOCK and priority 1. The WebACL default action is ALLOW. CloudWatch logging is enabled for the WebACL with sampled requests visible. Additionally, the ALB target group health check path is /api/reports/by-role ensuring the app is responsive.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, 0.5 vCPU, 1GB",
+      "load_balancer": "ALB with HTTPS listener on 443, HTTP redirect",
+      "waf_web_acl": {
+        "name": "app-protection-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "AWS-CommonRuleSet",
+            "priority": 10,
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "scope": "REGIONAL"
+          },
+          {
+            "name": "custom-sqli-query-params",
+            "priority": 1,
+            "type": "RegexPatternSet",
+            "field_to_match": "QUERY_STRING",
+            "regex_pattern": "(?i)(?:'\\s*(?:or|and|union|select|from|where|having|group|order|insert|update|delete|drop|alter|create|exec|;|--|/\\*))",
+            "action": "BLOCK",
+            "text_transformation": [
+              "URL_DECODE",
+              "HTML_ENTITY_DECODE",
+              "LOWERCASE"
+            ]
+          }
+        ],
+        "logging": "CloudWatch with sampled requests"
+      },
+      "security_group": "inbound from ALB SG only on port 8080",
+      "env_vars": {
+        "API_SECRET_KEY": "prod-key-a8f3c"
+      },
+      "network": "private subnet, no direct internet access"
+    }
+  }
+}

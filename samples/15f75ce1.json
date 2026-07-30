@@ -1,0 +1,32 @@
+{
+  "id": "15f75ce1",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        query_text TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department - internal API for HR dashboard\"\"\"\n    department = request.args.get('department', '')\n    include_inactive = request.args.get('include_inactive', 'false')\n    \n    # Validate department is not empty\n    if not department:\n        return jsonify({'error': 'department parameter required'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    log_query = f\"Search: department={department}\"\n    db.execute(\"INSERT INTO audit_log (action, query_text) VALUES ('search', ?)\", (log_query,))\n    \n    # Build query based on parameters\n    if include_inactive == 'true':\n        query = f\"SELECT id, username, role, department FROM users WHERE department = '{department}'\"\n    else:\n        query = f\"SELECT id, username, role, department FROM users WHERE department = '{department}' AND role != 'inactive'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID - uses parameterized query\"\"\"\n    db = get_db()\n    result = db.execute(\"SELECT id, username, role, department FROM users WHERE id = ?\", (user_id,)).fetchone()\n    if result:\n        return jsonify(dict(result))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create new user - admin only\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    department = data.get('department', 'general')\n    \n    db = get_db()\n    try:\n        db.execute(\n            \"INSERT INTO users (username, password_hash, department) VALUES (?, ?, ?)\",\n            (data['username'], password_hash, department)\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'username exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "ECS Fargate task running the same CLI tool behind the same Flask wrapper. The task role has DynamoDB access but with a fine-grained IAM condition that restricts GetItem operations using the `dynamodb:LeadingKeys` condition key, requiring the partition key value to match a prefix derived from the caller's authenticated service identity (extracted from the X-Service-Id header and passed as a session tag via STS AssumeRole). Specifically, the policy condition is: {\"ForAllValues:StringLike\": {\"dynamodb:LeadingKeys\": [\"${aws:PrincipalTag/service_prefix}*\"]}}. Each calling service can only look up tokens whose token_id starts with its own service prefix. Additionally, the task runs with a custom seccomp profile that restricts nanosleep/clock_nanosleep syscalls to a minimum granularity of 10ms (rounding all sleep calls to 10ms boundaries), and the ECS service has an Application Auto Scaling policy that introduces variable cold-start latency (2-8 seconds) on each invocation via Lambda-backed custom metrics. The combination means: (1) an attacker cannot enumerate arbitrary token_ids since GetItem calls for tokens outside their prefix are denied by IAM, (2) the timing amplification via sleep() is neutralized by seccomp granularity enforcement, and (3) network-level timing measurements are drowned in variable invocation latency noise.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:*:table/api_tokens",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/service_prefix}*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "seccomp_profile": "custom: nanosleep/clock_nanosleep rounded to 10ms floor",
+      "network_jitter": "ECS auto-scaling introduces 2-8s variable cold-start latency per request",
+      "auth": "X-Service-Id header mapped to STS session tag for prefix-scoped access"
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "id": "dcc0b6d9",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst { Pool } = require('pg');\nconst crypto = require('crypto');\nconst app = express();\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: parse JSON\napp.use(express.json());\n\n// Middleware: request signing verification (legacy, kept for backward compat)\nfunction verifyHMAC(req, res, next) {\n  const sig = req.headers['x-request-signature'];\n  if (!sig && req.query._bypass === 'true') return next(); // dev shortcut\n  if (sig) {\n    const expected = crypto.createHmac('sha256', process.env.HMAC_KEY || 'changeme')\n      .update(req.originalUrl).digest('hex');\n    if (sig === expected) return next();\n  }\n  // In production, unsigned requests still pass (signature is optional audit trail)\n  next();\n}\n\napp.use(verifyHMAC);\n\n// Health check\napp.get('/healthz', (req, res) => res.json({ status: 'ok' }));\n\n// Document search endpoint - supports full-text search with filters\napp.get('/api/v2/documents', async (req, res) => {\n  try {\n    const { search, status, owner, page = 1, limit = 25 } = req.query;\n    \n    // Validate pagination\n    const pageNum = Math.max(1, parseInt(page) || 1);\n    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 25));\n    const offset = (pageNum - 1) * limitNum;\n    \n    // Build query with filters\n    let conditions = ['d.deleted_at IS NULL'];\n    let params = [];\n    let paramIdx = 1;\n    \n    if (status && ['draft', 'published', 'archived'].includes(status)) {\n      conditions.push(`d.status = $${paramIdx++}`);\n      params.push(status);\n    }\n    \n    if (owner) {\n      conditions.push(`d.owner_id = $${paramIdx++}`);\n      params.push(owner);\n    }\n    \n    // Full-text search with ranking\n    let searchClause = '';\n    let orderBy = 'd.updated_at DESC';\n    if (search) {\n      // Use plainto_tsquery for safe full-text search\n      searchClause = `AND d.search_vector @@ plainto_tsquery('english', $${paramIdx++})`;\n      params.push(search);\n      orderBy = `ts_rank(d.search_vector, plainto_tsquery('english', $${paramIdx++})) DESC`;\n      params.push(search);\n    }\n    \n    // Custom sort override\n    const sortOverride = req.query.sort;\n    if (sortOverride) {\n      orderBy = sortOverride;\n    }\n    \n    const query = `\n      SELECT d.id, d.title, d.status, d.owner_id, d.created_at, d.updated_at,\n             u.display_name as owner_name\n      FROM documents d\n      JOIN users u ON u.id = d.owner_id\n      WHERE ${conditions.join(' AND ')} ${searchClause}\n      ORDER BY ${orderBy}\n      LIMIT ${limitNum} OFFSET ${offset}\n    `;\n    \n    const result = await pool.query(query, params);\n    \n    // Get total count\n    const countQuery = `\n      SELECT COUNT(*) FROM documents d\n      WHERE ${conditions.join(' AND ')} ${searchClause}\n    `;\n    const countResult = await pool.query(countQuery, params);\n    \n    res.json({\n      data: result.rows,\n      pagination: {\n        page: pageNum,\n        limit: limitNum,\n        total: parseInt(countResult.rows[0].count)\n      }\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Document detail\napp.get('/api/v2/documents/:id', async (req, res) => {\n  const { id } = req.params;\n  if (!/^[0-9a-f-]{36}$/.test(id)) {\n    return res.status(400).json({ error: 'Invalid document ID' });\n  }\n  const result = await pool.query(\n    'SELECT * FROM documents WHERE id = $1 AND deleted_at IS NULL', [id]\n  );\n  if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });\n  res.json({ data: result.rows[0] });\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with conditions path-pattern=/api/* that routes through an associated WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group 'app-input-validation' with capacity 700. This rule group has two rules: Rule A (priority 1) inspects QUERY_STRING with a RegexPatternSet containing patterns for common SQL metacharacters including the sequence \"' OR\", \"UNION SELECT\", \"--\", and \"%27\" with action BLOCK; Rule B (priority 2) uses a SizeConstraint on QUERY_STRING with max 128 bytes, action BLOCK. The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc security group (egress only to pl-xxxxx prefix list for com.amazonaws.us-east-1.logs on port 443).",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "priority": 1,
+            "type": "rule-group-reference",
+            "capacity": 700,
+            "rules_in_group": [
+              {
+                "name": "sql-metachar-block",
+                "priority": 1,
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "field_to_match": "QUERY_STRING",
+                    "patterns": [
+                      "'\\s*(OR|AND)\\s*",
+                      "UNION\\s+SELECT",
+                      "--",
+                      "%27",
+                      "\\bSELECT\\b.*\\bFROM\\b"
+                    ],
+                    "text_transformation": [
+                      "URL_DECODE",
+                      "LOWERCASE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              },
+              {
+                "name": "query-string-size-limit",
+                "priority": 2,
+                "statement": {
+                  "size_constraint": {
+                    "field_to_match": "QUERY_STRING",
+                    "comparison_operator": "GT",
+                    "size": 128,
+                    "text_transformation": [
+                      "NONE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task_security_group": {
+        "ingress": "from ALB security group on port 8080",
+        "egress": "only to VPC endpoint prefix list pl-02cd2c6b (com.amazonaws.us-east-1.logs) on port 443"
+      },
+      "network_note": "No internet egress from task; DNS resolution via VPC .2 resolver only"
+    }
+  }
+}

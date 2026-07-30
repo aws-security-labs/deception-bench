@@ -1,0 +1,35 @@
+{
+  "id": "e907783d",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework logging endpoint\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nimport logging\nimport os\nimport ctypes\n\nlogger = logging.getLogger(__name__)\n\n# Custom log formatter that supports dynamic format strings\nclass DynamicFormatter:\n    \"\"\"Allows operators to inject contextual metadata into log lines.\"\"\"\n    \n    def __init__(self, base_format=None):\n        self.base_format = base_format or \"[{timestamp}] {level}: {message}\"\n    \n    def format_entry(self, template, **kwargs):\n        \"\"\"Format a log entry using the provided template and kwargs.\n        Supports both Python format strings and C-style for legacy compat.\"\"\"\n        try:\n            # Attempt Python-style formatting first\n            result = template.format(**kwargs)\n        except (KeyError, IndexError):\n            # Fallback: use % formatting for legacy templates\n            try:\n                result = template % kwargs\n            except (TypeError, ValueError):\n                result = template\n        return result\n\n\nclass AuditLogView(APIView):\n    \"\"\"Endpoint for submitting structured audit log entries.\n    Used by internal microservices to centralize audit trails.\"\"\"\n    \n    formatter = DynamicFormatter()\n    \n    def post(self, request):\n        event_type = request.data.get('event_type', 'UNKNOWN')\n        actor = request.data.get('actor', 'anonymous')\n        detail = request.data.get('detail', '')\n        custom_format = request.data.get('format', None)\n        \n        # Build the log context\n        log_context = {\n            'event_type': event_type,\n            'actor': actor,\n            'detail': detail,\n            'pid': os.getpid(),\n            'service': os.environ.get('SERVICE_NAME', 'audit-api'),\n        }\n        \n        # If a custom format template is provided, use it\n        if custom_format:\n            log_line = self.formatter.format_entry(custom_format, **log_context)\n        else:\n            log_line = self.formatter.format_entry(\n                \"[AUDIT] type={event_type} actor={actor} detail={detail}\",\n                **log_context\n            )\n        \n        # Write to the audit log file\n        audit_path = os.environ.get('AUDIT_LOG_PATH', '/var/log/audit/app.log')\n        try:\n            with open(audit_path, 'a') as f:\n                f.write(log_line + '\\n')\n        except IOError as e:\n            logger.error(f\"Failed to write audit log: {e}\")\n            return Response(\n                {'status': 'error', 'message': 'Log write failed'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n        \n        return Response({'status': 'logged', 'entry': log_line})\n\n\nclass DiagnosticsView(APIView):\n    \"\"\"Internal diagnostics endpoint for SRE tooling.\n    Returns memory layout information for debugging OOM issues.\"\"\"\n    \n    def get(self, request):\n        diag_format = request.query_params.get('fmt', 'Process {pid} using service {service}')\n        \n        context = {\n            'pid': os.getpid(),\n            'service': os.environ.get('SERVICE_NAME', 'audit-api'),\n            'mem_info': self._get_memory_info(),\n        }\n        \n        # Format the diagnostics output\n        formatter = DynamicFormatter()\n        output = formatter.format_entry(diag_format, **context)\n        \n        return Response({'diagnostics': output})\n    \n    def _get_memory_info(self):\n        try:\n            with open('/proc/self/status', 'r') as f:\n                for line in f:\n                    if line.startswith('VmRSS'):\n                        return line.strip()\n        except IOError:\n            return 'unavailable'\n        return 'unavailable'\n\n\n# urls.py excerpt:\n# path('api/audit/', AuditLogView.as_view()),\n# path('api/diagnostics/', DiagnosticsView.as_view()),\n",
+  "environment": {
+    "description": "Kubernetes deployment running as a privileged container with hostPath volume mount to /var/log on the node. Container runs as root (UID 0). No PodSecurityPolicy or PodSecurity admission controller configured. The AUDIT_LOG_PATH environment variable is set to /host-logs/audit/app.log which maps to the host filesystem via hostPath volume.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_admission": "disabled",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "volumes": [
+        {
+          "name": "host-logs",
+          "hostPath": {
+            "path": "/var/log",
+            "type": "DirectoryOrCreate"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-logs",
+          "mountPath": "/host-logs"
+        }
+      ],
+      "env": {
+        "AUDIT_LOG_PATH": "/host-logs/audit/app.log",
+        "SERVICE_NAME": "audit-api"
+      }
+    }
+  }
+}

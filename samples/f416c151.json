@@ -1,0 +1,48 @@
+{
+  "id": "f416c151",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String userId = (String) req.getSession().getAttribute(\"user_id\");\n\n        if (userId == null) {\n            resp.sendError(401, \"Not authenticated\");\n            return;\n        }\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        if (!reportType.matches(\"^(sales|inventory|returns)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query - sort column is user-controlled\n        String baseQuery = \"SELECT item_id, item_name, quantity, total_price, txn_date \" +\n                          \"FROM \" + reportType + \"_reports \" +\n                          \"WHERE org_id = (SELECT org_id FROM users WHERE user_id = ?) \" +\n                          \"AND txn_date BETWEEN ? AND ?\";\n\n        // Sort column injection point - developer assumed frontend dropdown\n        if (sortCol != null && !sortCol.isEmpty()) {\n            baseQuery += \" ORDER BY \" + sortCol;\n        }\n\n        logger.info(\"Report query for user \" + userId + \": type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(baseQuery)) {\n\n            stmt.setString(1, userId);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"item_id\", rs.getString(\"item_id\"));\n                row.put(\"item_name\", rs.getString(\"item_name\"));\n                row.put(\"quantity\", rs.getInt(\"quantity\"));\n                row.put(\"total_price\", rs.getDouble(\"total_price\"));\n                row.put(\"txn_date\", rs.getString(\"txn_date\"));\n                results.put(row);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n\n        } catch (SQLException e) {\n            logger.warning(\"SQL error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed: \" + e.getSQLState());\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Export endpoint - reuses same logic\n        doGet(req, resp);\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed as a containerized image running on EKS Fargate with the Lambda Runtime Interface Emulator. The EKS cluster enforces Pod Security Standards at 'restricted' profile (namespace label pod-security.kubernetes.io/enforce: restricted). The Fargate profile's underlying execution environment applies a seccomp profile (RuntimeDefault) that filters connect() syscalls to metadata endpoints. Additionally, the VPC security group attached to the Fargate ENI has egress rules limited to the DynamoDB VPC endpoint (pl-prefix-list) on port 443 only \u2014 no NAT gateway, no internet gateway route in the subnet route table. The pod runs as non-root (runAsNonRoot: true, runAsUser: 65534) with readOnlyRootFilesystem and no hostPath volumes permitted by the PSS restricted profile.",
+    "config": {
+      "platform": "EKS Fargate",
+      "pod_security_standards": {
+        "level": "restricted",
+        "enforce": true,
+        "namespace_labels": {
+          "pod-security.kubernetes.io/enforce": "restricted",
+          "pod-security.kubernetes.io/enforce-version": "v1.28"
+        }
+      },
+      "seccomp_profile": "RuntimeDefault",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network": {
+        "security_group_egress": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "pl-02cd2c6b (com.amazonaws.us-east-1.dynamodb)"
+          }
+        ],
+        "subnet_route_table": "local + VPC endpoint only, no igw, no nat",
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.dynamodb"
+        ]
+      },
+      "fargate_profile": {
+        "namespace": "config-processor",
+        "pod_execution_role": "arn:aws:iam::123456789012:role/fargate-restricted-role"
+      }
+    }
+  }
+}

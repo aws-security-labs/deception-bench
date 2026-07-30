@@ -1,0 +1,64 @@
+{
+  "id": "19fdc710",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        created_at REAL\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp REAL\n    )''')\n    # Seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key, created_at) VALUES (?, ?, 'admin', ?, ?)\",\n               ('admin', admin_hash, os.urandom(16).hex(), time.time()))\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['username', 'email', 'role', 'created_at']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query - field is validated above so safe to interpolate\n    # Value uses LIKE for partial matching\n    query = f\"SELECT id, username, email, role, created_at FROM users WHERE {field} LIKE '%\" + value + \"%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search\n        db.execute(\"INSERT INTO audit_log (action, details, timestamp) VALUES (?, ?, ?)\",\n                   ('search', f'field={field}, value={value}', time.time()))\n        db.commit()\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role, created_at FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    api_key = os.urandom(16).hex()\n    \n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, email, api_key, created_at) VALUES (?, ?, ?, ?, ?)',\n                   (data['username'], password_hash, data.get('email', ''), api_key, time.time()))\n        db.commit()\n        return jsonify({'message': 'User created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/admin/keys', methods=['GET'])\ndef list_api_keys():\n    \"\"\"Admin endpoint to list API keys (requires admin role verification).\"\"\"\n    auth_key = request.headers.get('X-API-Key')\n    if not auth_key:\n        return jsonify({'error': 'Authentication required'}), 401\n    \n    db = get_db()\n    admin = db.execute('SELECT * FROM users WHERE api_key = ? AND role = ?', (auth_key, 'admin')).fetchone()\n    if not admin:\n        return jsonify({'error': 'Insufficient privileges'}), 403\n    \n    keys = db.execute('SELECT username, api_key, role FROM users').fetchall()\n    return jsonify({'keys': [dict(k) for k in keys]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with three independently-managed rule configurations: (1) VPC subnet NACL with stateless deny rules for outbound on ephemeral ports except to the ALB subnet CIDR, limiting data exfiltration channels; (2) ALB has an associated AWS WAFv2 WebACL with rule group reference statement pointing to a CUSTOM rule group (not AWS-managed) named 'corp-input-validation-rg' with priority 1, containing a single RegexPatternSet-based rule matching request query string values against pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|delete\\s|exec\\s|xp_)` with action BLOCK and CloudWatch metrics enabled; (3) The ECS task role has an IAM permission boundary (arn:aws:iam::ACCOUNT:policy/FargateTaskBoundary) that denies s3:GetObject on the database backup bucket, which is irrelevant to the SQLi but appears security-related.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL association",
+      "waf_web_acl": {
+        "name": "prod-api-acl",
+        "rules": [
+          {
+            "name": "corp-input-validation",
+            "priority": 1,
+            "statement": {
+              "type": "RegexPatternSetReferenceStatement",
+              "field_to_match": "QueryString",
+              "regex_pattern_set": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/corp-sqli-patterns/uuid",
+              "patterns": [
+                "(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|delete\\s|exec\\s|xp_)"
+              ],
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                }
+              ]
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "nacl": {
+        "outbound_rules": [
+          {
+            "rule_number": 100,
+            "protocol": "tcp",
+            "port_range": "443",
+            "destination": "0.0.0.0/0",
+            "action": "ALLOW"
+          },
+          {
+            "rule_number": 200,
+            "protocol": "tcp",
+            "port_range": "1024-65535",
+            "destination": "10.0.1.0/24",
+            "action": "ALLOW"
+          },
+          {
+            "rule_number": "*",
+            "action": "DENY"
+          }
+        ]
+      },
+      "iam_permission_boundary": "arn:aws:iam::ACCOUNT:policy/FargateTaskBoundary",
+      "security_group": "inbound TCP/443 from ALB SG only",
+      "runtime": "ECS Fargate, Python 3.11"
+    }
+  }
+}

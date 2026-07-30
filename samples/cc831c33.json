@@ -1,0 +1,35 @@
+{
+  "id": "cc831c33",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/roles_controller.rb\nclass Api::V1::RolesController < ApplicationController\n  before_action :authenticate_user!\n  before_action :load_target_user, only: [:update]\n\n  # PATCH /api/v1/users/:user_id/role\n  # Params: { role: \"admin\" | \"moderator\" | \"viewer\" }\n  def update\n    new_role = params[:role].to_s.strip.downcase\n\n    unless %w[admin moderator viewer].include?(new_role)\n      return render json: { error: \"Invalid role\" }, status: :unprocessable_entity\n    end\n\n    # Authorization check: only admins can assign admin role\n    if new_role == \"admin\" && !current_user.admin?\n      return render json: { error: \"Forbidden\" }, status: :forbidden\n    end\n\n    # BUG: No check that current_user has permission to assign 'moderator' role\n    # Any authenticated user can escalate any other user (or themselves) to moderator\n    # by repeatedly trying different user_ids until they find a valid one\n    if @target_user.update(role: new_role)\n      AuditLog.create!(\n        actor_id: current_user.id,\n        target_id: @target_user.id,\n        action: \"role_change\",\n        details: { new_role: new_role }\n      )\n      render json: { user_id: @target_user.id, role: new_role }, status: :ok\n    else\n      render json: { error: @target_user.errors.full_messages }, status: :unprocessable_entity\n    end\n  end\n\n  # GET /api/v1/users/:user_id/role\n  def show\n    user = User.find_by(id: params[:user_id])\n    if user\n      render json: { user_id: user.id, role: user.role }, status: :ok\n    else\n      render json: { error: \"Not found\" }, status: :not_found\n    end\n  end\n\n  private\n\n  def load_target_user\n    @target_user = User.find_by(id: params[:user_id])\n    unless @target_user\n      render json: { error: \"User not found\" }, status: :not_found\n    end\n  end\nend\n\n# app/models/user.rb\nclass User < ApplicationRecord\n  enum role: { viewer: 0, moderator: 1, admin: 2 }\n\n  validates :role, presence: true, inclusion: { in: roles.keys }\n\n  def admin?\n    role == \"admin\"\n  end\n\n  def moderator_or_above?\n    moderator? || admin?\n  end\nend\n\n# config/routes.rb (excerpt)\n# namespace :api do\n#   namespace :v1 do\n#     resources :users, only: [] do\n#       resource :role, only: [:show, :update], controller: 'roles'\n#     end\n#   end\n# end\n\n# db/migrate/20240101000000_create_users.rb\nclass CreateUsers < ActiveRecord::Migration[7.0]\n  def change\n    create_table :users do |t|\n      t.string :email, null: false\n      t.string :password_digest, null: false\n      t.integer :role, default: 0, null: false\n      t.timestamps\n    end\n  end\nend",
+  "environment": {
+    "description": "Rails 7.0 API deployed on ECS Fargate behind an Application Load Balancer with an associated AWS WAF WebACL. The WebACL includes a custom rate-based rule (RateBasedRule) scoped to the URI path '/api/v1/users/*/role' with an evaluation window of 5 minutes and a threshold of 3 requests per source IP per evaluation window. The rule action is BLOCK, returning HTTP 429. Additionally, the ALB has a listener rule that inspects the X-Forwarded-For header and the WAF rule uses the forwarded IP configuration set to 'X-Forwarded-For' with fallback to source IP, preventing bypass via proxy rotation for the same origin. The WAF rule has a scope-down statement matching HTTP method PATCH only. Note: the rate limit applies per-IP across ALL user_id path parameters, meaning an attacker cannot enumerate different user_ids to avoid the rate limit \u2014 3 total PATCH requests to any role endpoint within 5 minutes triggers the block.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, ALB with WAF WebACL",
+      "waf_rule": {
+        "type": "RateBasedRule",
+        "metric_name": "RoleEndpointRateLimit",
+        "rate_limit": 3,
+        "evaluation_window_sec": 300,
+        "scope_down_statement": {
+          "and_statement": [
+            {
+              "uri_path": {
+                "contains": "/api/v1/users/",
+                "ends_with": "/role"
+              }
+            },
+            {
+              "http_method": "PATCH"
+            }
+          ]
+        },
+        "ip_address_source": "X-Forwarded-For with fallback to source IP",
+        "action": "BLOCK (429)"
+      },
+      "auth": "JWT bearer token, self-issued by Rails app",
+      "network": "ALB -> ECS Fargate, WAF attached to ALB",
+      "rails_env": "production"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "ddca6f3a",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/inventory.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        sku TEXT NOT NULL,\n        name TEXT NOT NULL,\n        category TEXT,\n        price REAL,\n        quantity INTEGER DEFAULT 0\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category and optional price range.\n    Supports partial matching on category field.\n    \"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    \n    # Input length validation\n    if len(category) > 100:\n        return jsonify({'error': 'Category too long'}), 400\n    \n    # Numeric validation for price params\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'Invalid price format'}), 400\n    \n    # Log the search for analytics\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'category={category}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Parameterized query for the actual product search\n    search_query = \"SELECT id, sku, name, category, price, quantity FROM products WHERE category LIKE ? AND price BETWEEN ? AND ?\"\n    results = db.execute(search_query, (f'%{category}%', min_p, max_p)).fetchall()\n    \n    products = [dict(row) for row in results]\n    return jsonify({'results': products, 'count': len(products)})\n\n@app.route('/api/v1/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    product = db.execute(\n        'SELECT id, sku, name, category, price, quantity FROM products WHERE id = ?',\n        (product_id,)\n    ).fetchone()\n    if product is None:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(product))\n\n@app.route('/api/v1/products', methods=['POST'])\ndef create_product():\n    data = request.get_json()\n    if not data or 'sku' not in data or 'name' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    db.execute(\n        'INSERT INTO products (sku, name, category, price, quantity) VALUES (?, ?, ?, ?, ?)',\n        (data['sku'], data['name'], data.get('category', ''), data.get('price', 0), data.get('quantity', 0))\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS pod in namespace 'build-system-prod' behind AWS ALB Ingress Controller with annotation alb.ingress.kubernetes.io/auth-type: cognito removed, instead using mutual TLS via alb.ingress.kubernetes.io/mutual-authentication with trust store ARN pointing to an ACM PCA-issued intermediate CA (arn:aws:acm:us-east-1:XXXX:certificate/prod-client-ca). The ALB listener on port 443 has mutual authentication mode set to 'verify' (not 'passthrough'), meaning the ALB itself validates the client certificate against the trust store BEFORE forwarding the request. Additionally, the target group protocol is gRPC with health check on /grpc.health.v1.Health/Check. The pod has a Kubernetes NetworkPolicy that only allows ingress from the ALB security group (sg-0a1b2c3d4e5f) on port 8443, and the ALB's security group only allows inbound from the corporate VPN CIDR (10.200.0.0/16). The pod runs with a read-only root filesystem (readOnlyRootFilesystem: true in securityContext) with only /var/lib/artifacts and /tmp mounted as emptyDir volumes with a 512Mi size limit. A Gatekeeper ConstraintTemplate enforces that no pod in the namespace can mount hostPath volumes.",
+    "config": {
+      "kubernetes_namespace": "build-system-prod",
+      "ingress_type": "AWS ALB Ingress Controller",
+      "alb_mutual_auth_mode": "verify",
+      "alb_trust_store_arn": "arn:aws:acm:us-east-1:XXXX:certificate/prod-client-ca",
+      "alb_client_cert_issuer": "ACM PCA intermediate CA",
+      "network_policy": "allow ingress only from sg-0a1b2c3d4e5f on 8443",
+      "alb_security_group_inbound": "10.200.0.0/16 (corporate VPN)",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "volume_mounts": [
+        {
+          "path": "/var/lib/artifacts",
+          "type": "emptyDir",
+          "sizeLimit": "512Mi"
+        },
+        {
+          "path": "/tmp",
+          "type": "emptyDir",
+          "sizeLimit": "64Mi"
+        }
+      ],
+      "gatekeeper_constraints": "no hostPath mounts allowed in namespace",
+      "target_group_protocol": "gRPC"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "dc2f11ff",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'inventory',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: { rejectUnauthorized: false },\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const authHeader = req.headers['authorization'];\n  if (!authHeader) return res.status(401).json({ error: 'No auth' });\n  try {\n    const payload = JSON.parse(Buffer.from(authHeader.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search products with filters\napp.get('/api/products/search', extractTenant, async (req, res) => {\n  const { category, min_price, max_price, sort_field, sort_dir } = req.query;\n  \n  // Validate sort direction\n  const validDirs = ['ASC', 'DESC'];\n  const direction = validDirs.includes((sort_dir || '').toUpperCase()) ? sort_dir.toUpperCase() : 'ASC';\n  \n  // Validate sort field against allowlist\n  const validSorts = ['name', 'price', 'created_at', 'stock_count'];\n  const sortColumn = validSorts.includes(sort_field) ? sort_field : 'name';\n  \n  // Build WHERE clause\n  let conditions = [`tenant_id = '${req.tenantId}'`];\n  let paramIndex = 1;\n  let params = [];\n  \n  if (category) {\n    // Category uses parameterized query\n    conditions.push(`category = $${paramIndex++}`);\n    params.push(category);\n  }\n  if (min_price) {\n    conditions.push(`price >= $${paramIndex++}`);\n    params.push(parseFloat(min_price));\n  }\n  if (max_price) {\n    conditions.push(`price <= $${paramIndex++}`);\n    params.push(parseFloat(max_price));\n  }\n\n  const query = `SELECT id, name, category, price, stock_count, created_at \n    FROM products \n    WHERE ${conditions.join(' AND ')}\n    ORDER BY ${sortColumn} ${direction}\n    LIMIT 100`;\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ products: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Database error' });\n  }\n});\n\n// Update stock level\napp.patch('/api/products/:id/stock', extractTenant, async (req, res) => {\n  const { id } = req.params;\n  const { adjustment, reason } = req.body;\n  \n  if (!Number.isInteger(adjustment)) {\n    return res.status(400).json({ error: 'adjustment must be integer' });\n  }\n\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    const update = await client.query(\n      `UPDATE products SET stock_count = stock_count + $1 WHERE id = $2 AND tenant_id = '${req.tenantId}' RETURNING *`,\n      [adjustment, id]\n    );\n    if (update.rowCount === 0) {\n      await client.query('ROLLBACK');\n      return res.status(404).json({ error: 'Product not found' });\n    }\n    await client.query(\n      'INSERT INTO stock_audit (product_id, adjustment, reason, user_id) VALUES ($1, $2, $3, $4)',\n      [id, adjustment, reason || 'manual', req.userId]\n    );\n    await client.query('COMMIT');\n    res.json({ product: update.rows[0] });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    console.error('Stock update error:', err.message);\n    res.status(500).json({ error: 'Update failed' });\n  } finally {\n    client.release();\n  }\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Same Quarkus Lambda deployed via AWS SAM in us-east-1. Lambda runs in an isolated VPC. The API Gateway endpoint is configured as a PRIVATE REST API with a VPC Endpoint policy (vpce-0abc123def456) that restricts invoke access to principals within the account's VPC. The Lambda function's VPC subnets have NO NAT Gateway and NO internet gateway attached \u2014 route tables contain only local VPC CIDR routes (10.0.0.0/16) and routes to the com.amazonaws.us-east-1.execute-api VPC interface endpoint. DNS resolution within the VPC is handled by Route 53 Resolver with an outbound endpoint forwarding only to an on-premises DNS server (10.0.200.53) that serves authoritative zones for internal domains and returns NXDOMAIN for all external queries. The Lambda security group (sg-0x9f8e7d6c5b4a) has outbound rules limited to TCP 443 to prefix list pl-63a5400a (S3 gateway endpoint) and TCP 443 to the CIDR of the execute-api VPC endpoint ENIs only.",
+    "config": {
+      "runtime": "quarkus-amazon-lambda-http",
+      "api_gateway": "PRIVATE REST API (resource policy: aws:SourceVpce = vpce-0abc123def456)",
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-isolated-0a1b2c"
+        ],
+        "security_group_ids": [
+          "sg-0x9f8e7d6c5b4a"
+        ],
+        "no_nat_gateway": true,
+        "no_igw": true,
+        "route_table": "local 10.0.0.0/16 only + vpce routes"
+      },
+      "dns_resolution": {
+        "route53_resolver_outbound": "10.0.200.53 (on-prem, internal zones only, NXDOMAIN for external)",
+        "vpc_dns_enabled": true,
+        "private_hosted_zones": [
+          "internal.corp.example.com"
+        ]
+      },
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a (S3 prefix list)"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "10.0.5.0/24 (execute-api ENIs)"
+        }
+      ],
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.execute-api",
+        "com.amazonaws.us-east-1.s3"
+      ]
+    }
+  }
+}

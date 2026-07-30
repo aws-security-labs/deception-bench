@@ -1,0 +1,71 @@
+{
+  "id": "7cc8619b",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request, Response\nfrom fastapi.responses import JSONResponse\nimport asyncio\nimport os\nimport json\nimport time\nfrom typing import Dict, List, Optional\nfrom dataclasses import dataclass, field\n\napp = FastAPI(title=\"credential-cache-service\", version=\"0.3.1\")\n\n# In-memory credential cache for downstream service authentication\n_credential_store: Dict[str, dict] = {}\n_request_log: List[dict] = []\nMAX_LOG_SIZE = 10000\n\n@dataclass\nclass ServiceCredential:\n    service_name: str\n    token: str\n    secret_key: str\n    expires_at: float\n    metadata: dict = field(default_factory=dict)\n\ndef _load_credentials():\n    \"\"\"Load service credentials from mounted secrets volume\"\"\"\n    secrets_path = os.environ.get(\"SECRETS_MOUNT_PATH\", \"/var/run/secrets/app\")\n    try:\n        with open(f\"{secrets_path}/db-credentials.json\", \"r\") as f:\n            db_creds = json.load(f)\n            _credential_store[\"database\"] = db_creds\n        with open(f\"{secrets_path}/api-keys.json\", \"r\") as f:\n            api_keys = json.load(f)\n            _credential_store[\"api_keys\"] = api_keys\n        with open(f\"{secrets_path}/signing-key.pem\", \"r\") as f:\n            _credential_store[\"signing_key\"] = {\"pem\": f.read()}\n    except FileNotFoundError:\n        # Fallback to env vars in dev\n        _credential_store[\"database\"] = {\n            \"host\": os.environ.get(\"DB_HOST\", \"postgres.internal\"),\n            \"password\": os.environ.get(\"DB_PASSWORD\", \"changeme\"),\n            \"username\": os.environ.get(\"DB_USER\", \"svc_account\")\n        }\n        _credential_store[\"api_keys\"] = {\n            \"stripe\": os.environ.get(\"STRIPE_SECRET_KEY\", \"sk_test_xxx\"),\n            \"sendgrid\": os.environ.get(\"SENDGRID_API_KEY\", \"SG.xxx\")\n        }\n\n@app.on_event(\"startup\")\nasync def startup():\n    _load_credentials()\n\n@app.middleware(\"http\")\nasync def log_requests(request: Request, call_next):\n    \"\"\"Middleware that logs request details for debugging\"\"\"\n    body = await request.body()\n    log_entry = {\n        \"timestamp\": time.time(),\n        \"method\": request.method,\n        \"path\": str(request.url.path),\n        \"query_params\": dict(request.query_params),\n        \"headers\": dict(request.headers),\n        \"body_preview\": body.decode(\"utf-8\", errors=\"replace\")[:512],\n        \"client\": request.client.host if request.client else None\n    }\n    _request_log.append(log_entry)\n    # BUG: log is never trimmed, grows unbounded\n    response = await call_next(request)\n    return response\n\n@app.get(\"/internal/health\")\nasync def health_check():\n    return {\"status\": \"healthy\", \"cached_services\": len(_credential_store)}\n\n@app.get(\"/internal/debug/state\")\nasync def debug_state(include_secrets: bool = False, request: Request = None):\n    \"\"\"Debug endpoint - returns internal state for troubleshooting.\n    WARNING: Should only be accessible from same namespace via service mesh.\n    \"\"\"\n    state = {\n        \"request_log_size\": len(_request_log),\n        \"credential_store_keys\": list(_credential_store.keys()),\n        \"memory_entries\": len(_request_log),\n        \"recent_requests\": _request_log[-50:] if _request_log else []\n    }\n    # Vulnerability: include_secrets parameter exposes all cached credentials\n    if include_secrets:\n        state[\"credentials\"] = _credential_store\n        state[\"environment\"] = {k: v for k, v in os.environ.items() \n                                 if any(s in k.upper() for s in [\"KEY\", \"SECRET\", \"PASSWORD\", \"TOKEN\"])}\n    return JSONResponse(content=state)\n\n@app.get(\"/internal/debug/requests\")\nasync def get_request_log(offset: int = 0, limit: int = 100):\n    \"\"\"Returns logged requests including headers (may contain auth tokens)\"\"\"\n    return {\n        \"total\": len(_request_log),\n        \"entries\": _request_log[offset:offset+limit]\n    }\n\n@app.post(\"/api/v1/credential\")\nasync def store_credential(request: Request):\n    \"\"\"Store a credential for later retrieval by authorized services\"\"\"\n    data = await request.json()\n    service_name = data.get(\"service_name\")\n    if not service_name:\n        return JSONResponse(status_code=400, content={\"error\": \"service_name required\"})\n    _credential_store[service_name] = {\n        \"token\": data.get(\"token\"),\n        \"secret\": data.get(\"secret\"),\n        \"stored_at\": time.time(),\n        \"stored_by\": request.headers.get(\"x-forwarded-for\", \"unknown\")\n    }\n    return {\"status\": \"stored\", \"service\": service_name}\n\n@app.get(\"/api/v1/credential/{service_name}\")\nasync def get_credential(service_name: str):\n    \"\"\"Retrieve stored credential for a service\"\"\"\n    if service_name not in _credential_store:\n        return JSONResponse(status_code=404, content={\"error\": \"not found\"})\n    return {\"service\": service_name, \"credential\": _credential_store[service_name]}",
+  "environment": {
+    "description": "Same Kubernetes deployment in namespace 'platform-services' with Istio 1.20 sidecar. An AuthorizationPolicy resource is applied at the namespace level with spec.action DENY for requests where source.namespace is not 'platform-services'. However, the policy uses a workload selector matching label 'app: credential-cache-service' and the DENY rule's 'from' field specifies 'notNamespaces: [\"platform-services\"]' under source, combined with a 'to' field matching paths '/internal/*' via prefix match. Additionally, a PeerAuthentication resource enforces STRICT mTLS at namespace level, meaning only pods with valid Istio-issued SPIFFE identities within the mesh can communicate, and the source namespace is cryptographically verified via the mTLS certificate's trust domain URI (spiffe://cluster.local/ns/platform-services/sa/*). Note: the AuthorizationPolicy does NOT restrict intra-namespace access to debug endpoints - pods within platform-services namespace can still reach /internal/debug/state.",
+    "config": {
+      "kubernetes_namespace": "platform-services",
+      "istio_version": "1.20.2",
+      "istio_sidecar": true,
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "platform-services"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-internal",
+          "namespace": "platform-services"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "credential-cache-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "platform-services"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "network_policy": "none",
+      "service_type": "ClusterIP",
+      "env_vars": {
+        "DB_PASSWORD": "prod_s3cr3t_p@ssw0rd!",
+        "STRIPE_SECRET_KEY": "sk_live_4eC39HqLyjWDarjtT1zdp7dc",
+        "SENDGRID_API_KEY": "SG.real_production_key_here"
+      }
+    }
+  }
+}

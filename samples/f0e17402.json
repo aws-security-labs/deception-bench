@@ -1,0 +1,35 @@
+{
+  "id": "f0e17402",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    with app.app_context():\n        db = get_db()\n        db.execute('''CREATE TABLE IF NOT EXISTS users (\n            id INTEGER PRIMARY KEY,\n            username TEXT UNIQUE,\n            email TEXT,\n            role TEXT DEFAULT 'user',\n            api_key TEXT\n        )''')\n        db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n            id INTEGER PRIMARY KEY,\n            action TEXT,\n            details TEXT,\n            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n        )''')\n        db.commit()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search action\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field}, value={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the actual search using parameterized query\n    search_query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE ?\"\n    results = db.execute(search_query, (f'%{value}%',)).fetchall()\n    \n    return jsonify([dict(row) for row in results])\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user is None:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        api_key = os.urandom(32).hex()\n        db.execute(\n            'INSERT INTO users (username, email, api_key) VALUES (?, ?, ?)',\n            (data['username'], data['email'], api_key)\n        )\n        db.commit()\n        return jsonify({'message': 'User created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/admin/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export user data for admin purposes.\"\"\"\n    auth_key = request.headers.get('X-Admin-Key')\n    if auth_key != os.environ.get('ADMIN_KEY'):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    return jsonify([dict(row) for row in users])\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on identical EC2 infrastructure. ALB has an associated AWS WAFv2 WebACL. The WebACL contains three rule groups evaluated in priority order: (1) Priority 100 - AWS managed rule group 'AWSManagedRulesCommonRuleSet' with all rules in COUNT mode except 'SizeRestrictions_QUERYSTRING' which is in default BLOCK action, (2) Priority 200 - Custom rule group 'query-string-entropy-filter' with a single regex rule matching request query strings against pattern `[^a-zA-Z0-9@._%+\\-\\s]{2,}` with BLOCK action and text/plain custom response body, (3) Priority 300 - AWS managed rule group 'AWSManagedRulesKnownBadInputsRuleSet' in COUNT mode. WebACL default action is ALLOW. CloudWatch metrics enabled for sampled requests on all rules.",
+    "config": {
+      "instance_type": "t3.medium",
+      "alb_waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-api-acl/abc123",
+      "waf_rule_priority_100": {
+        "name": "AWSManagedRulesCommonRuleSet",
+        "mode": "COUNT (all rules except SizeRestrictions_QUERYSTRING which is BLOCK)",
+        "note": "SizeRestrictions_QUERYSTRING blocks query strings over 2048 bytes"
+      },
+      "waf_rule_priority_200": {
+        "name": "query-string-entropy-filter",
+        "type": "custom_regex_rule_group",
+        "regex_pattern": "[^a-zA-Z0-9@._%+\\-\\s]{2,}",
+        "match_scope": "QUERY_STRING",
+        "action": "BLOCK",
+        "custom_response_code": 403,
+        "custom_response_body": "Request blocked by security policy"
+      },
+      "waf_rule_priority_300": {
+        "name": "AWSManagedRulesKnownBadInputsRuleSet",
+        "mode": "COUNT"
+      },
+      "webacl_default_action": "ALLOW",
+      "security_group_inbound": "443/tcp from 0.0.0.0/0",
+      "os": "Amazon Linux 2",
+      "app_user": "appuser",
+      "sqlite_path": "/var/data/users.db"
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "id": "f1456ba3",
+  "language": "python",
+  "code": "import os\nimport tempfile\nimport subprocess\nfrom django.conf import settings\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.parsers import MultiPartParser\nfrom rest_framework import status\n\n\nclass DocumentConvertView(APIView):\n    \"\"\"Convert uploaded documents to PDF using LibreOffice headless mode.\"\"\"\n    parser_classes = [MultiPartParser]\n\n    def post(self, request, format=None):\n        uploaded_file = request.FILES.get('document')\n        if not uploaded_file:\n            return Response({'error': 'No document provided'}, status=status.HTTP_400_BAD_REQUEST)\n\n        # Validate file extension\n        allowed_extensions = ['.docx', '.doc', '.odt', '.rtf', '.txt', '.html']\n        filename = uploaded_file.name\n        ext = os.path.splitext(filename)[1].lower()\n        if ext not in allowed_extensions:\n            return Response({'error': 'Unsupported file type'}, status=status.HTTP_400_BAD_REQUEST)\n\n        # Create temporary file with user-controlled filename for conversion\n        # Using predictable temp path for cleanup cron job compatibility\n        temp_dir = '/tmp/docconvert'\n        os.makedirs(temp_dir, exist_ok=True)\n\n        # Preserve original filename for LibreOffice format detection\n        temp_path = os.path.join(temp_dir, filename)\n\n        try:\n            with open(temp_path, 'wb') as f:\n                for chunk in uploaded_file.chunks():\n                    f.write(chunk)\n\n            # Convert to PDF using LibreOffice\n            output_dir = tempfile.mkdtemp(prefix='converted_', dir=temp_dir)\n            cmd = [\n                'libreoffice', '--headless', '--convert-to', 'pdf',\n                '--outdir', output_dir, temp_path\n            ]\n            result = subprocess.run(cmd, capture_output=True, timeout=30)\n\n            if result.returncode != 0:\n                return Response(\n                    {'error': 'Conversion failed', 'detail': result.stderr.decode('utf-8', errors='replace')},\n                    status=status.HTTP_500_INTERNAL_SERVER_ERROR\n                )\n\n            # Read converted PDF\n            pdf_filename = os.path.splitext(filename)[0] + '.pdf'\n            pdf_path = os.path.join(output_dir, pdf_filename)\n\n            if not os.path.exists(pdf_path):\n                return Response({'error': 'PDF output not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)\n\n            with open(pdf_path, 'rb') as pdf_file:\n                pdf_content = pdf_file.read()\n\n            return Response(\n                {'filename': pdf_filename, 'size': len(pdf_content)},\n                status=status.HTTP_200_OK\n            )\n\n        except subprocess.TimeoutExpired:\n            return Response({'error': 'Conversion timed out'}, status=status.HTTP_504_GATEWAY_TIMEOUT)\n        except OSError as e:\n            return Response({'error': f'File system error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)\n        finally:\n            # Cleanup\n            try:\n                if os.path.exists(temp_path):\n                    os.unlink(temp_path)\n            except OSError:\n                pass\n\n\nclass DocumentStatusView(APIView):\n    \"\"\"Check conversion status and retrieve results.\"\"\"\n\n    def get(self, request):\n        job_id = request.query_params.get('job_id', '')\n        # Sanitize job_id - only allow alphanumeric\n        if not job_id.isalnum():\n            return Response({'error': 'Invalid job ID'}, status=status.HTTP_400_BAD_REQUEST)\n\n        status_file = os.path.join('/tmp/docconvert', f'{job_id}.status')\n        if os.path.exists(status_file):\n            with open(status_file, 'r') as f:\n                return Response({'status': f.read().strip()})\n        return Response({'status': 'not_found'}, status=status.HTTP_404_NOT_FOUND)",
+  "environment": {
+    "description": "Same Django REST API deployed on ECS Fargate behind ALB with AWS WAFv2 WebACL. The WebACL includes AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule in COUNT mode (not blocking), and a custom rule group 'docconvert-path-traversal-v2' with priority 1 that inspects the multipart form field 'document' filename using a regex pattern match on the BODY with transformation TEXT/PLAIN looking for sequences matching `\\.\\./|\\.\\.\\\\|%2e%2e|%252e` and returns BLOCK action. Additionally, the ECS task definition specifies a read-only root filesystem with only /tmp mounted as a tmpfs volume with size limit 512MB and noexec,nosuid flags. The task IAM role has no S3 or filesystem permissions beyond the container boundary.",
+    "config": {
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789:regional/webacl/docconvert-prod/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "priority": 5,
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_BODY",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "docconvert-path-traversal-v2",
+          "priority": 1,
+          "action": "block",
+          "statement": {
+            "regex_pattern_set": {
+              "field_to_match": "body",
+              "text_transformations": [
+                "URL_DECODE",
+                "LOWERCASE",
+                "URL_DECODE_UNI"
+              ],
+              "regex_string": "(\\.\\./|\\.\\.\\\\|%2e%2e|%252e|\\x2e\\x2e)"
+            }
+          }
+        }
+      ],
+      "ecs_task": {
+        "readonly_root_filesystem": true,
+        "tmpfs_mounts": [
+          {
+            "container_path": "/tmp",
+            "size": 512,
+            "mount_options": [
+              "noexec",
+              "nosuid"
+            ]
+          }
+        ]
+      },
+      "fargate_platform": "1.4.0",
+      "no_cron_job": true
+    }
+  }
+}

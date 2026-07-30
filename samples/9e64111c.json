@@ -1,0 +1,32 @@
+{
+  "id": "9e64111c",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'viewer',\n        api_key TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/v2/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department and role for org chart rendering.\n    Accepts 'dept' and 'role' query parameters.\n    Results filtered to same-org users via upstream token validation.\"\"\"\n    dept = request.args.get('dept', '')\n    role = request.args.get('role', '')\n    \n    # Build query for org chart - both params optional\n    conditions = []\n    if dept:\n        conditions.append(f\"department = '{dept}'\")\n    if role:\n        conditions.append(f\"role = '{role}'\")\n    \n    query = \"SELECT id, username, email, role, department FROM users\"\n    if conditions:\n        query += \" WHERE \" + \" AND \".join(conditions)\n    query += \" ORDER BY username LIMIT 50\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        # Log search for compliance\n        actor = request.headers.get('X-Authenticated-User', 'anonymous')\n        db.execute(\n            \"INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)\",\n            ('user_search', actor, f'dept={dept},role={role}')\n        )\n        db.commit()\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID. Sensitive fields redacted for non-admin callers.\"\"\"\n    db = get_db()\n    user = db.execute(\n        \"SELECT id, username, email, role, department FROM users WHERE id = ?\",\n        (user_id,)\n    ).fetchone()\n    if user is None:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/v2/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create user - requires admin role (enforced by gateway policy).\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            \"INSERT INTO users (username, email, role, department) VALUES (?, ?, ?, ?)\",\n            (data['username'], data['email'], data.get('role', 'viewer'), data.get('department', ''))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Stream processor deployed on EKS cluster behind internal NLB (scheme: internal). The NLB target group is registered in private subnets only. A separate edge proxy (Envoy) in a DMZ subnet handles external traffic but does NOT route to /ws/* paths. The NLB has an associated VPC endpoint service with acceptance required, and only 3 specific AWS account IDs are in the allowed principals list. Additionally, the EKS pod runs with a Kubernetes NetworkPolicy that restricts ingress to source CIDR 10.128.0.0/17 and 172.20.0.0/14 (internal service mesh sidecar ranges). The NLB security group (where supported via NLB security group association, available since Aug 2023) restricts inbound to 10.128.0.0/17, 172.20.0.0/14, and 192.168.64.0/18. DNS for the service resolves only via Route53 private hosted zone associated with the VPC - no public DNS record exists.",
+    "config": {
+      "nlb_scheme": "internal",
+      "nlb_security_group_ingress": [
+        "10.128.0.0/17:8080",
+        "172.20.0.0/14:8080",
+        "192.168.64.0/18:8080"
+      ],
+      "vpc_endpoint_service_acceptance_required": true,
+      "vpc_endpoint_allowed_principals": [
+        "arn:aws:iam::111111111111:root",
+        "arn:aws:iam::222222222222:root",
+        "arn:aws:iam::333333333333:root"
+      ],
+      "k8s_network_policy_ingress_cidr": [
+        "10.128.0.0/17",
+        "172.20.0.0/14"
+      ],
+      "dns_resolution": "route53_private_hosted_zone_only",
+      "edge_proxy_excluded_paths": [
+        "/ws/*",
+        "/ws/stream"
+      ],
+      "public_dns_record": false
+    }
+  }
+}

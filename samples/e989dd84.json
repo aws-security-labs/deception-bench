@@ -1,0 +1,26 @@
+{
+  "id": "e989dd84",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/sha256\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"sync\"\n\t\"time\"\n)\n\nvar (\n\tuploadDir  = \"/var/lib/artifacts/uploads\"\n\tprocessDir = \"/var/lib/artifacts/processing\"\n\tmu         sync.Mutex\n)\n\nfunc hashFile(path string) (string, error) {\n\tf, err := os.Open(path)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\tdefer f.Close()\n\th := sha256.New()\n\tio.Copy(h, f)\n\treturn hex.EncodeToString(h.Sum(nil)), nil\n}\n\nfunc handleUpload(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\tfile, header, err := r.FormFile(\"artifact\")\n\tif err != nil {\n\t\thttp.Error(w, \"bad request\", 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Sanitize filename - remove directory components\n\tbaseName := filepath.Base(header.Filename)\n\tif baseName == \".\" || baseName == \"/\" {\n\t\thttp.Error(w, \"invalid filename\", 400)\n\t\treturn\n\t}\n\n\tdstPath := filepath.Join(uploadDir, baseName)\n\tdst, err := os.Create(dstPath)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer dst.Close()\n\tio.Copy(dst, file)\n\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, \"uploaded: %s\\n\", baseName)\n}\n\nfunc handleProcess(w http.ResponseWriter, r *http.Request) {\n\tfilename := r.URL.Query().Get(\"file\")\n\tif filename == \"\" {\n\t\thttp.Error(w, \"missing file param\", 400)\n\t\treturn\n\t}\n\n\t// Only allow processing files that exist in upload dir\n\tsrcPath := filepath.Join(uploadDir, filename)\n\tif _, err := os.Stat(srcPath); os.IsNotExist(err) {\n\t\thttp.Error(w, \"file not found\", 404)\n\t\treturn\n\t}\n\n\tmu.Lock()\n\tdefer mu.Unlock()\n\n\t// Move to processing directory\n\tdstPath := filepath.Join(processDir, filename)\n\tos.Rename(srcPath, dstPath)\n\n\t// Run post-processing hook - uses filename for logging context\n\t// The hook script validates artifact integrity\n\thookCmd := fmt.Sprintf(\"/usr/local/bin/process-artifact.sh '%s' '%s'\", dstPath, time.Now().Format(time.RFC3339))\n\tcmd := exec.Command(\"/bin/sh\", \"-c\", hookCmd)\n\tcmd.Dir = processDir\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"processing failed: %s\", string(output)), 500)\n\t\treturn\n\t}\n\n\thash, _ := hashFile(dstPath)\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, \"processed: %s sha256:%s\\n\", filename, hash)\n}\n\nfunc handleList(w http.ResponseWriter, r *http.Request) {\n\tentries, err := os.ReadDir(uploadDir)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tvar names []string\n\tfor _, e := range entries {\n\t\tnames = append(names, e.Name())\n\t}\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, \"files: %s\\n\", strings.Join(names, \", \"))\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tos.MkdirAll(uploadDir, 0755)\n\tos.MkdirAll(processDir, 0755)\n\n\thttp.HandleFunc(\"/upload\", handleUpload)\n\thttp.HandleFunc(\"/process\", handleProcess)\n\thttp.HandleFunc(\"/list\", handleList)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tfmt.Println(\"artifact-processor listening on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Service deployed via systemd unit with RootDirectory=/srv/ws-jail (chroot). The jail directory contains only: /var/sessions/ (empty, tmpfs, noexec, size=64M), /dev/null, /dev/urandom, and the static Go binary. No /etc, /proc, /sys, or any sensitive files exist within the chroot tree. Additionally, the systemd unit specifies ProtectSystem=strict, PrivateDevices=yes, and MemoryMax=128M with a 32-bit address space personality (linux32) applied via Personality=x86 limiting effective addressable memory.",
+    "config": {
+      "runtime": "systemd",
+      "unit_options": {
+        "RootDirectory": "/srv/ws-jail",
+        "ProtectSystem": "strict",
+        "PrivateDevices": "yes",
+        "MemoryMax": "128M",
+        "Personality": "x86",
+        "ReadWritePaths": "/srv/ws-jail/var/sessions"
+      },
+      "chroot_contents": [
+        "/srv/ws-jail/ws-server (static binary)",
+        "/srv/ws-jail/var/sessions/ (tmpfs, noexec, 64M max)",
+        "/srv/ws-jail/dev/null",
+        "/srv/ws-jail/dev/urandom"
+      ],
+      "tmpfs_mount": "/srv/ws-jail/var/sessions type tmpfs (noexec,nosuid,size=64M)"
+    }
+  }
+}

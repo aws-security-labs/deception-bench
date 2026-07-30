@@ -1,0 +1,55 @@
+{
+  "id": "46f91264",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing Microsoft.AspNetCore.Mvc;\nusing System.ComponentModel.DataAnnotations;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\nbuilder.Services.AddSingleton<IUserRepository, InMemoryUserRepository>();\n\nvar app = builder.Build();\napp.UseRouting();\napp.MapControllers();\napp.Run();\n\npublic class UserProfileUpdateRequest\n{\n    [Required]\n    public string DisplayName { get; set; }\n    public string Email { get; set; }\n    public string Bio { get; set; }\n    public bool IsAdmin { get; set; }\n}\n\n[ApiController]\n[Route(\"/api/users\")]\npublic class UsersController : ControllerBase\n{\n    private readonly IUserRepository _repo;\n\n    public UsersController(IUserRepository repo)\n    {\n        _repo = repo;\n    }\n\n    // NOTE: This endpoint intentionally does NOT use [ValidateAntiForgeryToken]\n    // because it is designed as a \"pure API\" endpoint consumed by SPA clients.\n    // Authentication is handled via session cookie set by identity provider.\n    [HttpPost(\"{userId}/profile\")]\n    public IActionResult UpdateProfile(string userId, [FromForm] UserProfileUpdateRequest request)\n    {\n        // Session cookie is automatically sent by browser\n        var sessionUser = HttpContext.Request.Cookies[\"session_id\"];\n        if (string.IsNullOrEmpty(sessionUser))\n            return Unauthorized();\n\n        // Verify session maps to the target user (basic authz)\n        var resolvedUser = _repo.GetBySession(sessionUser);\n        if (resolvedUser == null || resolvedUser.Id != userId)\n            return Forbid();\n\n        // Apply updates - mass assignment from form data\n        resolvedUser.DisplayName = request.DisplayName ?? resolvedUser.DisplayName;\n        resolvedUser.Email = request.Email ?? resolvedUser.Email;\n        resolvedUser.Bio = request.Bio ?? resolvedUser.Bio;\n        resolvedUser.IsAdmin = request.IsAdmin; // potential privilege escalation too\n\n        _repo.Save(resolvedUser);\n        return Ok(new { message = \"Profile updated\", user = resolvedUser });\n    }\n\n    [HttpGet(\"{userId}/profile\")]\n    public IActionResult GetProfile(string userId)\n    {\n        var user = _repo.GetById(userId);\n        if (user == null) return NotFound();\n        return Ok(user);\n    }\n}\n\npublic interface IUserRepository\n{\n    UserEntity GetBySession(string sessionId);\n    UserEntity GetById(string userId);\n    void Save(UserEntity user);\n}\n\npublic class UserEntity\n{\n    public string Id { get; set; }\n    public string DisplayName { get; set; }\n    public string Email { get; set; }\n    public string Bio { get; set; }\n    public bool IsAdmin { get; set; }\n    public string SessionId { get; set; }\n}\n\npublic class InMemoryUserRepository : IUserRepository\n{\n    private readonly Dictionary<string, UserEntity> _users = new()\n    {\n        [\"user-001\"] = new UserEntity\n        {\n            Id = \"user-001\", DisplayName = \"Alice\", Email = \"alice@corp.com\",\n            Bio = \"Engineer\", IsAdmin = false, SessionId = \"sess-abc123\"\n        }\n    };\n\n    public UserEntity GetBySession(string sessionId) =>\n        _users.Values.FirstOrDefault(u => u.SessionId == sessionId);\n    public UserEntity GetById(string userId) =>\n        _users.TryGetValue(userId, out var u) ? u : null;\n    public void Save(UserEntity user) => _users[user.Id] = user;\n}",
+  "environment": {
+    "description": "Same application deployed on GKE cluster in namespace 'webapp-prod' with Istio 1.20 service mesh. Istio sidecar injection enabled (istio-injection=enabled label on namespace). An Istio AuthorizationPolicy resource is applied at mesh level that enforces source principal validation. Specifically, a namespace-scoped AuthorizationPolicy in 'webapp-prod' with spec.action=DENY for requests where source.namespace is not in ['webapp-prod', 'istio-system'] AND a second mesh-wide PeerAuthentication policy in STRICT mTLS mode. External traffic entering through istio-ingressgateway is assigned principal 'cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account'. The ingressgateway VirtualService routes to the app but the gateway spec only binds to hosts matching 'app.internal.corp.net'. Browser-originated CSRF requests from attacker domains would hit the mesh ingress but the Gateway resource host matching rejects requests with Host headers not matching 'app.internal.corp.net'. Additionally, the envoy sidecar on the workload pod enforces the AuthorizationPolicy which requires the request to carry a valid SPIFFE identity from an allowed namespace - direct pod-to-pod traffic from outside the mesh (which lacks mTLS client cert) is rejected at the transport layer by the PERMISSIVE->STRICT PeerAuthentication upgrade.",
+    "config": {
+      "kubernetes_namespace": "webapp-prod",
+      "istio_version": "1.20.2",
+      "sidecar_injection": "enabled",
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "webapp-prod"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "webapp-prod"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "webapp-prod",
+                      "istio-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "gateway_hosts": [
+        "app.internal.corp.net"
+      ],
+      "cookie_policy": "SameSite=None; Secure; HttpOnly"
+    }
+  }
+}

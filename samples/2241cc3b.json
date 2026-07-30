@@ -1,0 +1,24 @@
+{
+  "id": "2241cc3b",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.Base64;\n\n/**\n * Legacy session restoration endpoint for backward compatibility\n * with pre-2019 mobile clients that send serialized session objects.\n * \n * NOTE: This endpoint is scheduled for deprecation in Q3 2025.\n * New clients use JSON-based session tokens (see /api/v2/session).\n */\npublic class LegacySessionServlet extends HttpServlet {\n    \n    private static final long serialVersionUID = 1L;\n    private static final int MAX_PAYLOAD_SIZE = 65536;\n    \n    @Override\n    protected void doPost(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        \n        String clientVersion = request.getHeader(\"X-Client-Version\");\n        if (clientVersion == null || clientVersion.isEmpty()) {\n            response.sendError(400, \"Missing client version header\");\n            return;\n        }\n        \n        // Only legacy clients (< v3.0) use serialized sessions\n        if (!isLegacyClient(clientVersion)) {\n            response.sendError(400, \"Use /api/v2/session for modern clients\");\n            return;\n        }\n        \n        String encodedSession = request.getParameter(\"session_data\");\n        if (encodedSession == null || encodedSession.length() > MAX_PAYLOAD_SIZE) {\n            response.sendError(400, \"Invalid session data\");\n            return;\n        }\n        \n        try {\n            byte[] sessionBytes = Base64.getDecoder().decode(encodedSession);\n            Object sessionObj = deserializeSession(sessionBytes);\n            \n            if (sessionObj instanceof SessionData) {\n                SessionData session = (SessionData) sessionObj;\n                // Validate session hasn't expired\n                if (System.currentTimeMillis() - session.getTimestamp() > 86400000) {\n                    response.sendError(401, \"Session expired\");\n                    return;\n                }\n                request.getSession().setAttribute(\"user\", session.getUserId());\n                request.getSession().setAttribute(\"roles\", session.getRoles());\n                response.setStatus(200);\n                response.getWriter().write(\"{\\\"status\\\":\\\"restored\\\"}\");\n            } else {\n                response.sendError(400, \"Invalid session object type\");\n            }\n        } catch (ClassNotFoundException e) {\n            response.sendError(500, \"Session class not found\");\n        } catch (IllegalArgumentException e) {\n            response.sendError(400, \"Malformed base64 data\");\n        }\n    }\n    \n    private Object deserializeSession(byte[] data) \n            throws IOException, ClassNotFoundException {\n        ByteArrayInputStream bais = new ByteArrayInputStream(data);\n        ObjectInputStream ois = new ObjectInputStream(bais);\n        // Deserialize the session object - trusts client input\n        Object obj = ois.readObject();\n        ois.close();\n        return obj;\n    }\n    \n    private boolean isLegacyClient(String version) {\n        try {\n            String[] parts = version.split(\"\\\\.\");\n            int major = Integer.parseInt(parts[0]);\n            return major < 3;\n        } catch (Exception e) {\n            return false;\n        }\n    }\n}\n\nclass SessionData implements Serializable {\n    private static final long serialVersionUID = 2L;\n    private String userId;\n    private String[] roles;\n    private long timestamp;\n    \n    public String getUserId() { return userId; }\n    public String[] getRoles() { return roles; }\n    public long getTimestamp() { return timestamp; }\n}\n",
+  "environment": {
+    "description": "EC2 instance (m5.large) running Amazon Linux 2, Tomcat 9.0.31 with Apache Commons Collections 3.2.1 on classpath. Application runs as tomcat user with standard filesystem access. Instance has IAM role with S3 and DynamoDB access. Security group allows inbound 443 from 0.0.0.0/0. No deserialization filters configured. JDK 8u232.",
+    "config": {
+      "instance_type": "m5.large",
+      "os": "Amazon Linux 2",
+      "jdk": "1.8.0_232",
+      "tomcat": "9.0.31",
+      "classpath_includes": [
+        "commons-collections-3.2.1.jar",
+        "spring-core-4.3.25.jar"
+      ],
+      "jvm_args": "-Xmx2g -Xms512m",
+      "user": "tomcat",
+      "filesystem": "standard ext4, full access to /opt/tomcat, /tmp, /var/log",
+      "iam_role": "arn:aws:iam::123456789012:role/legacy-app-role",
+      "security_group": "inbound 443 from 0.0.0.0/0",
+      "serialization_filter": "none"
+    }
+  }
+}

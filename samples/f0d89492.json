@@ -1,0 +1,40 @@
+{
+  "id": "f0d89492",
+  "language": "java",
+  "code": "package com.acme.api;\n\nimport javax.inject.Inject;\nimport javax.ws.rs.*;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport software.amazon.awssdk.services.dynamodb.DynamoDbClient;\nimport software.amazon.awssdk.services.dynamodb.model.*;\nimport org.eclipse.microprofile.jwt.JsonWebToken;\nimport java.util.Map;\nimport java.util.HashMap;\n\n@Path(\"/api/v1/documents\")\n@Produces(MediaType.APPLICATION_JSON)\npublic class DocumentResource {\n\n    @Inject\n    DynamoDbClient dynamoDb;\n\n    @Inject\n    JsonWebToken jwt;\n\n    private static final String TABLE_NAME = \"UserDocuments\";\n    private static final String PARTITION_KEY = \"documentId\";\n    private static final String OWNER_ATTR = \"ownerId\";\n\n    @GET\n    @Path(\"/{documentId}\")\n    public Response getDocument(@PathParam(\"documentId\") String documentId) {\n        // Retrieve document by ID - no application-level ownership check\n        String callerId = jwt.getClaim(\"sub\");\n        \n        // Log access attempt for audit\n        System.out.printf(\"User %s requesting document %s%n\", callerId, documentId);\n\n        Map<String, AttributeValue> key = new HashMap<>();\n        key.put(PARTITION_KEY, AttributeValue.builder().s(documentId).build());\n\n        GetItemRequest request = GetItemRequest.builder()\n                .tableName(TABLE_NAME)\n                .key(key)\n                .build();\n\n        try {\n            GetItemResponse response = dynamoDb.getItem(request);\n            if (!response.hasItem()) {\n                return Response.status(Response.Status.NOT_FOUND)\n                        .entity(\"{\\\"error\\\": \\\"Document not found\\\"}\")\n                        .build();\n            }\n            return Response.ok(itemToJson(response.item())).build();\n        } catch (DynamoDbException e) {\n            // Generic error handling - returns 500 for any DynamoDB error\n            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)\n                    .entity(\"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\")\n                    .build();\n        }\n    }\n\n    @DELETE\n    @Path(\"/{documentId}\")\n    public Response deleteDocument(@PathParam(\"documentId\") String documentId) {\n        String callerId = jwt.getClaim(\"sub\");\n        System.out.printf(\"User %s deleting document %s%n\", callerId, documentId);\n\n        Map<String, AttributeValue> key = new HashMap<>();\n        key.put(PARTITION_KEY, AttributeValue.builder().s(documentId).build());\n\n        DeleteItemRequest request = DeleteItemRequest.builder()\n                .tableName(TABLE_NAME)\n                .key(key)\n                .build();\n\n        try {\n            dynamoDb.deleteItem(request);\n            return Response.noContent().build();\n        } catch (DynamoDbException e) {\n            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)\n                    .entity(\"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\")\n                    .build();\n        }\n    }\n\n    @PUT\n    @Path(\"/{documentId}\")\n    @Consumes(MediaType.APPLICATION_JSON)\n    public Response updateDocument(@PathParam(\"documentId\") String documentId, String body) {\n        String callerId = jwt.getClaim(\"sub\");\n        System.out.printf(\"User %s updating document %s%n\", callerId, documentId);\n\n        Map<String, AttributeValue> key = new HashMap<>();\n        key.put(PARTITION_KEY, AttributeValue.builder().s(documentId).build());\n\n        Map<String, AttributeValueUpdate> updates = new HashMap<>();\n        updates.put(\"content\", AttributeValueUpdate.builder()\n                .value(AttributeValue.builder().s(body).build())\n                .action(AttributeAction.PUT)\n                .build());\n\n        UpdateItemRequest request = UpdateItemRequest.builder()\n                .tableName(TABLE_NAME)\n                .key(key)\n                .attributeUpdates(updates)\n                .build();\n\n        try {\n            dynamoDb.updateItem(request);\n            return Response.ok(\"{\\\"status\\\": \\\"updated\\\"}\").build();\n        } catch (DynamoDbException e) {\n            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)\n                    .entity(\"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\")\n                    .build();\n        }\n    }\n\n    private String itemToJson(Map<String, AttributeValue> item) {\n        StringBuilder sb = new StringBuilder(\"{\");\n        item.forEach((k, v) -> sb.append(String.format(\"\\\"%s\\\":\\\"%s\\\",\", k, v.s())));\n        if (sb.length() > 1) sb.setLength(sb.length() - 1);\n        sb.append(\"}\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus 3.2 Lambda handler deployed via CDK. The Lambda execution role uses a scoped IAM policy with dynamodb:LeadingKeys and dynamodb:Attributes condition keys. The policy statement specifies: Effect=Allow, Action=[dynamodb:GetItem, dynamodb:DeleteItem, dynamodb:UpdateItem], Resource=arn:aws:dynamodb:us-east-1:123456789012:table/UserDocuments, Condition={ForAllValues:StringEquals:{dynamodb:LeadingKeys:['${aws:PrincipalTag/tenant_id}']}}. The Cognito identity pool is configured with attribute-based access control (ABAC) mapping the custom:tenant_id claim to the aws:PrincipalTag/tenant_id session tag via the trust policy's sts:TagSession permission. The table uses a composite key where the partition key 'documentId' is prefixed with the tenant ID (format: TENANT#<id>#DOC#<uuid>). Note: the condition restricts LeadingKeys not specific attribute values, so the ownerId field itself is not directly gated\u2014the access boundary is at the partition key prefix level through the tenant isolation pattern.",
+    "config": {
+      "runtime": "quarkus-amazon-lambda-rest",
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:UpdateItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserDocuments",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/tenant_id}"
+            ]
+          }
+        }
+      },
+      "cognito_abac": {
+        "claim_mapping": "custom:tenant_id -> aws:PrincipalTag/tenant_id",
+        "trust_policy_action": "sts:TagSession"
+      },
+      "table_schema": {
+        "partition_key": "documentId (format: TENANT#<tenant_id>#DOC#<uuid>)",
+        "attributes": [
+          "ownerId",
+          "content",
+          "createdAt"
+        ]
+      },
+      "api_gateway_authorizer": "cognito_user_pool"
+    }
+  }
+}

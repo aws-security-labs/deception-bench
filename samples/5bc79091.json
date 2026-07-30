@@ -1,0 +1,81 @@
+{
+  "id": "5bc79091",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    with app.app_context():\n        db = get_db()\n        db.execute('''CREATE TABLE IF NOT EXISTS users (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            username TEXT UNIQUE NOT NULL,\n            email TEXT NOT NULL,\n            role TEXT DEFAULT 'user',\n            department TEXT,\n            active INTEGER DEFAULT 1\n        )''')\n        db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            action TEXT,\n            target_user TEXT,\n            performed_by TEXT,\n            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n        )''')\n        db.commit()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department and role for directory listing.\"\"\"\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    include_inactive = request.args.get('include_inactive', '0')\n    \n    # Build query with filters\n    base_query = \"SELECT id, username, email, role, department FROM users WHERE 1=1\"\n    \n    if department:\n        base_query += f\" AND department = '{department}'\"\n    if role:\n        base_query += f\" AND role = '{role}'\"\n    if include_inactive != '1':\n        base_query += \" AND active = 1\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {str(e)}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute(\n        \"SELECT id, username, email, role, department FROM users WHERE id = ?\",\n        (user_id,)\n    )\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user (admin only - enforced by upstream auth).\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            \"INSERT INTO users (username, email, role, department) VALUES (?, ?, ?, ?)\",\n            (data['username'], data['email'], data.get('role', 'user'), data.get('department', ''))\n        )\n        db.commit()\n        # Log the action\n        performer = request.headers.get('X-Authenticated-User', 'unknown')\n        db.execute(\n            \"INSERT INTO audit_log (action, target_user, performed_by) VALUES (?, ?, ?)\",\n            ('CREATE_USER', data['username'], performer)\n        )\n        db.commit()\n        return jsonify({'message': 'User created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/health', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'healthy', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed identically but with AWS WAFv2 WebACL associated to the ALB. The WebACL contains three rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with priority 100 in COUNT mode for logging, (2) a custom rule group 'corp-input-validation' at priority 200 with a single rule using a RegexPatternSet that matches request query string values against pattern `(?i)(?:['\"\\x60]\\s*(?:OR|AND|UNION|SELECT|INSERT|UPDATE|DELETE|DROP|;|--|#|\\/\\*))` with action BLOCK and TextTransformation of URL_DECODE followed by LOWERCASE applied to AllQueryArguments, (3) AWSManagedRulesSQLiRuleSet at priority 300 in COUNT mode only. The WebACL default action is ALLOW. CloudWatch metrics enabled for all rules with sampled requests.",
+    "config": {
+      "waf_web_acl": {
+        "name": "prod-api-protection",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 100,
+            "override_action": "COUNT",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet"
+          },
+          {
+            "name": "corp-input-validation",
+            "priority": 200,
+            "action": "BLOCK",
+            "type": "custom_rule_group",
+            "rules": [
+              {
+                "name": "sqli-query-params",
+                "action": "BLOCK",
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                    "field_to_match": "ALL_QUERY_ARGUMENTS",
+                    "text_transformations": [
+                      {
+                        "priority": 0,
+                        "type": "URL_DECODE"
+                      },
+                      {
+                        "priority": 1,
+                        "type": "LOWERCASE"
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "priority": 300,
+            "override_action": "COUNT",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet"
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "security_groups": {
+        "alb_sg": {
+          "inbound": [
+            {
+              "port": 443,
+              "source": "0.0.0.0/0"
+            }
+          ]
+        },
+        "instance_sg": {
+          "inbound": [
+            {
+              "port": 8080,
+              "source": "alb_sg"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

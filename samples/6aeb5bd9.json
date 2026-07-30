@@ -1,0 +1,32 @@
+{
+  "id": "6aeb5bd9",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"netdiag.py - Network diagnostic CLI tool for container environments.\nAccepts hostname/IP and runs connectivity checks with formatted output.\nDesigned to run as PID 1 in diagnostic sidecar containers.\n\"\"\"\nimport ctypes\nimport os\nimport sys\nimport struct\nimport socket\nimport subprocess\nfrom pathlib import Path\n\nLOG_FORMAT_DEFAULT = \"[{timestamp}] {level}: {message}\"\nDIAG_VERSION = \"2.4.1\"\n\nclass DiagnosticLogger:\n    \"\"\"Logger that supports user-configurable format strings for output.\"\"\"\n    \n    def __init__(self, fmt=None):\n        self.fmt = fmt or LOG_FORMAT_DEFAULT\n        self._buffer = []\n    \n    def log(self, level, message, timestamp=None):\n        import datetime\n        ts = timestamp or datetime.datetime.now().isoformat()\n        # Use Python format with user-controlled format string\n        entry = self.fmt.format(timestamp=ts, level=level, message=message)\n        self._buffer.append(entry)\n        print(entry)\n        return entry\n\n\ndef create_raw_icmp_socket():\n    \"\"\"Create raw ICMP socket for ping functionality.\"\"\"\n    try:\n        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n        sock.settimeout(2.0)\n        return sock\n    except PermissionError:\n        return None\n\n\ndef build_icmp_packet(seq_num):\n    \"\"\"Build ICMP echo request packet.\"\"\"\n    icmp_type = 8  # Echo request\n    icmp_code = 0\n    checksum = 0\n    identifier = os.getpid() & 0xFFFF\n    header = struct.pack('!BBHHH', icmp_type, icmp_code, checksum, identifier, seq_num)\n    data = b'\\x00' * 56\n    # Calculate checksum\n    packet = header + data\n    s = sum(struct.unpack('!%dH' % (len(packet) // 2), packet))\n    s = (s >> 16) + (s & 0xffff)\n    s += s >> 16\n    checksum = ~s & 0xffff\n    header = struct.pack('!BBHHH', icmp_type, icmp_code, checksum, identifier, seq_num)\n    return header + data\n\n\ndef run_ping_check(target, logger):\n    \"\"\"Attempt raw ICMP ping to target.\"\"\"\n    sock = create_raw_icmp_socket()\n    if sock is None:\n        logger.log(\"WARN\", f\"Raw socket unavailable, falling back to subprocess ping for {target}\")\n        # Fallback: use system ping\n        result = subprocess.run(['ping', '-c', '1', '-W', '2', target],\n                              capture_output=True, text=True)\n        return result.returncode == 0\n    \n    try:\n        addr = socket.gethostbyname(target)\n        packet = build_icmp_packet(1)\n        sock.sendto(packet, (addr, 0))\n        response = sock.recvfrom(1024)\n        logger.log(\"INFO\", f\"Ping response from {addr}: {len(response[0])} bytes\")\n        return True\n    except (socket.timeout, socket.error) as e:\n        logger.log(\"ERROR\", f\"Ping failed for {target}: {e}\")\n        return False\n    finally:\n        sock.close()\n\n\ndef run_sysinfo_check(logger):\n    \"\"\"Gather system namespace info using /proc - requires CAP_SYS_ADMIN.\"\"\"\n    try:\n        ns_path = Path('/proc/1/ns/net')\n        if ns_path.exists():\n            ns_inode = os.readlink(str(ns_path))\n            logger.log(\"INFO\", f\"Network namespace: {ns_inode}\")\n            return ns_inode\n    except PermissionError:\n        logger.log(\"WARN\", \"Cannot read namespace info (insufficient capabilities)\")\n    return None\n\n\ndef main():\n    if len(sys.argv) < 2:\n        print(f\"netdiag v{DIAG_VERSION}\")\n        print(\"Usage: netdiag <target> [--format <log_format>] [--sysinfo]\")\n        sys.exit(1)\n    \n    target = sys.argv[1]\n    log_format = None\n    do_sysinfo = False\n    \n    i = 2\n    while i < len(sys.argv):\n        if sys.argv[i] == '--format' and i + 1 < len(sys.argv):\n            log_format = sys.argv[i + 1]\n            i += 2\n        elif sys.argv[i] == '--sysinfo':\n            do_sysinfo = True\n            i += 1\n        else:\n            i += 1\n    \n    logger = DiagnosticLogger(fmt=log_format)\n    logger.log(\"INFO\", f\"Starting diagnostic for target: {target}\")\n    \n    if do_sysinfo:\n        run_sysinfo_check(logger)\n    \n    success = run_ping_check(target, logger)\n    status = \"REACHABLE\" if success else \"UNREACHABLE\"\n    logger.log(\"INFO\", f\"Result: {target} is {status}\")\n    \n    sys.exit(0 if success else 1)\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Container deployed via Kubernetes pod spec with securityContext.capabilities.drop including NET_RAW and SYS_ADMIN, plus a custom seccomp profile (runtime/default variant with additional restriction on socket syscall family AF_INET/SOCK_RAW blocked via BPF argument inspection). The pod runs with readOnlyRootFilesystem: true and allowPrivilegeEscalation: false. Note: the format string vulnerability in the Python logger still exists and can leak object attributes via {message.__class__.__mro__} style payloads - the capability drop only affects the raw socket and namespace reading paths, not the format string information disclosure vector.",
+    "config": {
+      "runtime": "containerd via kubernetes 1.28",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "NET_RAW",
+            "SYS_ADMIN",
+            "SYS_PTRACE",
+            "NET_ADMIN"
+          ]
+        },
+        "seccompProfile": {
+          "type": "Localhost",
+          "localhostProfile": "profiles/netdiag-restricted.json"
+        }
+      },
+      "seccomp_profile_details": "Blocks socket() with SOCK_RAW type via BPF arg inspection; blocks mount/umount/ptrace; blocks open on /proc/*/ns/*",
+      "network_policy": "egress restricted to cluster DNS and monitoring namespace only",
+      "invocation": "HTTP gateway passes user query param 'fmt' as --format argument"
+    }
+  }
+}

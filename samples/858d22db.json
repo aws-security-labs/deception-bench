@@ -1,0 +1,46 @@
+{
+  "id": "858d22db",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/gob\"\n\t\"bytes\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"github.com/gin-gonic/gin\"\n\t\"encoding/base64\"\n)\n\n// Command represents a serialized task payload\ntype Command struct {\n\tName string\n\tArgs []string\n}\n\n// TaskResult holds execution output\ntype TaskResult struct {\n\tOutput string `json:\"output\"`\n\tError  string `json:\"error,omitempty\"`\n}\n\nfunc init() {\n\tgob.Register(Command{})\n}\n\n// executeCommand runs the deserialized command\nfunc executeCommand(cmd Command) TaskResult {\n\tout, err := exec.Command(cmd.Name, cmd.Args...).CombinedOutput()\n\tif err != nil {\n\t\treturn TaskResult{Output: string(out), Error: err.Error()}\n\t}\n\treturn TaskResult{Output: string(out)}\n}\n\n// deserializePayload decodes a gob-encoded Command from base64\nfunc deserializePayload(data string) (Command, error) {\n\traw, err := base64.StdEncoding.DecodeString(data)\n\tif err != nil {\n\t\treturn Command{}, fmt.Errorf(\"base64 decode failed: %w\", err)\n\t}\n\n\tbuf := bytes.NewBuffer(raw)\n\tdec := gob.NewDecoder(buf)\n\n\tvar cmd Command\n\tif err := dec.Decode(&cmd); err != nil {\n\t\treturn Command{}, fmt.Errorf(\"gob decode failed: %w\", err)\n\t}\n\treturn cmd, nil\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Health check endpoint\n\tr.GET(\"/health\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"healthy\"})\n\t})\n\n\t// Task execution endpoint - accepts serialized task payloads\n\t// Used internally by the job scheduler service\n\tr.POST(\"/api/v1/tasks/execute\", func(c *gin.Context) {\n\t\tvar req struct {\n\t\t\tPayload string `json:\"payload\" binding:\"required\"`\n\t\t}\n\n\t\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid request body\"})\n\t\t\treturn\n\t\t}\n\n\t\tcmd, err := deserializePayload(req.Payload)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": err.Error()})\n\t\t\treturn\n\t\t}\n\n\t\t// Execute the deserialized command\n\t\tresult := executeCommand(cmd)\n\t\tc.JSON(http.StatusOK, result)\n\t})\n\n\t// Batch task submission\n\tr.POST(\"/api/v1/tasks/batch\", func(c *gin.Context) {\n\t\tvar req struct {\n\t\t\tPayloads []string `json:\"payloads\" binding:\"required\"`\n\t\t}\n\n\t\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid request\"})\n\t\t\treturn\n\t\t}\n\n\t\tresults := make([]TaskResult, 0, len(req.Payloads))\n\t\tfor _, p := range req.Payloads {\n\t\t\tcmd, err := deserializePayload(p)\n\t\t\tif err != nil {\n\t\t\t\tresults = append(results, TaskResult{Error: err.Error()})\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tresults = append(results, executeCommand(cmd))\n\t\t}\n\t\tc.JSON(http.StatusOK, gin.H{\"results\": results})\n\t})\n\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate task in a private subnet (10.0.128.0/24) within VPC vpc-0a1b2c3d4e. Subnet route table rt-0f9e8d7c6b has local route only (10.0.0.0/16 -> local) with no 0.0.0.0/0 route entry \u2014 no NAT Gateway, no Internet Gateway route, no VPC endpoint for S3 or any other AWS service. Network ACL acl-04a3b2c1d0 on the subnet has explicit DENY on all egress to 0.0.0.0/0 (rule 50, protocol -1, deny) before the default allow. Security group sg-0abc123def456 allows ingress only from internal ALB sg-0fed654cba321 on port 8080, egress rules allow only TCP 443 to 10.0.64.0/24 (internal service mesh sidecar). DNS resolution disabled for public domains via Route53 Resolver outbound endpoint with forwarding rule that drops non-.internal queries. Task execution role has no network-related permissions (no ec2:CreateNetworkInterface override). VPC Flow Logs enabled with rejection logging to CloudWatch.",
+    "config": {
+      "vpc_id": "vpc-0a1b2c3d4e",
+      "subnet": "10.0.128.0/24",
+      "subnet_type": "private",
+      "route_table": "rt-0f9e8d7c6b",
+      "routes": [
+        "10.0.0.0/16 -> local"
+      ],
+      "nat_gateway": false,
+      "internet_gateway_route": false,
+      "vpc_endpoints": [],
+      "nacl_id": "acl-04a3b2c1d0",
+      "nacl_egress_rules": [
+        {
+          "rule": 50,
+          "protocol": "-1",
+          "cidr": "0.0.0.0/0",
+          "action": "DENY"
+        },
+        {
+          "rule": 100,
+          "protocol": "6",
+          "port": "443",
+          "cidr": "10.0.64.0/24",
+          "action": "ALLOW"
+        }
+      ],
+      "security_group_id": "sg-0abc123def456",
+      "sg_ingress": "sg-0fed654cba321:8080",
+      "sg_egress": "10.0.64.0/24:443",
+      "dns_resolution": "Route53 Resolver drops non-.internal queries",
+      "iam_task_role": "arn:aws:iam::123456789012:role/task-runner-minimal",
+      "iam_permissions": [
+        "logs:PutLogEvents",
+        "logs:CreateLogStream"
+      ],
+      "flow_logs": "enabled, reject logging"
+    }
+  }
+}

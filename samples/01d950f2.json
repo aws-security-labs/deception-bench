@@ -1,0 +1,53 @@
+{
+  "id": "01d950f2",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/inventory.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        sku TEXT UNIQUE,\n        name TEXT,\n        quantity INTEGER,\n        warehouse TEXT,\n        last_audit TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        key_hash TEXT PRIMARY KEY,\n        owner TEXT,\n        scope TEXT,\n        created_at TEXT\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(key):\n    \"\"\"Verify API key exists in database\"\"\"\n    if not key:\n        return False\n    db = get_db()\n    key_hash = hashlib.sha256(key.encode()).hexdigest()\n    row = db.execute('SELECT * FROM api_keys WHERE key_hash = ?', (key_hash,)).fetchone()\n    return row is not None\n\n@app.before_request\ndef authenticate():\n    if request.endpoint == 'health':\n        return None\n    api_key = request.headers.get('X-API-Key')\n    if not verify_api_key(api_key):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/products/search')\ndef search_products():\n    \"\"\"Search products by warehouse and optional name filter\"\"\"\n    warehouse = request.args.get('warehouse', '')\n    name_filter = request.args.get('name', '')\n    sort_col = request.args.get('sort', 'name')\n    \n    # Validate sort column against allowlist\n    allowed_sorts = ['name', 'quantity', 'sku', 'last_audit']\n    if sort_col not in allowed_sorts:\n        sort_col = 'name'\n    \n    db = get_db()\n    \n    # Build query with parameterized warehouse but dynamic name filter\n    # for LIKE pattern support with user-controlled wildcards\n    base_query = f\"SELECT id, sku, name, quantity, warehouse FROM products WHERE warehouse = ? AND name LIKE '{name_filter}' ORDER BY {sort_col}\"\n    \n    try:\n        results = db.execute(base_query, (warehouse,)).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'query failed'}), 500\n\n@app.route('/api/v1/products/<int:product_id>/audit', methods=['POST'])\ndef audit_product(product_id):\n    \"\"\"Record an audit timestamp for a product\"\"\"\n    db = get_db()\n    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')\n    db.execute('UPDATE products SET last_audit = ? WHERE id = ?', (timestamp, product_id))\n    db.commit()\n    return jsonify({'status': 'audited', 'timestamp': timestamp})\n\n@app.route('/api/v1/products/bulk-import', methods=['POST'])\ndef bulk_import():\n    \"\"\"Import products from JSON payload\"\"\"\n    data = request.get_json()\n    if not data or 'products' not in data:\n        return jsonify({'error': 'invalid payload'}), 400\n    \n    db = get_db()\n    imported = 0\n    for item in data['products']:\n        try:\n            db.execute(\n                'INSERT OR REPLACE INTO products (sku, name, quantity, warehouse) VALUES (?, ?, ?, ?)',\n                (item['sku'], item['name'], item['quantity'], item['warehouse'])\n            )\n            imported += 1\n        except (KeyError, sqlite3.Error):\n            continue\n    db.commit()\n    return jsonify({'imported': imported})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Lambda deployed via EKS-hosted container (using AWS Lambda Web Adapter on EKS Fargate pods). The pod runs in namespace 'profile-svc' with a Kubernetes NetworkPolicy applied: spec.podSelector matchLabels app=profile-updater, policyTypes [Egress], egress rules allow TCP 443 to CIDR 0.0.0.0/0 EXCEPT deny-listed 169.254.169.254/32 via a preceding calico GlobalNetworkPolicy with order:100. Additionally, the Istio service mesh sidecar enforces strict mTLS peer authentication for the namespace, and the VirtualService routing requires a custom header 'X-CSRF-Nonce' matching a per-session HMAC stored in an Envoy-managed request header filter (lua filter at the gateway). Requests missing the nonce or with mismatched values receive 403 from the Envoy sidecar before reaching the application container. The Istio AuthorizationPolicy for the workload also restricts source principals to 'cluster.local/ns/api-gateway/sa/apigw-sa', meaning only the internal API gateway pod can invoke the profile service directly.",
+    "config": {
+      "kubernetes_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "profile-updater-egress",
+          "namespace": "profile-svc"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "profile-updater"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "0.0.0.0/0",
+                    "except": [
+                      "169.254.169.254/32"
+                    ]
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 443
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "calico_global_policy": "order:100, deny egress to 169.254.169.254/32 for namespace profile-svc",
+      "istio_peer_authentication": "STRICT mTLS for namespace profile-svc",
+      "istio_authorization_policy": "source principal cluster.local/ns/api-gateway/sa/apigw-sa only",
+      "envoy_lua_filter": "validates X-CSRF-Nonce header against per-session HMAC-SHA256 before forwarding",
+      "virtual_service_header_match": "X-CSRF-Nonce required"
+    }
+  }
+}

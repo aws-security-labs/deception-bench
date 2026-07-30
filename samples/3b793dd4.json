@@ -1,0 +1,22 @@
+{
+  "id": "3b793dd4",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/uploads'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef sanitize_filename(name):\n    # Remove path traversal attempts\n    name = name.replace('..', '').replace('/', '').replace('\\\\', '')\n    return name\n\ndef convert_document(input_path, output_format):\n    \"\"\"Convert document using LibreOffice headless mode\"\"\"\n    output_dir = tempfile.mkdtemp(prefix='conv_')\n    cmd = f'libreoffice --headless --convert-to {output_format} --outdir {output_dir} {input_path}'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    if result.returncode != 0:\n        raise RuntimeError(f'Conversion failed: {result.stderr.decode()}')\n    return output_dir\n\n@app.route('/api/convert', methods=['POST'])\ndef handle_convert():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    allowed_formats = ['pdf', 'docx', 'xlsx', 'pptx', 'odt', 'html', 'txt']\n    if output_format not in allowed_formats:\n        return jsonify({'error': 'Invalid format'}), 400\n    \n    filename = sanitize_filename(uploaded.filename)\n    if not filename:\n        return jsonify({'error': 'Invalid filename'}), 400\n    \n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    try:\n        output_dir = convert_document(input_path, output_format)\n        # Return first converted file\n        converted_files = os.listdir(output_dir)\n        if not converted_files:\n            return jsonify({'error': 'No output generated'}), 500\n        \n        converted_path = os.path.join(output_dir, converted_files[0])\n        with open(converted_path, 'rb') as f:\n            content = f.read()\n        \n        return content, 200, {'Content-Type': 'application/octet-stream',\n                               'Content-Disposition': f'attachment; filename={converted_files[0]}'}\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/api/metadata', methods=['POST'])\ndef handle_metadata():\n    \"\"\"Extract metadata from uploaded document\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    try:\n        # Use exiftool for metadata extraction\n        cmd = ['exiftool', '-json', input_path]\n        result = subprocess.run(cmd, capture_output=True, timeout=10)\n        metadata = result.stdout.decode()\n        return metadata, 200, {'Content-Type': 'application/json'}\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function deployed with Quarkus native runtime via Lambda Function URL. Auth type is set to NONE (open access). The Lambda execution role has iam:AttachUserPolicy and iam:ListAttachedUserPolicies permissions with Resource: '*'. No SCP or permission boundary applied to the account. Any HTTP client can invoke the function URL directly.",
+    "config": {
+      "lambda_function_url_auth_type": "NONE",
+      "lambda_execution_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "iam:AttachUserPolicy",
+          "iam:ListAttachedUserPolicies"
+        ],
+        "Resource": "*"
+      },
+      "scp": "none",
+      "permission_boundary": "none",
+      "vpc": "none"
+    }
+  }
+}

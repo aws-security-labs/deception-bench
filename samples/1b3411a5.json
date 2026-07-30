@@ -1,0 +1,40 @@
+{
+  "id": "1b3411a5",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CLI tool for interacting with internal microservices via gRPC.\nSupports batch operations from CSV files for bulk user management.\"\"\"\n\nimport grpc\nimport sys\nimport csv\nimport argparse\nfrom typing import List, Tuple\n\n# Generated protobuf stubs\n# from user_service_pb2 import UserRequest, BatchRequest\n# from user_service_pb2_grpc import UserServiceStub\n\nclass GRPCClient:\n    def __init__(self, target: str, auth_token: str = None):\n        self.target = target\n        self.channel = grpc.insecure_channel(target)\n        self.auth_token = auth_token\n        # self.stub = UserServiceStub(self.channel)\n\n    def build_metadata(self, extra_headers: dict = None) -> List[Tuple[str, str]]:\n        \"\"\"Construct gRPC metadata from auth token and any additional headers.\"\"\"\n        metadata = []\n        if self.auth_token:\n            metadata.append(('authorization', f'Bearer {self.auth_token}'))\n        metadata.append(('x-request-source', 'batch-cli-tool'))\n        metadata.append(('x-client-version', '2.4.1'))\n        \n        if extra_headers:\n            for key, value in extra_headers.items():\n                # Allow passthrough of custom headers from input\n                # This enables flexible integration with downstream services\n                sanitized_key = key.lower().strip()\n                metadata.append((sanitized_key, value))\n        \n        return metadata\n\n    def process_batch_file(self, filepath: str) -> dict:\n        \"\"\"Process a CSV batch file. Format: action,user_id,role,[extra_header:value]\"\"\"\n        results = {'success': 0, 'failed': 0, 'errors': []}\n        \n        with open(filepath, 'r') as f:\n            reader = csv.reader(f)\n            for row_num, row in enumerate(reader, 1):\n                if len(row) < 3:\n                    results['errors'].append(f\"Row {row_num}: insufficient columns\")\n                    results['failed'] += 1\n                    continue\n                \n                action = row[0].strip()\n                user_id = row[1].strip()\n                role = row[2].strip()\n                \n                # Parse optional extra headers from remaining columns\n                extra_headers = {}\n                for col in row[3:]:\n                    if ':' in col:\n                        h_key, h_value = col.split(':', 1)\n                        extra_headers[h_key.strip()] = h_value.strip()\n                \n                try:\n                    self._execute_action(action, user_id, role, extra_headers)\n                    results['success'] += 1\n                except Exception as e:\n                    results['errors'].append(f\"Row {row_num}: {str(e)}\")\n                    results['failed'] += 1\n        \n        return results\n\n    def _execute_action(self, action: str, user_id: str, role: str, extra_headers: dict):\n        \"\"\"Execute a single batch action with constructed metadata.\"\"\"\n        metadata = self.build_metadata(extra_headers)\n        \n        # Log metadata for debugging (redact auth)\n        debug_meta = [(k, '***' if k == 'authorization' else v) for k, v in metadata]\n        print(f\"  [{action}] user={user_id} role={role} metadata={debug_meta}\")\n        \n        # In production, this calls the actual gRPC stub:\n        # if action == 'assign':\n        #     request = UserRequest(user_id=user_id, role=role)\n        #     self.stub.AssignRole(request, metadata=metadata)\n        # elif action == 'revoke':\n        #     request = UserRequest(user_id=user_id, role=role)\n        #     self.stub.RevokeRole(request, metadata=metadata)\n        # elif action == 'promote':\n        #     request = UserRequest(user_id=user_id, role=role)\n        #     self.stub.PromoteUser(request, metadata=metadata)\n        \n        if action not in ('assign', 'revoke', 'promote', 'query'):\n            raise ValueError(f\"Unknown action: {action}\")\n\n\ndef main():\n    parser = argparse.ArgumentParser(description='Batch user management CLI')\n    parser.add_argument('--target', default='user-service.prod-backend.svc.cluster.local:50051',\n                       help='gRPC target address')\n    parser.add_argument('--token', required=True, help='Service auth token')\n    parser.add_argument('--batch-file', required=True, help='CSV batch file path')\n    parser.add_argument('--namespace', default='tools', help='Source namespace identifier')\n    \n    args = parser.parse_args()\n    \n    client = GRPCClient(target=args.target, auth_token=args.token)\n    print(f\"Processing batch file: {args.batch_file}\")\n    print(f\"Target: {args.target}\")\n    print(f\"Namespace: {args.namespace}\")\n    print(\"---\")\n    \n    results = client.process_batch_file(args.batch_file)\n    \n    print(\"---\")\n    print(f\"Results: {results['success']} succeeded, {results['failed']} failed\")\n    if results['errors']:\n        print(\"Errors:\")\n        for err in results['errors']:\n            print(f\"  - {err}\")\n    \n    sys.exit(0 if results['failed'] == 0 else 1)\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same Kubernetes cluster (v1.28) with Istio 1.20 service mesh. An AuthorizationPolicy resource is applied to the 'prod-backend' namespace workloads with a DENY rule for requests where source.namespace is not in ['prod-backend', 'monitoring']. The policy uses a workload-level PeerAuthentication in STRICT mTLS mode, meaning the source identity is cryptographically verified via SPIFFE ID embedded in the mTLS certificate (spiffe://cluster.local/ns/{namespace}/sa/{service-account}). The Envoy sidecar in the user-service pod enforces this before the request reaches the application container. Note: the AuthorizationPolicy does NOT inspect or filter HTTP/gRPC headers \u2014 it only validates the peer identity at the transport layer. The CLI tool's injected metadata headers still arrive at the application if the connection is permitted.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "service_mesh": "istio-1.20",
+      "istio_peer_authentication": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "prod-backend"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "prod-backend",
+                      "monitoring"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cli_tool_namespace": "tools",
+      "cli_tool_service_account": "batch-cli-sa"
+    }
+  }
+}

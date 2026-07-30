@@ -1,0 +1,30 @@
+{
+  "id": "51a8894e",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c5b4a')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('svc-reader', 'svc@corp.internal', 'readonly', 'sk-reader-1a2b3c4d5e6f')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field} value={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the search - field is validated above so safe to interpolate\n    search_query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(search_query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, email) VALUES (?, ?)',\n                   (data['username'], data['email']))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on an EC2 instance (Amazon Linux 2) behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound 443 from 0.0.0.0/0. ALB has no AWS WAF WebACL associated. The Flask app runs as a systemd service with the sqlite database at /var/data/app.db. No additional middleware or reverse proxy filtering is applied.",
+    "config": {
+      "alb": {
+        "scheme": "internet-facing",
+        "listeners": [
+          {
+            "port": 443,
+            "protocol": "HTTPS",
+            "default_action": "forward"
+          }
+        ],
+        "waf_acl_arn": null
+      },
+      "ec2_security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0"
+          }
+        ]
+      },
+      "runtime": "systemd service, Python 3.9, no request filtering"
+    }
+  }
+}

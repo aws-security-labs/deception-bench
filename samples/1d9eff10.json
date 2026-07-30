@@ -1,0 +1,47 @@
+{
+  "id": "1d9eff10",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String format = req.getParameter(\"format\");\n\n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        List<String> allowedTypes = Arrays.asList(\"sales\", \"inventory\", \"returns\");\n        if (!allowedTypes.contains(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate date range format\n        if (!dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        // Build query - sortCol is user-controlled and injected directly\n        String baseQuery = \"SELECT id, product_name, quantity, price, created_at \" +\n                \"FROM report_\" + reportType + \" \" +\n                \"WHERE created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n\n        // Sort column injection point - no validation on sortCol\n        if (sortCol != null && !sortCol.isEmpty()) {\n            baseQuery += \" ORDER BY \" + sortCol;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(baseQuery)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                first = false;\n                out.printf(\"{\\\"id\\\":%d,\\\"product\\\":\\\"%s\\\",\\\"qty\\\":%d,\\\"price\\\":%.2f}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"product_name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getInt(\"quantity\"),\n                    rs.getDouble(\"price\"));\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error: \" + e.getMessage());\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch export endpoint - reads body as CSV of IDs\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            body.append(line);\n        }\n\n        String ids = body.toString().trim();\n        // Basic format check but doesn't prevent injection in edge cases\n        if (!ids.matches(\"[0-9,\\\\s]+\")) {\n            resp.sendError(400, \"Invalid ID list\");\n            return;\n        }\n\n        String query = \"SELECT * FROM report_sales WHERE id IN (\" + ids + \")\";\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            resp.setContentType(\"text/csv\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"id,product,quantity,price\");\n            while (rs.next()) {\n                out.printf(\"%d,%s,%d,%.2f%n\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"product_name\"),\n                    rs.getInt(\"quantity\"),\n                    rs.getDouble(\"price\"));\n            }\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same container image deployed on EKS 1.29 with Pod Security Admission (PSA) enforcing 'restricted' profile at namespace level. The pod spec includes securityContext with readOnlyRootFilesystem: true. No emptyDir, hostPath, or tmpfs volume mounts are defined in the pod manifest. The container's /tmp resolves to the read-only overlay filesystem layer. Additionally, a Cilium L4 NetworkPolicy is applied that allows egress only to port 443 on CIDR 0.0.0.0/0 with explicit deny to 169.254.0.0/16 and 10.0.0.0/8 link-local/VPC ranges. Note: the PSA restricted profile does NOT itself enforce network restrictions - it only validates pod security fields. The Cilium policy entity selectors use CIDR-based L3 rules without DNS-aware resolution.",
+    "config": {
+      "runtime": "dotnet:8.0-bookworm-slim",
+      "orchestrator": "EKS 1.29",
+      "psa_level": "restricted (enforce)",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "seccompProfile": "RuntimeDefault"
+      },
+      "volume_mounts": "none defined",
+      "network_policy": {
+        "engine": "Cilium 1.15",
+        "egress_rules": [
+          {
+            "action": "deny",
+            "toCIDR": [
+              "169.254.0.0/16",
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16"
+            ]
+          },
+          {
+            "action": "allow",
+            "toCIDR": [
+              "0.0.0.0/0"
+            ],
+            "toPorts": [
+              {
+                "port": "443",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "imds_access": "blocked by network policy (169.254.0.0/16 denied)"
+    }
+  }
+}

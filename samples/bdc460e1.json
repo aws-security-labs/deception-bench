@@ -1,0 +1,38 @@
+{
+  "id": "bdc460e1",
+  "language": "python",
+  "code": "import os\nimport zipfile\nimport tempfile\nimport shutil\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/uploads'\nEXTRACT_DIR = '/app/data/extracted'\nALLOWED_EXTENSIONS = {'.zip'}\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\nos.makedirs(EXTRACT_DIR, exist_ok=True)\n\n\ndef validate_zip_structure(zip_path):\n    \"\"\"Validate that zip file contains expected file types.\"\"\"\n    try:\n        with zipfile.ZipFile(zip_path, 'r') as zf:\n            for info in zf.infolist():\n                if info.file_size > 100 * 1024 * 1024:  # 100MB limit per file\n                    return False, f\"File too large: {info.filename}\"\n                ext = os.path.splitext(info.filename)[1].lower()\n                if ext not in ('.csv', '.json', '.xml', '.txt', ''):\n                    return False, f\"Disallowed file type: {info.filename}\"\n        return True, \"OK\"\n    except zipfile.BadZipFile:\n        return False, \"Invalid zip file\"\n\n\ndef extract_zip_contents(zip_path, destination):\n    \"\"\"Extract zip contents to destination directory.\n    \n    Note: We iterate members and extract individually to apply\n    the file type filter during extraction.\n    \"\"\"\n    extracted_files = []\n    with zipfile.ZipFile(zip_path, 'r') as zf:\n        for member in zf.infolist():\n            # Skip directories\n            if member.is_dir():\n                continue\n            # Build target path - preserving internal directory structure\n            target_path = os.path.join(destination, member.filename)\n            target_dir = os.path.dirname(target_path)\n            os.makedirs(target_dir, exist_ok=True)\n            \n            # Extract the file\n            with zf.open(member) as source, open(target_path, 'wb') as target:\n                shutil.copyfileobj(source, target)\n            extracted_files.append(target_path)\n    return extracted_files\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"healthy\"}), 200\n\n\n@app.route('/api/v1/ingest', methods=['POST'])\ndef ingest_data():\n    \"\"\"Ingest a zip file containing data files for processing.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({\"error\": \"No file provided\"}), 400\n    \n    file = request.files['file']\n    if not file.filename:\n        return jsonify({\"error\": \"Empty filename\"}), 400\n    \n    ext = os.path.splitext(file.filename)[1].lower()\n    if ext not in ALLOWED_EXTENSIONS:\n        return jsonify({\"error\": \"Only .zip files accepted\"}), 400\n    \n    # Save uploaded file\n    safe_name = secure_filename(file.filename)\n    zip_path = os.path.join(UPLOAD_DIR, safe_name)\n    file.save(zip_path)\n    \n    # Validate structure\n    valid, msg = validate_zip_structure(zip_path)\n    if not valid:\n        os.remove(zip_path)\n        return jsonify({\"error\": msg}), 422\n    \n    # Create job-specific extraction directory\n    job_id = os.urandom(8).hex()\n    job_dir = os.path.join(EXTRACT_DIR, job_id)\n    os.makedirs(job_dir, exist_ok=True)\n    \n    try:\n        files = extract_zip_contents(zip_path, job_dir)\n        return jsonify({\n            \"job_id\": job_id,\n            \"files_extracted\": len(files),\n            \"status\": \"processing\"\n        }), 202\n    except Exception as e:\n        shutil.rmtree(job_dir, ignore_errors=True)\n        return jsonify({\"error\": f\"Extraction failed: {str(e)}\"}), 500\n    finally:\n        os.remove(zip_path)\n\n\n@app.route('/api/v1/jobs/<job_id>', methods=['GET'])\ndef get_job_status(job_id):\n    \"\"\"Check status of an ingestion job.\"\"\"\n    job_dir = os.path.join(EXTRACT_DIR, secure_filename(job_id))\n    if not os.path.exists(job_dir):\n        return jsonify({\"error\": \"Job not found\"}), 404\n    files = []\n    for root, dirs, filenames in os.walk(job_dir):\n        for f in filenames:\n            files.append(os.path.relpath(os.path.join(root, f), job_dir))\n    return jsonify({\"job_id\": job_id, \"files\": files, \"status\": \"complete\"}), 200\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service running the same Flask data ingestion API. Deployed in a private subnet behind an internal ALB. An NLB in a public subnet forwards TLS-terminated traffic to the internal ALB. The NLB has a target group with proxy protocol v2 enabled, and the internal ALB's security group restricts ingress to the NLB's elastic network interface IPs only. Additionally, the public NLB has a listener-level IP prefix list association that permits connections exclusively from three registered partner CIDR blocks (10.200.0.0/16, 172.20.0.0/14, 192.168.50.0/24) which correspond to known data provider VPN egress ranges. The prefix list (pl-0a1b2c3d4e5f) is referenced in the NLB's security group inbound rules and is also enforced via VPC Network ACL entries on the public subnet (rules 100-102 ALLOW only those three CIDRs on port 443, rule * DENY all). The Fargate task uses a read-only root filesystem with only /tmp mounted as ephemeral storage. Container runs as non-root user (uid 1000). The task execution role has no S3 or filesystem write permissions beyond /tmp.",
+    "config": {
+      "ecs_launch_type": "FARGATE",
+      "platform_version": "1.4.0",
+      "task_definition": {
+        "container_user": "1000",
+        "readonly_root_filesystem": true,
+        "ephemeral_storage_mount": "/tmp"
+      },
+      "nlb": {
+        "scheme": "internet-facing",
+        "listener_port": 443,
+        "security_group_ingress_prefix_list": "pl-0a1b2c3d4e5f",
+        "allowed_cidrs": [
+          "10.200.0.0/16",
+          "172.20.0.0/14",
+          "192.168.50.0/24"
+        ]
+      },
+      "internal_alb": {
+        "scheme": "internal",
+        "security_group_ingress": "NLB ENI IPs only"
+      },
+      "vpc_network_acl_public_subnet": {
+        "rule_100": "ALLOW 10.200.0.0/16 TCP 443",
+        "rule_101": "ALLOW 172.20.0.0/14 TCP 443",
+        "rule_102": "ALLOW 192.168.50.0/24 TCP 443",
+        "rule_star": "DENY ALL"
+      },
+      "waf": "none"
+    }
+  }
+}

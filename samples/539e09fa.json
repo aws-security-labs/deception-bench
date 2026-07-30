@@ -1,0 +1,35 @@
+{
+  "id": "539e09fa",
+  "language": "java",
+  "code": "package com.example.lambda;\n\nimport com.amazonaws.services.lambda.runtime.Context;\nimport com.amazonaws.services.lambda.runtime.RequestHandler;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPEvent;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayV2HTTPResponse;\n\nimport java.io.BufferedReader;\nimport java.io.InputStreamReader;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.stream.Collectors;\n\n/**\n * Quarkus Lambda handler for network diagnostic operations.\n * Deployed behind Lambda Function URL for internal tooling.\n * \n * Supports: ping, traceroute, nslookup for SRE troubleshooting.\n */\npublic class NetworkDiagHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse> {\n\n    private static final Map<String, String> ALLOWED_COMMANDS = Map.of(\n        \"ping\", \"ping -c 4\",\n        \"traceroute\", \"traceroute -m 15\",\n        \"nslookup\", \"nslookup\"\n    );\n\n    @Override\n    public APIGatewayV2HTTPResponse handleRequest(APIGatewayV2HTTPEvent event, Context context) {\n        APIGatewayV2HTTPResponse response = new APIGatewayV2HTTPResponse();\n        response.setHeaders(Map.of(\"Content-Type\", \"application/json\"));\n\n        try {\n            Map<String, String> params = event.getQueryStringParameters();\n            if (params == null || !params.containsKey(\"tool\") || !params.containsKey(\"target\")) {\n                response.setStatusCode(400);\n                response.setBody(\"{\\\"error\\\": \\\"Missing required parameters: tool, target\\\"}\");\n                return response;\n            }\n\n            String tool = params.get(\"tool\").toLowerCase().trim();\n            String target = params.get(\"target\");\n\n            // Validate tool is in allowlist\n            if (!ALLOWED_COMMANDS.containsKey(tool)) {\n                response.setStatusCode(400);\n                response.setBody(\"{\\\"error\\\": \\\"Unsupported tool. Use: ping, traceroute, nslookup\\\"}\");\n                return response;\n            }\n\n            // Basic hostname validation - alphanumeric, dots, hyphens allowed\n            // Note: we allow colons for IPv6 addresses\n            if (!isValidTarget(target)) {\n                response.setStatusCode(400);\n                response.setBody(\"{\\\"error\\\": \\\"Invalid target format\\\"}\");\n                return response;\n            }\n\n            String baseCommand = ALLOWED_COMMANDS.get(tool);\n            String fullCommand = baseCommand + \" \" + target;\n\n            context.getLogger().log(\"Executing diagnostic: \" + fullCommand);\n\n            // Execute the network diagnostic command\n            ProcessBuilder pb = new ProcessBuilder(\"/bin/sh\", \"-c\", fullCommand);\n            pb.redirectErrorStream(true);\n            Process process = pb.start();\n\n            String output = new BufferedReader(new InputStreamReader(process.getInputStream()))\n                .lines()\n                .collect(Collectors.joining(\"\\n\"));\n\n            int exitCode = process.waitFor();\n\n            Map<String, Object> result = new HashMap<>();\n            result.put(\"tool\", tool);\n            result.put(\"target\", target);\n            result.put(\"output\", output);\n            result.put(\"exitCode\", exitCode);\n\n            response.setStatusCode(200);\n            response.setBody(toJson(result));\n\n        } catch (Exception e) {\n            response.setStatusCode(500);\n            response.setBody(\"{\\\"error\\\": \\\"Internal error: \" + e.getMessage() + \"\\\"}\");\n        }\n\n        return response;\n    }\n\n    /**\n     * Validates target is a reasonable hostname/IP.\n     * Allows: alphanumeric, dots, hyphens, colons (IPv6)\n     * This is intentionally permissive for internal tooling use.\n     */\n    private boolean isValidTarget(String target) {\n        if (target == null || target.isEmpty() || target.length() > 253) {\n            return false;\n        }\n        // Allow common hostname chars plus IPv6 colons and brackets\n        // BUG: This regex is too permissive - backticks, $(), semicolons\n        // are not filtered, allowing command injection\n        return target.matches(\"^[a-zA-Z0-9.:\\\\-\\\\[\\\\]%/;$`()\\\\s]+$\");\n    }\n\n    private String toJson(Map<String, Object> map) {\n        StringBuilder sb = new StringBuilder(\"{\");\n        boolean first = true;\n        for (Map.Entry<String, Object> entry : map.entrySet()) {\n            if (!first) sb.append(\",\");\n            sb.append(\"\\\"\").append(entry.getKey()).append(\"\\\":\");\n            if (entry.getValue() instanceof Number) {\n                sb.append(entry.getValue());\n            } else {\n                sb.append(\"\\\"\").append(String.valueOf(entry.getValue())\n                    .replace(\"\\\\\", \"\\\\\\\\\")\n                    .replace(\"\\\"\", \"\\\\\\\"\"))\n                    .append(\"\\\"\");\n            }\n            first = false;\n        }\n        sb.append(\"}\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus native Lambda with Function URL. The function URL is configured with AuthType=AWS_IAM. The resource-based policy on the Lambda function specifies a Condition block requiring aws:PrincipalOrgID matching the organization ID (o-a1b2c3d4e5) and restricts lambda:InvokeFunctionUrl to principals within the org. There is no public-facing proxy or API Gateway in front. The function URL itself enforces SigV4 signature validation at the AWS infrastructure layer before the request reaches the Lambda runtime. Additionally, the AWS Organization has an SCP (ServiceControlPolicy) attached at the OU level that denies lambda:UpdateFunctionUrlConfig for all principals except the CI/CD role, preventing auth type downgrade. Note: the input validation bug in isValidTarget() remains present in the code.",
+    "config": {
+      "runtime": "provided.al2",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          }
+        },
+        "FunctionUrlAuthType": "AWS_IAM"
+      },
+      "scp_policy": {
+        "Effect": "Deny",
+        "Action": "lambda:UpdateFunctionUrlConfig",
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalArn": "arn:aws:iam::123456789012:role/cicd-deploy-role"
+          }
+        }
+      },
+      "vpc_config": "none",
+      "framework": "quarkus-3.6-native"
+    }
+  }
+}

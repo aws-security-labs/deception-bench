@@ -1,0 +1,25 @@
+{
+  "id": "bfdbd896",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nTEMPLATE_DIR = '/opt/reports/templates'\nOUTPUT_DIR = '/opt/reports/output'\n\ndef get_db_connection():\n    import sqlite3\n    return sqlite3.connect('/opt/reports/metadata.db')\n\ndef validate_report_name(name):\n    \"\"\"Basic validation - alphanumeric and hyphens only\"\"\"\n    import re\n    if not re.match(r'^[a-zA-Z0-9\\-]{1,64}$', name):\n        return False\n    return True\n\ndef render_report(template_name, params):\n    \"\"\"Render a report using wkhtmltopdf with user-supplied parameters\"\"\"\n    template_path = os.path.join(TEMPLATE_DIR, template_name + '.html')\n    if not os.path.isfile(template_path):\n        return None, 'Template not found'\n    \n    with open(template_path, 'r') as f:\n        template_content = f.read()\n    \n    # Substitute placeholders in template\n    for key, value in params.items():\n        placeholder = '{{' + key + '}}'\n        template_content = template_content.replace(placeholder, str(value))\n    \n    # Write rendered HTML to temp file\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', dir='/tmp', delete=False) as tmp:\n        tmp.write(template_content)\n        tmp_path = tmp.name\n    \n    output_path = os.path.join(OUTPUT_DIR, f'report_{os.urandom(8).hex()}.pdf')\n    \n    # Build command - user controls header/footer text for PDF generation\n    header_text = params.get('header_text', 'Confidential Report')\n    footer_text = params.get('footer_text', 'Page [page] of [topage]')\n    \n    cmd = f'wkhtmltopdf --header-center \"{header_text}\" --footer-center \"{footer_text}\" {tmp_path} {output_path}'\n    \n    try:\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30, \n                               cwd='/opt/reports')\n        if result.returncode != 0:\n            return None, f'Render failed: {result.stderr.decode()[:200]}'\n    finally:\n        os.unlink(tmp_path)\n    \n    return output_path, None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid request'}), 400\n    \n    template_name = data.get('template', '')\n    if not validate_report_name(template_name):\n        return jsonify({'error': 'Invalid template name'}), 400\n    \n    params = data.get('params', {})\n    \n    # Audit log\n    conn = get_db_connection()\n    conn.execute('INSERT INTO audit_log (user, template, ts) VALUES (?, ?, datetime(\"now\"))',\n                 (request.headers.get('X-User-Id', 'anonymous'), template_name))\n    conn.commit()\n    conn.close()\n    \n    output_path, error = render_report(template_name, params)\n    if error:\n        return jsonify({'error': error}), 500\n    \n    return jsonify({'status': 'success', 'path': output_path})\n\n@app.route('/api/reports/list', methods=['GET'])\ndef list_reports():\n    conn = get_db_connection()\n    rows = conn.execute('SELECT user, template, ts FROM audit_log ORDER BY ts DESC LIMIT 50').fetchall()\n    conn.close()\n    return jsonify([{'user': r[0], 'template': r[1], 'ts': r[2]} for r in rows])\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    os.makedirs(OUTPUT_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Support team EC2 instance running Amazon Linux 2, tool deployed at /opt/support-tools/. Logging writes to /var/log/support-tool/activity.log which is ingested by a Splunk forwarder. The IAM role attached to the instance (arn:aws:iam::123456789012:role/SupportToolRole) has dynamodb:Query permission on the UserActivityLog table with no condition keys. Log files are rotated weekly by logrotate. Splunk alerts trigger on specific log patterns for security monitoring.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:Query",
+          "dynamodb:GetItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserActivityLog"
+      },
+      "log_path": "/var/log/support-tool/activity.log",
+      "splunk_forwarder": true,
+      "splunk_alert_patterns": [
+        "CRITICAL",
+        "UNAUTHORIZED",
+        "admin_escalation"
+      ]
+    }
+  }
+}

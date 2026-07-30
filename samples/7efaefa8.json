@@ -1,0 +1,81 @@
+{
+  "id": "7efaefa8",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { createClient } from 'redis';\nimport crypto from 'crypto';\nimport { execFile } from 'child_process';\nimport path from 'path';\n\nconst app = express();\napp.use(express.json());\n\nconst redis = createClient({ url: process.env.REDIS_URL });\nredis.connect();\n\n// Template rendering engine - supports user-defined templates\nconst TEMPLATE_DIR = process.env.TEMPLATE_DIR || '/app/templates';\n\n// Render template with variable substitution\nfunction renderTemplate(templateStr, vars) {\n  // Replace {{varName}} patterns with provided values\n  let result = templateStr;\n  for (const [key, value] of Object.entries(vars)) {\n    const pattern = new RegExp(`\\\\{\\\\{${key}\\\\}\\\\}`, 'g');\n    result = result.replace(pattern, value);\n  }\n  // Process {{#exec cmd}} directives for dynamic content\n  const execPattern = /\\{\\{#exec\\s+(.+?)\\}\\}/g;\n  let match;\n  const promises = [];\n  while ((match = execPattern.exec(result)) !== null) {\n    promises.push({ full: match[0], cmd: match[1] });\n  }\n  return { result, execDirectives: promises };\n}\n\nasync function executeDirectives(rendered, directives) {\n  let output = rendered;\n  for (const directive of directives) {\n    const cmdResult = await new Promise((resolve, reject) => {\n      // Split command for execFile - first token is binary, rest are args\n      const parts = directive.cmd.split(/\\s+/);\n      const bin = parts[0];\n      const args = parts.slice(1);\n      execFile(bin, args, { timeout: 5000 }, (err, stdout) => {\n        if (err) resolve(`[error: ${err.message}]`);\n        else resolve(stdout.trim());\n      });\n    });\n    output = output.replace(directive.full, cmdResult);\n  }\n  return output;\n}\n\n// User can store custom notification templates\napp.post('/api/templates/:name', async (req, res) => {\n  const { name } = req.params;\n  const { content, metadata } = req.body;\n  if (!content || typeof content !== 'string') {\n    return res.status(400).json({ error: 'content required' });\n  }\n  // Store template in Redis with user session prefix\n  const sessionId = req.headers['x-session-id'] || 'anonymous';\n  const key = `tmpl:${sessionId}:${name}`;\n  await redis.set(key, JSON.stringify({ content, metadata, created: Date.now() }));\n  res.json({ stored: key });\n});\n\n// Render a stored template with provided variables\napp.post('/api/render/:name', async (req, res) => {\n  const { name } = req.params;\n  const { variables } = req.body;\n  const sessionId = req.headers['x-session-id'] || 'anonymous';\n  const key = `tmpl:${sessionId}:${name}`;\n  \n  const raw = await redis.get(key);\n  if (!raw) return res.status(404).json({ error: 'template not found' });\n  \n  const template = JSON.parse(raw);\n  const { result, execDirectives } = renderTemplate(template.content, variables || {});\n  \n  let finalOutput;\n  if (execDirectives.length > 0) {\n    // Execute embedded commands for dynamic template content\n    finalOutput = await executeDirectives(result, execDirectives);\n  } else {\n    finalOutput = result;\n  }\n  \n  res.json({ rendered: finalOutput });\n});\n\n// Health check with system info\napp.get('/health', async (req, res) => {\n  const info = {\n    uptime: process.uptime(),\n    redis: redis.isReady ? 'connected' : 'disconnected',\n    pid: process.pid\n  };\n  res.json(info);\n});\n\n// Webhook callback endpoint - processes incoming notifications\napp.post('/api/webhook', async (req, res) => {\n  const { event, payload, templateName } = req.body;\n  const hmac = req.headers['x-webhook-signature'];\n  const secret = process.env.WEBHOOK_SECRET;\n  \n  if (secret && hmac) {\n    const expected = crypto.createHmac('sha256', secret)\n      .update(JSON.stringify(req.body)).digest('hex');\n    if (hmac !== expected) {\n      return res.status(401).json({ error: 'invalid signature' });\n    }\n  }\n  \n  // If templateName specified, render it with webhook payload as variables\n  if (templateName) {\n    const key = `tmpl:system:${templateName}`;\n    const raw = await redis.get(key);\n    if (raw) {\n      const template = JSON.parse(raw);\n      const { result, execDirectives } = renderTemplate(template.content, payload || {});\n      if (execDirectives.length > 0) {\n        await executeDirectives(result, execDirectives);\n      }\n    }\n  }\n  \n  res.json({ processed: true });\n});\n\napp.listen(3000, () => console.log('Template service running on :3000'));",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label set to 'restricted' profile in enforce mode (pod-security.kubernetes.io/enforce: restricted). Additionally, a Kyverno ClusterPolicy 'disallow-host-path-volumes' with validationFailureAction: Enforce denies any pod spec containing spec.volumes[*].hostPath. The restricted PSS profile independently rejects containers with securityContext.privileged: true, runAsUser: 0, and any volume type other than configMap, secret, emptyDir, downwardAPI, persistentVolumeClaim, projected, ephemeral, and csi. The application container runs as non-root UID 1000 with readOnlyRootFilesystem: true, and config is supplied via a Kubernetes ConfigMap mounted at /etc/app/config.json with valid authMode and no diagnosticsCommand field.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "latest"
+      },
+      "kyverno_policies": [
+        {
+          "name": "disallow-host-path-volumes",
+          "validationFailureAction": "Enforce",
+          "match": {
+            "resources": {
+              "kinds": [
+                "Pod"
+              ]
+            }
+          },
+          "validate": {
+            "message": "hostPath volumes are forbidden",
+            "pattern": {
+              "spec": {
+                "=(volumes)": [
+                  {
+                    "X(hostPath)": null
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "pod_spec": {
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 1000,
+          "fsGroup": 1000,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "readOnlyRootFilesystem": true,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            }
+          }
+        ],
+        "volumes": [
+          {
+            "name": "app-config",
+            "configMap": {
+              "name": "app-config"
+            }
+          }
+        ],
+        "volumeMounts": [
+          {
+            "name": "app-config",
+            "mountPath": "/etc/app",
+            "readOnly": true
+          }
+        ]
+      },
+      "configmap_data": {
+        "config.json": "{\"authMode\":\"token\",\"uploadDir\":\"/tmp/uploads\"}"
+      }
+    }
+  }
+}

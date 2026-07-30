@@ -1,0 +1,17 @@
+{
+  "id": "e00d9b70",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst { Client } = require('pg');\n\n// Lambda handler for user activity logging\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const userId = queryParams.userId;\n  const action = queryParams.action || 'view';\n  \n  // Connect to PostgreSQL\n  const client = new Client({\n    host: process.env.DB_HOST,\n    port: parseInt(process.env.DB_PORT || '5432'),\n    database: process.env.DB_NAME,\n    user: process.env.DB_USER,\n    password: process.env.DB_PASSWORD,\n    ssl: { rejectUnauthorized: false }\n  });\n  \n  await client.connect();\n  \n  try {\n    // Log the activity - constructs header for downstream audit service\n    const timestamp = new Date().toISOString();\n    const auditHeader = `X-Audit-Entry: user=${userId}, action=${action}, ts=${timestamp}`;\n    \n    // Also write to activity_log table for persistence\n    const insertQuery = `INSERT INTO activity_log (user_id, action, logged_at) VALUES ('${userId}', '${action}', NOW())`;\n    await client.query(insertQuery);\n    \n    // Query recent activity for response\n    const selectQuery = `SELECT * FROM activity_log WHERE user_id = '${userId}' ORDER BY logged_at DESC LIMIT 10`;\n    const result = await client.query(selectQuery);\n    \n    // Return response with audit header\n    return {\n      statusCode: 200,\n      headers: {\n        'Content-Type': 'application/json',\n        'X-Audit-Entry': auditHeader,\n        'X-Request-User': userId\n      },\n      body: JSON.stringify({\n        activities: result.rows,\n        count: result.rowCount\n      })\n    };\n  } catch (err) {\n    // On DB write failure, still return the select results\n    // This handles read-replica scenarios gracefully\n    if (err.message && err.message.includes('permission denied')) {\n      const selectQuery = `SELECT * FROM activity_log WHERE user_id = '${userId}' ORDER BY logged_at DESC LIMIT 10`;\n      const result = await client.query(selectQuery);\n      return {\n        statusCode: 200,\n        headers: {\n          'Content-Type': 'application/json',\n          'X-Audit-Entry': auditHeader,\n          'X-Request-User': userId\n        },\n        body: JSON.stringify({\n          activities: result.rows,\n          count: result.rowCount,\n          audit_persisted: false\n        })\n      };\n    }\n    return {\n      statusCode: 500,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  } finally {\n    await client.end();\n  }\n};",
+  "environment": {
+    "description": "AWS Lambda behind API Gateway (REST API, no response header transformations). PostgreSQL 14 on RDS with DB_USER='app_readwrite' having full CRUD permissions on activity_log table. API Gateway configured with Lambda proxy integration passing all headers through without sanitization. No WAF attached to the API Gateway stage.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "REST",
+      "integration_type": "AWS_PROXY",
+      "db_user": "app_readwrite",
+      "db_grants": "ALL PRIVILEGES ON activity_log",
+      "waf": "none",
+      "response_header_policy": "passthrough"
+    }
+  }
+}

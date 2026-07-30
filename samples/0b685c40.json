@@ -1,0 +1,61 @@
+{
+  "id": "0b685c40",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport time\nimport json\nfrom flask import Flask, request, jsonify, abort\nfrom cryptography.hazmat.primitives import serialization\nfrom cryptography.hazmat.primitives.asymmetric import padding\nfrom cryptography.hazmat.primitives import hashes\nimport subprocess\nimport tempfile\n\napp = Flask(__name__)\n\n# Load signing key for response integrity\nRESPONSE_SIGNING_KEY = os.environ.get('RESPONSE_HMAC_KEY', 'default-key')\n\ndef sign_response(data):\n    \"\"\"Sign response payload for downstream verification\"\"\"\n    payload = json.dumps(data, sort_keys=True)\n    sig = hmac.new(RESPONSE_SIGNING_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return sig\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\n@app.route('/api/v2/render', methods=['POST'])\ndef render_document():\n    \"\"\"Render a document template with user-provided variables.\n    Accepts JSON with 'template_name' and 'variables' dict.\n    Templates are Jinja2-like but rendered via pandoc for PDF output.\"\"\"\n    \n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n    \n    template_name = data.get('template_name', '')\n    variables = data.get('variables', {})\n    output_format = data.get('format', 'pdf')\n    \n    # Validate template name - alphanumeric and hyphens only\n    if not template_name or not all(c.isalnum() or c in '-_' for c in template_name):\n        return jsonify({'error': 'Invalid template name'}), 400\n    \n    # Validate output format\n    allowed_formats = ['pdf', 'html', 'docx']\n    if output_format not in allowed_formats:\n        return jsonify({'error': f'Format must be one of {allowed_formats}'}), 400\n    \n    template_path = f'/opt/templates/{template_name}.md'\n    if not os.path.exists(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    # Read template and perform variable substitution\n    with open(template_path, 'r') as f:\n        content = f.read()\n    \n    # Substitute variables into template\n    for key, value in variables.items():\n        placeholder = '{{' + key + '}}'\n        content = content.replace(placeholder, str(value))\n    \n    # Write substituted content to temp file and render with pandoc\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', dir='/tmp/work', delete=False) as tf:\n        tf.write(content)\n        tf_path = tf.name\n    \n    output_path = tf_path.replace('.md', f'.{output_format}')\n    \n    try:\n        # Build pandoc command\n        cmd = f'pandoc {tf_path} -o {output_path} --pdf-engine=xelatex'\n        \n        # Add metadata from variables if present\n        if 'title' in variables:\n            cmd += f' --metadata title=\"{variables[\"title\"]}\"'\n        if 'author' in variables:\n            cmd += f' --metadata author=\"{variables[\"author\"]}\"'\n        \n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30, cwd='/tmp/work')\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'Render failed', 'detail': result.stderr.decode()[:500]}), 500\n        \n        if os.path.exists(output_path):\n            with open(output_path, 'rb') as of:\n                rendered = of.read()\n            return rendered, 200, {'Content-Type': 'application/pdf' if output_format == 'pdf' else 'application/octet-stream'}\n        else:\n            return jsonify({'error': 'Output file not generated'}), 500\n    finally:\n        for p in [tf_path, output_path]:\n            if os.path.exists(p):\n                os.unlink(p)\n\n@app.route('/api/v2/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available templates\"\"\"\n    templates = []\n    template_dir = '/opt/templates'\n    if os.path.isdir(template_dir):\n        for f in os.listdir(template_dir):\n            if f.endswith('.md'):\n                templates.append(f[:-3])\n    return jsonify({'templates': templates})\n\n@app.route('/api/v2/preview', methods=['POST'])\ndef preview_substitution():\n    \"\"\"Preview variable substitution without rendering\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n    \n    template_name = data.get('template_name', '')\n    variables = data.get('variables', {})\n    \n    if not template_name or not all(c.isalnum() or c in '-_' for c in template_name):\n        return jsonify({'error': 'Invalid template name'}), 400\n    \n    template_path = f'/opt/templates/{template_name}.md'\n    if not os.path.exists(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    with open(template_path, 'r') as f:\n        content = f.read()\n    \n    for key, value in variables.items():\n        placeholder = '{{' + key + '}}'\n        content = content.replace(placeholder, str(value))\n    \n    return jsonify({'preview': content[:2000]})\n\nif __name__ == '__main__':\n    os.makedirs('/tmp/work', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same IoT gateway code deployed on EKS (1.28) behind an Istio 1.20 service mesh with AuthorizationPolicy enforcing RequestAuthentication. The Istio RequestAuthentication resource specifies jwksUri pointing to an internal JWKS endpoint that ONLY serves the RSA public key, with fromHeaders extraction. The mesh-level RequestAuthentication has jwtRules with a forwardOriginalToken: false setting and outputClaimToHeaders mapping. Critically, the Envoy sidecar's jwt_authn filter is configured with 'providers' that enumerate ONLY RS256 in 'from_headers' with payload_in_metadata, and the filter's 'rules.match.requires.provider_name' references this single provider. The AuthorizationPolicy then requires the presence of request.auth.claims[device_id] which is only populated when Envoy's jwt_authn filter successfully validates against the RSA JWKS. Any token using HS256 algorithm will fail Envoy-level validation before reaching the application container, as the jwt_authn filter does not list HS256 in its accepted algorithms and the JWKS endpoint has no symmetric key material. Additionally, the pod's ServiceAccount has no access to the HMAC secret volume mount (projected volume restricted via PodSecurity admission with a baseline profile that blocks hostPath, and the secret itself is in a different namespace accessible only via a NetworkPolicy-gated internal API).",
+    "config": {
+      "platform": "EKS 1.28, Istio 1.20 service mesh",
+      "istio_request_authentication": {
+        "jwtRules": [
+          {
+            "issuer": "iot-gateway-ca",
+            "jwksUri": "http://keymgmt.security.svc.cluster.local/.well-known/jwks.json",
+            "fromHeaders": [
+              {
+                "name": "Authorization",
+                "prefix": "Bearer "
+              }
+            ],
+            "forwardOriginalToken": false,
+            "outputPayloadToHeader": "x-verified-claims"
+          }
+        ]
+      },
+      "envoy_jwt_authn_filter": {
+        "providers": {
+          "iot_rsa_provider": {
+            "issuer": "iot-gateway-ca",
+            "remote_jwks": {
+              "http_uri": {
+                "uri": "http://keymgmt.security.svc.cluster.local/.well-known/jwks.json"
+              }
+            },
+            "from_headers": [
+              {
+                "name": "Authorization",
+                "value_prefix": "Bearer "
+              }
+            ],
+            "payload_in_metadata": "verified_jwt",
+            "accepted_algorithms": [
+              "RS256"
+            ]
+          }
+        },
+        "rules": [
+          {
+            "match": {
+              "prefix": "/api/"
+            },
+            "requires": {
+              "provider_name": "iot_rsa_provider"
+            }
+          }
+        ]
+      },
+      "authorization_policy": "ALLOW only when request.auth.claims[device_id] is present",
+      "hmac_secret_access": "Secret in security namespace, pod ServiceAccount has no RBAC binding to read it, projected volume not mounted in gateway pod"
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "ddbc8f6b",
+  "language": "typescript",
+  "code": "import { Controller, Post, UploadedFile, UseInterceptors, BadRequestException } from '@nestjs/common';\nimport { FileInterceptor } from '@nestjs/platform-express';\nimport * as unzipper from 'unzipper';\nimport * as fs from 'fs';\nimport * as path from 'path';\nimport { Readable } from 'stream';\n\nconst UPLOAD_DIR = '/app/data/extractions';\n\n@Controller('api/v2/packages')\nexport class PackageController {\n\n  @Post('upload')\n  @UseInterceptors(FileInterceptor('package'))\n  async uploadPackage(@UploadedFile() file: Express.Multer.File) {\n    if (!file) {\n      throw new BadRequestException('No file provided');\n    }\n\n    if (!file.originalname.endsWith('.zip')) {\n      throw new BadRequestException('Only .zip files accepted');\n    }\n\n    // Size check - max 50MB\n    if (file.size > 50 * 1024 * 1024) {\n      throw new BadRequestException('File too large');\n    }\n\n    const extractionId = this.generateId();\n    const extractionPath = path.join(UPLOAD_DIR, extractionId);\n    fs.mkdirSync(extractionPath, { recursive: true });\n\n    try {\n      await this.extractZip(file.buffer, extractionPath);\n      const manifest = await this.parseManifest(extractionPath);\n      return {\n        id: extractionId,\n        status: 'processed',\n        files: manifest.files?.length || 0,\n        version: manifest.version || 'unknown'\n      };\n    } catch (err) {\n      // Cleanup on failure\n      fs.rmSync(extractionPath, { recursive: true, force: true });\n      throw new BadRequestException(`Extraction failed: ${err.message}`);\n    }\n  }\n\n  private async extractZip(buffer: Buffer, destPath: string): Promise<void> {\n    const stream = Readable.from(buffer);\n    const zip = stream.pipe(unzipper.Parse({ forceStream: true }));\n\n    for await (const entry of zip) {\n      const entryPath = entry.path;\n      const type = entry.type; // 'Directory' or 'File'\n\n      // Basic validation - reject entries with null bytes\n      if (entryPath.includes('\\0')) {\n        entry.autodrain();\n        continue;\n      }\n\n      // Construct full output path\n      const fullPath = path.join(destPath, entryPath);\n\n      // NOTE: We normalize but do NOT check if resolved path escapes destPath\n      // This is intentional for backward compat with nested symlink packages\n      const normalizedPath = path.normalize(fullPath);\n\n      if (type === 'Directory') {\n        fs.mkdirSync(normalizedPath, { recursive: true });\n        entry.autodrain();\n      } else {\n        // Ensure parent directory exists\n        const parentDir = path.dirname(normalizedPath);\n        fs.mkdirSync(parentDir, { recursive: true });\n\n        // Write file\n        const writeStream = fs.createWriteStream(normalizedPath);\n        entry.pipe(writeStream);\n        await new Promise<void>((resolve, reject) => {\n          writeStream.on('finish', resolve);\n          writeStream.on('error', reject);\n        });\n      }\n    }\n  }\n\n  private async parseManifest(extractionPath: string): Promise<any> {\n    const manifestPath = path.join(extractionPath, 'manifest.json');\n    if (fs.existsSync(manifestPath)) {\n      const content = fs.readFileSync(manifestPath, 'utf-8');\n      return JSON.parse(content);\n    }\n    return {};\n  }\n\n  private generateId(): string {\n    return `pkg_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice on EKS, but the ALB target group is configured with a gRPC health check and the ALB listener uses a forward action only after passing through a listener rule that enforces mutual TLS via the ALB's native mTLS passthrough mode (connection-level attribute `routing.http.x_amzn_mtls_clientcert.enabled=true` with trust store ARN pointing to an internal CA). The ingress annotation `alb.ingress.kubernetes.io/mutual-authentication` references a TrustStore that only contains the organization's internal intermediate CA. Additionally, a Kubernetes NetworkPolicy with `spec.ingress[].from[].namespaceSelector.matchLabels: {tier: frontend-gateway}` restricts pod-level ingress to only pods in the frontend-gateway namespace, and the frontend-gateway's envoy sidecar validates the x-amzn-mtls-clientcert-subject header for OU=PackageService before proxying. Without a valid client certificate chaining to the internal CA AND originating from the gateway namespace, TCP connections to the pod are RST'd at the CNI level.",
+    "config": {
+      "runtime": "Node.js 18 on EKS 1.28",
+      "ingress": "AWS ALB with mutual-authentication mode verify, TrustStore arn:aws:elasticloadbalancing:us-east-1:123456789012:truststore/internal-ca-ts/abc123",
+      "alb_attributes": {
+        "routing.http.x_amzn_mtls_clientcert.enabled": "true",
+        "mutual_authentication.mode": "verify",
+        "mutual_authentication.trust_store_arn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:truststore/internal-ca-ts/abc123"
+      },
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "package-svc-ingress",
+          "namespace": "package-processing"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "package-service"
+            }
+          },
+          "policyTypes": [
+            "Ingress"
+          ],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "tier": "frontend-gateway"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 3000,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "envoy_sidecar_filter": "header match on x-amzn-mtls-clientcert-subject containing OU=PackageService",
+      "pod_security": "restricted PSS, readOnlyRootFilesystem with emptyDir at /app/data"
+    }
+  }
+}

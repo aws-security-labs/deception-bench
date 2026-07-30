@@ -1,0 +1,66 @@
+{
+  "id": "04973bb4",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class UserProfileServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(UserProfileServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String userId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        if (userId == null || userId.isEmpty()) {\n            resp.sendError(400, \"Missing id parameter\");\n            return;\n        }\n        \n        // Validate userId is numeric\n        if (!userId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid id format\");\n            return;\n        }\n        \n        // fields parameter allows caller to specify columns to return\n        // defaults to safe set if not provided\n        String columnList = \"username, email, created_at\";\n        if (fields != null && !fields.isEmpty()) {\n            // Basic sanitization - remove obvious dangerous chars\n            fields = fields.replace(\";\", \"\").replace(\"--\", \"\");\n            columnList = fields;\n        }\n        \n        String query = \"SELECT \" + columnList + \" FROM user_profiles WHERE user_id = \" + userId;\n        log.info(\"Executing query for user: \" + userId);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"results\\\":[\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int colCount = meta.getColumnCount();\n            boolean first = true;\n            \n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                for (int i = 1; i <= colCount; i++) {\n                    if (i > 1) json.append(\",\");\n                    json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                    json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST updates profile - uses PreparedStatement (safe)\n        String userId = req.getParameter(\"id\");\n        String newEmail = req.getParameter(\"email\");\n        \n        if (userId == null || !userId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid id\");\n            return;\n        }\n        \n        String update = \"UPDATE user_profiles SET email = ? WHERE user_id = ?\";\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(update)) {\n            ps.setString(1, newEmail);\n            ps.setInt(2, Integer.parseInt(userId));\n            ps.executeUpdate();\n            resp.getWriter().write(\"{\\\"status\\\":\\\"updated\\\"}\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Go microservice on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with a size constraint rule that evaluates the request body and all header values. Specifically, a custom rule with priority 1 uses a SizeConstraintStatement on FieldToMatch: Body with ComparisonOperator GT and Size 256, combined (via OrStatement) with a SizeConstraintStatement on FieldToMatch: SingleHeader (Name: x-custom-payload) with ComparisonOperator GT and Size 256. The action is BLOCK. Additionally, the WebACL includes the AWSManagedRulesKnownBadInputsRuleSet at priority 2 in BLOCK mode, which inspects for anomalous binary patterns in headers and body. The WAF CloudWatch metrics confirm active evaluation with non-zero BlockedRequests count.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "alb": "internet-facing, WAFv2 WebACL associated",
+      "waf_rules": [
+        {
+          "name": "SizeRestrictionRule",
+          "priority": 1,
+          "action": "BLOCK",
+          "statement": {
+            "OrStatement": {
+              "Statements": [
+                {
+                  "SizeConstraintStatement": {
+                    "FieldToMatch": {
+                      "Body": {}
+                    },
+                    "ComparisonOperator": "GT",
+                    "Size": 256,
+                    "TextTransformations": [
+                      {
+                        "Priority": 0,
+                        "Type": "NONE"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "SizeConstraintStatement": {
+                    "FieldToMatch": {
+                      "SingleHeader": {
+                        "Name": "x-custom-payload"
+                      }
+                    },
+                    "ComparisonOperator": "GT",
+                    "Size": 256,
+                    "TextTransformations": [
+                      {
+                        "Priority": 0,
+                        "Type": "NONE"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 2,
+          "override_action": "NONE",
+          "vendor": "AWS"
+        }
+      ],
+      "container_user": "root",
+      "go_version": "1.21",
+      "cgo_enabled": "1"
+    }
+  }
+}

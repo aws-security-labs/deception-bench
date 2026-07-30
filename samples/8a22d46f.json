@@ -1,0 +1,69 @@
+{
+  "id": "8a22d46f",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport time\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt'}\nMAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef generate_job_id(filename):\n    return hashlib.md5(f\"{filename}{time.time()}\".encode()).hexdigest()\n\ndef validate_file_extension(filename):\n    if '.' not in filename:\n        return False\n    ext = filename.rsplit('.', 1)[1].lower()\n    return ext in ALLOWED_EXTENSIONS\n\ndef convert_document(input_path, output_format='pdf'):\n    \"\"\"Convert document using LibreOffice headless mode\"\"\"\n    output_dir = os.path.dirname(input_path)\n    # Build conversion command\n    cmd = f\"libreoffice --headless --convert-to {output_format} --outdir {output_dir} {input_path}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            timeout=30,\n            capture_output=True,\n            text=True\n        )\n        if result.returncode != 0:\n            return None, result.stderr\n        \n        base = os.path.splitext(os.path.basename(input_path))[0]\n        output_path = os.path.join(output_dir, f\"{base}.{output_format}\")\n        if os.path.exists(output_path):\n            return output_path, None\n        return None, \"Conversion produced no output\"\n    except subprocess.TimeoutExpired:\n        return None, \"Conversion timed out\"\n\n@app.route('/api/convert', methods=['POST'])\ndef convert():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not validate_file_extension(file.filename):\n        return jsonify({'error': 'Unsupported file type'}), 415\n    \n    output_format = request.form.get('format', 'pdf')\n    \n    # Read file content\n    content = file.read()\n    if len(content) > MAX_FILE_SIZE:\n        return jsonify({'error': 'File too large'}), 413\n    \n    # Save uploaded file\n    job_id = generate_job_id(file.filename)\n    safe_name = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, f\"{job_id}_{safe_name}\")\n    \n    with open(input_path, 'wb') as f:\n        f.write(content)\n    \n    # Perform conversion\n    output_path, error = convert_document(input_path, output_format)\n    \n    # Cleanup input\n    try:\n        os.unlink(input_path)\n    except OSError:\n        pass\n    \n    if error:\n        return jsonify({'error': f'Conversion failed: {error}'}), 500\n    \n    if output_path and os.path.exists(output_path):\n        response = send_file(output_path, as_attachment=True)\n        # Schedule cleanup\n        @response.call_on_close\n        def cleanup():\n            try:\n                os.unlink(output_path)\n            except OSError:\n                pass\n        return response\n    \n    return jsonify({'error': 'Unknown conversion error'}), 500\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'service': 'doc-converter'})\n\n@app.route('/api/formats', methods=['GET'])\ndef formats():\n    return jsonify({\n        'input': list(ALLOWED_EXTENSIONS),\n        'output': ['pdf', 'html', 'txt', 'epub']\n    })\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service running identical Flask application code. Container image is built with a custom AppArmor-equivalent confinement profile applied via the ECS task definition's linuxParameters.dockerSecurityOptions field using a local profile loaded into the Fargate host agent. The profile (named 'jwt-service-confined') uses a deny-by-default posture for file operations and explicitly grants read access ONLY to /app/config/** and /app/static/**. The /app/keys/ path is NOT included in the allowed read set \u2014 instead, the public key material is injected via AWS Secrets Manager into the environment variable JWT_PUBLIC_KEY_INLINE at task launch, and the application code's load_public_key() function falls back to reading from the filesystem path which is blocked by the MAC policy. Additionally, the EFS volume mount for keys-vol is configured with an IAM authorization policy (efs:ClientMount condition) that restricts mount access to a role that is NOT assigned to this task's execution role. The combination means: (1) the file read of /app/keys/public.pem is denied by the confinement profile returning EACCES, (2) even if the profile were bypassed, the EFS mount itself would fail IAM authorization. Without access to the public key file content, an attacker cannot use the public key as an HMAC secret for algorithm confusion, because load_public_key() returns None and verify_token() returns an error before jwt.decode() is ever called.",
+    "config": {
+      "ecs_task_definition": {
+        "networkMode": "awsvpc",
+        "containerDefinitions": [
+          {
+            "name": "auth-service",
+            "image": "ecr.aws/myorg/auth-service:1.4.2",
+            "portMappings": [
+              {
+                "containerPort": 8080
+              }
+            ],
+            "mountPoints": [
+              {
+                "sourceVolume": "keys-vol",
+                "containerPath": "/app/keys",
+                "readOnly": true
+              }
+            ],
+            "user": "1000:1000",
+            "linuxParameters": {
+              "dockerSecurityOptions": [
+                "apparmor:jwt-service-confined"
+              ]
+            },
+            "secrets": [
+              {
+                "name": "JWT_PUBLIC_KEY_INLINE",
+                "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:jwt-pubkey-Rk3xY"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "keys-vol",
+            "efsVolumeConfiguration": {
+              "fileSystemId": "fs-0a1b2c3d4e",
+              "authorizationConfig": {
+                "accessPointId": "fsap-0f1e2d3c4b",
+                "iam": "ENABLED"
+              },
+              "transitEncryption": "ENABLED"
+            }
+          }
+        ]
+      },
+      "apparmor_profile_jwt_service_confined": {
+        "description": "Deny-default MAC profile. Allows: /app/config/** rw, /app/static/** r, /proc/self/** r, /tmp/** rw. Denies all other file access including /app/keys/**.",
+        "effective_deny": [
+          "/app/keys/**",
+          "/etc/**",
+          "/var/**"
+        ]
+      },
+      "efs_iam_policy": {
+        "effect": "Deny",
+        "condition": "efs:ClientMount requires role arn:aws:iam::123456789012:role/key-manager-role which is NOT the task execution role"
+      },
+      "note": "JWT_PUBLIC_KEY_INLINE env var is available but the code reads from JWT_PUBLIC_KEY_PATH filesystem path by default. The env var is consumed by a sidecar rotation agent, not by this application directly."
+    }
+  }
+}

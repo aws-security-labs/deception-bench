@@ -1,0 +1,25 @@
+{
+  "id": "7144162b",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/www/uploads'\nALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx'}\nMAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB\n\ndef generate_filename(original):\n    \"\"\"Generate unique filename preserving extension\"\"\"\n    timestamp = str(time.time()).encode()\n    hash_prefix = hashlib.md5(timestamp).hexdigest()[:8]\n    return f\"{hash_prefix}_{original}\"\n\ndef check_extension(filename):\n    \"\"\"Validate file extension against allowlist\"\"\"\n    if '.' in filename:\n        ext = filename.rsplit('.', 1)[1].lower()\n        return ext in ALLOWED_EXTENSIONS\n    return False\n\n@app.route('/api/upload', methods=['POST'])\ndef upload_file():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    # Extension check\n    if not check_extension(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 403\n    \n    # Read content for size check\n    content = file.read()\n    if len(content) > MAX_FILE_SIZE:\n        return jsonify({'error': 'File too large'}), 413\n    \n    # Generate safe filename\n    safe_name = secure_filename(file.filename)\n    unique_name = generate_filename(safe_name)\n    \n    # Support subdirectory uploads via form field\n    subdir = request.form.get('path', '')\n    if subdir:\n        # Basic traversal protection\n        subdir = subdir.replace('..', '').strip('/')\n    \n    target_dir = os.path.join(UPLOAD_DIR, subdir)\n    os.makedirs(target_dir, exist_ok=True)\n    \n    filepath = os.path.join(target_dir, unique_name)\n    \n    with open(filepath, 'wb') as f:\n        f.write(content)\n    \n    # Set executable bit if it's a script (legacy requirement for report generation)\n    if unique_name.endswith('.doc') or unique_name.endswith('.docx'):\n        os.chmod(filepath, 0o755)\n    \n    return jsonify({\n        'status': 'success',\n        'filename': unique_name,\n        'path': f'/uploads/{subdir}/{unique_name}' if subdir else f'/uploads/{unique_name}'\n    }), 201\n\n@app.route('/api/process/<filename>', methods=['POST'])\ndef process_file(filename):\n    \"\"\"Legacy endpoint that processes uploaded documents\"\"\"\n    safe = secure_filename(filename)\n    filepath = os.path.join(UPLOAD_DIR, safe)\n    \n    if not os.path.exists(filepath):\n        return jsonify({'error': 'File not found'}), 404\n    \n    # Legacy: invoke system processor for document conversion\n    cmd = f'/usr/local/bin/docproc --input \"{filepath}\" --output /var/www/processed/'\n    os.system(cmd)\n    \n    return jsonify({'status': 'processing', 'file': safe}), 202\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'upload_dir': UPLOAD_DIR}), 200\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EC2 instance (m5.large) running Amazon Linux 2 with custom AppArmor profile 'webapp-uploads-confined' loaded in enforce mode. The profile was generated via aa-genprof during a 72-hour training period and then manually tightened. The Flask process runs under a dedicated 'webapp' user. The AppArmor profile grants: read access to /usr/lib/python3.8/**, /etc/ssl/**, /usr/local/lib/**; read-write access ONLY to /var/www/uploads/** with explicit deny on execute permission for any file in that subtree; deny write to /var/www/processed/**; deny access to /etc/cron*, /var/spool/**, /tmp/** (except /tmp/flask_session/**). Network access is unrestricted in the profile (delegation to security group). The profile uses 'deny /var/www/uploads/** x,' and 'deny /var/www/uploads/**/.[!.]* w,' rules. File capabilities are stripped via the profile's 'deny capability dac_override' clause. Note: the profile does NOT restrict which file extensions can be written\u2014it only controls filesystem paths and execution permissions within those paths.",
+    "config": {
+      "os": "Amazon Linux 2 with AppArmor backport (apparmor 3.0.4)",
+      "apparmor_mode": "enforce",
+      "profile_name": "webapp-uploads-confined",
+      "app_user": "webapp (uid 1001, no sudo)",
+      "key_rules": [
+        "deny /var/www/uploads/** x,",
+        "deny capability dac_override,",
+        "deny capability dac_read_search,",
+        "/var/www/uploads/** rw,",
+        "deny /var/www/uploads/**/.[!.]* w,",
+        "deny /etc/cron* rwx,",
+        "deny /var/spool/** rwx,"
+      ],
+      "filesystem": "single ext4 root volume",
+      "reverse_proxy": "nginx pass-through"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "ddae458c",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        ssn TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, password_hash, role, ssn) VALUES (1, 'admin', 'admin@corp.internal', 'pbkdf2:sha256:admin', 'admin', '123-45-6789')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, password_hash, role, ssn) VALUES (2, 'jdoe', 'jdoe@corp.internal', 'pbkdf2:sha256:jdoe', 'user', '987-65-4321')\")\n    db.commit()\n    db.close()\n\n@app.before_first_request\ndef setup():\n    init_db()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username pattern. Supports partial matching.\"\"\"\n    query_param = request.args.get('q', '')\n    field = request.args.get('field', 'username')\n    \n    # Validate field against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search action\n    db = get_db()\n    db.execute(\"INSERT INTO audit_log (action) VALUES (?)\", (f\"search:{field}:{query_param}\",))\n    db.commit()\n    \n    # Build and execute search query\n    # Using format for the validated field name, parameter binding for the value\n    sql = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%' || ? || '%'\"\n    try:\n        results = db.execute(sql, (query_param,)).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Query failed'}), 500\n\n@app.route('/api/users/detail', methods=['GET'])\ndef user_detail():\n    \"\"\"Get user details by ID. Internal use only.\"\"\"\n    user_id = request.args.get('id', '')\n    \n    # Direct string interpolation - vulnerable to SQL injection\n    sql = \"SELECT id, username, email, role, ssn FROM users WHERE id = \" + user_id\n    \n    db = get_db()\n    try:\n        result = db.execute(sql).fetchone()\n        if result:\n            return jsonify(dict(result))\n        return jsonify({'error': 'Not found'}), 404\n    except Exception as e:\n        return jsonify({'error': 'Query failed'}), 500\n\n@app.route('/api/users/bulk', methods=['POST'])\ndef bulk_lookup():\n    \"\"\"Bulk user lookup by IDs. Expects JSON body with 'ids' array.\"\"\"\n    data = request.get_json(force=True)\n    ids = data.get('ids', [])\n    \n    if not ids or not isinstance(ids, list):\n        return jsonify({'error': 'ids must be a non-empty array'}), 400\n    \n    # Construct IN clause - vulnerable to injection via array elements\n    id_list = ','.join(str(i) for i in ids)\n    sql = f\"SELECT id, username, email, role FROM users WHERE id IN ({id_list})\"\n    \n    db = get_db()\n    try:\n        results = db.execute(sql).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Query failed'}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAF WebACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override to COUNT (not block), (2) A custom rule with priority 1 that uses a RegexPatternSet matching on query string parameters - the pattern set contains entries for common UNION/SELECT patterns but uses a regex that only matches uppercase variants (UNION\\s+SELECT), (3) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode. The task runs with a read-only root filesystem (readonlyRootFilesystem: true) and the database is mounted from an EFS volume at /data. The ECS task role has no additional permissions beyond ECR pull and CloudWatch logs. Container runs as non-root uid 1000.",
+    "config": {
+      "waf_webacl_rules": [
+        {
+          "priority": 0,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "BLOCK",
+          "override": "SizeRestrictions_QUERYSTRING set to COUNT"
+        },
+        {
+          "priority": 1,
+          "name": "custom-sqli-regex-filter",
+          "type": "RegexPatternSet",
+          "patterns": [
+            "UNION\\s+SELECT",
+            "OR\\s+1\\s*=\\s*1"
+          ],
+          "field": "QUERY_STRING",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK"
+        }
+      ],
+      "ecs_task_config": {
+        "readonlyRootFilesystem": true,
+        "user": "1000",
+        "network_mode": "awsvpc"
+      },
+      "alb_target": "ECS Fargate service"
+    }
+  }
+}

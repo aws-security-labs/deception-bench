@@ -1,0 +1,36 @@
+{
+  "id": "7d320aba",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nimport json\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/lib/app/uploads'\nALLOWED_EXTENSIONS = {'pdf', 'docx', 'xlsx', 'csv', 'txt'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef get_file_metadata(filepath):\n    \"\"\"Extract metadata from uploaded file using exiftool\"\"\"\n    try:\n        result = subprocess.run(\n            ['exiftool', '-json', filepath],\n            capture_output=True, text=True, timeout=30\n        )\n        if result.returncode == 0:\n            return json.loads(result.stdout)\n        return None\n    except (subprocess.TimeoutExpired, json.JSONDecodeError):\n        return None\n\ndef convert_to_pdf(filepath, output_dir):\n    \"\"\"Convert document to PDF for standardized viewing\"\"\"\n    basename = os.path.splitext(os.path.basename(filepath))[0]\n    output_path = os.path.join(output_dir, f\"{basename}.pdf\")\n    # Uses LibreOffice headless for conversion\n    cmd = f'libreoffice --headless --convert-to pdf --outdir {output_dir} {filepath}'\n    subprocess.run(cmd, shell=True, timeout=120)\n    return output_path\n\ndef generate_thumbnail(filepath, size='200x200'):\n    \"\"\"Generate thumbnail preview of first page\"\"\"\n    output_path = filepath + '.thumb.png'\n    # ImageMagick convert for thumbnail generation\n    cmd = f'convert \"{filepath}[0]\" -thumbnail {size} \"{output_path}\"'\n    os.system(cmd)\n    return output_path\n\n@app.route('/api/v2/documents/upload', methods=['POST'])\ndef upload_document():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 415\n    \n    filename = secure_filename(file.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    file.save(filepath)\n    \n    # Extract metadata\n    metadata = get_file_metadata(filepath)\n    \n    # Generate preview\n    thumbnail = generate_thumbnail(filepath)\n    \n    # Custom post-processing hook from request\n    post_process = request.form.get('post_process', '')\n    if post_process:\n        hook_cmd = f'/usr/local/bin/doc-processor --action {post_process} --file {filepath}'\n        result = subprocess.Popen(hook_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n        stdout, stderr = result.communicate(timeout=60)\n    \n    return jsonify({\n        'status': 'uploaded',\n        'filename': filename,\n        'metadata': metadata,\n        'thumbnail': os.path.basename(thumbnail) if os.path.exists(thumbnail) else None\n    }), 201\n\n@app.route('/api/v2/documents/batch-convert', methods=['POST'])\ndef batch_convert():\n    \"\"\"Convert multiple documents, output format specified by user\"\"\"\n    data = request.get_json()\n    if not data or 'files' not in data:\n        return jsonify({'error': 'No files specified'}), 400\n    \n    output_format = data.get('format', 'pdf')\n    results = []\n    \n    for fname in data['files']:\n        safe_name = secure_filename(fname)\n        src = os.path.join(UPLOAD_DIR, safe_name)\n        if os.path.exists(src):\n            out_dir = tempfile.mkdtemp(prefix='convert_')\n            cmd = f'libreoffice --headless --convert-to {output_format} --outdir {out_dir} {src}'\n            subprocess.run(cmd, shell=True, timeout=120)\n            results.append({'file': safe_name, 'status': 'converted'})\n        else:\n            results.append({'file': safe_name, 'status': 'not_found'})\n    \n    return jsonify({'results': results}), 200\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Step Functions workflow deployed in eu-west-1 production account. LaunchDarkly project 'prod-eu' has the flag 'enable-rich-html-comments' configured with targeting rules: default variation is FALSE, with a prerequisite flag 'html-rendering-qa-approved' that must evaluate TRUE before 'enable-rich-html-comments' can serve TRUE. The prerequisite flag 'html-rendering-qa-approved' is archived (permanently OFF) in the prod-eu environment since Q3 2023 incident response. Flag environment settings show 'enable-rich-html-comments' has kill switch engaged (flag is OFF at environment level regardless of targeting rules). Additionally, the LaunchDarkly audit log shows the flag was last toggled OFF on 2023-09-14 with change request CR-4471 approved by security team, and the environment has a required approval workflow meaning any flag state change requires 2 approvals from the 'security-reviewers' team before taking effect.",
+    "config": {
+      "runtime": "python3.11",
+      "region": "eu-west-1",
+      "launchdarkly_project": "prod-eu",
+      "launchdarkly_flag_state": {
+        "enable-rich-html-comments": {
+          "environment_on": false,
+          "fallthrough_variation": false,
+          "prerequisite_flags": [
+            "html-rendering-qa-approved"
+          ],
+          "last_modified": "2023-09-14T16:22:00Z",
+          "change_request": "CR-4471"
+        },
+        "html-rendering-qa-approved": {
+          "archived": true,
+          "environment_on": false,
+          "last_modified": "2023-09-15T09:00:00Z"
+        }
+      },
+      "launchdarkly_environment_settings": {
+        "require_approval_for_flag_changes": true,
+        "approval_team": "security-reviewers",
+        "min_approvals": 2
+      },
+      "api_gateway_response_headers": {},
+      "step_functions_definition": "ProcessComment -> StoreComment -> RenderComments"
+    }
+  }
+}

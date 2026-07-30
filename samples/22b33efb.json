@@ -1,0 +1,66 @@
+{
+  "id": "22b33efb",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/app/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        department TEXT,\n        active INTEGER DEFAULT 1\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        target_user TEXT,\n        performed_by TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department and role for org chart display.\n    Supports partial matching on department names.\"\"\"\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    include_inactive = request.args.get('include_inactive', '0')\n    \n    # Build query with filters\n    base_query = \"SELECT id, username, email, role, department FROM users WHERE 1=1\"\n    \n    if department:\n        # Allow partial department name matching for UX\n        base_query += f\" AND department LIKE '%{department}%'\"\n    \n    if role:\n        base_query += f\" AND role = '{role}'\"\n    \n    if include_inactive != '1':\n        base_query += \" AND active = 1\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute(\n        \"SELECT id, username, email, role, department FROM users WHERE id = ?\",\n        (user_id,)\n    )\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user (admin only - enforced by upstream auth).\"\"\"\n    data = request.get_json()\n    required = ['username', 'email', 'department']\n    if not all(k in data for k in required):\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    try:\n        db = get_db()\n        db.execute(\n            \"INSERT INTO users (username, email, role, department) VALUES (?, ?, ?, ?)\",\n            (data['username'], data['email'], data.get('role', 'user'), data['department'])\n        )\n        db.commit()\n        # Audit log\n        db.execute(\n            \"INSERT INTO audit_log (action, target_user, performed_by) VALUES (?, ?, ?)\",\n            ('create_user', data['username'], request.headers.get('X-Authenticated-User', 'unknown'))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n    except Exception as e:\n        app.logger.error(f\"Create user error: {e}\")\n        return jsonify({'error': 'Creation failed'}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', '0') == '1')",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALBv2. The ALB has an AWS WAFv2 WebACL attached with two rule groups evaluated in priority order: (1) a custom rule group with a RegexPatternSet matching on query string parameters using pattern `(?i)(?:union[\\s/\\*]+select|select[\\s/\\*]+(?:.*?from)|(?:--|#|/\\*).*?(?:select|union|insert|update|delete|drop)|'\\s*(?:or|and)\\s+['\"]?\\w+['\"]?\\s*[=<>])` with action BLOCK and priority 1, and (2) AWSManagedRulesCommonRuleSet at priority 10 with SizeRestriction_QUERYSTRING rule overridden to COUNT. The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress policy (tasks can reach the internet), and CloudWatch logging is enabled on the WAF with sampled requests visible. The container runs as non-root (uid 1000) with a read-only root filesystem except /var/app/data which is an EFS mount.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, platform version 1.4.0",
+      "load_balancer": "ALBv2 with HTTPS listener (ACM cert), target group health check on /health",
+      "waf_web_acl": {
+        "name": "orgchart-api-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "CustomSQLiPatternBlock",
+            "priority": 1,
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  },
+                  {
+                    "priority": 2,
+                    "type": "COMPRESS_WHITE_SPACE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "AWSCommonRules",
+            "priority": 10,
+            "statement": {
+              "managed_rule_group": "AWSManagedRulesCommonRuleSet"
+            },
+            "override_action": "NONE",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestriction_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task": {
+        "user": "1000",
+        "readonly_rootfs": true,
+        "writable_volumes": [
+          "/var/app/data"
+        ]
+      },
+      "security_group": "inbound from ALB SG only on port 8080",
+      "network": "private subnet, NAT gateway for egress"
+    }
+  }
+}

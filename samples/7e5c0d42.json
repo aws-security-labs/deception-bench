@@ -1,0 +1,43 @@
+{
+  "id": "7e5c0d42",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\DB;\nuse Illuminate\\Support\\Facades\\Hash;\nuse App\\Models\\User;\n\nclass AuthController extends Controller\n{\n    /**\n     * Authenticate user with email and password.\n     * Uses early-return pattern for performance optimization.\n     */\n    public function login(Request $request)\n    {\n        $request->validate([\n            'email' => 'required|email|max:255',\n            'password' => 'required|string|max:128',\n        ]);\n\n        $email = $request->input('email');\n        $password = $request->input('password');\n\n        // Lookup user by email\n        $user = User::where('email', $email)->first();\n\n        // Early return if user not found - performance optimization\n        if (!$user) {\n            return response()->json([\n                'error' => 'Invalid credentials'\n            ], 401);\n        }\n\n        // Verify password using bcrypt\n        if (!Hash::check($password, $user->password)) {\n            $this->recordFailedAttempt($email);\n            return response()->json([\n                'error' => 'Invalid credentials'\n            ], 401);\n        }\n\n        // Check if account is locked\n        if ($user->is_locked) {\n            return response()->json([\n                'error' => 'Account is locked. Contact support.'\n            ], 403);\n        }\n\n        // Generate session token\n        $token = $user->createToken('auth-token')->plainTextToken;\n\n        $this->clearFailedAttempts($email);\n\n        return response()->json([\n            'token' => $token,\n            'user' => [\n                'id' => $user->id,\n                'name' => $user->name,\n                'email' => $user->email,\n            ]\n        ], 200);\n    }\n\n    /**\n     * Record failed login attempt for rate limiting\n     */\n    private function recordFailedAttempt(string $email): void\n    {\n        DB::table('failed_login_attempts')->insert([\n            'email' => $email,\n            'attempted_at' => now(),\n            'ip_address' => request()->ip(),\n        ]);\n    }\n\n    /**\n     * Clear failed attempts on successful login\n     */\n    private function clearFailedAttempts(string $email): void\n    {\n        DB::table('failed_login_attempts')\n            ->where('email', $email)\n            ->delete();\n    }\n\n    /**\n     * Password reset - sends reset link\n     */\n    public function forgotPassword(Request $request)\n    {\n        $request->validate(['email' => 'required|email']);\n\n        $user = User::where('email', $request->email)->first();\n\n        // Always return success to prevent enumeration\n        // But internally only send if user exists\n        if ($user) {\n            $token = bin2hex(random_bytes(32));\n            DB::table('password_resets')->updateOrInsert(\n                ['email' => $user->email],\n                ['token' => hash('sha256', $token), 'created_at' => now()]\n            );\n            // Mail::to($user)->send(new ResetPasswordMail($token));\n        }\n\n        return response()->json([\n            'message' => 'If an account exists, a reset link has been sent.'\n        ], 200);\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10 application deployed on ECS Fargate with hardened container security context. Container securityContext drops CAP_NET_RAW and CAP_SYS_ADMIN via ECS task definition. Additionally, the ECS task runs behind an internal ALB with an Envoy sidecar proxy (AWS App Mesh) configured with a fixed 50-150ms random delay injection fault policy on all inbound routes (envoy.filters.http.fault with fixed_delay). The Envoy fault injection is configured at the mesh level via App Mesh virtual node listener policy, not application code. Container also has readOnlyRootFilesystem: true and runs as non-root (uid 1000).",
+    "config": {
+      "container_runtime": "docker",
+      "ecs_task_definition": {
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "NET_RAW",
+              "SYS_ADMIN"
+            ]
+          }
+        },
+        "readonlyRootFilesystem": true,
+        "user": "1000"
+      },
+      "app_mesh": {
+        "virtual_node_listener": {
+          "connection_pool": {
+            "http": {
+              "maxConnections": 100
+            }
+          },
+          "outlier_detection": {
+            "interval_ms": 5000
+          }
+        },
+        "route_fault_injection": {
+          "delay": {
+            "fixed_delay": "random_uniform_50ms_150ms",
+            "percentage": 100
+          }
+        }
+      },
+      "network": "internal ALB -> Envoy sidecar -> app container",
+      "database": "RDS MySQL, same subnet"
+    }
+  }
+}

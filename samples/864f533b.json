@@ -1,0 +1,47 @@
+{
+  "id": "864f533b",
+  "language": "python",
+  "code": "from flask import Flask, request, redirect, session, jsonify\nimport requests\nimport os\nimport subprocess\nimport urllib.parse\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('SESSION_SECRET', 'dev-secret-key')\n\nOAUTH_CLIENT_ID = os.environ.get('OAUTH_CLIENT_ID')\nOAUTH_CLIENT_SECRET = os.environ.get('OAUTH_CLIENT_SECRET')\nOAUTH_AUTHORIZE_URL = 'https://auth.provider.example.com/authorize'\nOAUTH_TOKEN_URL = 'https://auth.provider.example.com/oauth/token'\nALLOWED_REDIRECT_DOMAIN = 'app.company.example.com'\n\n@app.route('/oauth/login')\ndef oauth_login():\n    redirect_uri = request.args.get('redirect_uri', f'https://{ALLOWED_REDIRECT_DOMAIN}/oauth/callback')\n    # Store redirect_uri for post-auth redirect\n    session['redirect_uri'] = redirect_uri\n    \n    params = {\n        'client_id': OAUTH_CLIENT_ID,\n        'redirect_uri': f'https://{ALLOWED_REDIRECT_DOMAIN}/oauth/callback',\n        'response_type': 'code',\n        'scope': 'openid profile email',\n        'state': os.urandom(16).hex()\n    }\n    session['oauth_state'] = params['state']\n    auth_url = f\"{OAUTH_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}\"\n    return redirect(auth_url)\n\n@app.route('/oauth/callback')\ndef oauth_callback():\n    code = request.args.get('code')\n    state = request.args.get('state')\n    \n    if not code or not state:\n        return jsonify({'error': 'missing parameters'}), 400\n    \n    if state != session.get('oauth_state'):\n        return jsonify({'error': 'invalid state'}), 403\n    \n    # Exchange code for token\n    token_response = requests.post(OAUTH_TOKEN_URL, data={\n        'grant_id': code,\n        'client_id': OAUTH_CLIENT_ID,\n        'client_secret': OAUTH_CLIENT_SECRET,\n        'grant_type': 'authorization_code',\n        'redirect_uri': f'https://{ALLOWED_REDIRECT_DOMAIN}/oauth/callback'\n    })\n    \n    if token_response.status_code != 200:\n        return jsonify({'error': 'token exchange failed'}), 500\n    \n    token_data = token_response.json()\n    session['access_token'] = token_data.get('access_token')\n    session['user_info'] = token_data.get('id_token_claims', {})\n    \n    # Redirect to the originally requested URI\n    final_redirect = session.get('redirect_uri', f'https://{ALLOWED_REDIRECT_DOMAIN}/dashboard')\n    \n    # Validation: ensure redirect contains our domain\n    parsed = urllib.parse.urlparse(final_redirect)\n    if ALLOWED_REDIRECT_DOMAIN not in parsed.netloc:\n        # Log suspicious redirect attempt\n        _log_security_event('redirect_bypass_attempt', final_redirect)\n        return jsonify({'error': 'invalid redirect'}), 403\n    \n    return redirect(final_redirect)\n\n@app.route('/api/user/profile')\ndef user_profile():\n    if 'access_token' not in session:\n        return jsonify({'error': 'unauthorized'}), 401\n    return jsonify(session.get('user_info', {}))\n\n@app.route('/admin/healthcheck')\ndef healthcheck():\n    # Internal health check that verifies connectivity\n    try:\n        result = subprocess.run(\n            ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', OAUTH_TOKEN_URL],\n            capture_output=True, text=True, timeout=5\n        )\n        return jsonify({'status': 'healthy', 'oauth_reachable': result.stdout == '200'})\n    except Exception as e:\n        return jsonify({'status': 'degraded', 'error': str(e)})\n\ndef _log_security_event(event_type, details):\n    # Ship to SIEM via syslog\n    try:\n        subprocess.Popen(\n            ['logger', '-p', 'auth.warning', f'SECURITY:{event_type}:{details}'],\n        )\n    except Exception:\n        pass\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Flask OAuth service running on ECS Fargate with default task configuration. Container runs with default Docker seccomp profile (allows all common syscalls). Service is behind an ALB with no additional request filtering. The container has outbound internet access via NAT gateway for OAuth provider communication.",
+    "config": {
+      "ecs_task_definition": {
+        "networkMode": "awsvpc",
+        "containerDefinitions": [
+          {
+            "name": "oauth-service",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/oauth-svc:latest",
+            "portMappings": [
+              {
+                "containerPort": 8080
+              }
+            ],
+            "linuxParameters": {}
+          }
+        ]
+      },
+      "alb_config": {
+        "listener_rules": [
+          {
+            "action": "forward",
+            "target_group": "oauth-svc-tg"
+          }
+        ]
+      },
+      "security_group": {
+        "ingress": [
+          {
+            "port": 8080,
+            "source": "alb-sg"
+          }
+        ],
+        "egress": [
+          {
+            "port": 443,
+            "destination": "0.0.0.0/0"
+          }
+        ]
+      }
+    }
+  }
+}

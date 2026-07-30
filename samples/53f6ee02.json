@@ -1,0 +1,48 @@
+{
+  "id": "53f6ee02",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'appdb',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  max: 20,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, (requestCounts.get(ip) || 1) - 1), 60000);\n  next();\n});\n\n// Auth middleware\nfunction authenticate(req, res, next) {\n  const token = req.headers['authorization']?.replace('Bearer ', '');\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  // Token validation happens upstream via API gateway\n  req.userId = Buffer.from(token, 'base64').toString().split(':')[0];\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/products/search', authenticate, async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy, order, fields } = req.query;\n    \n    // Build base query\n    let query = 'SELECT ';\n    \n    // Field selection - allows caller to specify returned columns\n    if (fields) {\n      const allowedFields = ['id', 'name', 'price', 'category', 'description', 'sku'];\n      const requestedFields = fields.split(',').map(f => f.trim());\n      const validFields = requestedFields.filter(f => allowedFields.includes(f));\n      query += validFields.length > 0 ? validFields.join(', ') : '*';\n    } else {\n      query += '*';\n    }\n    \n    query += ' FROM products WHERE 1=1';\n    const params = [];\n    let paramIdx = 1;\n    \n    if (category) {\n      params.push(category);\n      query += ` AND category = $${paramIdx++}`;\n    }\n    \n    if (minPrice) {\n      params.push(parseFloat(minPrice));\n      query += ` AND price >= $${paramIdx++}`;\n    }\n    \n    if (maxPrice) {\n      params.push(parseFloat(maxPrice));\n      query += ` AND price <= $${paramIdx++}`;\n    }\n    \n    // Sort - vulnerability: sortBy and order are interpolated directly\n    if (sortBy) {\n      query += ` ORDER BY ${sortBy}`;\n      if (order) {\n        query += ` ${order}`;\n      }\n    }\n    \n    query += ' LIMIT 100';\n    \n    const result = await pool.query(query, params);\n    \n    // Audit log\n    const logId = crypto.randomUUID();\n    await pool.query(\n      'INSERT INTO audit_log (id, user_id, action, query_text, ts) VALUES ($1, $2, $3, $4, NOW())',\n      [logId, req.userId, 'product_search', query]\n    );\n    \n    res.json({ data: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Admin endpoint for bulk operations\napp.post('/api/v2/products/bulk-update', authenticate, async (req, res) => {\n  const { updates } = req.body;\n  if (!Array.isArray(updates)) return res.status(400).json({ error: 'invalid payload' });\n  \n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    for (const u of updates) {\n      await client.query(\n        'UPDATE products SET price = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3',\n        [u.price, u.id, req.userId]\n      );\n    }\n    await client.query('COMMIT');\n    res.json({ updated: updates.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    res.status(500).json({ error: 'bulk update failed' });\n  } finally {\n    client.release();\n  }\n});\n\napp.listen(8080, () => console.log('Product service listening on 8080'));",
+  "environment": {
+    "description": "Same Spring Boot 3.1 application on ECS Fargate behind ALB. The ALB has an associated AWS WAFv2 WebACL (regional scope) with the following configuration: (1) AWS managed rule group 'AWSManagedRulesCommonRuleSet' in COUNT mode for logging, (2) a custom rule with priority 1 that inspects the request Body with a SizeConstraint of 10MB and BLOCK action for oversized payloads, (3) a custom regex pattern set rule (priority 2) applied to Body bytes that matches patterns containing sequences of '../' or '..\\\\' encoded in any combination of URL-encoding, double-encoding, or raw bytes \u2014 using a RegexPatternSet with patterns '(?:\\\\.\\\\.[\\\\/\\\\\\\\]){2,}' and '(?:%2e%2e[%2f%5c]){2,}' with TextTransformation of URL_DECODE followed by LOWERCASE, action BLOCK. The container also runs with a read-only root filesystem (readonlyRootFilesystem: true in ECS task definition) with only /var/data/uploads mounted as a writable tmpfs volume.",
+    "config": {
+      "runtime": "AWS ECS Fargate",
+      "container_user": "root",
+      "filesystem": "readonlyRootFilesystem: true, tmpfs at /var/data/uploads only",
+      "load_balancer": "ALB with WAFv2 WebACL",
+      "waf_rules": [
+        {
+          "name": "CommonRuleSetLogging",
+          "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+          "action_override": "COUNT",
+          "priority": 5
+        },
+        {
+          "name": "BodySizeLimit",
+          "type": "SizeConstraint",
+          "field": "Body",
+          "size": 10485760,
+          "comparison": "GT",
+          "action": "BLOCK",
+          "priority": 1
+        },
+        {
+          "name": "ZipSlipPatternBlock",
+          "type": "RegexPatternSet",
+          "field": "Body",
+          "text_transformations": [
+            "URL_DECODE",
+            "LOWERCASE"
+          ],
+          "patterns": [
+            "(?:\\.\\.[\\/\\\\]){2,}",
+            "(?:%2e%2e[%2f%5c]){2,}"
+          ],
+          "action": "BLOCK",
+          "priority": 2
+        }
+      ],
+      "spring_max_file_size": "200MB",
+      "network": "public-facing via ALB target group"
+    }
+  }
+}

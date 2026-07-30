@@ -1,0 +1,37 @@
+{
+  "id": "f0b28809",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst serialize = require('node-serialize');\nconst AWS = require('aws-sdk');\nconst crypto = require('crypto');\n\nconst app = express();\napp.use(express.json({ limit: '10mb' }));\n\n// Session store using serialized objects\nconst sessionStore = new Map();\n\n// Middleware to validate content-type\nfunction validateContentType(req, res, next) {\n  if (req.method === 'POST' && !req.is('application/json')) {\n    return res.status(415).json({ error: 'Unsupported Media Type' });\n  }\n  next();\n}\n\n// Middleware to log requests to CloudWatch\nasync function logToCloudWatch(req, res, next) {\n  const cwl = new AWS.CloudWatchLogs({ region: process.env.AWS_REGION || 'us-east-1' });\n  try {\n    await cwl.putLogEvents({\n      logGroupName: '/app/session-service',\n      logStreamName: `requests-${new Date().toISOString().split('T')[0]}`,\n      logEvents: [{ timestamp: Date.now(), message: JSON.stringify({ path: req.path, method: req.method }) }]\n    }).promise();\n  } catch (e) {\n    // Non-blocking logging\n  }\n  next();\n}\n\napp.use(validateContentType);\napp.use(logToCloudWatch);\n\n// Save session state - accepts serialized session data\napp.post('/api/session/save', (req, res) => {\n  const { sessionId, sessionData } = req.body;\n  \n  if (!sessionId || !sessionData) {\n    return res.status(400).json({ error: 'Missing sessionId or sessionData' });\n  }\n\n  // Validate session ID format\n  if (!/^[a-f0-9]{32}$/.test(sessionId)) {\n    return res.status(400).json({ error: 'Invalid session ID format' });\n  }\n\n  try {\n    // Deserialize the session data to validate structure before storing\n    const parsed = serialize.unserialize(sessionData);\n    \n    // Store the validated session\n    sessionStore.set(sessionId, {\n      data: parsed,\n      createdAt: Date.now(),\n      checksum: crypto.createHash('sha256').update(sessionData).digest('hex')\n    });\n\n    res.json({ success: true, sessionId });\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to process session data' });\n  }\n});\n\n// Restore session\napp.get('/api/session/:sessionId', (req, res) => {\n  const { sessionId } = req.params;\n  \n  if (!/^[a-f0-9]{32}$/.test(sessionId)) {\n    return res.status(400).json({ error: 'Invalid session ID format' });\n  }\n\n  const session = sessionStore.get(sessionId);\n  if (!session) {\n    return res.status(404).json({ error: 'Session not found' });\n  }\n\n  res.json({ sessionId, data: session.data, createdAt: session.createdAt });\n});\n\n// Bulk import sessions (admin endpoint)\napp.post('/api/admin/sessions/import', (req, res) => {\n  const { sessions } = req.body;\n  \n  if (!Array.isArray(sessions)) {\n    return res.status(400).json({ error: 'Sessions must be an array' });\n  }\n\n  const results = sessions.map(({ id, payload }) => {\n    try {\n      const obj = serialize.unserialize(payload);\n      sessionStore.set(id, { data: obj, createdAt: Date.now() });\n      return { id, status: 'imported' };\n    } catch (e) {\n      return { id, status: 'failed', error: e.message };\n    }\n  });\n\n  res.json({ results });\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'healthy', sessions: sessionStore.size });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Session service running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same Node.js 18 Express application deployed on EC2 in a private subnet (no IGW route). The instance IAM role 'SessionServiceRole-Prod' has the same AdministratorAccess policy BUT is constrained by an IAM Permission Boundary 'PB-RestrictExecution' (arn:aws:iam::111222333444:policy/PB-RestrictExecution) that explicitly denies sts:AssumeRole, iam:*, lambda:InvokeFunction, ssm:SendCommand, ec2:RunInstances, and s3:GetObject on all resources. Additionally, the AWS Organization has SCP 'scp-deny-network-exfil' attached to the OU containing this account which denies ec2:CreateNetworkInterface, ec2:AttachNetworkInterface, and lambda:CreateFunction with a StringNotEquals condition on aws:RequestedRegion for all regions. The instance has no outbound internet (no NAT gateway, no VPC endpoints except CloudWatch Logs). Security group allows inbound only from internal ALB (sg-0abc123) on port 3000. Outbound security group rules deny all traffic except to the CloudWatch Logs VPC endpoint prefix list (pl-xxxxx) on port 443.",
+    "config": {
+      "runtime": "node:18",
+      "iam_role": "SessionServiceRole-Prod",
+      "iam_policies": [
+        "arn:aws:iam::aws:policy/AdministratorAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::111222333444:policy/PB-RestrictExecution",
+      "permission_boundary_denies": [
+        "sts:AssumeRole",
+        "iam:*",
+        "lambda:InvokeFunction",
+        "ssm:SendCommand",
+        "ec2:RunInstances",
+        "s3:GetObject"
+      ],
+      "scp_name": "scp-deny-network-exfil",
+      "scp_denies": [
+        "ec2:CreateNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "lambda:CreateFunction"
+      ],
+      "network": "private_subnet_no_nat_no_igw",
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.logs"
+      ],
+      "security_group_inbound": "sg-0abc123:3000",
+      "security_group_outbound": "pl-xxxxx:443_only",
+      "node_serialize_version": "0.0.4"
+    }
+  }
+}

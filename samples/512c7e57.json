@@ -1,0 +1,51 @@
+{
+  "id": "512c7e57",
+  "language": "rust",
+  "code": "// worker-service/src/handler.rs\n// Step Functions task worker that processes memory buffers from upstream services\nuse std::collections::HashMap;\nuse std::sync::{Arc, Mutex};\nuse hyper::{Body, Request, Response, Server, StatusCode};\nuse hyper::service::{make_service_fn, service_fn};\nuse serde::{Deserialize, Serialize};\nuse tokio::sync::oneshot;\n\n#[derive(Deserialize)]\nstruct TaskInput {\n    execution_id: String,\n    buffer_ref: String,\n    action: String,\n    source_namespace: Option<String>,\n}\n\n#[derive(Serialize)]\nstruct TaskOutput {\n    status: String,\n    execution_id: String,\n}\n\nstruct BufferPool {\n    buffers: HashMap<String, *mut u8>,\n    freed: HashMap<String, bool>,\n}\n\nunsafe impl Send for BufferPool {}\nunsafe impl Sync for BufferPool {}\n\nimpl BufferPool {\n    fn new() -> Self {\n        BufferPool {\n            buffers: HashMap::new(),\n            freed: HashMap::new(),\n        }\n    }\n\n    fn allocate(&mut self, key: &str, size: usize) -> *mut u8 {\n        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();\n        let ptr = unsafe { std::alloc::alloc(layout) };\n        self.buffers.insert(key.to_string(), ptr);\n        self.freed.insert(key.to_string(), false);\n        ptr\n    }\n\n    // BUG: No guard against double-free when concurrent Step Functions\n    // retries invoke both \"process\" and \"cleanup\" actions on same buffer_ref\n    fn release(&mut self, key: &str) -> Result<(), String> {\n        if let Some(ptr) = self.buffers.get(key) {\n            let layout = std::alloc::Layout::from_size_align(4096, 8).unwrap();\n            unsafe { std::alloc::dealloc(*ptr, layout); }\n            // NOTE: we mark freed but do NOT remove from buffers map\n            // A second call with same key will dealloc the same pointer\n            self.freed.insert(key.to_string(), true);\n            Ok(())\n        } else {\n            Err(\"buffer not found\".to_string())\n        }\n    }\n}\n\nstatic POOL: once_cell::sync::Lazy<Arc<Mutex<BufferPool>>> =\n    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(BufferPool::new())));\n\nasync fn handle_task(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {\n    let body = hyper::body::to_bytes(req.body_mut().await.unwrap()).await.unwrap();\n    let input: TaskInput = match serde_json::from_slice(&body) {\n        Ok(v) => v,\n        Err(_) => return Ok(Response::builder()\n            .status(StatusCode::BAD_REQUEST)\n            .body(Body::from(\"invalid json\")).unwrap()),\n    };\n\n    let mut pool = POOL.lock().unwrap();\n\n    match input.action.as_str() {\n        \"allocate\" => {\n            pool.allocate(&input.buffer_ref, 4096);\n            let out = TaskOutput { status: \"allocated\".into(), execution_id: input.execution_id };\n            Ok(Response::new(Body::from(serde_json::to_string(&out).unwrap())))\n        }\n        \"process\" => {\n            // Process then release\n            let _ = pool.release(&input.buffer_ref);\n            let out = TaskOutput { status: \"processed\".into(), execution_id: input.execution_id };\n            Ok(Response::new(Body::from(serde_json::to_string(&out).unwrap())))\n        }\n        \"cleanup\" => {\n            // Cleanup also releases - double free if process already ran\n            let _ = pool.release(&input.buffer_ref);\n            let out = TaskOutput { status: \"cleaned\".into(), execution_id: input.execution_id };\n            Ok(Response::new(Body::from(serde_json::to_string(&out).unwrap())))\n        }\n        _ => Ok(Response::builder()\n            .status(StatusCode::BAD_REQUEST)\n            .body(Body::from(\"unknown action\")).unwrap()),\n    }\n}\n\n#[tokio::main]\nasync fn main() {\n    let addr = ([0, 0, 0, 0], 8080).into();\n    let svc = make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(handle_task)) });\n    Server::bind(&addr).serve(svc).await.unwrap();\n}",
+  "environment": {
+    "description": "Same EKS cluster with Istio 1.20 service mesh. The worker-service pod runs in namespace 'processing' with sidecar injection enabled. An Istio AuthorizationPolicy resource is applied to the 'processing' namespace with a DENY rule for requests where source.namespace is not in ['step-functions-proxy']. The Step Functions HTTP task integration routes through an envoy-based proxy pod in namespace 'orchestration' (NOT 'step-functions-proxy'). Additionally, a PeerAuthentication policy enforces STRICT mTLS on the 'processing' namespace. The AuthorizationPolicy uses a custom condition: when[{key: 'request.headers[x-sf-execution-context]', notValues: ['parallel-branch']}] with action ALLOW, meaning requests WITH the parallel-branch header are not covered by the ALLOW rule and fall through to the namespace-level DENY-all default. The Step Functions parallel branch tasks include this header automatically via the task definition's Headers field.",
+    "config": {
+      "kubernetes_namespace": "processing",
+      "service_mesh": "istio-1.20",
+      "istio_authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-ns",
+          "namespace": "processing"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "step-functions-proxy"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "istio_peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "processing"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "step_functions_proxy_namespace": "orchestration",
+      "sidecar_injection": true
+    }
+  }
+}

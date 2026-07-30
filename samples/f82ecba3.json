@@ -1,0 +1,26 @@
+{
+  "id": "f82ecba3",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware to extract tenant context\napp.use((req, res, next) => {\n  req.tenantId = req.headers['x-tenant-id'] || 'default';\n  next();\n});\n\n// HMAC signature verification for webhooks\nfunction verifyWebhookSignature(payload, signature, secret) {\n  const expected = crypto.createHmac('sha256', secret)\n    .update(payload)\n    .digest('hex');\n  // Developer note: timing-safe compare\n  return expected === signature; // BUG: not actually timing-safe\n}\n\n// User lookup endpoint - supports flexible filtering\napp.get('/api/v2/users/search', async (req, res) => {\n  const { email, role, sort_by, direction } = req.query;\n  \n  let query = 'SELECT id, email, display_name, role, created_at FROM users WHERE tenant_id = $1';\n  const params = [req.tenantId];\n  let paramIdx = 2;\n\n  if (email) {\n    query += ` AND email ILIKE $${paramIdx}`;\n    params.push(`%${email}%`);\n    paramIdx++;\n  }\n\n  if (role) {\n    query += ` AND role = $${paramIdx}`;\n    params.push(role);\n    paramIdx++;\n  }\n\n  // Sort functionality - developer assumed sort_by is from a dropdown\n  const allowedDirections = ['ASC', 'DESC'];\n  const dir = allowedDirections.includes(direction?.toUpperCase()) ? direction.toUpperCase() : 'ASC';\n  \n  if (sort_by) {\n    // VULNERABILITY: sort_by is directly interpolated into query\n    query += ` ORDER BY ${sort_by} ${dir}`;\n  } else {\n    query += ' ORDER BY created_at DESC';\n  }\n\n  query += ' LIMIT 50';\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ users: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Webhook receiver for payment events\napp.post('/webhooks/payments', express.raw({ type: '*/*' }), (req, res) => {\n  const sig = req.headers['x-webhook-signature'];\n  const secret = process.env.WEBHOOK_SECRET;\n  \n  if (!verifyWebhookSignature(req.body.toString(), sig, secret)) {\n    return res.status(401).json({ error: 'Invalid signature' });\n  }\n  \n  // Process payment webhook\n  const event = JSON.parse(req.body.toString());\n  console.log('Payment event:', event.type);\n  res.status(200).json({ received: true });\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Server running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Rails 7.0.4 application deployed on Kubernetes (EKS 1.27) with containers running as root (UID 0). Pod spec uses hostPath volume mount at /var/run/docker.sock for legacy monitoring sidecar. No PodSecurityPolicy or Pod Security Standards enforced. Container image based on ubuntu:22.04 with ImageMagick 6.9.11 installed. The application process runs with CAP_SYS_ADMIN capability. No seccomp profile applied. Ingress is a basic nginx-ingress with no WAF rules.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "pod_security_policy": "none",
+      "pod_security_standards": "none",
+      "container_user": "root",
+      "capabilities": [
+        "SYS_ADMIN",
+        "NET_RAW",
+        "DAC_OVERRIDE"
+      ],
+      "host_path_mounts": [
+        "/var/run/docker.sock",
+        "/proc"
+      ],
+      "seccomp_profile": "unconfined",
+      "imagemagick_version": "6.9.11-60",
+      "image_base": "ubuntu:22.04"
+    }
+  }
+}

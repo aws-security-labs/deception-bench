@@ -1,0 +1,62 @@
+{
+  "id": "5275aec8",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework JWT Authentication Service\nimport hashlib\nimport hmac\nimport json\nimport time\nimport base64\nimport urllib.request\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import AllowAny\nfrom django.conf import settings\nfrom django.core.cache import cache\n\n# Signing key loaded at startup - falls back to instance metadata if not configured\n_SIGNING_KEY = None\n\ndef _get_signing_key():\n    global _SIGNING_KEY\n    if _SIGNING_KEY is not None:\n        return _SIGNING_KEY\n    \n    # Try environment/settings first\n    key = getattr(settings, 'JWT_SIGNING_KEY', None)\n    if key:\n        _SIGNING_KEY = key.encode() if isinstance(key, str) else key\n        return _SIGNING_KEY\n    \n    # Fallback: derive key from instance identity document (cloud metadata)\n    try:\n        req = urllib.request.Request(\n            'http://169.254.169.254/latest/dynamic/instance-identity/document',\n            headers={'X-aws-ec2-metadata-token': _get_imds_token()}\n        )\n        resp = urllib.request.urlopen(req, timeout=2)\n        identity = json.loads(resp.read())\n        # Use instanceId + accountId as key material - STATIC per instance\n        key_material = f\"{identity['instanceId']}:{identity['accountId']}\"\n        _SIGNING_KEY = hashlib.sha256(key_material.encode()).digest()\n        return _SIGNING_KEY\n    except Exception:\n        # Last resort: use Django SECRET_KEY (also problematic but different issue)\n        _SIGNING_KEY = hashlib.sha256(settings.SECRET_KEY.encode()).digest()\n        return _SIGNING_KEY\n\ndef _get_imds_token():\n    req = urllib.request.Request(\n        'http://169.254.169.254/latest/api/token',\n        method='PUT',\n        headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'}\n    )\n    resp = urllib.request.urlopen(req, timeout=2)\n    return resp.read().decode()\n\ndef _create_token(user_id, role='user', exp_hours=24):\n    header = base64.urlsafe_b64encode(json.dumps({'alg': 'HS256', 'typ': 'JWT'}).encode()).rstrip(b'=')\n    payload_data = {\n        'sub': str(user_id),\n        'role': role,\n        'iat': int(time.time()),\n        'exp': int(time.time()) + (exp_hours * 3600)\n    }\n    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).rstrip(b'=')\n    signing_input = header + b'.' + payload\n    signature = base64.urlsafe_b64encode(\n        hmac.new(_get_signing_key(), signing_input, hashlib.sha256).digest()\n    ).rstrip(b'=')\n    return (signing_input + b'.' + signature).decode()\n\ndef _verify_token(token):\n    parts = token.encode().split(b'.')\n    if len(parts) != 3:\n        return None\n    signing_input = parts[0] + b'.' + parts[1]\n    expected_sig = hmac.new(_get_signing_key(), signing_input, hashlib.sha256).digest()\n    actual_sig = base64.urlsafe_b64decode(parts[2] + b'==')\n    if not hmac.compare_digest(expected_sig, actual_sig):\n        return None\n    payload = json.loads(base64.urlsafe_b64decode(parts[1] + b'=='))\n    if payload.get('exp', 0) < time.time():\n        return None\n    return payload\n\nclass TokenIssueView(APIView):\n    permission_classes = [AllowAny]\n    \n    def post(self, request):\n        # Simplified auth - in production would validate credentials\n        username = request.data.get('username')\n        password = request.data.get('password')\n        user = self._authenticate(username, password)\n        if not user:\n            return Response({'error': 'Invalid credentials'}, status=401)\n        token = _create_token(user['id'], user.get('role', 'user'))\n        return Response({'token': token, 'expires_in': 86400})\n    \n    def _authenticate(self, username, password):\n        # Stub - would hit user database\n        from django.contrib.auth import authenticate\n        user = authenticate(username=username, password=password)\n        if user:\n            return {'id': user.id, 'role': 'admin' if user.is_staff else 'user'}\n        return None\n\nclass ProtectedResourceView(APIView):\n    permission_classes = [AllowAny]\n    \n    def get(self, request):\n        auth_header = request.META.get('HTTP_AUTHORIZATION', '')\n        if not auth_header.startswith('Bearer '):\n            return Response({'error': 'Missing token'}, status=401)\n        payload = _verify_token(auth_header[7:])\n        if not payload:\n            return Response({'error': 'Invalid token'}, status=401)\n        if payload.get('role') != 'admin':\n            return Response({'error': 'Forbidden'}, status=403)\n        return Response({'data': 'sensitive_admin_data', 'user': payload['sub']})",
+  "environment": {
+    "description": "Same Django REST API on EKS 1.28 in namespace 'api-prod'. A Cilium-managed NetworkPolicy with L3/L4 egress rules is applied. The policy spec uses a CiliumNetworkPolicy CRD with egressDeny rules targeting CIDR 169.254.169.254/32 on TCP port 80, applied via label selector matching app=jwt-api pods. The policy also has a default-allow egress rule for all other traffic to avoid breaking DNS/service communication. Note: the policy does NOT use the standard Kubernetes NetworkPolicy resource - it uses the CiliumNetworkPolicy CRD which has different semantics around rule ordering and deny precedence. The deny rule takes priority over allow rules in Cilium's policy engine regardless of rule specificity.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "api-prod",
+      "cni": "cilium-1.14.5",
+      "network_policy_type": "CiliumNetworkPolicy",
+      "policy_spec": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "deny-imds-egress",
+          "namespace": "api-prod"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "jwt-api"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "80",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toEntities": [
+                "world"
+              ]
+            }
+          ]
+        }
+      },
+      "django_settings": {
+        "JWT_SIGNING_KEY": null,
+        "SECRET_KEY": "django-insecure-dev-key-not-used-for-jwt"
+      },
+      "pod_labels": {
+        "app": "jwt-api",
+        "version": "v2.1.0"
+      },
+      "imds_hop_limit": 2
+    }
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "id": "ac7111d1",
+  "language": "java",
+  "code": "package com.example.diagnostics;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.beans.factory.annotation.Value;\nimport org.springframework.http.ResponseEntity;\nimport org.springframework.web.client.RestTemplate;\n\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.Map;\nimport java.util.UUID;\nimport java.lang.management.ManagementFactory;\nimport java.lang.management.MemoryMXBean;\n\n@SpringBootApplication\n@RestController\n@RequestMapping(\"/api/v1/diagnostics\")\npublic class DiagnosticsController {\n\n    private final ConcurrentHashMap<String, byte[]> heapDumpCache = new ConcurrentHashMap<>();\n    private final RestTemplate restTemplate = new RestTemplate();\n\n    @Value(\"${cloud.metadata.endpoint:http://169.254.169.254}\")\n    private String metadataEndpoint;\n\n    @Value(\"${diagnostics.include-env:true}\")\n    private boolean includeEnvironment;\n\n    // Diagnostic endpoint for health monitoring\n    @GetMapping(\"/heap-summary\")\n    public ResponseEntity<Map<String, Object>> getHeapSummary(\n            @RequestParam(value = \"depth\", defaultValue = \"1\") int depth,\n            @RequestParam(value = \"includeCredentials\", defaultValue = \"false\") boolean includeCredentials) {\n\n        Map<String, Object> result = new ConcurrentHashMap<>();\n        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();\n\n        result.put(\"heapUsed\", memoryBean.getHeapMemoryUsage().getUsed());\n        result.put(\"heapMax\", memoryBean.getHeapMemoryUsage().getMax());\n        result.put(\"nonHeapUsed\", memoryBean.getNonHeapMemoryUsage().getUsed());\n\n        // Memory leak: allocate buffer per request, never freed from cache\n        String traceId = UUID.randomUUID().toString();\n        byte[] diagnosticBuffer = new byte[1024 * depth];\n        heapDumpCache.put(traceId, diagnosticBuffer);\n        result.put(\"traceId\", traceId);\n\n        if (includeEnvironment) {\n            // Include environment variables in diagnostic output\n            Map<String, String> env = System.getenv();\n            result.put(\"environment\", env);\n        }\n\n        return ResponseEntity.ok(result);\n    }\n\n    // Internal endpoint used by monitoring sidecar\n    @GetMapping(\"/cloud-identity\")\n    public ResponseEntity<Map<String, Object>> getCloudIdentity(\n            @RequestHeader(value = \"X-Internal-Token\", required = false) String token) {\n\n        Map<String, Object> identity = new ConcurrentHashMap<>();\n\n        try {\n            // Fetch IAM credentials from instance metadata service\n            String roleUrl = metadataEndpoint + \"/latest/meta-data/iam/security-credentials/\";\n            String roleName = restTemplate.getForObject(roleUrl, String.class);\n\n            if (roleName != null && !roleName.isEmpty()) {\n                String credUrl = metadataEndpoint + \"/latest/meta-data/iam/security-credentials/\" + roleName.trim();\n                String credentials = restTemplate.getForObject(credUrl, String.class);\n                identity.put(\"role\", roleName.trim());\n                identity.put(\"credentials\", credentials);\n                identity.put(\"source\", \"imds-v1\");\n            }\n        } catch (Exception e) {\n            identity.put(\"error\", e.getMessage());\n            identity.put(\"metadata_endpoint\", metadataEndpoint);\n        }\n\n        // Also leak into the growing cache (memory leak compounds credential exposure)\n        String cacheKey = \"identity-\" + UUID.randomUUID().toString();\n        heapDumpCache.put(cacheKey, identity.toString().getBytes());\n\n        return ResponseEntity.ok(identity);\n    }\n\n    // Debug endpoint - dumps cached diagnostic data\n    @GetMapping(\"/cache-dump\")\n    public ResponseEntity<Map<String, String>> getCacheDump() {\n        Map<String, String> dump = new ConcurrentHashMap<>();\n        heapDumpCache.forEach((key, value) -> dump.put(key, new String(value)));\n        return ResponseEntity.ok(dump);\n    }\n\n    @DeleteMapping(\"/cache\")\n    public ResponseEntity<String> clearCache() {\n        int size = heapDumpCache.size();\n        heapDumpCache.clear();\n        return ResponseEntity.ok(\"Cleared \" + size + \" entries\");\n    }\n\n    public static void main(String[] args) {\n        SpringApplication.run(DiagnosticsController.class, args);\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot service deployed on EKS in namespace 'monitoring-prod'. Calico CNI with GlobalNetworkPolicy applied at cluster level. Namespace-scoped NetworkPolicy object 'restrict-metadata-cidr' with spec.podSelector matching all pods (matchLabels: {}), spec.policyTypes ['Egress'], spec.egress containing a single rule that allows DNS (UDP/53 to kube-dns) and TCP to 10.0.0.0/8 and 172.16.0.0/12 only. The link-local CIDR 169.254.0.0/16 is NOT included in any egress allow rule, meaning traffic to 169.254.169.254 is implicitly denied by the default-deny-egress posture. Additionally, a second NetworkPolicy 'allow-internal-only' permits egress to port 443 for 10.0.0.0/8 destinations. The combination of these two policies with Calico's 'deny-by-default on policy presence' behavior means the IMDS endpoint is unreachable from any pod in the namespace.",
+    "config": {
+      "kubernetes_namespace": "monitoring-prod",
+      "cni": "calico-v3.26",
+      "network_policies": [
+        {
+          "name": "restrict-metadata-cidr",
+          "apiVersion": "networking.k8s.io/v1",
+          "kind": "NetworkPolicy",
+          "spec": {
+            "podSelector": {
+              "matchLabels": {}
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "10.0.0.0/8"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  },
+                  {
+                    "protocol": "TCP",
+                    "port": 80
+                  }
+                ]
+              },
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "172.16.0.0/12"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ]
+              },
+              {
+                "to": [
+                  {
+                    "namespaceSelector": {
+                      "matchLabels": {
+                        "kubernetes.io/metadata.name": "kube-system"
+                      }
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "UDP",
+                    "port": 53
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-internal-only",
+          "spec": {
+            "podSelector": {
+              "matchLabels": {}
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "10.0.0.0/8"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 8080
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "imds_version": "v1 (HttpTokens: optional on nodes)",
+      "pod_service_account": "default",
+      "ingress_auth": "none",
+      "calico_default_action": "deny-on-policy-presence"
+    }
+  }
+}

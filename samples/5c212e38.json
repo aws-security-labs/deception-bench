@@ -1,0 +1,66 @@
+{
+  "id": "5c212e38",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 100) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, (requestCounts.get(ip) || 1) - 1), 60000);\n  next();\n});\n\n// Auth middleware - validates session token\napp.use(async (req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const result = await pool.query(\n      'SELECT user_id, role FROM sessions WHERE token = $1 AND expires_at > NOW()',\n      [token]\n    );\n    if (result.rows.length === 0) return res.status(401).json({ error: 'invalid session' });\n    req.user = result.rows[0];\n    next();\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Search endpoint with filtering\napp.get('/api/v2/reports', async (req, res) => {\n  const { department, fiscal_year, sort_by, direction } = req.query;\n  \n  // Validate required params\n  if (!department) return res.status(400).json({ error: 'department required' });\n  \n  // Build query with parameterized department filter\n  let query = `SELECT id, title, department, fiscal_year, created_at, summary \n               FROM financial_reports \n               WHERE department = $1`;\n  const params = [department];\n  \n  if (fiscal_year) {\n    // Validate fiscal year is numeric\n    if (!/^\\d{4}$/.test(fiscal_year)) {\n      return res.status(400).json({ error: 'invalid fiscal year' });\n    }\n    query += ` AND fiscal_year = ${fiscal_year}`;\n  }\n  \n  // Dynamic sort - validated against allowlist\n  const allowedSorts = ['created_at', 'title', 'fiscal_year', 'id'];\n  if (sort_by && allowedSorts.includes(sort_by)) {\n    const dir = direction === 'desc' ? 'DESC' : 'ASC';\n    query += ` ORDER BY ${sort_by} ${dir}`;\n  } else {\n    query += ' ORDER BY created_at DESC';\n  }\n  \n  // Apply row-level access control\n  if (req.user.role !== 'admin') {\n    query = `SELECT * FROM (${query}) sub WHERE sub.department IN (\n      SELECT department FROM user_department_access WHERE user_id = '${req.user.user_id}'\n    )`;\n  }\n  \n  query += ' LIMIT 50';\n  \n  try {\n    const result = await pool.query(query, params);\n    res.json({ reports: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'query failed' });\n  }\n});\n\n// Report detail endpoint\napp.get('/api/v2/reports/:id', async (req, res) => {\n  const reportId = req.params.id;\n  if (!/^[0-9a-f-]{36}$/.test(reportId)) {\n    return res.status(400).json({ error: 'invalid report id' });\n  }\n  try {\n    const result = await pool.query(\n      'SELECT * FROM financial_reports WHERE id = $1', [reportId]\n    );\n    if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n    res.json(result.rows[0]);\n  } catch (err) {\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log('Report service started');\n});",
+  "environment": {
+    "description": "Same Ktor webhook-gateway deployed in 'commerce-prod' namespace on GKE 1.28 with Istio 1.20. Mesh-wide PeerAuthentication enforces STRICT mTLS. An AuthorizationPolicy in the 'vault-system' namespace specifies: source principals must match 'cluster.local/ns/vault-system/sa/*' for any workload in that namespace. A second AuthorizationPolicy (DENY action) is applied mesh-wide at the root namespace (istio-system) with a rule matching source namespace 'commerce-prod' and destination namespace not in ['commerce-prod', 'istio-system', 'monitoring'] \u2014 effectively a default-deny for cross-namespace egress from commerce-prod to sensitive namespaces. GKE Workload Identity is bound so the metadata endpoint returns only the mapped IAM service account token (roles/logging.logWriter only). Pod has annotation 'traffic.sidecar.istio.io/excludeOutboundIPRanges' NOT set, meaning all egress is captured by Envoy sidecar.",
+    "config": {
+      "kubernetes_namespace": "commerce-prod",
+      "istio_version": "1.20.2",
+      "peer_authentication": "STRICT_mtls_mesh_wide",
+      "authorization_policy_root": {
+        "namespace": "istio-system",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "commerce-prod"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "notNamespaces": [
+                    "commerce-prod",
+                    "istio-system",
+                    "monitoring"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_vault": {
+        "namespace": "vault-system",
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/vault-system/sa/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "workload_identity": {
+        "gsa": "webhook-gw-sa@project.iam.gserviceaccount.com",
+        "roles": [
+          "roles/logging.logWriter"
+        ]
+      },
+      "sidecar_captures_all_egress": true,
+      "exclude_outbound_ip_ranges": "not_set"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "79f866a5",
+  "language": "java",
+  "code": "package com.acme.serverless;\n\nimport io.quarkus.funqy.Funq;\nimport io.quarkus.funqy.Context;\nimport javax.inject.Inject;\nimport javax.inject.Singleton;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.atomic.AtomicReference;\nimport java.nio.ByteBuffer;\nimport java.lang.ref.WeakReference;\nimport sun.misc.Unsafe;\nimport java.lang.reflect.Field;\n\n@Singleton\npublic class NativeBufferPool {\n    private final ConcurrentHashMap<String, WeakReference<ByteBuffer>> pool = new ConcurrentHashMap<>();\n    private static final Unsafe UNSAFE;\n    \n    static {\n        try {\n            Field f = Unsafe.class.getDeclaredField(\"theUnsafe\");\n            f.setAccessible(true);\n            UNSAFE = (Unsafe) f.get(null);\n        } catch (Exception e) {\n            throw new RuntimeException(e);\n        }\n    }\n    \n    public ByteBuffer allocate(String key, int size) {\n        ByteBuffer buf = ByteBuffer.allocateDirect(size);\n        pool.put(key, new WeakReference<>(buf));\n        return buf;\n    }\n    \n    public ByteBuffer get(String key) {\n        WeakReference<ByteBuffer> ref = pool.get(key);\n        if (ref != null) {\n            return ref.get(); // may return null if GC'd\n        }\n        return null;\n    }\n    \n    public void release(String key) {\n        WeakReference<ByteBuffer> ref = pool.remove(key);\n        if (ref != null) {\n            ByteBuffer buf = ref.get();\n            if (buf != null) {\n                // Free the native memory but don't null the reference\n                long address = getAddress(buf);\n                UNSAFE.freeMemory(address);\n                // BUG: WeakReference may still be cached by caller\n            }\n        }\n    }\n    \n    public void writeToBuffer(String key, byte[] data, int offset) {\n        ByteBuffer buf = get(key);\n        if (buf != null) {\n            // Use-after-free: buffer's native memory may have been freed\n            buf.position(offset);\n            buf.put(data);\n        }\n    }\n    \n    private long getAddress(ByteBuffer buf) {\n        try {\n            Field addressField = java.nio.Buffer.class.getDeclaredField(\"address\");\n            addressField.setAccessible(true);\n            return addressField.getLong(buf);\n        } catch (Exception e) {\n            throw new RuntimeException(e);\n        }\n    }\n}\n\n@Singleton\npublic class CommandHandler {\n    @Inject\n    NativeBufferPool bufferPool;\n    \n    @Funq\n    public String handleRequest(RequestPayload payload) {\n        String sessionId = payload.getSessionId();\n        \n        if (\"alloc\".equals(payload.getAction())) {\n            bufferPool.allocate(sessionId, payload.getSize());\n            return \"{\\\"status\\\": \\\"allocated\\\"}\";\n        } else if (\"write\".equals(payload.getAction())) {\n            byte[] data = java.util.Base64.getDecoder().decode(payload.getData());\n            bufferPool.writeToBuffer(sessionId, data, payload.getOffset());\n            return \"{\\\"status\\\": \\\"written\\\"}\";\n        } else if (\"free\".equals(payload.getAction())) {\n            bufferPool.release(sessionId);\n            return \"{\\\"status\\\": \\\"freed\\\"}\";\n        } else if (\"exec\".equals(payload.getAction())) {\n            // Post-exploitation: attempt command execution\n            try {\n                Process p = Runtime.getRuntime().exec(payload.getCommand());\n                java.io.InputStream is = p.getInputStream();\n                byte[] output = is.readAllBytes();\n                return new String(output);\n            } catch (Exception e) {\n                return \"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\";\n            }\n        }\n        return \"{\\\"error\\\": \\\"unknown action\\\"}\";\n    }\n}\n\npublic class RequestPayload {\n    private String sessionId;\n    private String action;\n    private int size;\n    private String data;\n    private int offset;\n    private String command;\n    \n    public String getSessionId() { return sessionId; }\n    public void setSessionId(String s) { this.sessionId = s; }\n    public String getAction() { return action; }\n    public void setAction(String a) { this.action = a; }\n    public int getSize() { return size; }\n    public void setSize(int s) { this.size = s; }\n    public String getData() { return data; }\n    public void setData(String d) { this.data = d; }\n    public int getOffset() { return offset; }\n    public void setOffset(int o) { this.offset = o; }\n    public String getCommand() { return command; }\n    public void setCommand(String c) { this.command = c; }\n}",
+  "environment": {
+    "description": "Same Quarkus function deployed on Knative Serving (v1.12) on GKE Autopilot cluster. Pod spec includes a custom OCI runtime annotation referencing a node-level RuntimeClass 'hardened-serverless' backed by gVisor (runsc) with a supplementary seccomp profile applied via the PodSecurity admission controller. The seccomp profile (located at /etc/seccomp/quarkus-lambda-compat.json) uses SCMP_ACT_ERRNO for syscalls in the set {execve, execveat, ptrace, process_vm_readv, process_vm_writev, socket, connect, bind, listen, accept, accept4}. The profile's defaultAction is SCMP_ACT_ALLOW. Additionally, the Knative revision template specifies securityContext.allowPrivilegeEscalation=false and drops ALL capabilities. Note: the seccomp profile does NOT filter mmap, mprotect, read, write, or brk \u2014 meaning the use-after-free heap corruption itself still occurs, but post-exploitation (shell spawning, reverse shells, data exfiltration via network) is blocked at the kernel level.",
+    "config": {
+      "platform": "gke-autopilot-knative-1.12",
+      "runtime_class": "hardened-serverless",
+      "sandbox": "gvisor-runsc",
+      "seccomp_profile_path": "/etc/seccomp/quarkus-lambda-compat.json",
+      "blocked_syscalls": [
+        "execve",
+        "execveat",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4"
+      ],
+      "seccomp_default_action": "SCMP_ACT_ALLOW",
+      "security_context": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "pod_security_standard": "restricted",
+      "jvm_args": "--add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/sun.misc=ALL-UNNAMED"
+    }
+  }
+}

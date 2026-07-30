@@ -1,0 +1,71 @@
+{
+  "id": "121decaa",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CLI tool for managing deployment configurations across namespaces.\nRuns as a sidecar utility in Kubernetes pods to apply config patches.\n\"\"\"\n\nimport subprocess\nimport sys\nimport json\nimport os\nimport tempfile\nimport yaml\nfrom pathlib import Path\n\nDEFAULT_NAMESPACE = os.environ.get('POD_NAMESPACE', 'default')\nSERVICE_ACCOUNT = os.environ.get('SERVICE_ACCOUNT', 'config-manager')\nAPI_ENDPOINT = os.environ.get('CONFIG_API', 'http://config-service.platform-system.svc.cluster.local:8080')\n\ndef validate_config_name(name):\n    \"\"\"Basic validation - alphanumeric, dashes, dots allowed.\"\"\"\n    import re\n    if not re.match(r'^[a-zA-Z0-9._-]+$', name):\n        raise ValueError(f\"Invalid config name: {name}\")\n    return name\n\ndef fetch_config(config_ref):\n    \"\"\"Fetch configuration from the platform config service.\"\"\"\n    import urllib.request\n    url = f\"{API_ENDPOINT}/api/v1/configs/{config_ref}\"\n    req = urllib.request.Request(url)\n    req.add_header('X-Source-Namespace', DEFAULT_NAMESPACE)\n    req.add_header('X-Service-Account', SERVICE_ACCOUNT)\n    with urllib.request.urlopen(req, timeout=10) as resp:\n        return json.loads(resp.read())\n\ndef apply_patch(config_data, target_namespace=None):\n    \"\"\"Apply configuration patch to the target namespace.\"\"\"\n    ns = target_namespace or DEFAULT_NAMESPACE\n    \n    # Write config to temp file for kubectl apply\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:\n        yaml.dump(config_data, f)\n        tmp_path = f.name\n    \n    try:\n        cmd = f\"kubectl apply -f {tmp_path} -n {ns}\"\n        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)\n        if result.returncode != 0:\n            print(f\"Error applying config: {result.stderr}\", file=sys.stderr)\n            return False\n        return True\n    finally:\n        os.unlink(tmp_path)\n\ndef process_batch_file(batch_path):\n    \"\"\"Process a batch configuration file with multiple operations.\n    Format: YAML with 'operations' list containing action, target, params.\n    \"\"\"\n    with open(batch_path) as f:\n        batch = yaml.safe_load(f)\n    \n    if not isinstance(batch, dict) or 'operations' not in batch:\n        raise ValueError(\"Invalid batch file format\")\n    \n    results = []\n    for op in batch['operations']:\n        action = op.get('action', '')\n        target = op.get('target', DEFAULT_NAMESPACE)\n        params = op.get('params', {})\n        \n        if action == 'apply_config':\n            config_ref = validate_config_name(op.get('config_ref', ''))\n            config_data = fetch_config(config_ref)\n            # Allow override of target namespace from batch file\n            success = apply_patch(config_data, target_namespace=target)\n            results.append({'action': action, 'target': target, 'success': success})\n        \n        elif action == 'exec_hook':\n            # Pre/post deployment hooks - runs arbitrary commands\n            # SECURITY: hooks should only affect local namespace resources\n            hook_cmd = params.get('command', '')\n            if hook_cmd:\n                env = os.environ.copy()\n                env['TARGET_NS'] = target\n                result = subprocess.run(\n                    hook_cmd, shell=True, capture_output=True,\n                    text=True, env=env, timeout=30\n                )\n                results.append({\n                    'action': action,\n                    'success': result.returncode == 0,\n                    'output': result.stdout[:500]\n                })\n        \n        elif action == 'scale':\n            deployment = validate_config_name(params.get('deployment', ''))\n            replicas = int(params.get('replicas', 1))\n            cmd = f\"kubectl scale deployment/{deployment} --replicas={replicas} -n {target}\"\n            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)\n            results.append({'action': action, 'success': result.returncode == 0})\n    \n    return results\n\ndef main():\n    if len(sys.argv) < 2:\n        print(\"Usage: config-manager <batch-file.yaml>\", file=sys.stderr)\n        sys.exit(1)\n    \n    batch_path = sys.argv[1]\n    if not Path(batch_path).exists():\n        print(f\"File not found: {batch_path}\", file=sys.stderr)\n        sys.exit(1)\n    \n    try:\n        results = process_batch_file(batch_path)\n        print(json.dumps({'results': results}, indent=2))\n    except Exception as e:\n        print(f\"Error: {e}\", file=sys.stderr)\n        sys.exit(1)\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 service mesh. The config-manager pod has an Envoy sidecar injected. An AuthorizationPolicy resource is applied at the mesh level with a 'DENY' action matching source principals not in the 'platform-system' namespace attempting to reach config-service.platform-system.svc.cluster.local. Additionally, a second AuthorizationPolicy in the 'platform-system' namespace uses a CUSTOM action delegating to an OPA sidecar that validates the X-Source-Namespace header matches the actual source.identity from the mTLS SPIFFE URI (spiffe://cluster.local/ns/{ns}/sa/{sa}). The pod's ServiceAccount has a RoleBinding scoped only to 'app-team' namespace (not ClusterRoleBinding). However, the exec_hook action still allows shell command execution within the pod context, and the Istio sidecar only intercepts HTTP traffic on declared service ports - it does NOT intercept kubectl commands which use the Kubernetes API server directly via the pod's mounted ServiceAccount token at /var/run/secrets/kubernetes.io/serviceaccount/token.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "namespace": "app-team",
+      "istio_version": "1.20",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace-config-access",
+          "namespace": "platform-system",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "platform-system"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "hosts": [
+                        "config-service.platform-system.svc.cluster.local"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "opa-header-validation",
+          "namespace": "platform-system",
+          "spec": {
+            "action": "CUSTOM",
+            "provider": {
+              "name": "opa-istio"
+            },
+            "rules": [
+              {
+                "to": [
+                  {
+                    "operation": {
+                      "paths": [
+                        "/api/v1/configs/*"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "rbac": "RoleBinding in app-team namespace only, Role with get/list/patch on deployments and configmaps",
+      "network_policy": "default-deny-ingress in platform-system",
+      "pod_security_standard": "baseline",
+      "service_account_token_mount": "projected volume with 1h expiry and audience binding"
+    }
+  }
+}

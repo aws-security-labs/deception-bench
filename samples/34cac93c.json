@@ -1,0 +1,65 @@
+{
+  "id": "34cac93c",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport hashlib\nimport time\nimport re\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/inventory.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        api_key = request.headers.get('X-API-Key')\n        if not api_key:\n            return jsonify({'error': 'Missing API key'}), 401\n        # Validate key format (64 hex chars)\n        if not re.match(r'^[a-f0-9]{64}$', api_key):\n            return jsonify({'error': 'Invalid key format'}), 401\n        db = get_db()\n        row = db.execute('SELECT id, role FROM api_keys WHERE key_hash = ?',\n                        (hashlib.sha256(api_key.encode()).hexdigest(),)).fetchone()\n        if not row:\n            return jsonify({'error': 'Unauthorized'}), 403\n        request.user_id = row['id']\n        request.user_role = row['role']\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/v2/inventory/search', methods=['GET'])\n@require_api_key\ndef search_inventory():\n    \"\"\"Search inventory with flexible filtering.\n    Supports: category, warehouse, min_qty, max_qty, sort_by, order\n    \"\"\"\n    category = request.args.get('category', '')\n    warehouse = request.args.get('warehouse', '')\n    min_qty = request.args.get('min_qty', '0')\n    sort_by = request.args.get('sort_by', 'name')\n    order = request.args.get('order', 'ASC')\n    \n    # Build query with filters\n    base_query = \"SELECT id, name, sku, category, warehouse, quantity, updated_at FROM inventory WHERE 1=1\"\n    params = []\n    \n    if category:\n        base_query += \" AND category = ?\"\n        params.append(category)\n    \n    if warehouse:\n        base_query += \" AND warehouse = ?\"\n        params.append(warehouse)\n    \n    try:\n        min_qty_val = int(min_qty)\n        base_query += \" AND quantity >= ?\"\n        params.append(min_qty_val)\n    except ValueError:\n        pass\n    \n    # Sort - whitelist column names but order direction is user-controlled\n    allowed_columns = ['name', 'sku', 'category', 'warehouse', 'quantity', 'updated_at']\n    if sort_by not in allowed_columns:\n        sort_by = 'name'\n    \n    # ORDER BY with validated column but unvalidated direction\n    base_query += f\" ORDER BY {sort_by} {order}\"\n    \n    base_query += \" LIMIT 100\"\n    \n    db = get_db()\n    try:\n        results = db.execute(base_query, params).fetchall()\n        return jsonify({\n            'results': [dict(row) for row in results],\n            'count': len(results),\n            'query_time': time.time()\n        })\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Query failed'}), 500\n\n@app.route('/api/v2/inventory/<int:item_id>', methods=['PUT'])\n@require_api_key\ndef update_inventory(item_id):\n    if request.user_role != 'admin':\n        return jsonify({'error': 'Insufficient permissions'}), 403\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'No data provided'}), 400\n    \n    allowed_fields = ['name', 'category', 'warehouse', 'quantity']\n    updates = []\n    params = []\n    for field in allowed_fields:\n        if field in data:\n            updates.append(f\"{field} = ?\")\n            params.append(data[field])\n    \n    if not updates:\n        return jsonify({'error': 'No valid fields'}), 400\n    \n    params.append(item_id)\n    query = f\"UPDATE inventory SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?\"\n    db = get_db()\n    db.execute(query, params)\n    db.commit()\n    return jsonify({'status': 'updated'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Celery worker deployed behind Kong Gateway (3.4.x) with a custom request-validator plugin configured using a JSON Schema definition that enforces 'options' field type constraint via additionalProperties and explicit type declarations. The schema is loaded from a ConfigMap mounted at /etc/kong/schemas/conversion-job.json. The plugin operates in 'strict' mode with coercion disabled (config.coerce_body=false), meaning any request where the 'options' field is not exactly type 'object' (or absent) receives HTTP 400 before reaching the Flask app or Redis queue. Note: the schema does NOT validate nested values within options dict - only the top-level type of the options field itself.",
+    "config": {
+      "gateway": "Kong 3.4.2 OSS",
+      "plugin": "request-validator (bundled)",
+      "schema_enforcement": {
+        "properties": {
+          "doc_id": {
+            "type": "string"
+          },
+          "source_format": {
+            "type": "string",
+            "enum": [
+              "pdf",
+              "docx",
+              "html",
+              "txt",
+              "rtf",
+              "odt"
+            ]
+          },
+          "target_format": {
+            "type": "string",
+            "enum": [
+              "pdf",
+              "docx",
+              "html",
+              "txt",
+              "rtf",
+              "odt"
+            ]
+          },
+          "options": {
+            "type": "object"
+          },
+          "callback_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        },
+        "required": [
+          "doc_id",
+          "source_format",
+          "target_format"
+        ],
+        "additionalProperties": false
+      },
+      "plugin_config": {
+        "content_type_subtype": "json",
+        "allowed_content_types": [
+          "application/json"
+        ],
+        "body_schema": "/etc/kong/schemas/conversion-job.json",
+        "verbose_response": false,
+        "coerce_body": false
+      },
+      "worker_user": "root",
+      "network": "Private subnet, Kong in DMZ"
+    }
+  }
+}

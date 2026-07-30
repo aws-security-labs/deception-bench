@@ -1,0 +1,36 @@
+{
+  "id": "d1fd87f3",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport time\nimport os\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives import padding as sym_padding\nfrom cryptography.hazmat.backends import default_backend\nimport struct\nimport hashlib\n\n# Generated protobuf stubs\nimport token_service_pb2\nimport token_service_pb2_grpc\n\nSECRET_KEY = os.environ.get('ENCRYPTION_KEY', 'a' * 32).encode()[:32]\n\ndef decrypt_token(ciphertext_with_iv):\n    \"\"\"Decrypt AES-CBC token with PKCS7 padding validation.\"\"\"\n    if len(ciphertext_with_iv) < 32:\n        raise ValueError(\"Token too short\")\n    \n    iv = ciphertext_with_iv[:16]\n    ciphertext = ciphertext_with_iv[16:]\n    \n    if len(ciphertext) % 16 != 0:\n        raise ValueError(\"Invalid ciphertext length\")\n    \n    cipher = Cipher(algorithms.AES(SECRET_KEY), modes.CBC(iv), backend=default_backend())\n    decryptor = cipher.decryptor()\n    padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()\n    \n    # Manual PKCS7 unpadding - raises distinct error on bad padding\n    pad_byte = padded_plaintext[-1]\n    if pad_byte == 0 or pad_byte > 16:\n        raise ValueError(\"Invalid padding byte\")\n    \n    for i in range(pad_byte):\n        if padded_plaintext[-(i+1)] != pad_byte:\n            raise ValueError(\"Padding verification failed\")\n    \n    return padded_plaintext[:-pad_byte]\n\n\nclass TokenValidationService(token_service_pb2_grpc.TokenValidationServiceServicer):\n    \n    def ValidateToken(self, request, context):\n        \"\"\"Validate an encrypted session token.\"\"\"\n        try:\n            token_bytes = request.encrypted_token\n            plaintext = decrypt_token(token_bytes)\n            \n            # Parse token: user_id (8 bytes) + expiry (8 bytes) + role_hash (32 bytes)\n            if len(plaintext) < 48:\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details(\"Malformed token payload\")\n                return token_service_pb2.ValidationResponse(valid=False)\n            \n            user_id = struct.unpack('>Q', plaintext[:8])[0]\n            expiry = struct.unpack('>Q', plaintext[8:16])[0]\n            role_hash = plaintext[16:48]\n            \n            if time.time() > expiry:\n                return token_service_pb2.ValidationResponse(\n                    valid=False, reason=\"Token expired\")\n            \n            return token_service_pb2.ValidationResponse(\n                valid=True, user_id=str(user_id), role_hash=role_hash.hex())\n        \n        except ValueError as e:\n            # VULNERABILITY: Different error messages for padding vs other errors\n            # This leaks padding validity information through gRPC status details\n            error_msg = str(e)\n            if \"padding\" in error_msg.lower() or \"Invalid padding\" in error_msg:\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details(\"PADDING_ERROR\")\n            else:\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details(\"DECRYPTION_ERROR\")\n            return token_service_pb2.ValidationResponse(valid=False)\n        \n        except Exception as e:\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details(\"Internal processing error\")\n            return token_service_pb2.ValidationResponse(valid=False)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    token_service_pb2_grpc.add_TokenValidationServiceServicer_to_server(\n        TokenValidationService(), server)\n    \n    listen_addr = os.environ.get('GRPC_LISTEN_ADDR', '0.0.0.0:50051')\n    server.add_insecure_port(listen_addr)\n    server.start()\n    print(f\"Token validation gRPC server listening on {listen_addr}\")\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "EKS pod deployed in a private subnet (subnet-0a3f8c92e7b41d6f2) within VPC vpc-04d8e3a1b7c92f5e0. The subnet route table (rtb-0f7a2c8e91b34d5a6) contains only local routes (10.0.128.0/18 -> local) and no 0.0.0.0/0 route entry \u2014 specifically, no NAT Gateway, no NAT instance, no VPC endpoint for internet-bound traffic, and no Transit Gateway attachment with external routing. The pod's Kubernetes Service is ClusterIP type only. VPC Flow Logs confirm zero packets leaving the VPC CIDR. The Security Group (sg-0b4e7f2a8c91d3e56) attached to the ENI has ingress rules allowing only 10.0.0.0/16 on port 50051 and egress rules limited to 10.0.0.0/16 (no 0.0.0.0/0 egress). Additionally, the EKS cluster has a Calico NetworkPolicy restricting pod ingress to namespace 'internal-services' pods with label app=api-gateway only.",
+    "config": {
+      "eks_cluster": "prod-us-east-1",
+      "subnet_id": "subnet-0a3f8c92e7b41d6f2",
+      "subnet_type": "private",
+      "vpc_id": "vpc-04d8e3a1b7c92f5e0",
+      "route_table": "rtb-0f7a2c8e91b34d5a6",
+      "routes": [
+        "10.0.128.0/18 -> local"
+      ],
+      "nat_gateway": null,
+      "nat_instance": null,
+      "internet_gateway_attached": false,
+      "transit_gateway": null,
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.eks",
+        "com.amazonaws.us-east-1.ecr.api"
+      ],
+      "service_type": "ClusterIP",
+      "security_group_id": "sg-0b4e7f2a8c91d3e56",
+      "security_group_ingress": "10.0.0.0/16:50051",
+      "security_group_egress": "10.0.0.0/16:all",
+      "calico_network_policy": {
+        "ingress_from": "namespace=internal-services,app=api-gateway",
+        "egress_to": "namespace=internal-services"
+      },
+      "pod_service_account": "token-validator-sa",
+      "vpc_flow_logs": "enabled"
+    }
+  }
+}

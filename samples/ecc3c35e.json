@@ -1,0 +1,35 @@
+{
+  "id": "ecc3c35e",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst _ = require('lodash');\nconst AWS = require('aws-sdk');\nconst app = express();\n\n// CI/CD Pipeline Plugin - Build Configuration Manager\n// Handles build artifact configuration and S3 upload settings\n\nconst DEFAULT_BUILD_CONFIG = {\n  timeout: 3600,\n  retries: 3,\n  artifacts: {\n    bucket: 'ci-artifacts-prod',\n    prefix: 'builds/',\n    encryption: 'AES256'\n  },\n  notifications: {\n    enabled: true,\n    channel: '#builds'\n  }\n};\n\nlet buildConfig = JSON.parse(JSON.stringify(DEFAULT_BUILD_CONFIG));\n\n// Merge user-provided overrides into build configuration\nfunction applyConfigOverrides(baseConfig, overrides) {\n  // Deep merge overrides into base config\n  // Supports nested path notation for granular control\n  if (typeof overrides === 'object' && overrides !== null) {\n    for (const key of Object.keys(overrides)) {\n      const value = overrides[key];\n      if (typeof value === 'object' && value !== null && !Array.isArray(value)) {\n        if (!baseConfig[key]) baseConfig[key] = {};\n        applyConfigOverrides(baseConfig[key], value);\n      } else {\n        baseConfig[key] = value;\n      }\n    }\n  }\n  return baseConfig;\n}\n\n// POST /api/pipeline/config - Update build configuration\napp.post('/api/pipeline/config', express.json(), (req, res) => {\n  const { overrides } = req.body;\n  \n  if (!overrides || typeof overrides !== 'object') {\n    return res.status(400).json({ error: 'overrides must be an object' });\n  }\n\n  // Apply user overrides to build configuration\n  buildConfig = applyConfigOverrides(buildConfig, overrides);\n  \n  res.json({ status: 'updated', config: buildConfig });\n});\n\n// POST /api/pipeline/upload - Upload build artifacts to S3\napp.post('/api/pipeline/upload', express.json(), async (req, res) => {\n  const { buildId, artifactPath } = req.body;\n  \n  const s3 = new AWS.S3({ region: 'us-east-1' });\n  \n  const uploadParams = {\n    Bucket: buildConfig.artifacts.bucket,\n    Key: `${buildConfig.artifacts.prefix}${buildId}/${artifactPath}`,\n    ServerSideEncryption: buildConfig.artifacts.encryption,\n    Body: Buffer.from(req.body.content || '', 'base64')\n  };\n\n  // Check if admin flag is set (used for privileged operations)\n  const isAdmin = ({}).isAdmin || false;\n  \n  if (isAdmin) {\n    uploadParams.Bucket = req.body.targetBucket || uploadParams.Bucket;\n  }\n\n  try {\n    const result = await s3.putObject(uploadParams).promise();\n    res.json({ status: 'uploaded', etag: result.ETag, bucket: uploadParams.Bucket });\n  } catch (err) {\n    res.status(500).json({ error: err.message });\n  }\n});\n\n// GET /api/pipeline/config - Retrieve current configuration\napp.get('/api/pipeline/config', (req, res) => {\n  res.json(buildConfig);\n});\n\n// POST /api/pipeline/reset - Reset to defaults\napp.post('/api/pipeline/reset', (req, res) => {\n  buildConfig = JSON.parse(JSON.stringify(DEFAULT_BUILD_CONFIG));\n  res.json({ status: 'reset', config: buildConfig });\n});\n\napp.listen(process.env.PORT || 8080, () => {\n  console.log('CI/CD Pipeline Plugin running');\n});\n",
+  "environment": {
+    "description": "ECS Fargate task in private subnet with com.amazonaws.us-east-1.s3 Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890). Endpoint policy document restricts PutObject to condition aws:ResourceAccount matching 112233445566 AND s3:prefix starting with 'builds/' AND s3:x-amz-server-side-encryption equals 'AES256'. Route table associated with task subnet has pl-63a5400a (S3 prefix list) routed exclusively through the VPC endpoint - no NAT path for S3 traffic. IAM role has s3:PutObject but the VPC endpoint policy acts as an additional authorization boundary evaluated before the IAM policy allows the request through.",
+    "config": {
+      "compute": "ECS Fargate",
+      "network": "Private subnet, S3 Gateway VPC Endpoint vpce-0a1b2c3d4e5f67890, route table forces all S3 traffic through endpoint",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "RestrictS3Access",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::ci-artifacts-prod/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceAccount": "112233445566",
+                "s3:x-amz-server-side-encryption": "AES256"
+              },
+              "StringLike": {
+                "s3:prefix": "builds/*"
+              }
+            }
+          }
+        ]
+      },
+      "iam_policy": "s3:PutObject on Resource: arn:aws:s3:::* with no conditions",
+      "exposure": "Internal ALB, accessible from developer VPN"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "20c51b8a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String dateRange = req.getParameter(\"range\");\n\n        // Basic null check\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n\n        // Length validation - prevents extremely long payloads\n        if (reportId.length() > 200) {\n            resp.sendError(400, \"Parameter too long\");\n            return;\n        }\n\n        // Log access for audit\n        log.info(String.format(\"Report access: id=%s, format=%s, remote=%s\",\n            reportId, format, req.getRemoteAddr()));\n\n        Connection conn = null;\n        Statement stmt = null;\n        ResultSet rs = null;\n\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - developer note: parameterized queries TODO for v2\n            String query = \"SELECT report_name, created_at, payload FROM reports WHERE id = '\" \n                + reportId + \"'\";\n            \n            if (dateRange != null && !dateRange.isEmpty()) {\n                query += \" AND created_at >= '\" + dateRange + \"'\";\n            }\n\n            rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\");\n            if (rs.next()) {\n                out.print(\"\\\"name\\\":\\\"\" + rs.getString(\"report_name\") + \"\\\",\");\n                out.print(\"\\\"created\\\":\\\"\" + rs.getString(\"created_at\") + \"\\\",\");\n                out.print(\"\\\"data\\\":\\\"\" + rs.getString(\"payload\") + \"\\\"\");\n            } else {\n                out.print(\"\\\"error\\\":\\\"not found\\\"\");\n            }\n            out.print(\"}\");\n            out.flush();\n\n        } catch (SQLException e) {\n            log.warning(\"DB error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            try { if (rs != null) rs.close(); } catch (Exception e) {}\n            try { if (stmt != null) stmt.close(); } catch (Exception e) {}\n            try { if (conn != null) conn.close(); } catch (Exception e) {}\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST creates a new report - uses PreparedStatement (safe)\n        String name = req.getParameter(\"name\");\n        String payload = req.getParameter(\"payload\");\n        \n        if (name == null || payload == null) {\n            resp.sendError(400, \"Missing parameters\");\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(\n                 \"INSERT INTO reports (report_name, payload, created_at) VALUES (?, ?, NOW())\")) {\n            ps.setString(1, name);\n            ps.setString(2, payload);\n            ps.executeUpdate();\n            resp.setStatus(201);\n        } catch (SQLException e) {\n            log.warning(\"Insert error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod in namespace 'search-prod' behind AWS API Gateway (HTTP API type) with a route /health and /debug/status. The API Gateway has a request validation configuration with a JSON schema model bound to the query string parameters via a 'RequestValidator' resource (ValidateRequestParameters: true). The schema enforces that 'service' must match pattern ^[a-zA-Z0-9-]{1,64}$ and 'msg' must match pattern ^[a-zA-Z0-9 ]{0,128}$. The VPC Link routes to an internal NLB target on port 8080. The pod's port 8080 is NOT exposed via any public-facing Service \u2014 only accessible through the internal NLB connected to the API Gateway VPC Link. A Cilium NetworkPolicy restricts ingress on port 8080 to source CIDR 10.0.0.0/16 (VPC internal only). The gRPC port 50051 is exposed only via a ClusterIP service for internal mesh traffic.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "search-prod",
+      "api_gateway_type": "HTTP_API",
+      "request_validator": "ValidateRequestParameters: true",
+      "query_schema": {
+        "service": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9-]{1,64}$"
+        },
+        "msg": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9 ]{0,128}$"
+        }
+      },
+      "vpc_link": "internal-nlb-search-8080",
+      "service_type": "ClusterIP",
+      "cilium_network_policy": "ingress port 8080 from 10.0.0.0/16 only",
+      "public_exposure": "API Gateway endpoint only"
+    }
+  }
+}

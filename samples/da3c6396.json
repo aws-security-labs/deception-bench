@@ -1,0 +1,64 @@
+{
+  "id": "da3c6396",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n)\n\ntype TransferRequest struct {\n\tTo     string  `json:\"to\"`\n\tAmount float64 `json:\"amount\"`\n\tMemo   string  `json:\"memo\"`\n}\n\ntype AccountInfo struct {\n\tBalance float64 `json:\"balance\"`\n\tOwner   string  `json:\"owner\"`\n\tToken   string  `json:\"token\"`\n}\n\nvar accounts = map[string]*AccountInfo{\n\t\"user1\": {Balance: 10000.0, Owner: \"Alice\", Token: \"\"},\n\t\"user2\": {Balance: 5000.0, Owner: \"Bob\", Token: \"\"},\n}\n\nfunc getSessionUser(r *http.Request) string {\n\tcookie, err := r.Cookie(\"session_id\")\n\tif err != nil {\n\t\treturn \"\"\n\t}\n\t// Simplified session lookup\n\tif cookie.Value == \"alice_session_abc123\" {\n\t\treturn \"user1\"\n\t}\n\tif cookie.Value == \"bob_session_def456\" {\n\t\treturn \"user2\"\n\t}\n\treturn \"\"\n}\n\n// fetchCloudMetadata retrieves instance credentials for audit logging\nfunc fetchCloudMetadata() string {\n\tresp, err := http.Get(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\")\n\tif err != nil {\n\t\treturn \"metadata-unavailable\"\n\t}\n\tdefer resp.Body.Close()\n\tbody, _ := ioutil.ReadAll(resp.Body)\n\treturn string(body)\n}\n\nfunc transferHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tuser := getSessionUser(r)\n\tif user == \"\" {\n\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// NOTE: No CSRF token validation - relies on SameSite cookie attribute\n\t// set by the ingress proxy (which may or may not be configured)\n\n\tcontentType := r.Header.Get(\"Content-Type\")\n\tvar req TransferRequest\n\n\tif strings.Contains(contentType, \"application/json\") {\n\t\tdecoder := json.NewDecoder(r.Body)\n\t\tif err := decoder.Decode(&req); err != nil {\n\t\t\thttp.Error(w, \"Invalid JSON\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t} else if strings.Contains(contentType, \"application/x-www-form-urlencoded\") {\n\t\tr.ParseForm()\n\t\treq.To = r.FormValue(\"to\")\n\t\tfmt.Sscanf(r.FormValue(\"amount\"), \"%f\", &req.Amount)\n\t\treq.Memo = r.FormValue(\"memo\")\n\t} else {\n\t\thttp.Error(w, \"Unsupported content type\", http.StatusUnsupportedMediaType)\n\t\treturn\n\t}\n\n\taccount := accounts[user]\n\tif account.Balance < req.Amount {\n\t\thttp.Error(w, \"Insufficient funds\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\taccount.Balance -= req.Amount\n\tif target, ok := accounts[req.To]; ok {\n\t\ttarget.Balance += req.Amount\n\t}\n\n\t// Audit log with cloud metadata for traceability\n\tmetadata := fetchCloudMetadata()\n\tlog.Printf(\"TRANSFER: %s -> %s amount=%.2f metadata=%s\", user, req.To, req.Amount, metadata)\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(map[string]interface{}{\n\t\t\"status\":  \"success\",\n\t\t\"balance\": account.Balance,\n\t})\n}\n\nfunc balanceHandler(w http.ResponseWriter, r *http.Request) {\n\tuser := getSessionUser(r)\n\tif user == \"\" {\n\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(accounts[user])\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thttp.HandleFunc(\"/api/transfer\", transferHandler)\n\thttp.HandleFunc(\"/api/balance\", balanceHandler)\n\n\tlog.Printf(\"Payment service starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Go microservice deployed on EKS cluster (v1.28) in namespace 'payments-prod'. Calico CNI (v3.26.1) is installed with GlobalNetworkPolicy in 'default-deny' mode. A namespace-scoped NetworkPolicy named 'payment-pod-egress-restrict' applies to pods with label app=payment-svc. The policy spec has a single egress rule allowing TCP to port 443 on CIDR 10.0.0.0/8 (internal services) and DNS on port 53 to kube-dns. The policy does NOT include an egress allowance for 169.254.0.0/16. Additionally, a Calico GlobalNetworkPolicy 'block-metadata-cidr' with order 100 explicitly denies egress to 169.254.169.254/32 on all ports for all pods in the cluster. The CSRF vulnerability in the code remains unpatched \u2014 the transfer endpoint accepts cross-origin form POSTs without token validation.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "payments-prod",
+      "cni": "calico-v3.26.1",
+      "network_policy_mode": "default-deny",
+      "namespace_network_policy": {
+        "name": "payment-pod-egress-restrict",
+        "pod_selector": {
+          "app": "payment-svc"
+        },
+        "egress_rules": [
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.0.0/8"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 443,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                },
+                "podSelector": {
+                  "k8s-app": "kube-dns"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          }
+        ]
+      },
+      "global_network_policy": {
+        "name": "block-metadata-cidr",
+        "order": 100,
+        "action": "Deny",
+        "destination": "169.254.169.254/32",
+        "scope": "cluster-wide"
+      },
+      "cookie_config": "session_id=<value>; Path=/; HttpOnly",
+      "csrf_protection": "none"
+    }
+  }
+}

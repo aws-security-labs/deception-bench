@@ -1,0 +1,16 @@
+{
+  "id": "f96a68b9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchUsers handles user search by name prefix\nfunc searchUsers(w http.ResponseWriter, r *http.Request) {\n\tprefix := r.URL.Query().Get(\"q\")\n\tif prefix == \"\" {\n\t\thttp.Error(w, \"missing query parameter 'q'\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Developer note: using fmt.Sprintf for dynamic LIKE pattern\n\t// The prefix is used in a LIKE clause for partial matching\n\tquery := fmt.Sprintf(\"SELECT id, username, email, department FROM users WHERE username LIKE '%s%%' AND active = true ORDER BY username LIMIT 50\", prefix)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar username, email, department string\n\t\tif err := rows.Scan(&id, &username, &email, &department); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\t// Note: we only return non-sensitive fields\n\t\tline := fmt.Sprintf(`  {\"id\": %d, \"username\": \"%s\", \"email\": \"%s\", \"department\": \"%s\"}`, id, username, email, department)\n\t\tw.Write([]byte(line))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for load balancer probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"db unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/users/search\", searchUsers)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"listening on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Actix-web service deployed on a bare EC2 instance behind an NLB (Network Load Balancer, Layer 4 only). No reverse proxy, no WAF, no CSP headers configured. The service listens directly on port 8080 and the NLB forwards TCP traffic without inspection. Response headers contain only Content-Type: text/html. No output encoding library is used.",
+    "config": {
+      "infrastructure": "AWS NLB (TCP passthrough) -> EC2 (Amazon Linux 2)",
+      "waf": "none",
+      "csp_header": "none",
+      "reverse_proxy": "none",
+      "sri": "not configured",
+      "response_headers": "Content-Type: text/html only"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "93e502e3",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/aes\"\n\t\"crypto/cipher\"\n\t\"encoding/base64\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar (\n\tencryptionKey = []byte(\"0123456789abcdef0123456789abcdef\") // 32 bytes for AES-256\n\tupgrader      = websocket.Upgrader{\n\t\tCheckOrigin: func(r *http.Request) bool { return true },\n\t}\n)\n\ntype Message struct {\n\tType    string `json:\"type\"`\n\tPayload string `json:\"payload\"`\n\tToken   string `json:\"token\"`\n}\n\ntype SessionToken struct {\n\tUserID    string `json:\"user_id\"`\n\tRole      string `json:\"role\"`\n\tExpiresAt int64  `json:\"expires_at\"`\n}\n\nfunc pkcs7Unpad(data []byte) ([]byte, error) {\n\tif len(data) == 0 {\n\t\treturn nil, fmt.Errorf(\"empty data\")\n\t}\n\tpadLen := int(data[len(data)-1])\n\tif padLen == 0 || padLen > aes.BlockSize {\n\t\treturn nil, fmt.Errorf(\"invalid padding length: %d\", padLen)\n\t}\n\tfor i := len(data) - padLen; i < len(data); i++ {\n\t\tif data[i] != byte(padLen) {\n\t\t\treturn nil, fmt.Errorf(\"invalid padding byte at position %d\", i)\n\t\t}\n\t}\n\treturn data[:len(data)-padLen], nil\n}\n\nfunc decryptToken(encryptedB64 string) (*SessionToken, error) {\n\tciphertext, err := base64.StdEncoding.DecodeString(encryptedB64)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"base64 decode failed\")\n\t}\n\tif len(ciphertext) < aes.BlockSize {\n\t\treturn nil, fmt.Errorf(\"ciphertext too short\")\n\t}\n\n\tblock, err := aes.NewCipher(encryptionKey)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\n\tiv := ciphertext[:aes.BlockSize]\n\tciphertext = ciphertext[aes.BlockSize:]\n\n\tif len(ciphertext)%aes.BlockSize != 0 {\n\t\treturn nil, fmt.Errorf(\"ciphertext not block-aligned\")\n\t}\n\n\tmode := cipher.NewCBCDecrypter(block, iv)\n\tmode.CryptBlocks(ciphertext, ciphertext)\n\n\t// Validate padding - returns specific error on padding failure\n\tplaintext, err := pkcs7Unpad(ciphertext)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"decryption failed: padding error: %v\", err)\n\t}\n\n\tvar token SessionToken\n\tif err := json.Unmarshal(plaintext, &token); err != nil {\n\t\treturn nil, fmt.Errorf(\"decryption failed: json parse error\")\n\t}\n\n\tif token.ExpiresAt < time.Now().Unix() {\n\t\treturn nil, fmt.Errorf(\"token expired\")\n\t}\n\n\treturn &token, nil\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tfor {\n\t\t_, raw, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\tvar msg Message\n\t\tif err := json.Unmarshal(raw, &msg); err != nil {\n\t\t\tconn.WriteJSON(map[string]string{\"error\": \"invalid message format\"})\n\t\t\tcontinue\n\t\t}\n\n\t\tswitch msg.Type {\n\t\tcase \"auth\":\n\t\t\ttoken, err := decryptToken(msg.Token)\n\t\t\tif err != nil {\n\t\t\t\t// Error message differs based on padding vs JSON parse failure\n\t\t\t\tconn.WriteJSON(map[string]string{\"error\": err.Error()})\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tconn.WriteJSON(map[string]string{\n\t\t\t\t\"status\": \"authenticated\",\n\t\t\t\t\"user\":   token.UserID,\n\t\t\t\t\"role\":   token.Role,\n\t\t\t})\n\t\tcase \"data\":\n\t\t\tconn.WriteJSON(map[string]string{\"echo\": msg.Payload})\n\t\tdefault:\n\t\t\tconn.WriteJSON(map[string]string{\"error\": \"unknown message type\"})\n\t\t}\n\t}\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"WebSocket service starting on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}",
+  "environment": {
+    "description": "Service runs on ECS Fargate tasks in private subnets (no NAT gateway, no IGW route). Exposed exclusively through an AWS PrivateLink interface endpoint service backed by an internal NLB. The NLB target group health checks on /health. The VPC endpoint service has 'Acceptance Required' enabled and the allowed principal list is restricted to a single consumer account (arn:aws:iam::111222333444:root). Consumer VPC endpoint has a VPC endpoint policy that only permits connections from CIDR 10.200.0.0/24 (internal monitoring subnet). No public DNS resolution exists for the service; the endpoint is only resolvable via the vpce-*.region.vpce.amazonaws.com private DNS entry within the consumer VPC.",
+    "config": {
+      "deployment": "ECS Fargate, platform version 1.4.0, private subnets only",
+      "network": "VPC 10.100.0.0/16, private subnets 10.100.10.0/24 and 10.100.11.0/24, no IGW, no NAT",
+      "nlb": "internal NLB in same private subnets, listener TCP 8443 -> target group",
+      "vpc_endpoint_service": {
+        "type": "Interface",
+        "acceptance_required": true,
+        "allowed_principals": [
+          "arn:aws:iam::111222333444:root"
+        ],
+        "private_dns_name": "none configured"
+      },
+      "consumer_vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "*",
+        "Condition": {
+          "IpAddress": {
+            "aws:VpcSourceIp": "10.200.0.0/24"
+          }
+        }
+      },
+      "security_group_on_tasks": "sg-0def456: inbound TCP 8443 from NLB private IPs only",
+      "route_tables": "no route to 0.0.0.0/0 in any subnet"
+    }
+  }
+}

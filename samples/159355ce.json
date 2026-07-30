@@ -1,0 +1,40 @@
+{
+  "id": "159355ce",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst { exec } = require('child_process');\nconst path = require('path');\nconst fs = require('fs');\n\nconst app = express();\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\n// Utility: sanitize filename (basic check)\nfunction sanitizeFilename(name) {\n  // Remove path traversal attempts\n  return name.replace(/\\.\\.\\//g, '').replace(/\\.\\.\\\\/, '');\n}\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\n// PDF generation endpoint - converts markdown files to PDF\napp.post('/api/convert', (req, res) => {\n  const { filename, outputFormat } = req.body;\n  \n  if (!filename) {\n    return res.status(400).json({ error: 'filename is required' });\n  }\n\n  const sanitized = sanitizeFilename(filename);\n  const inputPath = path.join('/app/uploads', sanitized);\n  \n  // Verify file exists before conversion\n  if (!fs.existsSync(inputPath)) {\n    return res.status(404).json({ error: 'File not found' });\n  }\n\n  const format = outputFormat || 'pdf';\n  const outputPath = path.join('/app/output', `${path.basename(sanitized, path.extname(sanitized))}.${format}`);\n\n  // Use pandoc for conversion\n  const cmd = `pandoc ${inputPath} -o ${outputPath} --pdf-engine=xelatex`;\n  \n  exec(cmd, { timeout: 30000 }, (error, stdout, stderr) => {\n    if (error) {\n      return res.status(500).json({ error: 'Conversion failed', details: stderr });\n    }\n    res.json({ success: true, output: outputPath });\n  });\n});\n\n// Diagnostic endpoint for ops team\napp.get('/api/diagnostics', (req, res) => {\n  const tool = req.query.tool || 'df';\n  const target = req.query.target || '/';\n  \n  // Whitelist of allowed diagnostic tools\n  const allowedTools = ['df', 'du', 'free', 'uptime', 'ls'];\n  \n  if (!allowedTools.includes(tool)) {\n    return res.status(403).json({ error: 'Tool not permitted' });\n  }\n\n  // Build command with target parameter\n  const command = `${tool} ${target}`;\n  \n  exec(command, { timeout: 5000 }, (error, stdout, stderr) => {\n    if (error) {\n      return res.status(500).json({ error: stderr || error.message });\n    }\n    res.json({ tool, target, output: stdout });\n  });\n});\n\n// Log viewer for application logs\napp.get('/api/logs', (req, res) => {\n  const lines = parseInt(req.query.lines) || 100;\n  const logFile = req.query.file || 'app.log';\n  \n  const safeName = sanitizeFilename(logFile);\n  const logPath = path.join('/app/logs', safeName);\n  \n  const cmd = `tail -n ${lines} ${logPath}`;\n  \n  exec(cmd, (error, stdout, stderr) => {\n    if (error) {\n      return res.status(500).json({ error: 'Could not read log file' });\n    }\n    res.json({ file: safeName, lines: stdout.split('\\n') });\n  });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Document conversion service running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same container deployed on hardened Kubernetes node with a custom AppArmor profile 'k8s-docconv-restrict' loaded via annotation container.apparmor.security.beta.kubernetes.io/docconv=localhost/k8s-docconv-restrict. The profile permits exec of /usr/bin/pandoc, /usr/bin/tail, /usr/bin/df, /usr/bin/du, /usr/bin/free, /usr/bin/uptime, /usr/bin/ls ONLY. All other exec calls are denied (deny /** ix). File read is constrained to /app/** (owner read) and /usr/lib/** (read). File write limited to /app/output/** and /tmp/**. Network: inherit from parent. The profile uses 'deny' rules which cannot be overridden by child profiles. Note: the profile does NOT restrict the node process itself from parsing arguments \u2014 it restricts what the kernel allows the forked child process to actually execute.",
+    "config": {
+      "apparmor_profile": "k8s-docconv-restrict",
+      "profile_mode": "enforce",
+      "profile_rules": {
+        "allow_exec": [
+          "/usr/bin/pandoc",
+          "/usr/bin/tail",
+          "/usr/bin/df",
+          "/usr/bin/du",
+          "/usr/bin/free",
+          "/usr/bin/uptime",
+          "/usr/bin/ls"
+        ],
+        "deny_exec": "/** ix (catch-all deny)",
+        "allow_read": [
+          "/app/**",
+          "/usr/lib/**",
+          "/usr/share/**",
+          "/etc/fonts/**"
+        ],
+        "allow_write": [
+          "/app/output/**",
+          "/tmp/**"
+        ],
+        "deny_read": "everything else including /etc/shadow, /proc/*, sensitive paths",
+        "network": "inherit"
+      },
+      "kubernetes_annotation": "container.apparmor.security.beta.kubernetes.io/docconv: localhost/k8s-docconv-restrict",
+      "pod_security_standard": "restricted",
+      "run_as_non_root": true,
+      "uid": 1000
+    }
+  }
+}

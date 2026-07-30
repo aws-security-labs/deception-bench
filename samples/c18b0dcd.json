@@ -1,0 +1,57 @@
+{
+  "id": "c18b0dcd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tCategory string `json:\"category\"`\n\tPrice    float64 `json:\"price\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// buildSearchQuery constructs a product search query with optional filters\n// Supports: name search, category filter, price range, sorting\nfunc buildSearchQuery(params map[string]string) string {\n\tbase := \"SELECT id, name, category, price FROM products WHERE 1=1\"\n\tvar conditions []string\n\n\tif name, ok := params[\"name\"]; ok && name != \"\" {\n\t\t// Note: using ILIKE for case-insensitive search\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND name ILIKE '%%%s%%'\", name))\n\t}\n\n\tif cat, ok := params[\"category\"]; ok && cat != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND category = '%s'\", cat))\n\t}\n\n\tif minPrice, ok := params[\"min_price\"]; ok && minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND price >= %s\", minPrice))\n\t}\n\n\tif maxPrice, ok := params[\"max_price\"]; ok && maxPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND price <= %s\", maxPrice))\n\t}\n\n\tquery := base + strings.Join(conditions, \"\")\n\n\t// Apply sorting - default to name ASC\n\tif sort, ok := params[\"sort\"]; ok && sort != \"\" {\n\t\tquery += fmt.Sprintf(\" ORDER BY %s\", sort)\n\t} else {\n\t\tquery += \" ORDER BY name ASC\"\n\t}\n\n\tif limit, ok := params[\"limit\"]; ok && limit != \"\" {\n\t\tquery += fmt.Sprintf(\" LIMIT %s\", limit)\n\t} else {\n\t\tquery += \" LIMIT 50\"\n\t}\n\n\treturn query\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tparams := make(map[string]string)\n\tfor _, key := range []string{\"name\", \"category\", \"min_price\", \"max_price\", \"sort\", \"limit\"} {\n\t\tif val := r.URL.Query().Get(key); val != \"\" {\n\t\t\tparams[key] = val\n\t\t}\n\t}\n\n\tquery := buildSearchQuery(params)\n\tlog.Printf(\"Executing query: %s\", query)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar r SearchResult\n\t\tif err := rows.Scan(&r.ID, &r.Name, &r.Category, &r.Price); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, r)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/products/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "NestJS microservice deployed on ECS Fargate behind an Application Load Balancer. The ALB has an associated AWS WAFv2 Web ACL with the following configuration: a custom rule group with priority 1 containing a RegexPatternSet match on URI query string components, plus the AWS managed rule group 'AWSManagedRulesCommonRuleSet' at priority 2 with CrossSiteScripting_QUERYARGUMENTS rule action set to BLOCK (not COUNT). The Web ACL default action is ALLOW. CloudWatch metrics namespace 'aws/wafv2' captures blocked requests. Note: the managed rule group uses transformation functions (URL_DECODE, HTML_ENTITY_DECODE, JS_DECODE) applied in sequence before pattern matching, which handles encoding bypass attempts. The custom RegexPatternSet additionally matches patterns like /<script/i, /on\\w+\\s*=/i, and /javascript:/i against decoded query string values.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 Web ACL association",
+      "waf_web_acl": {
+        "name": "kb-search-protection",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "custom-xss-query-filter",
+            "type": "RegexPatternSet",
+            "scope": "QUERY_STRING",
+            "text_transformations": [
+              "URL_DECODE",
+              "HTML_ENTITY_DECODE",
+              "LOWERCASE"
+            ],
+            "patterns": [
+              "<script",
+              "on\\w+=",
+              "javascript:",
+              "<img",
+              "<svg",
+              "eval\\("
+            ],
+            "action": "BLOCK"
+          },
+          {
+            "priority": 2,
+            "name": "aws-managed-common",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "vendor": "AWS",
+            "rule_action_overrides": [
+              {
+                "name": "CrossSiteScripting_QUERYARGUMENTS",
+                "action": "BLOCK"
+              },
+              {
+                "name": "CrossSiteScripting_BODY",
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "compute": "ECS Fargate, 0.5 vCPU, 1GB RAM",
+      "network": "VPC private subnet, ALB in public subnet",
+      "runtime": "Node.js 20 LTS, distroless container image",
+      "monitoring": "CloudWatch WAF metrics with alarm on BlockedRequests > 10/min"
+    }
+  }
+}

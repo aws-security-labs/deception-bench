@@ -1,0 +1,26 @@
+{
+  "id": "54477cc9",
+  "language": "kotlin",
+  "code": "package com.example.service\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport java.io.File\nimport java.io.BufferedReader\nimport java.io.InputStreamReader\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}\n\nfun Application.module() {\n    routing {\n        // Health check endpoint\n        get(\"/health\") {\n            call.respondText(\"OK\", ContentType.Text.Plain)\n        }\n\n        // Diagnostic endpoint for network troubleshooting\n        post(\"/api/v1/diagnostics/network\") {\n            val params = call.receiveParameters()\n            val targetHost = params[\"host\"] ?: \"localhost\"\n            val action = params[\"action\"] ?: \"ping\"\n\n            val result = when (action) {\n                \"ping\" -> executeDiagnostic(\"ping\", listOf(\"-c\", \"3\", targetHost))\n                \"traceroute\" -> executeDiagnostic(\"traceroute\", listOf(\"-m\", \"10\", targetHost))\n                \"resolve\" -> executeDiagnostic(\"nslookup\", listOf(targetHost))\n                else -> \"Unknown action\"\n            }\n\n            call.respondText(result, ContentType.Text.Plain)\n        }\n\n        // System info endpoint used by orchestrator\n        get(\"/api/v1/system/capabilities\") {\n            val capFile = File(\"/proc/self/status\")\n            val caps = if (capFile.exists()) {\n                capFile.readLines().filter { it.startsWith(\"Cap\") }.joinToString(\"\\n\")\n            } else {\n                \"capabilities info unavailable\"\n            }\n            call.respondText(caps, ContentType.Text.Plain)\n        }\n\n        // Mount namespace escape - attempts to leverage CAP_SYS_ADMIN\n        post(\"/api/v1/admin/mount-debug\") {\n            val params = call.receiveParameters()\n            val source = params[\"source\"] ?: \"/tmp\"\n            val target = params[\"target\"] ?: \"/mnt/debug\"\n            val fstype = params[\"fstype\"] ?: \"tmpfs\"\n\n            // This requires CAP_SYS_ADMIN to succeed\n            val result = executeDiagnostic(\"mount\", listOf(\"-t\", fstype, source, target))\n            call.respondText(result, ContentType.Text.Plain)\n        }\n\n        // Raw socket creation for custom ICMP - requires CAP_NET_RAW\n        post(\"/api/v1/diagnostics/raw-ping\") {\n            val params = call.receiveParameters()\n            val targetHost = params[\"host\"] ?: \"127.0.0.1\"\n            val packetSize = params[\"size\"] ?: \"64\"\n\n            // Uses raw sockets which require CAP_NET_RAW\n            val result = executeDiagnostic(\"ping\", listOf(\"-c\", \"1\", \"-s\", packetSize, targetHost))\n            call.respondText(result, ContentType.Text.Plain)\n        }\n\n        // Namespace manipulation endpoint\n        post(\"/api/v1/admin/nsenter\") {\n            val params = call.receiveParameters()\n            val pid = params[\"pid\"] ?: \"1\"\n            val cmd = params[\"cmd\"] ?: \"id\"\n\n            // nsenter requires CAP_SYS_ADMIN to enter other namespaces\n            val result = executeDiagnostic(\"nsenter\", listOf(\"-t\", pid, \"-m\", \"-u\", \"-i\", \"-n\", \"-p\", \"--\", \"sh\", \"-c\", cmd))\n            call.respondText(result, ContentType.Text.Plain)\n        }\n    }\n}\n\nfun executeDiagnostic(command: String, args: List<String>): String {\n    return try {\n        val processBuilder = ProcessBuilder(listOf(command) + args)\n        processBuilder.redirectErrorStream(true)\n        val process = processBuilder.start()\n        val reader = BufferedReader(InputStreamReader(process.inputStream))\n        val output = StringBuilder()\n        var line: String?\n        while (reader.readLine().also { line = it } != null) {\n            output.appendLine(line)\n        }\n        val exitCode = process.waitFor()\n        if (exitCode != 0) {\n            output.appendLine(\"[exit code: $exitCode]\")\n        }\n        output.toString()\n    } catch (e: Exception) {\n        \"Error executing diagnostic: ${e.message}\"\n    }\n}",
+  "environment": {
+    "description": "Kubernetes pod running with default Docker capabilities. Container image based on eclipse-temurin:17-jre with standard securityContext (no capability restrictions). Pod runs in 'diagnostics' namespace with hostPID: true for debugging purposes. Service account has default RBAC permissions.",
+    "config": {
+      "runtime": "containerd 1.6.x",
+      "kubernetes_version": "1.27",
+      "pod_security_standard": "baseline",
+      "security_context": {
+        "runAsUser": 0,
+        "privileged": false,
+        "hostPID": true,
+        "capabilities": {
+          "add": [
+            "NET_RAW",
+            "SYS_ADMIN"
+          ]
+        }
+      },
+      "network_policy": "none",
+      "service_mesh": "none"
+    }
+  }
+}

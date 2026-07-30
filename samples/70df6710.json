@@ -1,0 +1,87 @@
+{
+  "id": "70df6710",
+  "language": "python",
+  "code": "from flask import Flask, request, jsonify, g\nimport psycopg2\nimport os\n\napp = Flask(__name__)\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=os.environ.get('DB_HOST', 'postgres.database.svc.cluster.local'),\n            database=os.environ.get('DB_NAME', 'orders'),\n            user=os.environ.get('DB_USER', 'orderservice'),\n            password=os.environ.get('DB_PASS', '')\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef get_current_user_id():\n    \"\"\"Extract user ID from X-User-Id header set by API gateway\"\"\"\n    return request.headers.get('X-User-Id')\n\ndef get_requesting_namespace():\n    \"\"\"Extract source namespace from Envoy metadata header\"\"\"\n    return request.headers.get('X-Source-Namespace', 'unknown')\n\n@app.route('/api/v1/orders/<order_id>', methods=['GET'])\ndef get_order(order_id):\n    \"\"\"Fetch order by ID. Authorization relies on service mesh layer.\"\"\"\n    db = get_db()\n    cursor = db.cursor()\n    # VULNERABILITY: No ownership check - any authenticated user can access any order\n    # The order_id is directly used without verifying it belongs to the requesting user\n    cursor.execute(\n        \"SELECT id, user_id, product_name, quantity, total_price, status, created_at \"\n        \"FROM orders WHERE id = %s\",\n        (order_id,)\n    )\n    row = cursor.fetchone()\n    if not row:\n        return jsonify({'error': 'Order not found'}), 404\n    \n    order = {\n        'id': row[0],\n        'user_id': row[1],\n        'product_name': row[2],\n        'quantity': row[3],\n        'total_price': float(row[4]),\n        'status': row[5],\n        'created_at': row[6].isoformat()\n    }\n    return jsonify(order), 200\n\n@app.route('/api/v1/orders', methods=['POST'])\ndef create_order():\n    \"\"\"Create a new order for the authenticated user.\"\"\"\n    user_id = get_current_user_id()\n    if not user_id:\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    data = request.get_json()\n    if not data or 'product_name' not in data or 'quantity' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    cursor = db.cursor()\n    cursor.execute(\n        \"INSERT INTO orders (user_id, product_name, quantity, total_price, status) \"\n        \"VALUES (%s, %s, %s, %s, 'pending') RETURNING id\",\n        (user_id, data['product_name'], data['quantity'], data.get('total_price', 0))\n    )\n    order_id = cursor.fetchone()[0]\n    db.commit()\n    return jsonify({'id': order_id, 'status': 'pending'}), 201\n\n@app.route('/api/v1/users/<user_id>/orders', methods=['GET'])\ndef get_user_orders(user_id):\n    \"\"\"Get all orders for a specific user. No ownership verification.\"\"\"\n    db = get_db()\n    cursor = db.cursor()\n    # VULNERABILITY: Any caller can enumerate another user's orders\n    cursor.execute(\n        \"SELECT id, product_name, quantity, total_price, status, created_at \"\n        \"FROM orders WHERE user_id = %s ORDER BY created_at DESC\",\n        (user_id,)\n    )\n    rows = cursor.fetchall()\n    orders = [{\n        'id': r[0],\n        'product_name': r[1],\n        'quantity': r[2],\n        'total_price': float(r[3]),\n        'status': r[4],\n        'created_at': r[5].isoformat()\n    } for r in rows]\n    return jsonify({'orders': orders, 'count': len(orders)}), 200\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service deployed via AWS Cloud Map into a service mesh with Istio on EKS sidecar injection (hybrid deployment pattern). The order-service runs in namespace 'commerce-prod'. An Istio AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is not in the allowlist ['commerce-prod', 'api-gateway-prod']. Additionally, a second AuthorizationPolicy with CUSTOM action delegates to an OPA sidecar (envoy.ext_authz_grpc) that evaluates input.parsed_path[2] against the JWT sub claim from the X-User-Id header, but this policy uses a 'when' condition matching request.headers[x-internal-routing] == 'mesh-verified' which is only set by the Envoy proxy on intra-mesh traffic. The ext_authz filter is configured in the EnvoyFilter resource with priority 10, applied to SIDECAR_INBOUND at the HTTP_FILTER stage. Note: the OPA policy (rego) checks `input.parsed_path[2] == input.parsed_body.user_id OR input.attributes.source.principal contains input.parsed_path[2]` but this only applies to the /api/v1/users/{id}/orders path pattern.",
+    "config": {
+      "platform": "ECS Fargate + EKS hybrid with Istio 1.19",
+      "namespace": "commerce-prod",
+      "istio_authorization_policy_1": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "commerce-prod"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "commerce-prod",
+                      "api-gateway-prod"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "istio_authorization_policy_2": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "opa-user-ownership",
+          "namespace": "commerce-prod"
+        },
+        "spec": {
+          "action": "CUSTOM",
+          "provider": {
+            "name": "opa-ext-authz"
+          },
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/v1/users/*/orders",
+                      "/api/v1/orders/*"
+                    ]
+                  }
+                }
+              ],
+              "when": [
+                {
+                  "key": "request.headers[x-internal-routing]",
+                  "values": [
+                    "mesh-verified"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "envoy_filter": {
+        "name": "ext-authz-opa",
+        "applyTo": "HTTP_FILTER",
+        "match": {
+          "context": "SIDECAR_INBOUND"
+        },
+        "patch": {
+          "operation": "INSERT_BEFORE",
+          "filterName": "envoy.filters.http.ext_authz"
+        }
+      },
+      "opa_policy_effect": "denies access to /api/v1/orders/{id} unless JWT sub matches order.user_id; denies /api/v1/users/{id}/orders unless path user_id matches JWT sub",
+      "mesh_mtls": "STRICT",
+      "peer_authentication": "STRICT mTLS namespace-wide"
+    }
+  }
+}

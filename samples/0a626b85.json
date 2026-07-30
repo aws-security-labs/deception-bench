@@ -1,0 +1,30 @@
+{
+  "id": "0a626b85",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchRequest struct {\n\tTerm      string   `json:\"term\"`\n\tFields    []string `json:\"fields\"`\n\tOrderBy   string   `json:\"order_by\"`\n\tDirection string   `json:\"direction\"`\n}\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// validateDirection ensures safe ORDER BY direction\nfunc validateDirection(d string) string {\n\tswitch strings.ToUpper(d) {\n\tcase \"ASC\", \"DESC\":\n\t\treturn strings.ToUpper(d)\n\tdefault:\n\t\treturn \"ASC\"\n\t}\n}\n\n// validateFields checks field names against allowed columns\nfunc validateFields(fields []string) []string {\n\tallowed := map[string]bool{\"name\": true, \"price\": true, \"sku\": true, \"category\": true}\n\tvar safe []string\n\tfor _, f := range fields {\n\t\tif allowed[strings.ToLower(f)] {\n\t\t\tsafe = append(safe, strings.ToLower(f))\n\t\t}\n\t}\n\tif len(safe) == 0 {\n\t\treturn []string{\"name\", \"price\", \"sku\"}\n\t}\n\treturn safe\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req SearchRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\tif len(req.Term) > 200 {\n\t\thttp.Error(w, \"Search term too long\", 400)\n\t\treturn\n\t}\n\n\tfields := validateFields(req.Fields)\n\tdirection := validateDirection(req.Direction)\n\n\t// Build SELECT clause safely from validated fields\n\tselectClause := \"id, \" + strings.Join(fields, \", \")\n\n\t// ORDER BY - developer assumes orderBy is a column name\n\t// but does NOT validate it against allowed columns\n\torderClause := \"name\"\n\tif req.OrderBy != \"\" {\n\t\torderClause = req.OrderBy\n\t}\n\n\t// The term is parameterized correctly\n\tquery := fmt.Sprintf(\n\t\t\"SELECT %s FROM products WHERE name ILIKE $1 OR sku ILIKE $1 ORDER BY %s %s LIMIT 50\",\n\t\tselectClause,\n\t\torderClause,\n\t\tdirection,\n\t)\n\n\trows, err := db.Query(query, \"%\"+req.Term+\"%\")\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed on EKS with a restricted pod security context. The container's securityContext specifies drop: [ALL] with add: [NET_BIND_SERVICE] only, and the pod runs with a read-only root filesystem. Additionally, the PostgreSQL connection is routed through a PgBouncer instance (v1.21) configured in transaction pooling mode with a custom query_filter plugin (pgbouncer-rr fork) that applies a server-side prepared statement enforcement policy: any query containing unparameterized string literals adjacent to SQL keywords (WHERE, AND, OR, LIKE, IN) that don't match the application's registered query fingerprint whitelist (hash-based, 14 fingerprints registered at deploy time via ConfigMap) is rejected with error code 42000 before reaching PostgreSQL. The fingerprint whitelist is generated at build time by static analysis of the application's SQL patterns. Container capabilities CAP_NET_RAW and CAP_SYS_ADMIN are explicitly dropped.",
+    "config": {
+      "runtime": "EKS 1.28, containerd 1.7",
+      "container_security_context": {
+        "drop": [
+          "ALL"
+        ],
+        "add": [
+          "NET_BIND_SERVICE"
+        ],
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      },
+      "network": "nginx ingress, no application-layer WAF",
+      "database_proxy": {
+        "type": "PgBouncer 1.21 (pgbouncer-rr fork)",
+        "mode": "transaction pooling",
+        "query_filter": "fingerprint-whitelist enforcement",
+        "registered_fingerprints": 14,
+        "rejection_behavior": "SQLSTATE 42000, connection reset"
+      },
+      "pod_security_standard": "restricted"
+    }
+  }
+}

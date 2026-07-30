@@ -1,0 +1,31 @@
+{
+  "id": "7fe17027",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.*;\n\npublic class ReportGeneratorServlet extends HttpServlet {\n    private static final String TEMPLATE_DIR = \"/opt/reports/templates/\";\n    private static final String JDBC_URL = System.getenv(\"JDBC_URL\");\n    \n    // Template engine for dynamic report generation\n    // NOTE: input sanitization handled by API gateway layer per arch doc v2.3\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customTitle = req.getParameter(\"title\");\n        String outputFormat = req.getParameter(\"format\");\n        \n        // Validate report type against allowed list\n        List<String> allowedTypes = Arrays.asList(\"sales\", \"inventory\", \"audit\", \"compliance\");\n        if (!allowedTypes.contains(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Load template\n        String templatePath = TEMPLATE_DIR + reportType + \".sql\";\n        String template = new String(java.nio.file.Files.readAllBytes(\n            java.nio.file.Paths.get(templatePath)));\n        \n        // Build substitution map from request parameters\n        Map<String, String> params = new HashMap<>();\n        params.put(\"date_range\", dateRange);\n        params.put(\"title\", customTitle);\n        params.put(\"format\", outputFormat != null ? outputFormat : \"pdf\");\n        params.put(\"generated_by\", req.getRemoteUser());\n        \n        // Perform template substitution\n        // Templates use ${variable} syntax for dynamic values\n        StringSubstitutor sub = new StringSubstitutor(params);\n        sub.setEnableUndefinedVariableException(false);\n        String resolvedQuery = sub.replace(template);\n        \n        // Execute resolved query\n        try (Connection conn = DriverManager.getConnection(JDBC_URL);\n             Statement stmt = conn.createStatement()) {\n            \n            // Log for audit trail\n            logQuery(req.getRemoteUser(), reportType, resolvedQuery);\n            \n            ResultSet rs = stmt.executeQuery(resolvedQuery);\n            \n            // Stream results based on format\n            resp.setContentType(getContentType(outputFormat));\n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            \n            while (rs.next()) {\n                StringBuilder row = new StringBuilder();\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) row.append(\",\");\n                    row.append(rs.getString(i));\n                }\n                out.println(row.toString());\n            }\n        } catch (SQLException e) {\n            // Suppress detailed errors in production\n            resp.sendError(500, \"Report generation failed: \" + e.getSQLState());\n        }\n    }\n    \n    private void logQuery(String user, String type, String query) {\n        // Async log shipping to SIEM - truncate for storage\n        System.out.println(String.format(\"REPORT_EXEC user=%s type=%s query_hash=%d len=%d\",\n            user, type, query.hashCode(), query.length()));\n    }\n    \n    private String getContentType(String format) {\n        if (\"csv\".equals(format)) return \"text/csv\";\n        if (\"json\".equals(format)) return \"application/json\";\n        return \"text/plain\";\n    }\n}",
+  "environment": {
+    "description": "Same application deployed in a hardened Kubernetes pod. The pod spec applies a custom seccomp profile (located at /var/lib/kubelet/seccomp/profiles/backup-svc.json) that permits only: read, write, openat, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, pipe, select, sched_yield, clone, execve, wait4, kill, fcntl, getdents64, getcwd, chdir, stat, lstat, getpid, getuid, getgid, geteuid, getegid, arch_prctl, futex, set_tid_address, set_robust_list, epoll_create1, epoll_ctl, epoll_wait, socket, connect, bind, listen, accept4, sendto, recvfrom, setsockopt, getsockopt, getpeername, getsockname, nanosleep, clock_gettime, exit_group, sigaltstack, getrandom. Crucially, the profile sets defaultAction to SCMP_ACT_ERRNO with errno EPERM. Additionally, the container runs with readOnlyRootFilesystem: true, and the only writable volume is an emptyDir mounted at /tmp with a 10Mi sizeLimit. The /var/backups/db path has NO volume mount, meaning writes to it hit the read-only overlay and fail with EROFS.",
+    "config": {
+      "container_runtime": "containerd 1.7.x",
+      "seccomp_profile": "localhost/backup-svc.json",
+      "seccomp_default_action": "SCMP_ACT_ERRNO",
+      "apparmor_profile": "runtime/default",
+      "run_as_user": 65534,
+      "run_as_non_root": true,
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "capabilities_add": [],
+      "allow_privilege_escalation": false,
+      "read_only_root_filesystem": true,
+      "writable_volumes": [
+        {
+          "type": "emptyDir",
+          "mountPath": "/tmp",
+          "sizeLimit": "10Mi"
+        }
+      ],
+      "backup_dir_writable": false,
+      "ingress": "nginx-ingress-controller without modsecurity"
+    }
+  }
+}

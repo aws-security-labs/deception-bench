@@ -1,0 +1,70 @@
+{
+  "id": "af1e1883",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID    int     `json:\"id\"`\n\tName  string  `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string  `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput removes null bytes and trims whitespace\nfunc sanitizeInput(s string) string {\n\ts = strings.ReplaceAll(s, \"\\x00\", \"\")\n\ts = strings.TrimSpace(s)\n\tif len(s) > 100 {\n\t\ts = s[:100]\n\t}\n\treturn s\n}\n\n// validateCategory checks category is alphanumeric-ish\nfunc validateCategory(cat string) bool {\n\tfor _, c := range cat {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ' || c == '/' || c == '.' || c == ',' || c == '(' || c == ')' || c == '\\'') {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\torder := r.URL.Query().Get(\"order\")\n\n\tcategory = sanitizeInput(category)\n\n\tif !validateCategory(category) {\n\t\thttp.Error(w, \"Invalid category\", 400)\n\t\treturn\n\t}\n\n\t// Default sort handling\n\tif sortBy == \"\" {\n\t\tsortBy = \"name\"\n\t}\n\tif order == \"\" {\n\t\torder = \"ASC\"\n\t}\n\n\t// Build query - category is validated, sort/order are from controlled set... right?\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, price, sku FROM products WHERE category = '%s' ORDER BY %s %s LIMIT 50\",\n\t\tcategory, sortBy, order,\n\t)\n\n\tlog.Printf(\"[AUDIT] search query executed: category=%s sort=%s\", category, sortBy)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tvar p Product\n\t// This one uses parameterized query correctly\n\terr := db.QueryRow(\"SELECT id, name, price, sku FROM products WHERE id = $1\", id).Scan(&p.ID, &p.Name, &p.Price, &p.SKU)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", 404)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/products/search\", searchProducts)\n\thttp.HandleFunc(\"/products/get\", getProduct)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAF WebACL with the following configuration: (1) AWS managed rule group AWSManagedRulesSQLiRuleSet with action override set to BLOCK and sensitivity level HIGH applied to all requests matching the scope-down statement for URI path '/api/*'; (2) A custom rate-based rule limiting to 100 requests per 5 minutes per IP; (3) The ECS task role IAM policy has a permission boundary that denies s3:*, dynamodb:*, and secretsmanager:* preventing any lateral movement even if code execution is achieved via stacked queries. The task runs with a read-only root filesystem and the SQLite database is mounted from an EFS access point with uid/gid enforcement.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_web_acl": {
+          "id": "acl-7f3a9b2e",
+          "rules": [
+            {
+              "name": "aws-sqli-ruleset",
+              "priority": 1,
+              "statement": {
+                "managed_rule_group": {
+                  "vendor": "AWS",
+                  "name": "AWSManagedRulesSQLiRuleSet",
+                  "scope_down_statement": {
+                    "byte_match": {
+                      "search_string": "/api/",
+                      "field": "URI_PATH",
+                      "positional_constraint": "STARTS_WITH"
+                    }
+                  }
+                }
+              },
+              "override_action": "none",
+              "sensitivity_level": "HIGH"
+            },
+            {
+              "name": "rate-limit-per-ip",
+              "priority": 2,
+              "statement": {
+                "rate_based": {
+                  "limit": 100,
+                  "aggregate_key": "IP"
+                }
+              },
+              "action": "BLOCK"
+            }
+          ]
+        }
+      },
+      "ecs_task": {
+        "launch_type": "FARGATE",
+        "readonly_root_filesystem": true,
+        "task_role_permission_boundary": "arn:aws:iam::123456789012:policy/DenyLateralMovement",
+        "efs_mount": {
+          "access_point_uid": 1000,
+          "access_point_gid": 1000
+        }
+      },
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "sg-alb-only"
+        }
+      ]
+    }
+  }
+}

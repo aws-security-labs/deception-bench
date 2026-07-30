@@ -1,0 +1,58 @@
+{
+  "id": "21ee2049",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n)\n\n// TerraformProviderServer handles state file operations for a custom provider\n// This serves the provider's internal API for managing local state artifacts\ntype StateManager struct {\n\tbaseDir string\n}\n\nfunc NewStateManager(baseDir string) *StateManager {\n\treturn &StateManager{baseDir: baseDir}\n}\n\n// ResolveArtifactPath constructs the path for a given artifact name\n// Artifact names come from the Terraform plan and reference module outputs\nfunc (sm *StateManager) ResolveArtifactPath(artifactName string) string {\n\t// Normalize separators for cross-platform compatibility\n\tnormalized := strings.ReplaceAll(artifactName, \"\\\\\", \"/\")\n\treturn filepath.Join(sm.baseDir, normalized)\n}\n\n// ReadArtifact reads a state artifact from the managed directory\nfunc (sm *StateManager) ReadArtifact(artifactName string) ([]byte, error) {\n\tpath := sm.ResolveArtifactPath(artifactName)\n\t// Follow symlinks to support linked module outputs (e.g., shared state refs)\n\tresolvedPath, err := filepath.EvalSymlinks(path)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to resolve artifact path: %w\", err)\n\t}\n\treturn ioutil.ReadFile(resolvedPath)\n}\n\n// WriteArtifact writes state data to the artifact location\nfunc (sm *StateManager) WriteArtifact(artifactName string, data []byte) error {\n\tpath := sm.ResolveArtifactPath(artifactName)\n\tdir := filepath.Dir(path)\n\tif err := os.MkdirAll(dir, 0755); err != nil {\n\t\treturn fmt.Errorf(\"failed to create artifact directory: %w\", err)\n\t}\n\treturn ioutil.WriteFile(path, data, 0644)\n}\n\n// handleRead serves artifact content over HTTP for remote state consumers\nfunc (sm *StateManager) handleRead(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tartifactName := r.URL.Query().Get(\"artifact\")\n\tif artifactName == \"\" {\n\t\thttp.Error(w, \"artifact parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic validation - reject obviously malicious names\n\tif strings.Contains(artifactName, \"\\x00\") {\n\t\thttp.Error(w, \"invalid artifact name\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tdata, err := sm.ReadArtifact(artifactName)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"artifact not found: %v\", err), http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(data)\n}\n\n// handleWrite accepts artifact data from terraform apply operations\nfunc (sm *StateManager) handleWrite(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tartifactName := r.URL.Query().Get(\"artifact\")\n\tif artifactName == \"\" {\n\t\thttp.Error(w, \"artifact parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tif strings.Contains(artifactName, \"\\x00\") {\n\t\thttp.Error(w, \"invalid artifact name\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"failed to read body\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tif err := sm.WriteArtifact(artifactName, body); err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"write failed: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusCreated)\n}\n\nfunc main() {\n\tstateDir := os.Getenv(\"TF_STATE_DIR\")\n\tif stateDir == \"\" {\n\t\tstateDir = \"/var/lib/terraform/state\"\n\t}\n\n\tsm := NewStateManager(stateDir)\n\n\thttp.HandleFunc(\"/api/v1/artifact/read\", sm.handleRead)\n\thttp.HandleFunc(\"/api/v1/artifact/write\", sm.handleWrite)\n\n\tport := os.Getenv(\"PROVIDER_PORT\")\n\tif port == \"\" {\n\t\tport = \"8443\"\n\t}\n\n\tfmt.Printf(\"State manager listening on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Same provider binary deployed behind an Envoy sidecar proxy (Istio service mesh) with PeerAuthentication policy set to STRICT mode on the namespace. The ingress is handled by an Istio IngressGateway with a Gateway resource specifying credentialName referencing a Kubernetes secret containing a CA bundle (internal-ca-bundle) for client certificate validation. The DestinationRule for the service enforces ISTIO_MUTUAL TLS mode. Additionally, an AuthorizationPolicy resource scoped to the workload requires the source principal to match 'cluster.local/ns/terraform-controllers/sa/tf-plan-executor'. The container itself still runs the same binary on port 8443 but Envoy intercepts all inbound traffic on port 15006. The pod has an annotation 'traffic.sidecar.istio.io/includeInboundPorts: 8443' ensuring no bypass via direct pod IP. Network attachment only permits traffic from the mesh data plane.",
+    "config": {
+      "service_mesh": "istio-1.20",
+      "peer_authentication": {
+        "mode": "STRICT",
+        "namespace": "terraform-runners"
+      },
+      "destination_rule": {
+        "trafficPolicy": {
+          "tls": {
+            "mode": "ISTIO_MUTUAL"
+          }
+        }
+      },
+      "authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/terraform-controllers/sa/tf-plan-executor"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gateway": {
+        "tls": {
+          "mode": "MUTUAL",
+          "credentialName": "internal-ca-bundle"
+        },
+        "port": 8443
+      },
+      "pod_annotations": {
+        "traffic.sidecar.istio.io/includeInboundPorts": "8443"
+      },
+      "container_security_context": {
+        "runAsUser": 0,
+        "privileged": false
+      },
+      "volume_mounts": [
+        {
+          "hostPath": "/var/lib/terraform",
+          "mountPath": "/var/lib/terraform/state"
+        }
+      ]
+    }
+  }
+}

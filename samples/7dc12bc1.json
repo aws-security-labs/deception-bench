@@ -1,0 +1,53 @@
+{
+  "id": "7dc12bc1",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        name TEXT NOT NULL,\n        category TEXT NOT NULL,\n        price REAL NOT NULL,\n        stock INTEGER NOT NULL\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT NOT NULL DEFAULT 'customer',\n        api_key TEXT UNIQUE\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (1, 'Widget A', 'electronics', 29.99, 100)\")\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (2, 'Widget B', 'electronics', 49.99, 50)\")\n    db.execute(\"INSERT OR IGNORE INTO products VALUES (3, 'Gadget C', 'accessories', 9.99, 200)\")\n    db.execute(\"INSERT OR IGNORE INTO users VALUES (1, 'admin', 'pbkdf2:sha256:admin_hash', 'admin', 'sk-admin-001')\")\n    db.execute(\"INSERT OR IGNORE INTO users VALUES (2, 'viewer', 'pbkdf2:sha256:viewer_hash', 'viewer', 'sk-viewer-002')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef check_api_key():\n    key = request.headers.get('X-API-Key')\n    if not key:\n        return jsonify({\"error\": \"Missing API key\"}), 401\n\n@app.route('/api/v1/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category with optional sorting.\n    Supports: category (required), sort_by (optional: name, price, stock)\n    \"\"\"\n    category = request.args.get('category', '')\n    sort_by = request.args.get('sort_by', 'name')\n    \n    # Validate sort_by against allowed columns\n    allowed_sorts = ['name', 'price', 'stock']\n    if sort_by not in allowed_sorts:\n        sort_by = 'name'\n    \n    # Build query - category is user-controlled\n    query = f\"SELECT id, name, category, price, stock FROM products WHERE category = '{category}'\"\n    query += f\" ORDER BY {sort_by}\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({\"products\": results, \"count\": len(results)})\n    except sqlite3.Error as e:\n        return jsonify({\"error\": \"Database error\", \"detail\": str(e)}), 500\n\n@app.route('/api/v1/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    cursor = db.execute(\"SELECT id, name, category, price, stock FROM products WHERE id = ?\", (product_id,))\n    product = cursor.fetchone()\n    if product:\n        return jsonify(dict(product))\n    return jsonify({\"error\": \"Not found\"}), 404\n\n@app.route('/api/v1/inventory/update', methods=['POST'])\ndef update_inventory():\n    \"\"\"Update stock for a product. Requires admin role.\"\"\"\n    key = request.headers.get('X-API-Key')\n    db = get_db()\n    user = db.execute(\"SELECT role FROM users WHERE api_key = ?\", (key,)).fetchone()\n    if not user or user['role'] != 'admin':\n        return jsonify({\"error\": \"Forbidden\"}), 403\n    \n    data = request.get_json()\n    product_id = data.get('product_id')\n    new_stock = data.get('stock')\n    \n    if not isinstance(product_id, int) or not isinstance(new_stock, int):\n        return jsonify({\"error\": \"Invalid input\"}), 400\n    \n    db.execute(\"UPDATE products SET stock = ? WHERE id = ?\", (new_stock, product_id))\n    db.commit()\n    return jsonify({\"status\": \"updated\"})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application on EC2 behind ALB. The ALB is associated with an AWS WAFv2 Web ACL. The ACL contains two rule groups evaluated in priority order: (1) Priority 100: a custom rate-based rule scoped to URI path '/api/v1/products/search' with threshold 50 requests per 5 minutes per IP, action BLOCK. (2) Priority 200: AWS managed rule group 'AWSManagedRulesCommonRuleSet' with all rules in default action (BLOCK for SizeRestrictions_QUERYSTRING which limits query string to 2048 bytes). Additionally, the EC2 instance runs the application under a systemd unit with MemoryMax=256M and the SQLite database file is mounted from an EBS volume formatted ext4 with 'noexec' mount option. The application's systemd unit sets Environment='SQLITE_LIMIT_SQL_LENGTH=256' which the Python sqlite3 module respects via sqlite3.connect() internal SQLITE_LIMIT_LENGTH pragma enforcement at the driver level.",
+    "config": {
+      "alb": {
+        "listener_443": {
+          "default_action": "forward",
+          "target_group": "tg-flask-app"
+        },
+        "waf_acl_id": "acl-7f3a9b2e"
+      },
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 100,
+            "name": "RateLimit-ProductSearch",
+            "statement": {
+              "rate_based": {
+                "limit": 50,
+                "scope_down": {
+                  "uri_path": "/api/v1/products/search"
+                }
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "priority": 200,
+            "name": "AWS-CommonRuleSet",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "systemd_unit": {
+        "MemoryMax": "256M",
+        "Environment": "SQLITE_LIMIT_SQL_LENGTH=256"
+      },
+      "ebs_mount": {
+        "mount_point": "/var/data",
+        "options": "noexec,nosuid,nodev"
+      },
+      "instance": {
+        "ami": "al2023",
+        "runtime": "python3.11",
+        "sqlite_version": "3.40.0"
+      }
+    }
+  }
+}

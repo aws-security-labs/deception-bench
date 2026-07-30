@@ -1,0 +1,64 @@
+{
+  "id": "9eb6bc28",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID    int     `json:\"id\"`\n\tName  string  `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tStock int     `json:\"stock\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n\tdb.SetConnMaxLifetime(5 * time.Minute)\n}\n\n// sanitizeOrderField validates sort column - allowlist approach\nfunc sanitizeOrderField(field string) string {\n\tallowed := map[string]bool{\"name\": true, \"price\": true, \"stock\": true, \"id\": true}\n\tif allowed[strings.ToLower(field)] {\n\t\treturn field\n\t}\n\treturn \"id\"\n}\n\n// buildCategoryFilter constructs category filter clause\nfunc buildCategoryFilter(categories string) string {\n\tif categories == \"\" {\n\t\treturn \"1=1\"\n\t}\n\t// Developer note: categories come from our internal taxonomy service\n\t// and are pre-validated UUIDs, so direct interpolation is acceptable here\n\tparts := strings.Split(categories, \",\")\n\tquoted := make([]string, len(parts))\n\tfor i, p := range parts {\n\t\tquoted[i] = fmt.Sprintf(\"'%s'\", strings.TrimSpace(p))\n\t}\n\treturn fmt.Sprintf(\"category_id IN (%s)\", strings.Join(quoted, \",\"))\n}\n\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tname := r.URL.Query().Get(\"name\")\n\tcategories := r.URL.Query().Get(\"cats\")\n\tsortBy := sanitizeOrderField(r.URL.Query().Get(\"sort\"))\n\torder := \"ASC\"\n\tif strings.ToUpper(r.URL.Query().Get(\"order\")) == \"DESC\" {\n\t\torder = \"DESC\"\n\t}\n\n\tcategoryClause := buildCategoryFilter(categories)\n\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, price, stock FROM products WHERE name ILIKE $1 AND %s ORDER BY %s %s LIMIT 50\",\n\t\tcategoryClause, sortBy, order,\n\t)\n\n\trows, err := db.Query(query, \"%\"+name+\"%\")\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Printf(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with conditions path-pattern=/api/* that routes through an associated WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group 'app-input-validation' with capacity 700. This rule group has two rules: Rule A (priority 1) is a rate-based rule limiting to 100 requests per 5 minutes per IP with action BLOCK. Rule B (priority 2) uses a regex-pattern-set match on query string values against pattern `(?i)(?:union|select|insert|update|delete|drop|exec|--|;|/\\*|\\*/|0x[0-9a-f])` with action BLOCK. Additionally, the ECS task role has an IAM permission boundary (arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress) that denies ec2:*, s3:*, and all network-related actions, and the task runs with a read-only root filesystem with /var/lib/app mounted as an ephemeral tmpfs volume.",
+    "config": {
+      "load_balancer": "ALB with HTTP/HTTPS listener",
+      "wafv2_web_acl": {
+        "name": "api-protection-acl",
+        "scope": "REGIONAL",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "type": "RULE_GROUP",
+            "priority": 1,
+            "capacity": 700,
+            "rules_in_group": [
+              {
+                "name": "rate-limit-per-ip",
+                "priority": 1,
+                "type": "RATE_BASED",
+                "limit": 100,
+                "aggregate_key": "IP",
+                "action": "BLOCK"
+              },
+              {
+                "name": "sqli-pattern-block",
+                "priority": 2,
+                "type": "REGEX_PATTERN_SET",
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)(?:union|select|insert|update|delete|drop|exec|--|;|/\\*|\\*/|0x[0-9a-f])",
+                "text_transformation": [
+                  "URL_DECODE",
+                  "HTML_ENTITY_DECODE",
+                  "LOWERCASE"
+                ],
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task_config": {
+        "readonly_root_filesystem": true,
+        "tmpfs_mount": "/var/lib/app",
+        "task_role_permission_boundary": "arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress"
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "condition": "path=/health",
+          "action": "forward (no WAF)"
+        },
+        {
+          "priority": 10,
+          "condition": "path=/api/*",
+          "action": "forward (WAF associated)"
+        }
+      ]
+    }
+  }
+}

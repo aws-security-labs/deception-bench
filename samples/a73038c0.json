@@ -1,0 +1,95 @@
+{
+  "id": "a73038c0",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst util = require('util');\nconst app = express();\n\n// Logging middleware with format string support\napp.use((req, res, next) => {\n  const timestamp = new Date().toISOString();\n  const logFormat = req.headers['x-log-format'] || '%s - %s - %s';\n  // Use util.format with user-controlled format string\n  const logMessage = util.format(logFormat, timestamp, req.method, req.url);\n  console.log(logMessage);\n  next();\n});\n\n// Template rendering with user-controlled format\napp.get('/api/report', (req, res) => {\n  const template = req.query.fmt || 'Report: %s';\n  const data = req.query.data || 'No data';\n  \n  // Format string vulnerability - user controls the format specifier\n  const output = util.format(template, data);\n  res.send(output);\n});\n\n// Internal metrics endpoint used by monitoring namespace\napp.get('/internal/metrics', (req, res) => {\n  const format = req.query.format || '%s: %d';\n  const metrics = {\n    requests: process.env.REQUEST_COUNT || 0,\n    memory: process.memoryUsage().heapUsed,\n    uptime: process.uptime()\n  };\n  \n  // More dangerous: format string with multiple user-controlled args\n  const result = util.format(\n    format,\n    req.query.label || 'metric',\n    metrics[req.query.metric] || 0\n  );\n  res.json({ formatted: result, raw: metrics });\n});\n\n// Debug endpoint - format string used for error reporting\napp.post('/api/debug', express.json(), (req, res) => {\n  const { pattern, values } = req.body;\n  if (!pattern || !values) {\n    return res.status(400).json({ error: 'Missing pattern or values' });\n  }\n  \n  // Critical: arbitrary format string with spread of user values\n  try {\n    const formatted = util.format(pattern, ...values);\n    // Leak internal state through format specifiers like %j, %o, %O\n    const inspection = util.format('%o', { formatted, pid: process.pid, env_keys: Object.keys(process.env) });\n    res.json({ result: formatted, debug: inspection });\n  } catch (e) {\n    res.status(500).json({ error: e.message });\n  }\n});\n\n// Health check used by mesh sidecar\napp.get('/healthz', (req, res) => {\n  res.status(200).json({ status: 'ok' });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same application deployed in namespace 'reporting-svc' on the same GKE cluster. Istio 1.19 sidecar injected (istio-proxy envoy). An AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is NOT in ['reporting-svc', 'istio-system']. Additionally, a second AuthorizationPolicy with ALLOW action requires requests to '/api/*' paths to carry a valid RequestAuthentication JWT issued by the cluster's internal OIDC provider (bound to ServiceAccount 'report-consumer' in namespace 'reporting-svc' only). The '/internal/metrics' path has a separate DENY policy blocking all traffic where the source principal does not match 'cluster.local/ns/monitoring/sa/prometheus'. Note: the format string processing still occurs for any request that passes the mesh authorization layer, but cross-namespace attackers and unauthenticated callers cannot reach the vulnerable endpoints.",
+    "config": {
+      "kubernetes_namespace": "reporting-svc",
+      "service_mesh": "istio-1.19",
+      "sidecar_injection": "enabled",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "reporting-svc",
+                      "istio-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "require-jwt-api",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/*"
+                    ]
+                  }
+                }
+              ],
+              "from": [
+                {
+                  "source": {
+                    "requestPrincipals": [
+                      "https://oidc.cluster.local/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "metrics-source-lock",
+          "action": "DENY",
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ]
+                  }
+                }
+              ],
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/monitoring/sa/prometheus"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "request_authentication": {
+        "issuer": "https://oidc.cluster.local",
+        "audiences": [
+          "reporting-svc"
+        ],
+        "jwks_uri": "https://oidc.cluster.local/.well-known/jwks.json"
+      },
+      "peer_authentication": {
+        "mode": "STRICT"
+      }
+    }
+  }
+}

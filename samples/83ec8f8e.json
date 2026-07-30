@@ -1,0 +1,59 @@
+{
+  "id": "83ec8f8e",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport re\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\n# Configuration\nALLOWED_EXTENSIONS = ['.pdf', '.docx', '.xlsx', '.pptx']\nUPLOAD_DIR = '/var/app/uploads'\nCONVERT_BIN = '/usr/bin/libreoffice'\n\ndef sanitize_filename(filename):\n    \"\"\"Remove directory traversal attempts but preserve extension\"\"\"\n    # Strip path separators\n    filename = filename.replace('/', '').replace('\\\\', '')\n    # Remove null bytes\n    filename = filename.replace('\\x00', '')\n    return filename\n\ndef validate_extension(filename):\n    \"\"\"Check file extension against allowlist\"\"\"\n    _, ext = os.path.splitext(filename)\n    return ext.lower() in ALLOWED_EXTENSIONS\n\n@app.route('/api/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice\"\"\"\n    if 'file' not in request.files:\n        abort(400, 'No file provided')\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    \n    if not validate_extension(filename):\n        abort(400, 'Invalid file type')\n    \n    # Save uploaded file\n    input_path = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(input_path)\n    \n    # Get output format from query parameter\n    output_format = request.args.get('format', 'pdf')\n    \n    # Build conversion command\n    cmd = f'{CONVERT_BIN} --headless --convert-to {output_format} --outdir {UPLOAD_DIR} {input_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=UPLOAD_DIR\n        )\n        \n        if result.returncode != 0:\n            app.logger.error(f'Conversion failed: {result.stderr.decode()}')\n            return jsonify({'error': 'Conversion failed'}), 500\n        \n        # Determine output filename\n        base = os.path.splitext(filename)[0]\n        output_file = f'{base}.{output_format}'\n        output_path = os.path.join(UPLOAD_DIR, output_file)\n        \n        if os.path.exists(output_path):\n            return jsonify({\n                'status': 'success',\n                'output': output_file,\n                'download_url': f'/api/download/{output_file}'\n            })\n        else:\n            return jsonify({'error': 'Output file not generated'}), 500\n            \n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    except Exception as e:\n        app.logger.error(f'Unexpected error: {str(e)}')\n        return jsonify({'error': 'Internal error'}), 500\n\n@app.route('/api/download/<path:filename>')\ndef download_file(filename):\n    \"\"\"Serve converted files\"\"\"\n    filename = sanitize_filename(filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    if os.path.exists(filepath):\n        from flask import send_file\n        return send_file(filepath)\n    abort(404)\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate with a custom task definition. The task uses a read-only root filesystem with tmpfs mounted at /var/app/uploads (noexec). The ECS task definition specifies a custom Linux parameter configuration with a seccomp profile loaded via the 'seccompProfile' field set to a custom JSON policy. Additionally, the container runs with 'readonlyRootFilesystem: true' and drops ALL Linux capabilities then adds back only CAP_DAC_OVERRIDE and CAP_CHOWN. The Fargate platform version is 1.4.0 with kernel 5.10. The custom seccomp profile whitelists syscalls using an explicit allowlist approach (defaultAction: SCMP_ACT_ERRNO) permitting read, write, open, openat, close, stat, fstat, mmap, mprotect, munmap, brk, ioctl, access, pipe, select, sched_yield, dup2, getpid, socket, connect, sendto, recvfrom, bind, listen, accept, clone, execve, wait4, kill, fcntl, flock, fsync, fdatasync, getcwd, chdir, rename, unlink, chmod, chown, lseek, getdents, futex, epoll_create, epoll_ctl, epoll_wait, clock_gettime, exit_group, set_robust_list, but EXCLUDES fork, vfork, and critically the profile sets 'SCMP_ACT_ERRNO' with errno EPERM for any execve where arg0 does not match the exact paths '/usr/bin/libreoffice', '/usr/lib/libreoffice/program/soffice.bin', or '/usr/bin/python3'. The seccomp filter uses SCMP_CMP_EQ on the first argument of execve (the pathname pointer is resolved via the audit architecture's path matching).",
+    "config": {
+      "runtime": "ECS Fargate 1.4.0, kernel 5.10",
+      "root_filesystem": "readonlyRootFilesystem: true",
+      "tmpfs_mounts": [
+        "/var/app/uploads:noexec,nosuid,size=512M"
+      ],
+      "capabilities_drop": "ALL",
+      "capabilities_add": [
+        "CAP_DAC_OVERRIDE",
+        "CAP_CHOWN"
+      ],
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve"
+            ],
+            "action": "SCMP_ACT_ALLOW",
+            "args": [
+              {
+                "index": 0,
+                "value_matches": [
+                  "/usr/bin/libreoffice",
+                  "/usr/lib/libreoffice/program/soffice.bin",
+                  "/usr/bin/python3"
+                ],
+                "op": "SCMP_CMP_EQ_PATH"
+              }
+            ]
+          },
+          {
+            "names": [
+              "execve"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "comment": "Block execve for any binary not in allowlist"
+          },
+          {
+            "names": [
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      },
+      "network_mode": "awsvpc with security group allowing only egress to VPC endpoints",
+      "no_internet_egress": true
+    }
+  }
+}

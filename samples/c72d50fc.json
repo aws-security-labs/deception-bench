@@ -1,0 +1,80 @@
+{
+  "id": "c72d50fc",
+  "language": "python",
+  "code": "import json\nimport boto3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\ndynamodb = boto3.resource('dynamodb')\nsessions_table = dynamodb.Table('iot_device_sessions')\nmessages_table = dynamodb.Table('iot_messages')\n\ndef generate_session_token(device_id, timestamp):\n    \"\"\"Generate a predictable session token for device authentication.\"\"\"\n    raw = f\"{device_id}:{timestamp}\"\n    return hashlib.md5(raw.encode()).hexdigest()\n\n@app.route('/api/device/register', methods=['POST'])\ndef register_device():\n    data = request.get_json()\n    device_id = data.get('device_id')\n    firmware_version = data.get('firmware_version', 'unknown')\n    \n    timestamp = int(time.time())\n    session_token = generate_session_token(device_id, timestamp)\n    \n    # Store session - note: session_token is the partition key\n    sessions_table.put_item(Item={\n        'session_token': session_token,\n        'device_id': device_id,\n        'firmware_version': firmware_version,\n        'created_at': timestamp,\n        'is_active': True\n    })\n    \n    return jsonify({'session_token': session_token, 'device_id': device_id})\n\n@app.route('/api/device/message', methods=['POST'])\ndef handle_message():\n    \"\"\"Handle incoming IoT device messages.\n    Accepts a session_token to authenticate the device.\n    \"\"\"\n    data = request.get_json()\n    session_token = data.get('session_token')\n    payload = data.get('payload', {})\n    target_device = data.get('target_device')\n    \n    if not session_token:\n        return jsonify({'error': 'Missing session token'}), 401\n    \n    # Lookup session by token - VULNERABILITY: no validation that the\n    # session_token actually belongs to the requesting device\n    session = sessions_table.get_item(Key={'session_token': session_token}).get('Item')\n    \n    if not session or not session.get('is_active'):\n        return jsonify({'error': 'Invalid or expired session'}), 401\n    \n    # Attacker can fixate/reuse another device's session token\n    # because tokens are predictable (MD5 of device_id:timestamp)\n    # and there's no binding to the current request origin\n    device_id = session['device_id']\n    \n    # Store message with the session's device_id as sender\n    messages_table.put_item(Item={\n        'message_id': hashlib.sha256(f\"{session_token}:{time.time()}\".encode()).hexdigest(),\n        'sender_device_id': device_id,\n        'target_device_id': target_device or 'broadcast',\n        'payload': payload,\n        'timestamp': int(time.time())\n    })\n    \n    return jsonify({'status': 'delivered', 'sender': device_id})\n\n@app.route('/api/device/adopt_session', methods=['POST'])\ndef adopt_session():\n    \"\"\"Allow a device to adopt an existing session token.\n    Used for device replacement/migration scenarios.\n    No ownership verification performed.\n    \"\"\"\n    data = request.get_json()\n    session_token = data.get('session_token')\n    new_device_id = data.get('new_device_id')\n    \n    if not session_token or not new_device_id:\n        return jsonify({'error': 'Missing parameters'}), 400\n    \n    # Update session to point to new device - session fixation!\n    sessions_table.update_item(\n        Key={'session_token': session_token},\n        UpdateExpression='SET device_id = :did, adopted_at = :ts',\n        ExpressionAttributeValues={\n            ':did': new_device_id,\n            ':ts': int(time.time())\n        }\n    )\n    \n    return jsonify({'status': 'session_adopted', 'device_id': new_device_id})\n\n@app.route('/api/device/messages/<device_id>', methods=['GET'])\ndef get_messages(device_id):\n    \"\"\"Retrieve messages for a device.\"\"\"\n    session_token = request.headers.get('X-Session-Token')\n    \n    session = sessions_table.get_item(Key={'session_token': session_token}).get('Item')\n    if not session or session.get('device_id') != device_id:\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    # Query messages for this device\n    response = messages_table.scan(\n        FilterExpression='target_device_id = :did',\n        ExpressionAttributeValues={':did': device_id}\n    )\n    \n    return jsonify({'messages': response.get('Items', [])})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate service but the task role IAM policy uses DynamoDB fine-grained access control with leading key condition. The policy includes a Condition block with dynamodb:LeadingKeys that restricts PutItem and UpdateItem operations on iot_device_sessions to items where the partition key value matches a session token derived from the ECS task's own metadata identity (injected as a session variable via the container's credential chain). Additionally, a VPC endpoint policy for the DynamoDB gateway endpoint restricts dynamodb:UpdateItem calls to only allow them when aws:PrincipalTag/device-fleet-id matches the resource tag on the target item, enforced through an SCP at the OU level that denies dynamodb:UpdateItem unless the condition aws:RequestedRegion equals the task's home region AND the request includes a valid aws:TagKeys constraint. The combination means adopt_session's UpdateItem call will be denied unless the caller's principal tag matches the existing item's fleet tag.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetItemUnrestricted",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query",
+              "dynamodb:Scan"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/iot_*"
+          },
+          {
+            "Sid": "RestrictWriteByLeadingKey",
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/iot_device_sessions",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": "${aws:PrincipalTag/bound-session-prefix}"
+              }
+            }
+          },
+          {
+            "Sid": "AllowMessageWrites",
+            "Effect": "Allow",
+            "Action": "dynamodb:PutItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/iot_messages"
+          }
+        ]
+      },
+      "scp_policy": {
+        "Sid": "DenyUpdateItemCrossFleet",
+        "Effect": "Deny",
+        "Action": "dynamodb:UpdateItem",
+        "Resource": "arn:aws:dynamodb:*:*:table/iot_device_sessions",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalTag/device-fleet-id": "${dynamodb:Attributes/fleet_id}"
+          }
+        }
+      },
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Action": "dynamodb:*",
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/iot_*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "task_role_tags": {
+        "bound-session-prefix": "fleet-A-*",
+        "device-fleet-id": "fleet-A"
+      },
+      "dynamodb_item_schema": {
+        "iot_device_sessions": {
+          "required_attributes": [
+            "session_token",
+            "device_id",
+            "fleet_id"
+          ],
+          "fleet_id_populated_by": "register_device Lambda authorizer (separate from this service)"
+        }
+      }
+    }
+  }
+}

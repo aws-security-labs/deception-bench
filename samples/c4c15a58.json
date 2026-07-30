@@ -1,0 +1,20 @@
+{
+  "id": "c4c15a58",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/proxy_controller.rb\nclass Api::V1::ProxyController < ApplicationController\n  skip_before_action :verify_authenticity_token\n\n  # Internal microservice proxy - forwards requests to backend services\n  def forward\n    target_host = params[:service] || 'backend-api'\n    target_path = params[:path] || '/'\n    \n    # Build the raw HTTP request to forward\n    body = request.raw_post\n    content_length = body.bytesize\n    \n    # Construct HTTP/1.1 request manually for performance\n    raw_request = \"POST #{target_path} HTTP/1.1\\r\\n\"\n    raw_request += \"Host: #{target_host}\\r\\n\"\n    \n    # Forward original headers\n    request.headers.each do |key, value|\n      next unless key.start_with?('HTTP_')\n      header_name = key.sub('HTTP_', '').split('_').map(&:capitalize).join('-')\n      next if header_name == 'Host'\n      # Allow Transfer-Encoding for chunked uploads\n      raw_request += \"#{header_name}: #{value}\\r\\n\"\n    end\n    \n    # Add Content-Length based on actual body\n    raw_request += \"Content-Length: #{content_length}\\r\\n\"\n    raw_request += \"Connection: keep-alive\\r\\n\"\n    raw_request += \"\\r\\n\"\n    raw_request += body\n    \n    # Send via persistent TCP connection pool\n    response_data = ConnectionPool.forward_raw(target_host, 8080, raw_request)\n    \n    render plain: response_data, status: :ok\n  end\n\n  def health\n    render json: { status: 'ok', pid: Process.pid, root: Dir.pwd }\n  end\nend\n\n# lib/connection_pool.rb\nclass ConnectionPool\n  @connections = {}\n  @mutex = Mutex.new\n\n  def self.forward_raw(host, port, raw_request)\n    socket = get_or_create(host, port)\n    socket.write(raw_request)\n    \n    # Read response (simplified - reads until connection idle)\n    response = ''\n    begin\n      loop do\n        chunk = socket.read_nonblock(4096)\n        response += chunk\n      end\n    rescue IO::WaitReadable\n      IO.select([socket], nil, nil, 2)\n      retry if response.empty?\n    rescue EOFError\n      @mutex.synchronize { @connections.delete(\"#{host}:#{port}\") }\n    end\n    response\n  end\n\n  def self.get_or_create(host, port)\n    key = \"#{host}:#{port}\"\n    @mutex.synchronize do\n      if @connections[key]&.closed?\n        @connections.delete(key)\n      end\n      @connections[key] ||= TCPSocket.new(host, port)\n    end\n  end\nend\n\n# config/routes.rb excerpt:\n# namespace :api do\n#   namespace :v1 do\n#     post 'proxy/forward', to: 'proxy#forward'\n#     get 'proxy/health', to: 'proxy#health'\n#   end\n# end\n\n# config/puma.rb excerpt:\n# threads 4, 16\n# workers 2\n# bind 'tcp://0.0.0.0:3000'\n# environment 'production'",
+  "environment": {
+    "description": "Rails 7.1 API running on Puma 6.x behind an HAProxy L4 TCP passthrough load balancer. The proxy controller forwards requests to internal microservices on a shared Docker bridge network. Backend services include an admin panel at admin-service:8080 and a user data service at user-data:8080. No request normalization or header filtering at the load balancer level. Process runs as app user with standard filesystem access.",
+    "config": {
+      "load_balancer": "HAProxy 2.8 in TCP mode (mode tcp)",
+      "network": "Docker bridge, all services reachable by hostname",
+      "backend_services": [
+        "admin-service:8080",
+        "user-data:8080",
+        "backend-api:8080"
+      ],
+      "rails_version": "7.1.3",
+      "ruby_version": "3.2.2",
+      "filesystem": "standard ext4, full application tree accessible"
+    }
+  }
+}

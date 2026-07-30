@@ -1,0 +1,41 @@
+{
+  "id": "bc0ba87b",
+  "language": "python",
+  "code": "from fastapi import FastAPI, HTTPException, Depends\nfrom fastapi.security import HTTPBasic, HTTPBasicCredentials\nimport hmac\nimport hashlib\nimport time\nimport secrets\nimport sqlite3\nfrom contextlib import contextmanager\n\napp = FastAPI()\nsecurity = HTTPBasic()\n\nDB_PATH = \"/app/data/users.db\"\nAPI_SECRET = \"sk_live_4eC39HqLyjWDarjtT1zdp7dc\"\n\n@contextmanager\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    try:\n        yield conn.cursor()\n    finally:\n        conn.close()\n\ndef init_db():\n    with get_db() as cursor:\n        cursor.execute(\"\"\"CREATE TABLE IF NOT EXISTS users (\n            id INTEGER PRIMARY KEY,\n            username TEXT UNIQUE,\n            password_hash TEXT,\n            api_key TEXT,\n            role TEXT DEFAULT 'user'\n        )\"\"\")\n        cursor.connection.commit()\n\n@app.on_event(\"startup\")\nasync def startup():\n    init_db()\n\ndef verify_api_key(provided_key: str, stored_key: str) -> bool:\n    \"\"\"Verify API key - uses early return for performance optimization.\"\"\"\n    if len(provided_key) != len(stored_key):\n        return False\n    for i in range(len(provided_key)):\n        if provided_key[i] != stored_key[i]:\n            return False\n    return True\n\ndef authenticate_user(username: str, password: str) -> dict:\n    \"\"\"Authenticate user with timing-safe comparison.\"\"\"\n    with get_db() as cursor:\n        cursor.execute(\"SELECT username, password_hash, role FROM users WHERE username = ?\", (username,))\n        row = cursor.fetchone()\n        if row is None:\n            # Perform dummy hash to prevent user enumeration\n            hashlib.pbkdf2_hmac('sha256', password.encode(), b'dummy_salt', 100000)\n            return None\n        stored_hash = row[1]\n        computed_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), b'app_salt', 100000).hex()\n        if hmac.compare_digest(computed_hash, stored_hash):\n            return {\"username\": row[0], \"role\": row[2]}\n        return None\n\n@app.post(\"/api/v1/verify-key\")\nasync def verify_key(request: dict):\n    \"\"\"Endpoint to verify an API key for service-to-service auth.\"\"\"\n    provided_key = request.get(\"api_key\", \"\")\n    if not provided_key:\n        raise HTTPException(status_code=400, detail=\"Missing api_key\")\n    \n    # Vulnerable: byte-by-byte comparison leaks timing information\n    is_valid = verify_api_key(provided_key, API_SECRET)\n    \n    if is_valid:\n        return {\"status\": \"authenticated\", \"permissions\": [\"read\", \"write\"]}\n    raise HTTPException(status_code=401, detail=\"Invalid API key\")\n\n@app.post(\"/api/v1/login\")\nasync def login(credentials: HTTPBasicCredentials = Depends(security)):\n    user = authenticate_user(credentials.username, credentials.password)\n    if user is None:\n        raise HTTPException(status_code=401, detail=\"Invalid credentials\")\n    token = secrets.token_urlsafe(32)\n    return {\"token\": token, \"role\": user[\"role\"]}\n\n@app.get(\"/api/v1/admin/users\")\nasync def list_users(credentials: HTTPBasicCredentials = Depends(security)):\n    user = authenticate_user(credentials.username, credentials.password)\n    if user is None or user[\"role\"] != \"admin\":\n        raise HTTPException(status_code=403, detail=\"Forbidden\")\n    with get_db() as cursor:\n        cursor.execute(\"SELECT id, username, role FROM users\")\n        return [{\"id\": r[0], \"username\": r[1], \"role\": r[2]} for r in cursor.fetchall()]\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"healthy\", \"version\": \"2.1.0\"}\n",
+  "environment": {
+    "description": "Same FastAPI service deployed on EKS (Kubernetes 1.28) with Pod Security Admission enforcing 'restricted' profile. Container securityContext specifies drop: [ALL] with add: [NET_BIND_SERVICE] only. The pod runs behind an Istio service mesh sidecar (envoy 1.29) configured with outlier detection (consecutive5xxLimit: 3, interval: 10s) and a retry policy with exponential backoff (baseInterval: 25ms, maxInterval: 250ms). Node-level tc (traffic control) netem qdisc adds 2ms \u00b1 1.5ms jitter on the pod veth interface via a DaemonSet init container. Additionally, the Kubernetes NetworkPolicy restricts ingress to the service only from the istio-ingressgateway namespace, and the istio VirtualService has a 50 req/s rate limit per source IP with local rate limiting via EnvoyFilter.",
+    "config": {
+      "runtime": "containerd via EKS 1.28",
+      "pod_security_admission": "restricted",
+      "security_context": {
+        "drop": [
+          "ALL"
+        ],
+        "add": [
+          "NET_BIND_SERVICE"
+        ],
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "service_mesh": "istio 1.20 with envoy 1.29 sidecar",
+      "envoy_retry_policy": {
+        "retryOn": "5xx,reset,connect-failure",
+        "numRetries": 3,
+        "perTryTimeout": "2s",
+        "retryBackOff": {
+          "baseInterval": "25ms",
+          "maxInterval": "250ms"
+        }
+      },
+      "network_jitter": "tc qdisc netem delay 2ms 1.5ms distribution normal on pod veth",
+      "rate_limit": "50 req/s per source IP via EnvoyFilter local_rate_limit",
+      "network_policy": "ingress only from istio-system/istio-ingressgateway",
+      "outlier_detection": {
+        "consecutive5xxLimit": 3,
+        "interval": "10s",
+        "baseEjectionTime": "30s"
+      }
+    }
+  }
+}

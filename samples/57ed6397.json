@@ -1,0 +1,27 @@
+{
+  "id": "57ed6397",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionId = req.getSession(false) != null ? req.getSession().getId() : null;\n        if (sessionId == null) {\n            resp.sendError(401, \"Authentication required\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n\n        if (reportType == null || !reportType.matches(\"(summary|detail|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        if (dateRange == null || !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        // department parameter is used for filtering - validated against org structure\n        if (department == null || department.length() > 100) {\n            resp.sendError(400, \"Invalid department\");\n            return;\n        }\n\n        String query = buildReportQuery(reportType, startDate, endDate, department);\n        log.info(\"Executing report query for session \" + sessionId.substring(0, 8) + \"...\");\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.setCharacterEncoding(\"UTF-8\");\n            resp.getWriter().write(results.toString());\n\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildReportQuery(String type, String start, String end, String dept) {\n        String baseTable = type.equals(\"audit\") ? \"audit_log\" : \"transactions\";\n        String columns = type.equals(\"summary\")\n            ? \"department, COUNT(*) as cnt, SUM(amount) as total\"\n            : \"*\";\n        String groupBy = type.equals(\"summary\") ? \" GROUP BY department\" : \"\";\n\n        // Note: dates are regex-validated as YYYY-MM-DD format above\n        // Department is length-checked but used directly for flexible matching\n        return String.format(\n            \"SELECT %s FROM %s WHERE created_at BETWEEN '%s' AND '%s' AND department = '%s'%s\",\n            columns, baseTable, start, end, dept, groupBy\n        );\n    }\n}",
+  "environment": {
+    "description": "Kubernetes pod running in namespace 'data-jobs' on EKS cluster. Pod uses default service account with IAM role attached via IRSA (IAM Roles for Service Accounts). No network restrictions applied. Pod runs as root (UID 0) with default securityContext. Multiple pods from different teams share the same node. The /tmp directory is backed by the node's ephemeral storage (emptyDir not used, hostPath /tmp mounted for legacy compatibility).",
+    "config": {
+      "kubernetes_namespace": "data-jobs",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "fsGroup": 0
+      },
+      "network_policy": "none",
+      "volume_mounts": [
+        {
+          "name": "tmp-shared",
+          "mountPath": "/tmp",
+          "type": "hostPath",
+          "hostPath": "/tmp"
+        }
+      ],
+      "node_instance_type": "m5.xlarge",
+      "imds_version": "IMDSv1",
+      "service_account_iam_role": "arn:aws:iam::123456789012:role/migration-runner"
+    }
+  }
+}

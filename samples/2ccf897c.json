@@ -1,0 +1,31 @@
+{
+  "id": "2ccf897c",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: basic session check\napp.use((req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (!token && req.path !== '/api/health') {\n    return res.status(401).json({ error: 'Missing session token' });\n  }\n  req.sessionToken = token;\n  next();\n});\n\n// Search endpoint with filtering\napp.get('/api/products/search', async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy, order } = req.query;\n    \n    let baseQuery = 'SELECT id, name, description, price, category FROM products WHERE 1=1';\n    const params = [];\n    let paramIdx = 1;\n\n    if (category) {\n      baseQuery += ` AND category = $${paramIdx++}`;\n      params.push(category);\n    }\n    if (minPrice) {\n      baseQuery += ` AND price >= $${paramIdx++}`;\n      params.push(parseFloat(minPrice));\n    }\n    if (maxPrice) {\n      baseQuery += ` AND price <= $${paramIdx++}`;\n      params.push(parseFloat(maxPrice));\n    }\n\n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['price', 'name', 'created_at'];\n    const allowedOrders = ['ASC', 'DESC'];\n    const sortCol = allowedSorts.includes(sortBy) ? sortBy : 'name';\n    const sortOrder = allowedOrders.includes(order?.toUpperCase()) ? order.toUpperCase() : 'ASC';\n    baseQuery += ` ORDER BY ${sortCol} ${sortOrder}`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ products: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Search failed', detail: err.message });\n  }\n});\n\n// User profile lookup - VULNERABLE to SQL injection\napp.get('/api/users/profile', async (req, res) => {\n  try {\n    const { username } = req.query;\n    if (!username) {\n      return res.status(400).json({ error: 'username required' });\n    }\n    \n    // Developer note: using template literal for LIKE pattern matching\n    // pg parameterized queries don't support dynamic LIKE patterns well\n    const query = `SELECT id, username, email, display_name, created_at \n                   FROM users \n                   WHERE username LIKE '%${username}%' \n                   AND account_status = 'active'`;\n    \n    const result = await pool.query(query);\n    \n    if (result.rows.length === 0) {\n      return res.status(404).json({ error: 'User not found' });\n    }\n    \n    // Mask email for privacy\n    const users = result.rows.map(u => ({\n      ...u,\n      email: u.email.replace(/(.{2}).*(@.*)/, '$1***$2')\n    }));\n    \n    res.json({ users });\n  } catch (err) {\n    console.error('Profile lookup error:', err.stack);\n    res.status(500).json({ error: 'Lookup failed' });\n  }\n});\n\n// Admin report endpoint\napp.post('/api/admin/report', async (req, res) => {\n  const { reportType, dateRange } = req.body;\n  \n  // Note: admin check relies on upstream proxy headers\n  const role = req.headers['x-user-role'];\n  if (role !== 'admin') {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n  \n  const validTypes = ['sales', 'inventory', 'users'];\n  if (!validTypes.includes(reportType)) {\n    return res.status(400).json({ error: 'Invalid report type' });\n  }\n  \n  const query = `SELECT * FROM ${reportType}_report WHERE generated_at > $1`;\n  const result = await pool.query(query, [dateRange?.start || '2024-01-01']);\n  res.json({ report: result.rows });\n});\n\napp.get('/api/health', (req, res) => {\n  res.json({ status: 'ok', version: process.env.APP_VERSION || '1.2.3' });\n});\n\napp.listen(3000, () => console.log('Service running on :3000'));",
+  "environment": {
+    "description": "Quarkus native image deployed on AWS Lambda with custom runtime layer using a multi-stage build. The final stage uses a scratch-derived OCI image with pivot_root(2) into /app at PID 1 init, establishing a process namespace where the root filesystem is bind-mounted read-only from a content-addressed layer containing only: /app/config/*.json, /app/application, /tmp (tmpfs), and /dev/null. The Lambda extension bootstrap invokes unshare(CLONE_NEWNS) followed by pivot_root before exec'ing the Quarkus binary. No /etc, /proc, /sys, /var, or /root paths exist in the mount namespace. The process runs under a seccomp-bpf profile (applied via prctl at bootstrap) that additionally blocks openat(2) calls where the resolved path contains '..' components via SECCOMP_RET_ERRNO(EACCES). Container uses uid 65534 (nobody).",
+    "config": {
+      "runtime": "quarkus-native-3.2",
+      "platform": "aws-lambda-custom-runtime",
+      "container_user": "nobody (65534)",
+      "filesystem_isolation": "pivot_root into /app with bind-mount RO layer",
+      "mount_namespace": "unshare(CLONE_NEWNS) before exec",
+      "available_paths": [
+        "/app/config/*.json",
+        "/app/application",
+        "/tmp",
+        "/dev/null"
+      ],
+      "seccomp_profile": "custom-bpf-filter blocking openat with path traversal components",
+      "missing_paths": [
+        "/etc",
+        "/proc",
+        "/sys",
+        "/var",
+        "/root",
+        "/home"
+      ],
+      "oci_image_base": "scratch-derived, content-addressed layers only"
+    }
+  }
+}

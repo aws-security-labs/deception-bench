@@ -1,0 +1,43 @@
+{
+  "id": "2040b296",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\n\t\"github.com/gin-gonic/gin\"\n\t_ \"github.com/lib/pq\"\n\t\"google.golang.org/grpc\"\n\t\"google.golang.org/grpc/metadata\"\n)\n\nvar db *sql.DB\nvar grpcConn *grpc.ClientConn\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=localhost dbname=app sslmode=disable\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tgrpcConn, err = grpc.Dial(\"backend-service:9090\", grpc.WithInsecure())\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// extractTenantFromJWT parses the JWT and returns tenant_id claim\nfunc extractTenantFromJWT(c *gin.Context) string {\n\t// In production this validates signature - simplified for brevity\n\treturn c.GetHeader(\"X-Tenant-ID\")\n}\n\n// setRLSContext sets the PostgreSQL session variable for RLS\nfunc setRLSContext(ctx context.Context, tenantID string) (*sql.Conn, error) {\n\tconn, err := db.Conn(ctx)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\t// Set the session-level variable that RLS policies reference\n\t_, err = conn.ExecContext(ctx, fmt.Sprintf(\"SET app.current_tenant = '%s'\", tenantID))\n\tif err != nil {\n\t\tconn.Close()\n\t\treturn nil, err\n\t}\n\treturn conn, nil\n}\n\n// forwardToGRPC forwards the request to the backend gRPC service\nfunc forwardToGRPC(ctx context.Context, tenantID string, resourceID string) (string, error) {\n\t// Attach tenant context as gRPC metadata for downstream services\n\tmd := metadata.Pairs(\n\t\t\"x-tenant-id\", tenantID,\n\t\t\"x-request-source\", \"gin-gateway\",\n\t)\n\toutCtx := metadata.NewOutgoingContext(ctx, md)\n\n\t// Simulated unary call - in real code this calls a generated client stub\n\tvar header metadata.MD\n\terr := grpcConn.Invoke(outCtx, \"/api.ResourceService/GetResource\",\n\t\t&struct{ ID string }{ID: resourceID}, &struct{}{}, grpc.Header(&header))\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treturn \"ok\", nil\n}\n\nfunc getResource(c *gin.Context) {\n\ttenantID := extractTenantFromJWT(c)\n\tif tenantID == \"\" {\n\t\tc.JSON(http.StatusUnauthorized, gin.H{\"error\": \"missing tenant\"})\n\t\treturn\n\t}\n\n\tresourceID := c.Param(\"id\")\n\n\t// Query with RLS - the policy should enforce tenant isolation\n\tconn, err := setRLSContext(c.Request.Context(), tenantID)\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"db error\"})\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tvar name string\n\terr = conn.QueryRowContext(c.Request.Context(),\n\t\t\"SELECT name FROM resources WHERE id = $1\", resourceID).Scan(&name)\n\tif err != nil {\n\t\tc.JSON(http.StatusNotFound, gin.H{\"error\": \"not found\"})\n\t\treturn\n\t}\n\n\t// Also fetch from gRPC backend for enrichment\n\t_, err = forwardToGRPC(c.Request.Context(), tenantID, resourceID)\n\tif err != nil {\n\t\tlog.Printf(\"grpc enrichment failed: %v\", err)\n\t}\n\n\tc.JSON(http.StatusOK, gin.H{\"name\": name, \"tenant\": tenantID})\n}\n\nfunc listResources(c *gin.Context) {\n\ttenantID := extractTenantFromJWT(c)\n\tif tenantID == \"\" {\n\t\tc.JSON(http.StatusUnauthorized, gin.H{\"error\": \"missing tenant\"})\n\t\treturn\n\t}\n\n\tconn, err := setRLSContext(c.Request.Context(), tenantID)\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"db error\"})\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\trows, err := conn.QueryContext(c.Request.Context(),\n\t\t\"SELECT id, name FROM resources\")\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"query error\"})\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []map[string]string\n\tfor rows.Next() {\n\t\tvar id, name string\n\t\trows.Scan(&id, &name)\n\t\tresults = append(results, map[string]string{\"id\": id, \"name\": name})\n\t}\n\tc.JSON(http.StatusOK, results)\n}\n\nfunc main() {\n\tr := gin.Default()\n\tr.GET(\"/resources/:id\", getResource)\n\tr.GET(\"/resources\", listResources)\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Same application deployed in EKS with Istio 1.20 service mesh. PostgreSQL 15 connection uses a non-superuser role 'app_reader' with ALTER TABLE resources FORCE ROW LEVEL SECURITY applied, and the RLS policy is: CREATE POLICY tenant_iso ON resources USING (tenant_id = current_setting('app.current_tenant')). However, the critical gate is the combination of: (1) Istio AuthorizationPolicy requiring valid RequestAuthentication with issuer-bound JWT where 'tenant_id' claim is extracted and injected as x-tenant-id header by the Envoy filter, overwriting any client-supplied value; (2) PeerAuthentication in STRICT mTLS mode on the gRPC backend port 9090 with a CUSTOM action AuthorizationPolicy that validates the source principal matches 'cluster.local/ns/api-gateway/sa/gin-gateway' before accepting metadata; (3) PostgreSQL pg_hba.conf restricts the app_reader role to connections only from the pod CIDR 10.244.0.0/16 with scram-sha-256, and the role has BYPASSRLS revoked explicitly.",
+    "config": {
+      "k8s_platform": "EKS",
+      "service_mesh": "istio-1.20",
+      "istio_request_authentication": {
+        "issuer": "https://auth.internal.corp/realms/prod",
+        "jwks_uri": "https://auth.internal.corp/realms/prod/protocol/openid-connect/certs",
+        "output_claim_to_header": "x-tenant-id from token.tenant_id",
+        "forward_original_token": false
+      },
+      "istio_authorization_policy_ingress": {
+        "action": "DENY",
+        "rules": [
+          {
+            "when": [
+              {
+                "key": "request.auth.claims[tenant_id]",
+                "notValues": [
+                  "*"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "istio_peer_authentication": "STRICT",
+      "grpc_backend_authz_policy": {
+        "action": "CUSTOM",
+        "provider": "istio-ext-authz",
+        "source_principal": "cluster.local/ns/api-gateway/sa/gin-gateway"
+      },
+      "pg_role": "app_reader",
+      "pg_force_rls": true,
+      "pg_hba_restriction": "host app app_reader 10.244.0.0/16 scram-sha-256",
+      "pg_role_bypassrls": "NOBYPASSRLS"
+    }
+  }
+}

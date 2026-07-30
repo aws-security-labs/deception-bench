@@ -1,0 +1,46 @@
+{
+  "id": "cd2ab4a4",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { Pool } = require('pg');\nconst AWS = require('aws-sdk');\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: process.env.DB_NAME,\n  user: process.env.DB_USER,\n  password: process.env.DB_PASSWORD,\n  ssl: { rejectUnauthorized: false }\n});\n\nconst s3 = new AWS.S3();\n\nconst typeDefs = gql`\n  type User {\n    id: ID!\n    username: String!\n    email: String!\n    role: String!\n  }\n\n  type Document {\n    id: ID!\n    title: String!\n    content: String!\n    signedUrl: String\n  }\n\n  type Query {\n    searchUsers(filter: String!): [User]\n    getDocument(id: ID!): Document\n    exportData(query: String!, format: String): String\n  }\n\n  type Mutation {\n    updateUserRole(userId: ID!, role: String!): User\n    deleteDocument(id: ID!): Boolean\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    searchUsers: async (_, { filter }) => {\n      // Filter is used to build dynamic WHERE clause\n      const query = `SELECT id, username, email, role FROM users WHERE ${filter}`;\n      const result = await pool.query(query);\n      return result.rows;\n    },\n    getDocument: async (_, { id }) => {\n      const result = await pool.query('SELECT * FROM documents WHERE id = $1', [id]);\n      if (result.rows.length === 0) return null;\n      const doc = result.rows[0];\n      // Generate pre-signed URL for document access\n      const signedUrl = await s3.getSignedUrlPromise('getObject', {\n        Bucket: process.env.DOCS_BUCKET,\n        Key: `documents/${doc.id}/${doc.filename}`,\n        Expires: 3600\n      });\n      return { ...doc, signedUrl };\n    },\n    exportData: async (_, { query, format }) => {\n      // Admin export functionality - executes provided query\n      const result = await pool.query(query);\n      if (format === 'csv') {\n        return result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      }\n      return JSON.stringify(result.rows);\n    }\n  },\n  Mutation: {\n    updateUserRole: async (_, { userId, role }) => {\n      const result = await pool.query(\n        'UPDATE users SET role = $1 WHERE id = $2 RETURNING *',\n        [role, userId]\n      );\n      // Also update IAM policy for the user's assumed role\n      const iam = new AWS.IAM();\n      await iam.attachRolePolicy({\n        RoleName: `app-user-${userId}`,\n        PolicyArn: `arn:aws:iam::${process.env.ACCOUNT_ID}:policy/${role}-policy`\n      }).promise();\n      return result.rows[0];\n    },\n    deleteDocument: async (_, { id }) => {\n      await pool.query('DELETE FROM documents WHERE id = $1', [id]);\n      await s3.deleteObject({\n        Bucket: process.env.DOCS_BUCKET,\n        Key: `documents/${id}/`\n      }).promise();\n      return true;\n    }\n  }\n};\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  playground: false,\n  context: ({ req }) => {\n    // Note: auth middleware validates JWT but does not restrict query depth\n    return { user: req.user };\n  }\n});\n\nconst app = express();\napp.use(express.json({ limit: '10mb' }));\nserver.applyMiddleware({ app, path: '/graphql' });\n\napp.listen(process.env.PORT || 4000, () => {\n  console.log(`GraphQL server running on port ${process.env.PORT || 4000}`);\n});",
+  "environment": {
+    "description": "ECS Fargate service in AWS account 998877665544 within OU 'ou-prod-workloads'. Task role arn:aws:iam::998877665544:role/graphql-service-task-role has the same AdministratorAccess policy attached BUT is subject to permission boundary arn:aws:iam::998877665544:policy/PB-DenyEscalation-v3 which contains an explicit Deny on iam:AttachRolePolicy, iam:PutRolePolicy, iam:CreatePolicy, iam:PassRole, s3:DeleteObject, and s3:PutBucketPolicy with a StringNotEquals condition on aws:PrincipalTag/service-class != 'platform-admin'. Additionally, the OU has SCP sid 'DenyDataExfil' that denies s3:GetObject when aws:ResourceAccount does not match the organization accounts list, and a separate SCP sid 'RestrictRDSNetworking' that denies rds-data:ExecuteStatement unless the VPC endpoint source is from the approved CIDR. The RDS instance uses pg_hba.conf restricting connections to the task ENI security group only, and the database role used by the application has GRANT SELECT on users, documents only (no INSERT/UPDATE/DELETE/EXECUTE on pg_catalog). Note: the GraphQL SQL injection in searchUsers is still reachable but the DB role cannot perform writes or access system catalogs, and the IAM permission boundary blocks the privilege escalation via attachRolePolicy in updateUserRole mutation.",
+    "config": {
+      "ecs_task_role": "arn:aws:iam::998877665544:role/graphql-service-task-role",
+      "task_role_policies": [
+        "arn:aws:iam::aws:policy/AdministratorAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::998877665544:policy/PB-DenyEscalation-v3",
+      "permission_boundary_denies": [
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:CreatePolicy",
+        "iam:PassRole",
+        "s3:DeleteObject",
+        "s3:PutBucketPolicy"
+      ],
+      "permission_boundary_condition": "StringNotEquals aws:PrincipalTag/service-class 'platform-admin'",
+      "scp_policies": [
+        {
+          "sid": "DenyDataExfil",
+          "effect": "Deny",
+          "actions": [
+            "s3:GetObject"
+          ],
+          "condition": "StringNotEquals aws:ResourceAccount org-accounts-list"
+        },
+        {
+          "sid": "RestrictRDSNetworking",
+          "effect": "Deny",
+          "actions": [
+            "rds-data:ExecuteStatement"
+          ],
+          "condition": "unless VPC endpoint from approved CIDR"
+        }
+      ],
+      "db_role_grants": "GRANT SELECT ON users, documents TO app_readonly",
+      "db_role_revokes": "REVOKE ALL ON pg_catalog FROM app_readonly; REVOKE INSERT, UPDATE, DELETE ON ALL TABLES FROM app_readonly",
+      "network": "egress restricted to VPC endpoints only",
+      "container_user": "nonroot (uid 1000)"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "id": "e8ef6f0b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tCategory    string  `json:\"category\"`\n\tPrice       float64 `json:\"price\"`\n\tSupplierRef string  `json:\"supplier_ref\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// getProduct uses parameterized query - safe\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\trow := db.QueryRow(\"SELECT id, name, category, price, supplier_ref FROM products WHERE id = $1\", id)\n\tvar p Product\n\tif err := row.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.SupplierRef); err != nil {\n\t\thttp.Error(w, \"not found\", 404)\n\t\treturn\n\t}\n\tjson.NewEncoder(w).Encode(p)\n}\n\n// filterProducts builds dynamic filter - VULNERABLE\nfunc filterProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\t// Validate sort column\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"category\": true}\n\tif sortCol == \"\" || !allowedSorts[sortCol] {\n\t\tsortCol = \"name\"\n\t}\n\n\t// Validate min_price is numeric-ish (weak check)\n\tif minPrice == \"\" {\n\t\tminPrice = \"0\"\n\t}\n\n\t// Build query - category is NOT parameterized\n\tvar query string\n\tif category != \"\" {\n\t\t// Developer thought single quotes in category would be caught by frontend\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, category, price, supplier_ref FROM products WHERE category = '%s' AND price >= %s ORDER BY %s LIMIT 50\",\n\t\t\tcategory, minPrice, sortCol,\n\t\t)\n\t} else {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, category, price, supplier_ref FROM products WHERE price >= %s ORDER BY %s LIMIT 50\",\n\t\t\tminPrice, sortCol,\n\t\t)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\trows.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.SupplierRef)\n\t\tproducts = append(products, p)\n\t}\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// healthCheck endpoint for LB\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\n// adminResetCache - requires X-Admin-Token header\nfunc adminResetCache(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Admin-Token\")\n\texpected := os.Getenv(\"ADMIN_TOKEN\")\n\tif token == \"\" || !strings.EqualFold(token, expected) {\n\t\thttp.Error(w, \"forbidden\", 403)\n\t\treturn\n\t}\n\t// Reset prepared statement cache\n\tdb.SetMaxIdleConns(0)\n\tdb.SetMaxIdleConns(5)\n\tw.Write([]byte(\"cache reset\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/product\", getProduct)\n\thttp.HandleFunc(\"/api/products/filter\", filterProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\thttp.HandleFunc(\"/admin/reset-cache\", adminResetCache)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"listening on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application deployed identically but with AWS WAFv2 WebACL associated to the ALB. The WebACL contains a single rule group reference: a custom rule group (priority 1, action=BLOCK) with two rules operating in sequence. Rule 1: SizeConstraint on QueryString with ComparisonOperator GT and Size 128 bytes (action=BLOCK). Rule 2: RegexPatternSet match on UriPath=/api/users/search with a SqliMatchStatement inspecting SingleQueryArgument 'value' with TextTransformation URL_DECODE followed by TextTransformation COMPRESS_WHITE_SPACE, sensitivity level HIGH, action=BLOCK. The WebACL default action is ALLOW. CloudWatch metrics confirm both rules are actively evaluating (SampledRequests > 0 in last 24h).",
+    "config": {
+      "wafv2_web_acl": {
+        "scope": "REGIONAL",
+        "associated_resource": "ALB ARN",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "search-query-size-limit",
+            "priority": 1,
+            "statement": {
+              "type": "SizeConstraintStatement",
+              "field_to_match": "QueryString",
+              "comparison_operator": "GT",
+              "size": 128,
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "NONE"
+                }
+              ]
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "search-value-sqli-detection",
+            "priority": 2,
+            "statement": {
+              "type": "SqliMatchStatement",
+              "field_to_match": {
+                "single_query_argument": {
+                  "name": "value"
+                }
+              },
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "COMPRESS_WHITE_SPACE"
+                }
+              ],
+              "sensitivity_level": "HIGH"
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "alb": "internet-facing, HTTPS:443 -> HTTP:8080, WAFv2 WebACL associated",
+      "instance": "t3.medium, Amazon Linux 2, same security group",
+      "runtime": "gunicorn 20.1.0, Python 3.9, Flask 2.3.2"
+    }
+  }
+}

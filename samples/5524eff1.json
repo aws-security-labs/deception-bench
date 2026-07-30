@@ -1,0 +1,40 @@
+{
+  "id": "5524eff1",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\nDATABASE = '/app/data/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp REAL\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, password_hash, role, api_key) VALUES ('admin', 'admin@corp.internal', 'pbkdf2:sha256:260000$salt$hash', 'admin', 'ak_prod_7f3a9b2c')\")\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_session_token(token):\n    \"\"\"Verify HMAC-based session token: username.timestamp.signature\"\"\"\n    try:\n        parts = token.split('.')\n        if len(parts) != 3:\n            return None\n        username, ts, sig = parts\n        if time.time() - float(ts) > 3600:\n            return None\n        expected = hmac.new(SECRET_KEY.encode(), f\"{username}.{ts}\".encode(), hashlib.sha256).hexdigest()[:16]\n        if hmac.compare_digest(sig, expected):\n            return username\n    except Exception:\n        pass\n    return None\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({\"error\": \"Invalid field\"}), 400\n    \n    if not value or len(value) > 100:\n        return jsonify({\"error\": \"Invalid query\"}), 400\n    \n    db = get_db()\n    # Using format string for column name (validated above) and\n    # string concatenation for the LIKE pattern\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({\"error\": \"Query failed\", \"detail\": str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID. Requires valid session.\"\"\"\n    token = request.headers.get('X-Session-Token', '')\n    caller = verify_session_token(token)\n    if not caller:\n        return jsonify({\"error\": \"Unauthorized\"}), 401\n    \n    db = get_db()\n    user = db.execute(\"SELECT username, email, role FROM users WHERE id = ?\", (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({\"error\": \"Not found\"}), 404\n\n@app.route('/api/admin/export', methods=['POST'])\ndef export_data():\n    \"\"\"Admin endpoint to export user data. Validates role.\"\"\"\n    token = request.headers.get('X-Session-Token', '')\n    caller = verify_session_token(token)\n    if not caller:\n        return jsonify({\"error\": \"Unauthorized\"}), 401\n    \n    db = get_db()\n    user = db.execute(\"SELECT role FROM users WHERE username = ?\", (caller,)).fetchone()\n    if not user or user['role'] != 'admin':\n        return jsonify({\"error\": \"Forbidden\"}), 403\n    \n    fmt = request.json.get('format', 'json')\n    users = db.execute(\"SELECT id, username, email, role FROM users\").fetchall()\n    return jsonify({\"users\": [dict(u) for u in users], \"format\": fmt})\n\nif __name__ == '__main__':\n    os.makedirs('/app/data', exist_ok=True)\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an Application Load Balancer. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with priority 1, (2) AWSManagedRulesKnownBadInputsRuleSet with priority 2, (3) A custom rule with priority 3 that applies a rate limit of 100 requests per 5 minutes per IP with action BLOCK. The WebACL default action is ALLOW. Additionally, the ECS task definition specifies a read-only root filesystem (readonlyRootFilesystem: true) and the container runs as a non-root user (user: '1000:1000'). The ALB access logs are shipped to CloudWatch with a metric filter alarm on 4xx spike. Note: the AWSManagedRulesCommonRuleSet includes SizeRestrictions_QUERYSTRING (blocks query strings > 2048 bytes) and CrossSiteScripting_QUERYSTRING but does NOT include SQL injection rules \u2014 those are in the separate AWSManagedRulesSQLiRuleSet which is NOT attached to this WebACL.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 1,
+            "action": "none (uses rule group actions)",
+            "override": "none"
+          },
+          {
+            "name": "AWSManagedRulesKnownBadInputsRuleSet",
+            "priority": 2,
+            "action": "none (uses rule group actions)",
+            "override": "none"
+          },
+          {
+            "name": "RateLimit",
+            "priority": 3,
+            "action": "BLOCK",
+            "rate": "100 per 5 min per IP"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "ecs_task": {
+        "readonlyRootFilesystem": true,
+        "user": "1000:1000",
+        "network_mode": "awsvpc"
+      },
+      "monitoring": "CloudWatch metric filter on ALB 4xx responses"
+    }
+  }
+}

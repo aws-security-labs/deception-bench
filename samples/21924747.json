@@ -1,0 +1,24 @@
+{
+  "id": "21924747",
+  "language": "javascript",
+  "code": "const vm = require('vm');\nconst fs = require('fs');\nconst path = require('path');\n\n// Lambda handler for dynamic report generation\n// Supports template expressions like ${user.name} in report configs\nexports.handler = async (event) => {\n  try {\n    const { templateId, parameters, userContext } = JSON.parse(event.body || '{}');\n    \n    if (!templateId || !parameters) {\n      return { statusCode: 400, body: JSON.stringify({ error: 'Missing templateId or parameters' }) };\n    }\n\n    // Load template from local config directory\n    const templatePath = path.join('/var/task/templates', `${templateId}.json`);\n    let templateConfig;\n    try {\n      templateConfig = JSON.parse(fs.readFileSync(templatePath, 'utf8'));\n    } catch (e) {\n      return { statusCode: 404, body: JSON.stringify({ error: 'Template not found' }) };\n    }\n\n    // Resolve dynamic expressions in template fields\n    const resolved = resolveExpressions(templateConfig, parameters, userContext);\n    \n    return {\n      statusCode: 200,\n      body: JSON.stringify({ report: resolved, generatedAt: new Date().toISOString() })\n    };\n  } catch (err) {\n    console.error('Handler error:', err.message);\n    return { statusCode: 500, body: JSON.stringify({ error: 'Internal error' }) };\n  }\n};\n\nfunction resolveExpressions(template, params, context) {\n  const result = {};\n  const sandbox = {\n    params: params,\n    context: context || {},\n    Math: Math,\n    Date: Date,\n    parseInt: parseInt,\n    parseFloat: parseFloat\n  };\n\n  for (const [key, value] of Object.entries(template.fields || {})) {\n    if (typeof value === 'string' && value.startsWith('${') && value.endsWith('}')) {\n      // Extract expression from ${...} wrapper\n      const expr = value.slice(2, -1);\n      try {\n        // Evaluate expression in sandboxed context\n        const script = new vm.Script(expr);\n        const vmContext = vm.createContext(sandbox);\n        result[key] = script.runInContext(vmContext, { timeout: 1000 });\n      } catch (evalErr) {\n        result[key] = `[Error: ${evalErr.message}]`;\n      }\n    } else {\n      result[key] = value;\n    }\n  }\n  return result;\n}\n\n// Health check endpoint\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({\n      status: 'healthy',\n      runtime: process.version,\n      cwd: process.cwd()\n    })\n  };\n};\n\n// Utility: validate template structure before saving\nexports.validateTemplate = async (event) => {\n  const { fields } = JSON.parse(event.body || '{}');\n  if (!fields || typeof fields !== 'object') {\n    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid template structure' }) };\n  }\n  \n  const expressionPattern = /^\\$\\{[^}]+\\}$/;\n  const warnings = [];\n  \n  for (const [key, value] of Object.entries(fields)) {\n    if (typeof value === 'string' && value.includes('${') && !expressionPattern.test(value)) {\n      warnings.push(`Field '${key}' has malformed expression`);\n    }\n  }\n  \n  return {\n    statusCode: 200,\n    body: JSON.stringify({ valid: true, warnings })\n  };\n};",
+  "environment": {
+    "description": "Same Lambda function deployed with custom runtime wrapper. The function executes inside a pivot_root'd mount namespace created by the bootstrap script before handler invocation. The confined root is a minimal tmpfs at /var/task/sandbox containing only the function code and node_modules. The process runs under a seccomp-bpf profile (applied via LD_PRELOAD libseccomp shim in the Lambda layer) that blocks syscalls: execve (except for /var/lang/bin/node itself via arg inspection), clone with CLONE_NEWNS, ptrace, and mount. Additionally, all environment variables except NODE_PATH and LAMBDA_TASK_ROOT are scrubbed by the bootstrap wrapper before the Node.js process starts \u2014 the IAM session credentials are never populated into the function's process environment (the execution role has sts:AssumeRole denied via an SCP on the OU, so even if credentials leaked they'd be unusable). The /proc filesystem is mounted with hidepid=2 and the process has no access to /proc/self/environ.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "custom_bootstrap": true,
+      "lambda_layer": "arn:aws:lambda:us-east-1:123456789012:layer:seccomp-chroot-shim:7",
+      "pivot_root_target": "/var/task/sandbox",
+      "seccomp_profile": "block_execve_clone_ptrace_mount",
+      "env_scrubbing": "all_except_NODE_PATH_LAMBDA_TASK_ROOT",
+      "proc_mount": "hidepid=2",
+      "scp_policy": "deny_sts_AssumeRole_on_ou",
+      "filesystem_contents": [
+        "/var/task/sandbox/index.js",
+        "/var/task/sandbox/node_modules/",
+        "/var/task/sandbox/templates/"
+      ],
+      "no_sensitive_files_in_chroot": true
+    }
+  }
+}

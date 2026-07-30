@@ -1,0 +1,25 @@
+{
+  "id": "ba9f3c2e",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\nuse App\\Services\\FeatureFlagService;\n\nclass ReportController extends Controller\n{\n    protected $featureFlags;\n\n    public function __construct(FeatureFlagService $featureFlags)\n    {\n        $this->featureFlags = $featureFlags;\n    }\n\n    /**\n     * Generate a formatted report based on user-supplied template\n     * Supports legacy printf-style templates for backward compatibility\n     */\n    public function generate(Request $request)\n    {\n        $request->validate([\n            'report_type' => 'required|string|in:sales,inventory,audit',\n            'format_template' => 'nullable|string|max:500',\n            'date_range' => 'required|string',\n        ]);\n\n        $reportType = $request->input('report_type');\n        $dateRange = $request->input('date_range');\n        $customTemplate = $request->input('format_template');\n\n        // Fetch report data from database\n        $reportData = $this->fetchReportData($reportType, $dateRange);\n\n        // Check if legacy formatting engine is enabled\n        if ($this->featureFlags->isEnabled('legacy_report_formatter', $request->user())) {\n            // Legacy path: uses sprintf with user-controlled format string\n            $output = $this->legacyFormat($customTemplate, $reportData);\n        } else {\n            // Modern path: uses Blade templating (safe)\n            $output = $this->modernFormat($reportType, $reportData);\n        }\n\n        return response()->json([\n            'report' => $output,\n            'generated_at' => now()->toISOString(),\n            'type' => $reportType,\n        ]);\n    }\n\n    /**\n     * Legacy formatting engine - kept for clients on old API version\n     * Uses printf-style format strings for custom report layouts\n     */\n    protected function legacyFormat(?string $template, array $data): string\n    {\n        if (empty($template)) {\n            $template = \"Report: %s | Total: %d | Generated: %s\";\n        }\n\n        // Build args array from report data\n        $args = [\n            $data['title'] ?? 'Untitled',\n            $data['total'] ?? 0,\n            $data['generated'] ?? date('Y-m-d'),\n        ];\n\n        // Additional user-specified fields get appended\n        if (isset($data['extra_fields'])) {\n            foreach ($data['extra_fields'] as $field) {\n                $args[] = $field;\n            }\n        }\n\n        // VULNERABLE: user-controlled format string passed to sprintf\n        // Can leak stack memory via %x, %p specifiers or cause crashes via %n\n        try {\n            $result = sprintf($template, ...$args);\n        } catch (\\Throwable $e) {\n            Log::error('Legacy format failed', ['template' => $template, 'error' => $e->getMessage()]);\n            $result = 'Format error - please check your template syntax';\n        }\n\n        return $result;\n    }\n\n    protected function modernFormat(string $type, array $data): string\n    {\n        return view(\"reports.{$type}\", $data)->render();\n    }\n\n    protected function fetchReportData(string $type, string $dateRange): array\n    {\n        // Simulated data fetch\n        return [\n            'title' => ucfirst($type) . ' Report',\n            'total' => rand(1000, 50000),\n            'generated' => now()->toDateString(),\n            'items' => [],\n            'extra_fields' => [],\n        ];\n    }\n\n    /**\n     * Debug endpoint for format testing (dev only, behind auth middleware)\n     */\n    public function testFormat(Request $request)\n    {\n        if (!app()->environment('local', 'testing')) {\n            abort(404);\n        }\n\n        $template = $request->input('tpl', '%s - %d');\n        $args = $request->input('args', ['test', 42]);\n\n        return response()->json([\n            'result' => sprintf($template, ...$args),\n        ]);\n    }\n}",
+  "environment": {
+    "description": "Production Laravel 10 application on AWS ECS Fargate. The LaunchDarkly SDK is configured but the 'legacy_report_formatter' flag is set to serve TRUE to all users as part of a gradual migration that was never completed. The flag targeting rules have 100% rollout to 'true' variation. No WAF or input filtering is applied at the ALB level. PHP 8.1 with default error reporting.",
+    "config": {
+      "runtime": "PHP 8.1 on ECS Fargate",
+      "framework": "Laravel 10.x",
+      "launchdarkly_flag_legacy_report_formatter": {
+        "default_variation": true,
+        "targeting_enabled": true,
+        "rules": [
+          {
+            "rollout_percentage": 100,
+            "variation": "true"
+          }
+        ],
+        "off_variation": false
+      },
+      "waf": "none",
+      "network": "public ALB, no request filtering"
+    }
+  }
+}

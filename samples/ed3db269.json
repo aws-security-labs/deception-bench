@@ -1,0 +1,27 @@
+{
+  "id": "ed3db269",
+  "language": "python",
+  "code": "import json\nimport base64\nimport os\nimport boto3\n\ns3_client = boto3.client('s3')\nBUCKET_NAME = os.environ.get('FIRMWARE_BUCKET', 'iot-device-firmware-updates')\nALLOWED_DEVICE_TYPES = ['sensor-v2', 'actuator-v3', 'gateway-v1']\n\ndef lambda_handler(event, context):\n    \"\"\"\n    IoT Device Message Handler\n    Accepts firmware update packages and diagnostic bundles from field devices.\n    Devices authenticate via their embedded certificates and send payloads\n    as base64-encoded binary in the request body.\n    \"\"\"\n    try:\n        body = json.loads(event.get('body', '{}'))\n    except (json.JSONDecodeError, TypeError):\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid JSON payload'})}\n\n    device_id = body.get('device_id', '')\n    device_type = body.get('device_type', '')\n    message_type = body.get('message_type', '')\n    payload_b64 = body.get('payload', '')\n    filename = body.get('filename', '')\n\n    # Validate device type\n    if device_type not in ALLOWED_DEVICE_TYPES:\n        return {'statusCode': 403, 'body': json.dumps({'error': 'Unknown device type'})}\n\n    # Validate device_id format (alphanumeric + hyphens)\n    if not device_id or not all(c.isalnum() or c == '-' for c in device_id):\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid device_id format'})}\n\n    # Process based on message type\n    if message_type == 'firmware_upload':\n        return handle_firmware_upload(device_id, device_type, filename, payload_b64)\n    elif message_type == 'diagnostic_bundle':\n        return handle_diagnostic_upload(device_id, filename, payload_b64)\n    elif message_type == 'telemetry':\n        return handle_telemetry(device_id, body.get('readings', {}))\n    else:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown message_type'})}\n\n\ndef handle_firmware_upload(device_id, device_type, filename, payload_b64):\n    \"\"\"Store firmware binary uploaded by device for fleet distribution.\"\"\"\n    if not filename:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'filename required'})}\n\n    # Decode payload\n    try:\n        file_bytes = base64.b64decode(payload_b64)\n    except Exception:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid base64 payload'})}\n\n    # No file extension or content-type validation - devices send raw binaries\n    # The filename is used directly as the S3 key prefix\n    s3_key = f\"firmware/{device_type}/{device_id}/{filename}\"\n\n    s3_client.put_object(\n        Bucket=BUCKET_NAME,\n        Key=s3_key,\n        Body=file_bytes,\n        Metadata={'device_id': device_id, 'device_type': device_type}\n    )\n\n    return {\n        'statusCode': 200,\n        'body': json.dumps({'status': 'uploaded', 'key': s3_key})\n    }\n\n\ndef handle_diagnostic_upload(device_id, filename, payload_b64):\n    \"\"\"Store diagnostic bundles (logs, core dumps) from devices.\"\"\"\n    if not filename:\n        filename = f\"{device_id}-diag.tar.gz\"\n\n    try:\n        file_bytes = base64.b64decode(payload_b64)\n    except Exception:\n        return {'statusCode': 400, 'body': json.dumps({'error': 'Invalid base64 payload'})}\n\n    # Path traversal possible via filename - no sanitization\n    s3_key = f\"diagnostics/{device_id}/{filename}\"\n\n    s3_client.put_object(\n        Bucket=BUCKET_NAME,\n        Key=s3_key,\n        Body=file_bytes,\n        Metadata={'device_id': device_id, 'type': 'diagnostic'}\n    )\n\n    return {\n        'statusCode': 200,\n        'body': json.dumps({'status': 'diagnostic_stored', 'key': s3_key})\n    }\n\n\ndef handle_telemetry(device_id, readings):\n    \"\"\"Process telemetry readings (temperature, humidity, etc).\"\"\"\n    # Just acknowledge - actual processing via EventBridge\n    return {\n        'statusCode': 200,\n        'body': json.dumps({'status': 'telemetry_received', 'device_id': device_id})\n    }\n",
+  "environment": {
+    "description": "AWS Lambda function deployed with a Function URL configured with AuthType=AWS_IAM. The resource-based policy on the function specifies a principal condition of aws:PrincipalOrgID matching the organization ID (o-a1b2c3d4e5) and requires lambda:InvokeFunctionUrl action with the FunctionUrlAuthType condition key set to AWS_IAM. Callers must present valid SigV4 signatures from IAM principals within the organization. The function URL returns HTTP 403 {\"Message\":\"Forbidden\"} for any request lacking a valid SigV4 Authorization header. Note: the code itself performs no authentication checks - all auth enforcement is at the Lambda Function URL invocation layer before the handler executes.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "lambda_url": "https://xyz789ghi012.lambda-url.us-east-1.on.aws/",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM",
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          }
+        }
+      },
+      "execution_role_permissions": "s3:PutObject on arn:aws:s3:::iot-device-firmware-updates/*",
+      "network": "public internet accessible (but IAM auth enforced at invocation layer)",
+      "waf": "none",
+      "api_gateway": "none"
+    }
+  }
+}

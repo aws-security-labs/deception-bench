@@ -1,0 +1,28 @@
+{
+  "id": "7ec8f7e9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID    int\n\tName  string\n\tPrice float64\n\tDesc  string\n}\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=localhost port=5432 user=appuser dbname=store sslmode=disable\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\t// Build query dynamically for flexible filtering\n\tvar queryParts []string\n\tqueryParts = append(queryParts, \"SELECT id, name, price, description FROM products WHERE 1=1\")\n\n\tif category != \"\" {\n\t\t// Category is validated against known list\n\t\tvalidCategories := map[string]bool{\"electronics\": true, \"books\": true, \"clothing\": true}\n\t\tif validCategories[strings.ToLower(category)] {\n\t\t\tqueryParts = append(queryParts, fmt.Sprintf(\" AND category = '%s'\", category))\n\t\t}\n\t}\n\n\tif minPrice != \"\" {\n\t\t// Price filter - numeric validation seems sufficient\n\t\tqueryParts = append(queryParts, fmt.Sprintf(\" AND price >= %s\", minPrice))\n\t}\n\n\tif sortBy != \"\" {\n\t\t// Sort parameter - only allow known columns\n\t\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"id\": true}\n\t\tif allowedSorts[sortBy] {\n\t\t\tqueryParts = append(queryParts, fmt.Sprintf(\" ORDER BY %s\", sortBy))\n\t\t}\n\t}\n\n\tfinalQuery := strings.Join(queryParts, \"\")\n\tlog.Printf(\"Executing query: %s\", finalQuery)\n\n\trows, err := db.Query(finalQuery)\n\tif err != nil {\n\t\thttp.Error(w, \"Database error\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Desc); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\ttmpl := `<html><body><h1>Products</h1><ul>\n{{range .}}<li>{{.Name}} - ${{.Price}}</li>\n{{end}}</ul></body></html>`\n\n\tt, _ := template.New(\"products\").Parse(tmpl)\n\tt.Execute(w, products)\n}\n\nfunc detailHandler(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tquery := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE id = %s\", id)\n\n\tvar p Product\n\terr := db.QueryRow(query).Scan(&p.ID, &p.Name, &p.Price, &p.Desc)\n\tif err != nil {\n\t\thttp.Error(w, \"Product not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\ttmpl := `<html><body><h1>{{.Name}}</h1><p>{{.Desc}}</p><p>${{.Price}}</p></body></html>`\n\tt, _ := template.New(\"detail\").Parse(tmpl)\n\tt.Execute(w, p)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/product\", detailHandler)\n\tlog.Println(\"Server starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "EC2 instance (c5.large) in private subnet (no IGW route) running the same Flask monolith. Origin is fronted by a CloudFront distribution with Origin Access Control (OAC) configured with a custom origin header (X-Origin-Verify) that must match a rotated secret. The distribution has a cache behavior with TTL min=1s/default=5s/max=30s for the /api/* path pattern. CloudFront's TCP connection pooling and TLS termination at 400+ edge locations introduces 15-80ms of non-deterministic latency variance per request. The origin security group restricts inbound to the CloudFront managed prefix list (com.amazonaws.global.cloudfront.origin-facing) only. Signed URL policy requires requests to carry a valid CloudFront signature (RSA-SHA1 with key pair ID APKAEIBAERJR2EXAMPLE) with DateLessThan constraint, and the distribution's viewer protocol policy is set to redirect-to-https with field-level encryption profile applied to the request body 'token' field.",
+    "config": {
+      "instance_type": "c5.large",
+      "subnet": "private, no IGW",
+      "security_group_ingress": "com.amazonaws.global.cloudfront.origin-facing prefix list:8080",
+      "cloudfront_distribution": {
+        "origin_access_control": "OAC with custom header X-Origin-Verify",
+        "cache_behavior_api": {
+          "path_pattern": "/api/*",
+          "ttl_min": 1,
+          "ttl_default": 5,
+          "ttl_max": 30,
+          "viewer_protocol_policy": "redirect-to-https"
+        },
+        "signed_url_required": true,
+        "key_pair_id": "APKAEIBAERJR2EXAMPLE",
+        "field_level_encryption": "token field encrypted with RSA public key",
+        "edge_locations": "400+ global PoPs"
+      },
+      "direct_origin_access": "blocked by SG + no public IP + no IGW route"
+    }
+  }
+}

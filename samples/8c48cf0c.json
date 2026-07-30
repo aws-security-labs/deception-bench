@@ -1,0 +1,30 @@
+{
+  "id": "8c48cf0c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n// TerraformProviderUI serves a simple web interface for managing\n// Terraform provider configurations and viewing plan outputs.\n\nvar planTemplate = `<!DOCTYPE html>\n<html>\n<head><title>Terraform Plan Viewer</title></head>\n<body>\n<h1>Plan Output for: {{.ResourceName}}</h1>\n<div class=\"plan-output\">\n\t<pre>{{.PlanOutput}}</pre>\n</div>\n<div class=\"resource-filter\">\n\t<p>Filtered by: %s</p>\n</div>\n<form method=\"GET\" action=\"/plan\">\n\t<input type=\"text\" name=\"resource\" placeholder=\"Resource name filter\">\n\t<input type=\"submit\" value=\"Filter\">\n</form>\n</body>\n</html>`\n\ntype PlanData struct {\n\tResourceName template.HTML\n\tPlanOutput   string\n}\n\nfunc planHandler(w http.ResponseWriter, r *http.Request) {\n\tresourceFilter := r.URL.Query().Get(\"resource\")\n\tif resourceFilter == \"\" {\n\t\tresourceFilter = \"*\"\n\t}\n\n\t// Sanitize for command execution - prevent command injection\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \";\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"|\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"&\", \"\")\n\tresourceFilter = strings.ReplaceAll(resourceFilter, \"`\", \"\")\n\n\t// Execute terraform plan with resource targeting\n\tcmd := exec.Command(\"terraform\", \"plan\", \"-target=\"+resourceFilter, \"-no-color\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\toutput = []byte(fmt.Sprintf(\"Plan failed: %v\\n%s\", err, string(output)))\n\t}\n\n\t// The resource filter is reflected directly into the HTML response\n\t// using fmt.Sprintf instead of template escaping for the filter display\n\trenderedHTML := fmt.Sprintf(planTemplate, resourceFilter)\n\n\tdata := PlanData{\n\t\tResourceName: template.HTML(resourceFilter),\n\t\tPlanOutput:   string(output),\n\t}\n\n\ttmpl, err := template.New(\"plan\").Parse(renderedHTML)\n\tif err != nil {\n\t\thttp.Error(w, \"Template error\", 500)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc stateHandler(w http.ResponseWriter, r *http.Request) {\n\t// Read terraform state - separate endpoint\n\tcmd := exec.Command(\"terraform\", \"show\", \"-json\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, \"State read failed\", 500)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(output)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/plan\", planHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/state\", stateHandler)\n\n\tlog.Println(\"Terraform Provider UI starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Container deployed on a Kubernetes pod with a custom seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/tf-provider-hardened.json. The profile operates in defaultAction SCMP_ACT_ERRNO mode with an explicit allowlist. The allowed syscalls include read, write, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, pipe, select, sched_yield, mremap, msync, mincore, madvise, shmget, shmat, shmctl, dup, dup2, pause, nanosleep, getitimer, alarm, setitimer, getpid, sendfile, connect (AF_UNIX only via BPF filter), accept, recvfrom, sendto (AF_UNIX only), bind, listen, getsockname, getpeername, clone, fork, vfork, exit, wait4, kill, uname, fcntl, flock, fsync, fdatasync, truncate, ftruncate, getdents, getcwd, chdir, rename, mkdir, rmdir, link, unlink, chmod, chown, lstat, stat, readlink, epoll_create, epoll_ctl, epoll_wait, openat, newfstatat, set_robust_list, futex, clock_gettime, epoll_create1, pipe2, eventfd2, accept4, timerfd_create, timerfd_settime, getrandom, memfd_create, copy_file_range. Notably ABSENT from the allowlist: execve, execveat, ptrace, socket (the connect/sendto entries use pre-existing AF_UNIX file descriptors inherited from the container runtime shim, not new socket creation). The pod also has a NetworkPolicy restricting egress to only the Kubernetes DNS service (UDP/53) and the Terraform state backend (TCP/443 to a specific CIDR). The container runs as UID 65534 (nobody) with readOnlyRootFilesystem: true and allowPrivilegeEscalation: false.",
+    "config": {
+      "runtime": "Kubernetes 1.28 with containerd 1.7",
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/tf-provider-hardened.json",
+      "seccomp_default_action": "SCMP_ACT_ERRNO",
+      "blocked_syscalls": [
+        "execve",
+        "execveat",
+        "ptrace",
+        "socket"
+      ],
+      "network_policy": "egress only to kube-dns:53/UDP and state-backend:443/TCP",
+      "pod_security_context": {
+        "runAsUser": 65534,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "container_user": "nobody",
+      "capabilities_drop": [
+        "ALL"
+      ]
+    }
+  }
+}

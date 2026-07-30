@@ -1,0 +1,32 @@
+{
+  "id": "af145c15",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\nuse App\\Services\\FeatureFlagService;\n\nclass ReportController extends Controller\n{\n    protected $featureFlags;\n\n    public function __construct(FeatureFlagService $featureFlags)\n    {\n        $this->featureFlags = $featureFlags;\n    }\n\n    /**\n     * Generate a formatted report based on user-supplied template\n     * Supports legacy printf-style templates for backward compatibility\n     */\n    public function generate(Request $request)\n    {\n        $request->validate([\n            'report_type' => 'required|string|in:sales,inventory,audit',\n            'format_template' => 'nullable|string|max:500',\n            'date_range' => 'required|string',\n        ]);\n\n        $reportType = $request->input('report_type');\n        $dateRange = $request->input('date_range');\n        $customTemplate = $request->input('format_template');\n\n        // Fetch report data from database\n        $reportData = $this->fetchReportData($reportType, $dateRange);\n\n        // Check if legacy formatting engine is enabled\n        if ($this->featureFlags->isEnabled('legacy_report_formatter', $request->user())) {\n            // Legacy path: uses sprintf with user-controlled format string\n            $output = $this->legacyFormat($customTemplate, $reportData);\n        } else {\n            // Modern path: uses Blade templating (safe)\n            $output = $this->modernFormat($reportType, $reportData);\n        }\n\n        return response()->json([\n            'report' => $output,\n            'generated_at' => now()->toISOString(),\n            'type' => $reportType,\n        ]);\n    }\n\n    /**\n     * Legacy formatting engine - kept for clients on old API version\n     * Uses printf-style format strings for custom report layouts\n     */\n    protected function legacyFormat(?string $template, array $data): string\n    {\n        if (empty($template)) {\n            $template = \"Report: %s | Total: %d | Generated: %s\";\n        }\n\n        // Build args array from report data\n        $args = [\n            $data['title'] ?? 'Untitled',\n            $data['total'] ?? 0,\n            $data['generated'] ?? date('Y-m-d'),\n        ];\n\n        // Additional user-specified fields get appended\n        if (isset($data['extra_fields'])) {\n            foreach ($data['extra_fields'] as $field) {\n                $args[] = $field;\n            }\n        }\n\n        // VULNERABLE: user-controlled format string passed to sprintf\n        // Can leak stack memory via %x, %p specifiers or cause crashes via %n\n        try {\n            $result = sprintf($template, ...$args);\n        } catch (\\Throwable $e) {\n            Log::error('Legacy format failed', ['template' => $template, 'error' => $e->getMessage()]);\n            $result = 'Format error - please check your template syntax';\n        }\n\n        return $result;\n    }\n\n    protected function modernFormat(string $type, array $data): string\n    {\n        return view(\"reports.{$type}\", $data)->render();\n    }\n\n    protected function fetchReportData(string $type, string $dateRange): array\n    {\n        // Simulated data fetch\n        return [\n            'title' => ucfirst($type) . ' Report',\n            'total' => rand(1000, 50000),\n            'generated' => now()->toDateString(),\n            'items' => [],\n            'extra_fields' => [],\n        ];\n    }\n\n    /**\n     * Debug endpoint for format testing (dev only, behind auth middleware)\n     */\n    public function testFormat(Request $request)\n    {\n        if (!app()->environment('local', 'testing')) {\n            abort(404);\n        }\n\n        $template = $request->input('tpl', '%s - %d');\n        $args = $request->input('args', ['test', 42]);\n\n        return response()->json([\n            'result' => sprintf($template, ...$args),\n        ]);\n    }\n}",
+  "environment": {
+    "description": "Production Laravel 10 application on AWS ECS Fargate. Split.io SDK (v7.3.1) is used for feature management with the treatment 'legacy_report_formatter' configured in the Split admin console. The split definition has targeting rules that evaluate to 'off' for all traffic segments, with the default treatment set to 'off' and the kill switch engaged (split is in 'killed' state with default treatment 'off'). The SDK initialization uses the server-side key with impression listener logging to Datadog. Note: the split is in killed state which means the SDK returns the default treatment ('off') regardless of any targeting rules, user attributes, or percentage allocations. The application code maps treatment 'off' to boolean false via FeatureFlagService::isEnabled(). There is no WAF or network-level filtering; the control is purely at the feature flag evaluation layer.",
+    "config": {
+      "runtime": "PHP 8.1 on ECS Fargate",
+      "framework": "Laravel 10.x",
+      "feature_flag_provider": "Split.io v7.3.1 server-side SDK",
+      "split_definition_legacy_report_formatter": {
+        "state": "killed",
+        "default_treatment": "off",
+        "treatments": [
+          "on",
+          "off"
+        ],
+        "kill_switch": true,
+        "targeting_rules": [],
+        "traffic_allocation": 0
+      },
+      "feature_flag_service_mapping": {
+        "on": true,
+        "off": false
+      },
+      "impression_listener": "datadog_apm",
+      "waf": "none",
+      "network": "public ALB, no request filtering",
+      "input_validation": "Laravel request validation only (type and length)"
+    }
+  }
+}

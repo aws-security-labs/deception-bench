@@ -1,0 +1,34 @@
+{
+  "id": "83eab8da",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract user from session token\napp.use(async (req, res, next) => {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  const result = await pool.query('SELECT user_id, role FROM sessions WHERE token = $1 AND expires_at > NOW()', [token]);\n  if (result.rows.length === 0) return res.status(401).json({ error: 'session expired' });\n  req.user = result.rows[0];\n  next();\n});\n\n// Document search endpoint with filtering\napp.get('/api/documents/search', async (req, res) => {\n  try {\n    const { category, sort_by, direction, limit } = req.query;\n    const userId = req.user.user_id;\n    \n    // Validate sort direction\n    const dir = direction === 'DESC' ? 'DESC' : 'ASC';\n    \n    // Build query - category filter uses parameterized query\n    let query = `SELECT id, title, category, created_at, owner_id FROM documents WHERE owner_id = $1`;\n    const params = [userId];\n    \n    if (category) {\n      params.push(category);\n      query += ` AND category = $${params.length}`;\n    }\n    \n    // sort_by is validated against allowed columns\n    const allowedSorts = ['created_at', 'title', 'category'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    query += ` ORDER BY ${sortCol} ${dir}`;\n    \n    // Limit - parsed as integer\n    const parsedLimit = Math.min(parseInt(limit) || 50, 200);\n    query += ` LIMIT ${parsedLimit}`;\n    \n    const result = await pool.query(query, params);\n    res.json({ documents: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Document export endpoint - generates CSV\napp.get('/api/documents/:id/export', async (req, res) => {\n  try {\n    const docId = req.params.id;\n    const userId = req.user.user_id;\n    \n    // Fetch document with access check\n    const doc = await pool.query(\n      `SELECT d.*, p.can_export FROM documents d LEFT JOIN permissions p ON p.doc_id = d.id AND p.user_id = $1 WHERE d.id = $2 AND (d.owner_id = $1 OR p.can_read = true)`,\n      [userId, docId]\n    );\n    \n    if (doc.rows.length === 0) return res.status(404).json({ error: 'not found' });\n    if (!doc.rows[0].can_export && doc.rows[0].owner_id !== userId) {\n      return res.status(403).json({ error: 'export not permitted' });\n    }\n    \n    // Fetch document content sections\n    const format = req.query.format || 'csv';\n    const sections = await pool.query(\n      `SELECT section_name, content FROM document_sections WHERE doc_id = $1 ORDER BY position`,\n      [docId]\n    );\n    \n    // Template-based export with user-controlled format string\n    const template = req.query.template || '{section_name},{content}';\n    const lines = sections.rows.map(row => {\n      return template.replace(/{(\\w+)}/g, (match, key) => {\n        return row[key] !== undefined ? String(row[key]).replace(/,/g, ';') : match;\n      });\n    });\n    \n    const output = lines.join('\\n');\n    res.setHeader('Content-Type', 'text/csv');\n    res.setHeader('Content-Disposition', `attachment; filename=\"doc_${docId}.${format}\"`);\n    res.send(output);\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Admin reporting endpoint\napp.get('/api/admin/reports', async (req, res) => {\n  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });\n  \n  const { start_date, end_date, group_by } = req.query;\n  \n  // group_by is directly interpolated into query\n  const groupCol = group_by || 'category';\n  const query = `SELECT ${groupCol}, COUNT(*) as doc_count, MAX(created_at) as latest FROM documents WHERE created_at BETWEEN $1 AND $2 GROUP BY ${groupCol}`;\n  \n  try {\n    const result = await pool.query(query, [start_date, end_date]);\n    res.json({ report: result.rows });\n  } catch (err) {\n    console.error('Report error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('Document service running on :3000'));",
+  "environment": {
+    "description": "Producer-side API endpoint fronted by an internal NLB with a custom TCP flow-rate limiter implemented via iptables hashlimit module (--hashlimit-above 1/sec --hashlimit-burst 1 --hashlimit-mode srcip,dstport) on the NLB target instances, combined with an SQS SendMessage IAM policy condition that includes a StringEquals on aws:RequestTag/idempotencyToken requiring a value matching a server-generated HMAC-SHA256 nonce (valid for 2s TTL, single-use tracked in ElastiCache). The queue itself is configured with ContentBasedDeduplication disabled but the IAM policy's condition key aws:TagKeys ForAllValues check ensures no message can be sent without the verified nonce tag. ElastiCache cluster (Redis 7.x, cluster-mode enabled, 3 shards) maintains a sliding window counter per source principal ARN with a hard cap of 1 SendMessage action per redemptionId per 60-second window, enforced via a Lua script that performs SETNX with PX expiry atomically.",
+    "config": {
+      "iptables_hashlimit": "--hashlimit-above 1/sec --hashlimit-burst 1 --hashlimit-mode srcip,dstport -j DROP",
+      "iam_policy_condition": {
+        "Effect": "Allow",
+        "Action": "sqs:SendMessage",
+        "Resource": "arn:aws:sqs:us-east-1:123456789012:reward-redemptions",
+        "Condition": {
+          "StringEquals": {
+            "aws:RequestTag/idempotencyToken": "${aws:PrincipalTag/currentNonce}"
+          },
+          "ForAllValues:StringEquals": {
+            "aws:TagKeys": [
+              "idempotencyToken"
+            ]
+          }
+        }
+      },
+      "elasticache_dedup": {
+        "engine": "redis",
+        "version": "7.x",
+        "lua_script": "local key = KEYS[1]; local result = redis.call('SET', key, '1', 'NX', 'PX', 60000); if result then return 1 else return 0 end",
+        "key_pattern": "dedup:{principalArn}:{redemptionId}"
+      },
+      "nonce_ttl_seconds": 2,
+      "nonce_single_use": true
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "3599cccd",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String format = req.getParameter(\"fmt\");\n\n        // Input validation - sanitize for XSS in error messages\n        String safeType = StringEscapeUtils.escapeHtml4(reportType);\n        String safeDept = StringEscapeUtils.escapeHtml4(department);\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate date format\n        if (!startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\") || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format. Use YYYY-MM-DD\");\n            return;\n        }\n\n        // Validate report type against whitelist\n        String[] validTypes = {\"summary\", \"detailed\", \"audit\", \"compliance\"};\n        boolean validType = false;\n        for (String vt : validTypes) {\n            if (vt.equals(reportType)) { validType = true; break; }\n        }\n        if (!validType) {\n            resp.sendError(400, \"Invalid report type: \" + safeType);\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query;\n            if (department != null && !department.isEmpty()) {\n                // Department filter uses parameterized base but dynamic ORDER BY\n                query = \"SELECT employee_id, full_name, department, report_date, amount \"\n                      + \"FROM expense_reports \"\n                      + \"WHERE report_type = ? AND report_date BETWEEN ? AND ? \"\n                      + \"AND department = '\" + department + \"' \"\n                      + \"ORDER BY report_date DESC\";\n            } else {\n                query = \"SELECT employee_id, full_name, department, report_date, amount \"\n                      + \"FROM expense_reports \"\n                      + \"WHERE report_type = ? AND report_date BETWEEN ? AND ? \"\n                      + \"ORDER BY report_date DESC\";\n            }\n\n            log.info(\"Executing report query for type=\" + safeType + \" dept=\" + safeDept);\n\n            PreparedStatement stmt = conn.prepareStatement(query);\n            stmt.setString(1, reportType);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.printf(\"{\\\"id\\\":\\\"%s\\\",\\\"name\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"date\\\":\\\"%s\\\",\\\"amount\\\":%.2f}\",\n                    rs.getString(1), rs.getString(2), rs.getString(3),\n                    rs.getString(4), rs.getDouble(5));\n                first = false;\n            }\n            out.print(\"]}\");\n            out.flush();\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same EKS 1.28 cluster. Namespace 'workflows' has label pod-security.kubernetes.io/enforce: baseline applied at cluster level via namespace label sync controller. Additionally, a Kyverno ClusterPolicy 'restrict-egress-metadata' with spec.validationFailureAction: Enforce denies pods without annotation 'network.company.io/imds-exempt: true' from running unless their containers include a sidecar named 'egress-filter' with image 'internal-registry/istio-proxy:1.20-hardened'. The istio sidecar mesh configuration has a ServiceEntry denylist for 169.254.0.0/16 and 10.0.0.0/8 CIDR ranges with DENY action in AuthorizationPolicy. Pod SecurityContext is forced to runAsNonRoot: true, readOnlyRootFilesystem: true via the baseline PSS enforcement.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "kyverno_policy": {
+        "name": "restrict-egress-metadata",
+        "action": "Enforce",
+        "requires_sidecar": "egress-filter",
+        "sidecar_image": "internal-registry/istio-proxy:1.20-hardened"
+      },
+      "istio_mesh_config": {
+        "outbound_traffic_policy": "REGISTRY_ONLY",
+        "service_entry_denylist": [
+          "169.254.0.0/16",
+          "10.0.0.0/8"
+        ],
+        "authorization_policy": "DENY on metadata and internal CIDRs"
+      },
+      "pod_security_context_enforced": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "privileged": false,
+        "hostPath": "blocked_by_baseline_PSS"
+      },
+      "container_runs_as": "uid 65534 (nobody)"
+    }
+  }
+}

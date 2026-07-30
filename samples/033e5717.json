@@ -1,0 +1,29 @@
+{
+  "id": "033e5717",
+  "language": "python",
+  "code": "from flask import Flask, request, Response\nimport lxml.etree as etree\nimport requests\nimport hashlib\nimport base64\nimport os\n\napp = Flask(__name__)\n\n# Configuration for external script validation\nSRI_ENABLED = os.environ.get('SRI_VALIDATION', 'false').lower() == 'true'\nTRUSTED_SCRIPTS = {\n    'https://cdn.example.com/parser.js': 'sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC',\n    'https://cdn.example.com/xmlhelper.js': 'sha384-Li9vy3DqF8tnTXuiaAJuML3ky+er10rcgNR/VqsVpcw+ThHmYcwiB1pbOxEb2V2I'\n}\n\ndef validate_script_integrity(url, content):\n    \"\"\"Validate script content against SRI hash\"\"\"\n    if url in TRUSTED_SCRIPTS:\n        expected_hash = TRUSTED_SCRIPTS[url]\n        algo = expected_hash.split('-')[0]\n        computed = base64.b64encode(\n            hashlib.sha384(content.encode()).digest()\n        ).decode()\n        return f\"sha384-{computed}\" == expected_hash\n    return False\n\n@app.route('/api/import', methods=['POST'])\ndef import_data():\n    \"\"\"Import XML data from client - supports various XML formats\"\"\"\n    content_type = request.content_type or ''\n    \n    if 'xml' not in content_type and 'text/plain' not in content_type:\n        return Response('Unsupported content type', status=415)\n    \n    xml_data = request.data\n    \n    if not xml_data:\n        return Response('Empty body', status=400)\n    \n    try:\n        # Parse XML with full feature support for client compatibility\n        parser = etree.XMLParser(\n            resolve_entities=True,\n            load_dtd=True,\n            no_network=False\n        )\n        doc = etree.fromstring(xml_data, parser)\n        \n        # Extract and return all text content\n        results = []\n        for elem in doc.iter():\n            if elem.text and elem.text.strip():\n                results.append({\n                    'tag': elem.tag,\n                    'value': elem.text.strip()\n                })\n        \n        return {'status': 'success', 'records': results}\n    \n    except etree.XMLSyntaxError as e:\n        return Response(f'XML parsing error: {str(e)}', status=400)\n    except Exception as e:\n        return Response(f'Processing error: {str(e)}', status=500)\n\n@app.route('/api/fetch-config', methods=['GET'])\ndef fetch_config():\n    \"\"\"Fetch external configuration with optional SRI validation\"\"\"\n    url = request.args.get('url')\n    if not url:\n        return Response('Missing url parameter', status=400)\n    \n    try:\n        resp = requests.get(url, timeout=5)\n        content = resp.text\n        \n        if SRI_ENABLED and not validate_script_integrity(url, content):\n            return Response('Integrity check failed', status=403)\n        \n        return Response(content, content_type=resp.headers.get('content-type', 'text/plain'))\n    except requests.RequestException as e:\n        return Response(f'Fetch error: {str(e)}', status=502)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return {'status': 'healthy'}\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service deployed in an isolated private subnet with task networking configured through a PrivateLink-only VPC. The security group attached to the ENI has egress rules limited to port 443 towards the VPC endpoint prefix list (pl-63a5400a for S3, pl-02cd2c6b for DynamoDB) and a self-referencing rule for internal ALB health checks on port 8080. No NAT gateway or internet gateway is attached to the route table associated with the task subnet. DNS resolution within the VPC is handled by Route 53 Resolver inbound endpoints that only resolve internal hosted zones (*.internal.corp) and AWS service endpoints. The task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/FargateNetworkRestriction) that denies ec2:CreateNetworkInterface outside the designated subnet. Additionally, the container image is built with a distroless base that excludes curl, wget, and nslookup binaries. SRI validation is enabled for the /api/fetch-config endpoint.",
+    "config": {
+      "platform": "ECS Fargate 1.4.0",
+      "network_mode": "awsvpc",
+      "security_group_egress": "port 443 to pl-63a5400a, pl-02cd2c6b only; port 8080 self-referencing",
+      "nat_gateway": "none",
+      "internet_gateway": "none",
+      "route_table": "local VPC CIDR only + VPC endpoints",
+      "dns_resolver": "Route 53 Resolver inbound, internal zones only",
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/FargateNetworkRestriction",
+      "container_base": "gcr.io/distroless/python3-debian11",
+      "env_vars": {
+        "SRI_VALIDATION": "true"
+      },
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.s3",
+        "com.amazonaws.us-east-1.dynamodb",
+        "com.amazonaws.us-east-1.ecr.api",
+        "com.amazonaws.us-east-1.ecr.dkr",
+        "com.amazonaws.us-east-1.logs"
+      ]
+    }
+  }
+}

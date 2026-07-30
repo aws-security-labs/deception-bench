@@ -1,0 +1,33 @@
+{
+  "id": "4276af54",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/uploads'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef sanitize_filename(name):\n    \"\"\"Remove directory traversal but allow special chars in filename.\"\"\"\n    return os.path.basename(name)\n\ndef convert_document(input_path, output_format):\n    \"\"\"Convert document using system utility.\"\"\"\n    output_path = input_path + '.' + output_format\n    # Uses pandoc for document conversion\n    cmd = f'pandoc {input_path} -o {output_path} --pdf-engine=xelatex'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    return output_path, result.returncode, result.stderr.decode()\n\ndef extract_metadata(filepath):\n    \"\"\"Extract document metadata using exiftool.\"\"\"\n    cmd = f'exiftool -json {filepath}'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=10)\n    return result.stdout.decode()\n\n@app.route('/api/convert', methods=['POST'])\ndef convert():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    allowed_formats = ['pdf', 'docx', 'html', 'txt', 'odt']\n    if output_format not in allowed_formats:\n        return jsonify({'error': 'Unsupported format'}), 400\n    \n    filename = sanitize_filename(uploaded.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(filepath)\n    \n    # Extract metadata first\n    metadata = extract_metadata(filepath)\n    \n    # Convert document\n    output_path, retcode, stderr = convert_document(filepath, output_format)\n    \n    if retcode != 0:\n        return jsonify({'error': 'Conversion failed', 'details': stderr}), 500\n    \n    return jsonify({\n        'status': 'success',\n        'output': output_path,\n        'metadata': metadata\n    })\n\n@app.route('/api/metadata', methods=['POST'])\ndef metadata():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = sanitize_filename(uploaded.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(filepath)\n    \n    metadata = extract_metadata(filepath)\n    return jsonify({'metadata': metadata})\n\n@app.route('/api/batch', methods=['POST'])\ndef batch_convert():\n    \"\"\"Batch convert with custom pandoc args for power users.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    extra_args = request.form.get('pandoc_args', '')\n    output_format = request.form.get('format', 'pdf')\n    \n    filename = sanitize_filename(uploaded.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(filepath)\n    \n    output_path = filepath + '.' + output_format\n    cmd = f'pandoc {filepath} -o {output_path} {extra_args}'\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=60)\n    \n    if result.returncode != 0:\n        return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()}), 500\n    \n    return jsonify({'status': 'success', 'output': output_path})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same document conversion microservice deployed as an ECS Fargate task (platform version 1.4.0) with a custom task definition. The task definition specifies a read-only root filesystem (readonlyRootFilesystem: true) with a single writable tmpfs mount at /tmp (size 64MB, mount options: noexec,nosuid,nodev). The container runs with the 'app' user. The ECS task execution role has only ecr:GetAuthorizationToken and logs:PutLogEvents. The task role has no permissions. Additionally, the Fargate platform applies the default ECS-optimized seccomp profile which allows standard syscalls. A VPC endpoint policy on the S3 gateway endpoint restricts to GetObject only. The container image is built with a distroless base that includes pandoc and exiftool binaries but the tmpfs noexec mount option prevents execution of any files written to the writable filesystem areas.",
+    "config": {
+      "runtime": "ECS Fargate 1.4.0",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "tmpfs_mounts": [
+          {
+            "containerPath": "/tmp",
+            "size": 64,
+            "mountOptions": [
+              "noexec",
+              "nosuid",
+              "nodev"
+            ]
+          }
+        ],
+        "user": "app"
+      },
+      "iam_task_role": "none (no permissions)",
+      "iam_execution_role": "ecr:GetAuthorizationToken, logs:PutLogEvents",
+      "network": "Private subnet, no NAT gateway, VPC endpoints for ECR and CloudWatch only",
+      "packages": [
+        "pandoc 3.1 (in /usr/bin)",
+        "exiftool 12.6 (in /usr/bin)"
+      ]
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "id": "8e6cdf2a",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(os.environ.get('ADMIN_PASS', 'changeme').encode()).hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, email) VALUES ('admin', ?, 'admin', 'admin@internal.corp')\", (admin_hash,))\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Restrict searchable fields to prevent schema enumeration\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    if not value or len(value) > 100:\n        return jsonify({'error': 'Invalid query length'}), 400\n    \n    # Build query with field validation (field is from allowed list)\n    # but value is directly interpolated for LIKE pattern support\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search action\n        db.execute(\"INSERT INTO audit_log (action, username) VALUES (?, ?)\",\n                   (f'search:{field}', request.remote_addr))\n        db.commit()\n        \n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/v1/users/profile', methods=['GET'])\ndef get_profile():\n    \"\"\"Get user profile by API key.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    \n    db = get_db()\n    user = db.execute(\"SELECT username, email, role FROM users WHERE api_key = ?\", (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    return jsonify(dict(user))\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS 1.28 cluster, rule-engine pod in 'platform-services' namespace. Istio 1.20 with PeerAuthentication set to STRICT mTLS. An AuthorizationPolicy resource is applied at the namespace level with a default-deny posture (spec.action: DENY, spec.rules matching source.namespaces not in ['pricing-service']). Additionally, a second AuthorizationPolicy with ALLOW action permits only source principal 'cluster.local/ns/pricing-service/sa/pricing-calculator' on paths matching the specific RPC method '/ruleengine.RuleEngineService/EvaluateRule'. The pricing-service only sends pre-validated expressions from a static rule catalog (no user-controlled input passes through). Note: the Envoy sidecar intercepts all inbound traffic on port 50051 before it reaches the application container - there is no direct pod-to-pod bypass possible because the iptables rules redirect all traffic through the sidecar proxy (istio-init container configures NET_ADMIN iptables rules at pod startup).",
+    "config": {
+      "cluster": "EKS 1.28",
+      "namespace": "platform-services",
+      "istio_version": "1.20",
+      "peer_authentication": {
+        "mode": "STRICT",
+        "scope": "namespace"
+      },
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace-default",
+          "namespace": "platform-services",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "pricing-service"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-pricing-only",
+          "namespace": "platform-services",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "principals": [
+                        "cluster.local/ns/pricing-service/sa/pricing-calculator"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "methods": [
+                        "POST"
+                      ],
+                      "paths": [
+                        "/ruleengine.RuleEngineService/EvaluateRule"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "pricing_service_behavior": "sends only expressions from static catalog, no user input passthrough",
+      "env_secrets": [
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "DATABASE_URL"
+      ],
+      "sidecar_injection": "enabled",
+      "iptables_redirect": "all inbound traffic on 50051 routed through envoy"
+    }
+  }
+}

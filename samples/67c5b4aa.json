@@ -1,0 +1,21 @@
+{
+  "id": "67c5b4aa",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst axios = require('axios');\nconst AWS = require('aws-sdk');\n\nconst app = express();\napp.use(express.json());\n\n// Internal service discovery endpoint\n// Fetches health status from microservices by URL\napp.post('/api/v1/service-check', async (req, res) => {\n  const { serviceUrl, timeout } = req.body;\n  \n  if (!serviceUrl) {\n    return res.status(400).json({ error: 'serviceUrl is required' });\n  }\n\n  // Basic validation - ensure it looks like a URL\n  try {\n    new URL(serviceUrl);\n  } catch (e) {\n    return res.status(400).json({ error: 'Invalid URL format' });\n  }\n\n  // Block obvious localhost references\n  const parsed = new URL(serviceUrl);\n  if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {\n    return res.status(403).json({ error: 'Localhost access denied' });\n  }\n\n  try {\n    const response = await axios.get(serviceUrl, {\n      timeout: timeout || 5000,\n      maxRedirects: 3,\n      validateStatus: () => true\n    });\n\n    // If response contains AWS credentials, use them to describe the instance\n    let instanceInfo = null;\n    if (response.data && typeof response.data === 'object' && response.data.AccessKeyId) {\n      const sts = new AWS.STS({\n        accessKeyId: response.data.AccessKeyId,\n        secretAccessKey: response.data.SecretAccessKey,\n        sessionToken: response.data.Token\n      });\n      try {\n        instanceInfo = await sts.getCallerIdentity().promise();\n      } catch (stsErr) {\n        instanceInfo = { error: 'Could not verify identity' };\n      }\n    }\n\n    return res.json({\n      status: response.status,\n      headers: response.headers,\n      body: typeof response.data === 'string' ? response.data.substring(0, 2048) : response.data,\n      instanceInfo\n    });\n  } catch (error) {\n    return res.status(502).json({\n      error: 'Service unreachable',\n      details: error.message\n    });\n  }\n});\n\n// Webhook registration - fetches URL to validate it's alive\napp.post('/api/v1/webhooks/register', async (req, res) => {\n  const { callbackUrl, events } = req.body;\n\n  if (!callbackUrl || !events || !Array.isArray(events)) {\n    return res.status(400).json({ error: 'callbackUrl and events[] required' });\n  }\n\n  // Validate the callback URL is reachable\n  try {\n    const validation = await axios.post(callbackUrl, {\n      challenge: Math.random().toString(36).substring(7)\n    }, { timeout: 3000 });\n\n    if (validation.status >= 200 && validation.status < 300) {\n      return res.json({ registered: true, id: Math.random().toString(36).substring(7) });\n    }\n    return res.status(400).json({ error: 'Callback URL did not respond successfully' });\n  } catch (err) {\n    return res.status(400).json({ error: 'Callback URL unreachable', details: err.message });\n  }\n});\n\napp.listen(3000, () => {\n  console.log('Service mesh gateway running on :3000');\n});",
+  "environment": {
+    "description": "ECS Fargate task running in a VPC with IMDSv1 enabled on the underlying host. The task IAM role (arn:aws:iam::111122223333:role/ServiceMeshGateway) has s3:*, sts:AssumeRole, and ec2:Describe* permissions. No network ACLs restrict outbound traffic from the container. The service is exposed via an ALB with no WAF attached. The container runs with default networking allowing access to the link-local metadata endpoint at 169.254.169.254.",
+    "config": {
+      "imds_version": "v1",
+      "task_role": "arn:aws:iam::111122223333:role/ServiceMeshGateway",
+      "task_role_permissions": [
+        "s3:*",
+        "sts:AssumeRole",
+        "ec2:Describe*"
+      ],
+      "network_mode": "awsvpc",
+      "metadata_endpoint_accessible": true,
+      "waf_enabled": false,
+      "permission_boundary": "none"
+    }
+  }
+}

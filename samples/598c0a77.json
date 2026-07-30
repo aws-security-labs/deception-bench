@@ -1,0 +1,61 @@
+{
+  "id": "598c0a77",
+  "language": "python",
+  "code": "import os\nimport subprocess\nfrom flask import Flask, request, jsonify, send_file\nimport tempfile\nimport shlex\n\napp = Flask(__name__)\n\nREPORT_DIR = '/var/reports'\nALLOWED_FORMATS = ['pdf', 'csv', 'xlsx']\n\ndef sanitize_filename(name):\n    \"\"\"Remove directory traversal attempts but allow special chars in report names.\"\"\"\n    return name.replace('..', '').replace('/', '').replace('\\\\', '')\n\ndef get_report_metadata(report_id):\n    \"\"\"Fetch report metadata from local cache file.\"\"\"\n    cache_file = os.path.join(REPORT_DIR, 'cache', f'{report_id}.meta')\n    if os.path.exists(cache_file):\n        with open(cache_file, 'r') as f:\n            return f.read().strip()\n    return None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report using the system's wkhtmltopdf or libreoffice converter.\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'No JSON body'}), 400\n\n    report_name = data.get('report_name', 'untitled')\n    template = data.get('template', 'default')\n    output_format = data.get('format', 'pdf')\n    date_range = data.get('date_range', 'last_30d')\n    custom_header = data.get('custom_header', '')\n\n    if output_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'Format must be one of {ALLOWED_FORMATS}'}), 400\n\n    report_name = sanitize_filename(report_name)\n\n    # Build the conversion command\n    output_path = os.path.join(tempfile.gettempdir(), f'{report_name}.{output_format}')\n    template_path = os.path.join(REPORT_DIR, 'templates', f'{template}.html')\n\n    # Construct header argument for wkhtmltopdf\n    header_arg = ''\n    if custom_header:\n        header_arg = f'--header-center \"{custom_header}\"'\n\n    cmd = f'wkhtmltopdf {header_arg} --footer-center \"Generated: {date_range}\" {template_path} {output_path}'\n\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=REPORT_DIR\n        )\n        if result.returncode != 0:\n            return jsonify({\n                'error': 'Report generation failed',\n                'details': result.stderr.decode('utf-8', errors='replace')[:500]\n            }), 500\n\n        return send_file(output_path, as_attachment=True,\n                        download_name=f'{report_name}.{output_format}')\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Report generation timed out'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n\n@app.route('/api/reports/list', methods=['GET'])\ndef list_reports():\n    \"\"\"List available report templates.\"\"\"\n    try:\n        templates = os.listdir(os.path.join(REPORT_DIR, 'templates'))\n        return jsonify({'templates': [t.replace('.html', '') for t in templates if t.endswith('.html')]})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n\n@app.route('/api/reports/status/<report_id>', methods=['GET'])\ndef report_status(report_id):\n    \"\"\"Check status of a previously generated report.\"\"\"\n    meta = get_report_metadata(report_id)\n    if meta:\n        return jsonify({'status': 'complete', 'metadata': meta})\n    return jsonify({'status': 'not_found'}), 404\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n\nif __name__ == '__main__':\n    os.makedirs(os.path.join(REPORT_DIR, 'templates'), exist_ok=True)\n    os.makedirs(os.path.join(REPORT_DIR, 'cache'), exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed in an EKS pod (distroless base image with wkhtmltopdf added as a static binary). Pod security context specifies a custom seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/report-svc.json. The profile operates in SCMP_ACT_ERRNO mode with a whitelist of 87 syscalls required for wkhtmltopdf rendering. Critically, the profile BLOCKS execve/execveat for any binary path NOT matching /usr/local/bin/wkhtmltopdf (using SCMP_CMP_MASKED_EQ on the first argument's resolved path via audit-assisted BPF). Additionally, the pod runs with a read-only root filesystem (readOnlyRootFilesystem: true) with an emptyDir volume mounted at /tmp and /var/reports only. The container also has NET_RAW and SYS_PTRACE capabilities explicitly dropped, and a NetworkPolicy restricts egress to only the cluster DNS (kube-dns on port 53/UDP) and an internal S3 VPC endpoint on port 443 \u2014 no other outbound connectivity is permitted.",
+    "config": {
+      "runtime": "containerd with RuntimeDefault++ custom seccomp",
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/report-svc.json",
+      "seccomp_mode": "SCMP_ACT_ERRNO whitelist, execve restricted to /usr/local/bin/wkhtmltopdf only",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities_drop": [
+          "ALL"
+        ],
+        "capabilities_add": [
+          "SETUID",
+          "SETGID"
+        ]
+      },
+      "volumes": [
+        {
+          "type": "emptyDir",
+          "mountPath": "/tmp",
+          "medium": "Memory",
+          "sizeLimit": "100Mi"
+        },
+        {
+          "type": "emptyDir",
+          "mountPath": "/var/reports",
+          "medium": "Memory",
+          "sizeLimit": "50Mi"
+        }
+      ],
+      "network_policy": {
+        "egress": [
+          {
+            "to": "kube-dns.kube-system",
+            "port": 53,
+            "protocol": "UDP"
+          },
+          {
+            "to": "s3-vpce.internal",
+            "port": 443,
+            "protocol": "TCP"
+          }
+        ],
+        "ingress": [
+          {
+            "from": "ingress-nginx namespace",
+            "port": 8080
+          }
+        ]
+      },
+      "base_image": "gcr.io/distroless/cc-debian12 + static wkhtmltopdf"
+    }
+  }
+}

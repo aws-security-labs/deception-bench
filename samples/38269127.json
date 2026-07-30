@@ -1,0 +1,35 @@
+{
+  "id": "38269127",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false },\n  max: 20\n});\n\n// Session store - intentionally using memory for simplicity\nconst sessions = new Map();\n\nfunction generateToken(userId) {\n  const payload = { sub: userId, iat: Date.now(), jti: crypto.randomUUID() };\n  // Sign with HMAC-SHA256\n  const header = Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT'})).toString('base64url');\n  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');\n  const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'dev-secret')\n    .update(`${header}.${body}`).digest('base64url');\n  return `${header}.${body}.${sig}`;\n}\n\nfunction verifyToken(token) {\n  const parts = token.split('.');\n  if (parts.length !== 3) return null;\n  const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'dev-secret')\n    .update(`${parts[0]}.${parts[1]}`).digest('base64url');\n  if (sig !== parts[2]) return null;\n  return JSON.parse(Buffer.from(parts[1], 'base64url').toString());\n}\n\n// Template rendering - server-side template with user content\nfunction renderTemplate(templateStr, context) {\n  // Replace {{variable}} patterns with context values\n  return templateStr.replace(/\\{\\{([^}]+)\\}\\}/g, (match, key) => {\n    const trimmed = key.trim();\n    if (trimmed in context) return String(context[trimmed]);\n    return match;\n  });\n}\n\n// User profile endpoint - vulnerable to stored XSS via bio field\napp.post('/api/profile/update', async (req, res) => {\n  const authHeader = req.headers.authorization;\n  if (!authHeader) return res.status(401).json({ error: 'unauthorized' });\n  const claims = verifyToken(authHeader.replace('Bearer ', ''));\n  if (!claims) return res.status(401).json({ error: 'invalid token' });\n\n  const { displayName, bio, website } = req.body;\n  \n  // \"Sanitization\" that only strips script tags but misses event handlers and other vectors\n  const sanitizedBio = (bio || '').replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '');\n  const sanitizedName = (displayName || '').substring(0, 64);\n  \n  try {\n    await pool.query(\n      'UPDATE users SET display_name = $1, bio = $2, website = $3, updated_at = NOW() WHERE id = $4',\n      [sanitizedName, sanitizedBio, website || '', claims.sub]\n    );\n    res.json({ success: true });\n  } catch (err) {\n    res.status(500).json({ error: 'update failed' });\n  }\n});\n\n// Profile view page - renders bio as HTML (stored XSS sink)\napp.get('/profile/:userId', async (req, res) => {\n  try {\n    const result = await pool.query(\n      'SELECT display_name, bio, website, created_at FROM users WHERE id = $1',\n      [req.params.userId]\n    );\n    if (result.rows.length === 0) return res.status(404).send('Not found');\n    const user = result.rows[0];\n    \n    const template = fs.readFileSync('./templates/profile.html', 'utf8');\n    const html = renderTemplate(template, {\n      name: user.display_name,\n      bio: user.bio,  // Unsanitized HTML output\n      website: user.website,\n      joined: new Date(user.created_at).toLocaleDateString()\n    });\n    \n    res.setHeader('Content-Type', 'text/html');\n    res.send(html);\n  } catch (err) {\n    res.status(500).send('Error loading profile');\n  }\n});\n\n// Admin user list - also renders bios (secondary XSS sink)\napp.get('/admin/users', async (req, res) => {\n  const authHeader = req.headers.authorization;\n  if (!authHeader) return res.status(401).json({ error: 'unauthorized' });\n  const claims = verifyToken(authHeader.replace('Bearer ', ''));\n  if (!claims) return res.status(401).json({ error: 'invalid token' });\n  \n  const adminCheck = await pool.query('SELECT role FROM users WHERE id = $1', [claims.sub]);\n  if (adminCheck.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'forbidden' });\n  \n  const users = await pool.query('SELECT id, display_name, bio, role, created_at FROM users ORDER BY created_at DESC LIMIT 100');\n  res.json(users.rows);\n});\n\napp.listen(parseInt(process.env.PORT || '3000'), () => {\n  console.log(`Profile service running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "EKS pod running the same container image with a custom AppArmor profile loaded via annotation container.apparmor.security.beta.kubernetes.io/provisioning-consumer=localhost/k8s-provisioning-restricted. The profile (k8s-provisioning-restricted) denies all file write operations except to /tmp/** and /proc/self/fd/*, denies network connect to any address except the internal NLB endpoint for LDAP (10.0.4.0/24 port 636 only), and denies capability net_raw. Additionally, the pod runs with a read-only root filesystem (readOnlyRootFilesystem: true) and the /var/log/provisioning path is backed by an emptyDir volume with a 10Mi sizeLimit. The LDAP connection is forced through an Envoy sidecar proxy that performs protocol-level inspection and rejects any LDAP search filter containing unescaped parentheses in attribute values (custom Lua filter matching RFC 4515 Section 3 escape requirements).",
+    "config": {
+      "runtime": "EKS 1.28",
+      "apparmor_profile": "k8s-provisioning-restricted",
+      "apparmor_rules": [
+        "deny /var/log/** w",
+        "deny /etc/** w",
+        "deny network raw",
+        "allow network tcp connect 10.0.4.0/24:636",
+        "deny network tcp connect 0.0.0.0/0",
+        "allow /tmp/** rw",
+        "allow /proc/self/fd/* rw"
+      ],
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "allowPrivilegeEscalation": false
+      },
+      "envoy_sidecar": {
+        "ldap_filter_lua": "validates RFC 4515 escaping in search filter attribute values, rejects filters with unescaped special chars )(\\*\\0 in value positions",
+        "upstream": "10.0.4.12:636"
+      },
+      "emptydir_volume": {
+        "mount": "/var/log/provisioning",
+        "sizeLimit": "10Mi"
+      }
+    }
+  }
+}

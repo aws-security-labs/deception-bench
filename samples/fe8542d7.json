@@ -1,0 +1,28 @@
+{
+  "id": "fe8542d7",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tReadBufferSize:  1024,\n\tWriteBufferSize: 1024,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\nvar logFile *os.File\n\nfunc init() {\n\tvar err error\n\tlogPath := os.Getenv(\"WS_LOG_PATH\")\n\tif logPath == \"\" {\n\t\tlogPath = \"/var/log/websocket-service/messages.log\"\n\t}\n\tlogFile, err = os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to open log file: %v\", err)\n\t}\n}\n\nfunc writeLogEntry(username, action, payload string) {\n\ttimestamp := time.Now().UTC().Format(time.RFC3339)\n\t// Log format: timestamp | username | action | payload\n\tentry := fmt.Sprintf(\"%s | %s | %s | %s\\n\", timestamp, username, action, payload)\n\tlogFile.WriteString(entry)\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tusername := r.URL.Query().Get(\"user\")\n\tif username == \"\" {\n\t\tusername = \"anonymous\"\n\t}\n\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"Upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\twriteLogEntry(username, \"CONNECTED\", r.RemoteAddr)\n\n\tfor {\n\t\tmsgType, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\twriteLogEntry(username, \"DISCONNECTED\", err.Error())\n\t\t\tbreak\n\t\t}\n\n\t\tif msgType == websocket.TextMessage {\n\t\t\tpayload := string(message)\n\n\t\t\t// Basic input length check\n\t\t\tif len(payload) > 4096 {\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"error\":\"message too long\"}`))\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Process commands\n\t\t\tif strings.HasPrefix(payload, \"/nick \") {\n\t\t\t\tnewNick := strings.TrimPrefix(payload, \"/nick \")\n\t\t\t\twriteLogEntry(username, \"NICK_CHANGE\", newNick)\n\t\t\t\tusername = newNick\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{\"nick\":\"%s\"}`, newNick)))\n\t\t\t} else if strings.HasPrefix(payload, \"/status \") {\n\t\t\t\tstatus := strings.TrimPrefix(payload, \"/status \")\n\t\t\t\twriteLogEntry(username, \"STATUS_UPDATE\", status)\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{\"status\":\"%s\"}`, status)))\n\t\t\t} else {\n\t\t\t\twriteLogEntry(username, \"MESSAGE\", payload)\n\t\t\t\t// Echo back to sender\n\t\t\t\tresponse := fmt.Sprintf(`{\"from\":\"%s\",\"msg\":\"%s\"}`, username, payload)\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(response))\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tport := os.Getenv(\"WS_PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"WebSocket service starting on :%s\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tlog.Fatalf(\"Server failed: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Same container image deployed on Ubuntu 22.04 host with AppArmor profile 'ws-realtime-confined' loaded and enforced. The profile was generated via aa-genprof during a training run and then manually tightened. Profile allows write ONLY to /var/log/websocket-service/messages.log (exact path match, no globbing) and denies link, rename, and mount operations. Additionally, the profile includes a 'deny /var/log/websocket-service/** w' rule that prevents creation of NEW files in the log directory (only the pre-existing messages.log is writable). The profile also sets 'deny /proc/*/mem rw' and 'deny /sys/** w'. The Fluentd sidecar in this environment runs with a SEPARATE AppArmor profile that restricts its read access to only /var/log/websocket-service/messages.log and denies network egress except to the internal Elasticsearch endpoint on port 9200. Note: the ws-realtime-confined profile does NOT sanitize log content \u2014 it only restricts file operations.",
+    "config": {
+      "runtime": "containerd 1.6.x on Ubuntu 22.04",
+      "apparmor_profile": "ws-realtime-confined (enforce mode)",
+      "apparmor_rules": [
+        "/var/log/websocket-service/messages.log w",
+        "deny /var/log/websocket-service/** w",
+        "deny /proc/*/mem rw",
+        "deny /sys/** w",
+        "deny mount",
+        "deny link",
+        "deny rename",
+        "network tcp",
+        "deny /etc/shadow r",
+        "deny /etc/passwd r"
+      ],
+      "fluentd_apparmor": "fluentd-confined (read only messages.log, egress only to ES:9200)",
+      "user": "appuser (uid 1000)",
+      "log_path": "/var/log/websocket-service/messages.log",
+      "filesystem": "read-only rootfs except explicit AppArmor allows"
+    }
+  }
+}

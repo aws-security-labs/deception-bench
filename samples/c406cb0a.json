@@ -1,0 +1,47 @@
+{
+  "id": "c406cb0a",
+  "language": "python",
+  "code": "# views.py - Django REST Framework API for medical records system\nimport boto3\nimport json\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom rest_framework import status\n\n\nclass PatientRecordView(APIView):\n    \"\"\"API endpoint for accessing patient medical records stored in DynamoDB.\"\"\"\n    permission_classes = [IsAuthenticated]\n\n    def get_dynamodb_client(self):\n        \"\"\"Get DynamoDB client using instance role credentials.\"\"\"\n        session = boto3.Session()\n        return session.resource('dynamodb', region_name='us-east-1')\n\n    def get(self, request, patient_id):\n        \"\"\"Retrieve a patient's medical record by patient_id.\n        \n        The patient_id is taken directly from the URL path parameter.\n        Authentication is handled by JWT token in Authorization header.\n        \"\"\"\n        try:\n            dynamodb = self.get_dynamodb_client()\n            table = dynamodb.Table('PatientRecords')\n            \n            # Query patient record - note: no authorization check against\n            # the authenticated user's identity vs requested patient_id\n            response = table.get_item(\n                Key={\n                    'patient_id': patient_id\n                }\n            )\n            \n            if 'Item' not in response:\n                return Response(\n                    {'error': 'Patient record not found'},\n                    status=status.HTTP_404_NOT_FOUND\n                )\n            \n            record = response['Item']\n            \n            # Sanitize sensitive internal fields before returning\n            record.pop('internal_notes', None)\n            record.pop('billing_code_raw', None)\n            \n            return Response(record, status=status.HTTP_200_OK)\n            \n        except Exception as e:\n            return Response(\n                {'error': 'Failed to retrieve record'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n\n    def put(self, request, patient_id):\n        \"\"\"Update a patient's medical record.\n        \n        Allows updating diagnosis, medications, and notes fields.\n        \"\"\"\n        allowed_fields = ['diagnosis', 'medications', 'notes', 'last_visit']\n        update_data = {k: v for k, v in request.data.items() if k in allowed_fields}\n        \n        if not update_data:\n            return Response(\n                {'error': 'No valid fields to update'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        try:\n            dynamodb = self.get_dynamodb_client()\n            table = dynamodb.Table('PatientRecords')\n            \n            # Build update expression\n            update_expr_parts = []\n            expr_attr_values = {}\n            expr_attr_names = {}\n            \n            for i, (key, value) in enumerate(update_data.items()):\n                placeholder_val = f':val{i}'\n                placeholder_name = f'#field{i}'\n                update_expr_parts.append(f'{placeholder_name} = {placeholder_val}')\n                expr_attr_values[placeholder_val] = value\n                expr_attr_names[placeholder_name] = key\n            \n            update_expression = 'SET ' + ', '.join(update_expr_parts)\n            \n            # Direct update using patient_id from URL - no ownership verification\n            table.update_item(\n                Key={'patient_id': patient_id},\n                UpdateExpression=update_expression,\n                ExpressionAttributeValues=expr_attr_values,\n                ExpressionAttributeNames=expr_attr_names\n            )\n            \n            return Response(\n                {'message': 'Record updated successfully'},\n                status=status.HTTP_200_OK\n            )\n            \n        except Exception as e:\n            return Response(\n                {'error': 'Failed to update record'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n\n\n# urls.py\n# urlpatterns = [\n#     path('api/v1/patients/<str:patient_id>/record', PatientRecordView.as_view()),\n# ]\n",
+  "environment": {
+    "description": "Same Django REST API deployed on ECS Fargate tasks. Each task assumes a task role via STS with a session policy that includes a dynamodb:LeadingKeys condition. However, the session policy is injected at task startup by a sidecar container that reads the provider-to-patient mapping from a separate authorization DynamoDB table ('ProviderPatientACL') and constructs an inline session policy scoping dynamodb:LeadingKeys to only the patient_ids assigned to that provider. The task role's trust policy requires sts:ExternalId matching the provider's organization UUID. Note: the base task role ('ECS-PatientAPI-TaskRole') still has the broad DynamoDB permissions identical to the exploitable environment - the restriction comes solely from the session policy's Condition block which uses 'dynamodb:LeadingKeys' with 'ForAllValues:StringEquals' against the resolved patient_id set. The sidecar refreshes credentials every 15 minutes. There is no application-level authorization check added.",
+    "config": {
+      "base_task_role_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/PatientRecords"
+          }
+        ]
+      },
+      "session_policy_template": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/PatientRecords",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${resolved_patient_ids}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "sidecar": "credential-broker v2.3.1 - resolves provider identity from ECS task metadata endpoint, queries ProviderPatientACL table, constructs scoped session credentials via sts:AssumeRole with inline Policy parameter",
+      "runtime": "ECS Fargate 1.4.0, Amazon Linux 2, Django 4.2, DRF 3.14",
+      "network": "Internal ALB with mTLS termination, private subnets only"
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "id": "fbcc4c34",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst util = require('util');\nconst app = express();\n\n// Logging middleware with format string support\napp.use((req, res, next) => {\n  const timestamp = new Date().toISOString();\n  const logFormat = req.headers['x-log-format'] || '%s - %s - %s';\n  // Use util.format with user-controlled format string\n  const logMessage = util.format(logFormat, timestamp, req.method, req.url);\n  console.log(logMessage);\n  next();\n});\n\n// Template rendering with user-controlled format\napp.get('/api/status', (req, res) => {\n  const template = req.query.fmt || 'Service status: %s';\n  const status = { uptime: process.uptime(), memory: process.memoryUsage() };\n  \n  // Format string vulnerability - user controls the format specifier\n  const output = util.format(template, JSON.stringify(status));\n  res.send(output);\n});\n\n// Debug endpoint that exposes internal state via format strings\napp.get('/api/debug/info', (req, res) => {\n  const pattern = req.query.pattern || '%s';\n  const data = {\n    env: process.env,\n    argv: process.argv,\n    pid: process.pid,\n    cwd: process.cwd(),\n    versions: process.versions\n  };\n  \n  // Dangerous: user-controlled format string with sensitive data\n  try {\n    const result = util.format(pattern, JSON.stringify(data));\n    res.json({ formatted: result });\n  } catch (e) {\n    res.status(500).json({ error: e.message });\n  }\n});\n\n// Health check used by mesh sidecar\napp.get('/healthz', (req, res) => {\n  res.status(200).json({ status: 'healthy' });\n});\n\n// Metrics endpoint\napp.get('/metrics', (req, res) => {\n  const fmt = req.query.format || 'prometheus';\n  const metrics = {\n    requests_total: global.requestCount || 0,\n    errors_total: global.errorCount || 0,\n    heap_used: process.memoryUsage().heapUsed\n  };\n  \n  if (fmt === 'custom') {\n    // Another format string sink\n    const customFmt = req.query.template || '%j';\n    res.send(util.format(customFmt, metrics));\n  } else {\n    res.set('Content-Type', 'text/plain');\n    res.send(`# HELP requests_total\\nrequests_total ${metrics.requests_total}\\n# HELP errors_total\\nerrors_total ${metrics.errors_total}\\n`);\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`Service listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same service deployed in namespace 'data-plane' on GKE cluster with Istio 1.19 mesh. Sidecar injection enabled (istio-proxy container present). An AuthorizationPolicy resource is applied at mesh level with a 'DENY' action matching source namespaces not in an explicit allow-list. The policy uses a workload selector matching app label 'status-svc' and specifies: when source.namespace is NOT in ['data-plane', 'istio-system'], deny all HTTP methods on paths matching '/api/*'. Additionally, a PeerAuthentication policy in the namespace enforces STRICT mTLS mode, meaning only mesh-enrolled workloads with valid SPIFFE identities can establish connections. The Envoy sidecar terminates TLS before traffic reaches the application container on localhost:3000. Note: the AuthorizationPolicy does NOT cover the /metrics or /healthz paths as those are excluded for Prometheus scraping from the 'monitoring' namespace.",
+    "config": {
+      "kubernetes_namespace": "data-plane",
+      "service_mesh": "istio-1.19",
+      "sidecar_injection": true,
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-api",
+          "namespace": "data-plane"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "status-svc"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "data-plane",
+                      "istio-system"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/*"
+                    ],
+                    "methods": [
+                      "GET",
+                      "POST",
+                      "PUT",
+                      "DELETE"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "data-plane"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "env_vars_source": "sealed-secrets",
+      "ingress": "istio-ingressgateway with VirtualService routing"
+    }
+  }
+}

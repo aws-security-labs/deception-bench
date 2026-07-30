@@ -1,0 +1,75 @@
+{
+  "id": "c664eb5c",
+  "language": "typescript",
+  "code": "import { Controller, Post, Body, Injectable, Module } from '@nestjs/common';\nimport { NestFactory } from '@nestjs/core';\nimport * as ldap from 'ldapjs';\n\n@Injectable()\nclass LdapService {\n  private client: any;\n\n  constructor() {\n    this.client = ldap.createClient({\n      url: process.env.LDAP_URL || 'ldap://ldap.internal.corp:389',\n      timeout: 5000,\n      connectTimeout: 10000,\n    });\n  }\n\n  async authenticate(username: string, password: string): Promise<any> {\n    const baseDN = process.env.LDAP_BASE_DN || 'dc=corp,dc=internal';\n    \n    // Build search filter to find user entry\n    // Note: username is used to locate the DN before bind\n    const searchFilter = `(&(objectClass=person)(uid=${username}))`;\n    \n    return new Promise((resolve, reject) => {\n      this.client.search(baseDN, {\n        filter: searchFilter,\n        scope: 'sub',\n        attributes: ['dn', 'cn', 'mail', 'memberOf'],\n      }, (err: any, res: any) => {\n        if (err) return reject(err);\n        \n        const entries: any[] = [];\n        res.on('searchEntry', (entry: any) => entries.push(entry));\n        res.on('error', (e: any) => reject(e));\n        res.on('end', () => {\n          if (entries.length === 0) {\n            return reject(new Error('User not found'));\n          }\n          // Attempt bind with found DN\n          const userDN = entries[0].objectName;\n          this.client.bind(userDN, password, (bindErr: any) => {\n            if (bindErr) return reject(new Error('Invalid credentials'));\n            resolve({\n              dn: userDN,\n              cn: entries[0].attributes?.find((a: any) => a.type === 'cn')?.values[0],\n              mail: entries[0].attributes?.find((a: any) => a.type === 'mail')?.values[0],\n              groups: entries[0].attributes?.find((a: any) => a.type === 'memberOf')?.values || [],\n            });\n          });\n        });\n      });\n    });\n  }\n\n  async searchUsers(query: string, department: string): Promise<any[]> {\n    const baseDN = process.env.LDAP_BASE_DN || 'dc=corp,dc=internal';\n    \n    // Search for users matching query within department\n    const filter = `(&(objectClass=inetOrgPerson)(department=${department})(|(cn=*${query}*)(mail=*${query}*)))`;\n    \n    return new Promise((resolve, reject) => {\n      this.client.search(baseDN, {\n        filter: filter,\n        scope: 'sub',\n        attributes: ['cn', 'mail', 'department', 'title'],\n        sizeLimit: 100,\n      }, (err: any, res: any) => {\n        if (err) return reject(err);\n        \n        const results: any[] = [];\n        res.on('searchEntry', (entry: any) => results.push(entry.object));\n        res.on('error', (e: any) => reject(e));\n        res.on('end', () => resolve(results));\n      });\n    });\n  }\n}\n\n@Controller('api/v2/directory')\nclass DirectoryController {\n  constructor(private readonly ldapService: LdapService) {}\n\n  @Post('authenticate')\n  async authenticate(@Body() body: { username: string; password: string }) {\n    if (!body.username || !body.password) {\n      return { error: 'Username and password required' };\n    }\n    try {\n      const user = await this.ldapService.authenticate(body.username, body.password);\n      return { success: true, user };\n    } catch (e: any) {\n      return { success: false, error: e.message };\n    }\n  }\n\n  @Post('search')\n  async search(@Body() body: { query: string; department: string }) {\n    if (!body.query || !body.department) {\n      return { error: 'Query and department required' };\n    }\n    try {\n      const users = await this.ldapService.searchUsers(body.query, body.department);\n      return { results: users };\n    } catch (e: any) {\n      return { error: 'Search failed', detail: e.message };\n    }\n  }\n}\n\n@Module({\n  controllers: [DirectoryController],\n  providers: [LdapService],\n})\nclass AppModule {}\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();",
+  "environment": {
+    "description": "NestJS microservice deployed on EKS cluster behind an internal-scheme AWS Application Load Balancer (scheme: internal). The ALB resides in private subnets (10.0.64.0/19, 10.0.96.0/19) with no Internet Gateway route. Security group sg-0a4f2e8c9b allows inbound TCP/443 only from source prefixes matching the corporate VPN egress range (172.16.0.0/12) and the shared-services VPC CIDR (10.1.0.0/16) via a VPC peering connection (pcx-0f3a7b2d). Additionally, a Kubernetes NetworkPolicy of type Ingress is applied to the namespace restricting pod-to-pod traffic to only the API gateway pods labeled app=api-gw in namespace platform. AWS PrivateLink is NOT used; connectivity relies on the peering + SG combination. The ALB access logs are shipped to S3 with a lifecycle policy but no real-time alerting is configured on them.",
+    "config": {
+      "alb_scheme": "internal",
+      "alb_subnets": [
+        "subnet-priv-a (10.0.64.0/19)",
+        "subnet-priv-b (10.0.96.0/19)"
+      ],
+      "route_table": "no igw route, only local + pcx-0f3a7b2d + nat-gw for egress",
+      "security_group_ingress_rules": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "172.16.0.0/12",
+          "description": "corporate VPN egress"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "10.1.0.0/16",
+          "description": "shared-services VPC via peering"
+        }
+      ],
+      "k8s_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "directory-svc-ingress",
+          "namespace": "directory"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "directory-svc"
+            }
+          },
+          "policyTypes": [
+            "Ingress"
+          ],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "name": "platform"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "api-gw"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "TCP",
+                  "port": 3000
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "waf_association": "none",
+      "privatelink": "not configured",
+      "alb_access_logs": "enabled, s3://corp-alb-logs/directory/, no real-time alerting"
+    }
+  }
+}

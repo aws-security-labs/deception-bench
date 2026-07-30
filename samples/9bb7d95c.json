@@ -1,0 +1,118 @@
+{
+  "id": "9bb7d95c",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport java.util.*;\nimport com.sun.net.httpserver.*;\n\npublic class ReportService {\n    private static final String DB_URL = System.getenv(\"DB_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);\n        server.createContext(\"/api/reports\", ReportService::handleReports);\n        server.createContext(\"/api/export\", ReportService::handleExport);\n        server.setExecutor(null);\n        server.start();\n    }\n\n    static void handleReports(HttpExchange exchange) throws IOException {\n        if (!\"GET\".equals(exchange.getRequestMethod())) {\n            exchange.sendResponseHeaders(405, 0); exchange.close(); return;\n        }\n        String query = exchange.getRequestURI().getQuery();\n        Map<String, String> params = parseQuery(query);\n        String department = params.getOrDefault(\"dept\", \"engineering\");\n        String quarter = params.getOrDefault(\"quarter\", \"Q1\");\n        // Validate quarter format\n        if (!quarter.matches(\"Q[1-4]\")) {\n            sendResponse(exchange, 400, \"Invalid quarter format\");\n            return;\n        }\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            // Department is user-controlled and concatenated directly\n            String sql = \"SELECT report_id, title, created_at, author FROM reports WHERE department = '\" + department + \"' AND quarter = '\" + quarter + \"' ORDER BY created_at DESC\";\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(sql);\n            StringBuilder json = new StringBuilder(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(String.format(\"{\\\"id\\\":%d,\\\"title\\\":\\\"%s\\\",\\\"date\\\":\\\"%s\\\",\\\"author\\\":\\\"%s\\\"}\",\n                    rs.getInt(1), rs.getString(2), rs.getString(3), rs.getString(4)));\n                first = false;\n            }\n            json.append(\"]\");\n            sendResponse(exchange, 200, json.toString());\n        } catch (SQLException e) {\n            sendResponse(exchange, 500, \"{\\\"error\\\":\\\"Database error\\\"}\");\n        }\n    }\n\n    static void handleExport(HttpExchange exchange) throws IOException {\n        if (!\"POST\".equals(exchange.getRequestMethod())) {\n            exchange.sendResponseHeaders(405, 0); exchange.close(); return;\n        }\n        String body = new String(exchange.getRequestBody().readAllBytes());\n        // Parse simple JSON manually (no library dependency)\n        String filename = extractJsonField(body, \"filename\");\n        String content = extractJsonField(body, \"content\");\n        if (filename == null || content == null) {\n            sendResponse(exchange, 400, \"Missing fields\"); return;\n        }\n        // Sanitize filename - remove path separators\n        filename = filename.replaceAll(\"[/\\\\\\\\]\", \"\").replaceAll(\"\\\\.\\\\.\", \"\");\n        File exportDir = new File(\"/tmp/exports\");\n        exportDir.mkdirs();\n        File outFile = new File(exportDir, filename);\n        try (FileWriter fw = new FileWriter(outFile)) {\n            fw.write(content);\n        }\n        sendResponse(exchange, 200, \"{\\\"path\\\":\\\"\" + outFile.getAbsolutePath() + \"\\\"}\");\n    }\n\n    static String extractJsonField(String json, String field) {\n        int idx = json.indexOf(\"\\\"\" + field + \"\\\"\");\n        if (idx == -1) return null;\n        int colon = json.indexOf(\":\", idx);\n        int start = json.indexOf(\"\\\"\", colon) + 1;\n        int end = json.indexOf(\"\\\"\", start);\n        return (start > 0 && end > start) ? json.substring(start, end) : null;\n    }\n\n    static Map<String, String> parseQuery(String query) {\n        Map<String, String> map = new HashMap<>();\n        if (query == null) return map;\n        for (String param : query.split(\"&\")) {\n            String[] kv = param.split(\"=\", 2);\n            if (kv.length == 2) map.put(URLDecoder.decode(kv[0], java.nio.charset.StandardCharsets.UTF_8),\n                                         URLDecoder.decode(kv[1], java.nio.charset.StandardCharsets.UTF_8));\n        }\n        return map;\n    }\n\n    static void sendResponse(HttpExchange exchange, int code, String body) throws IOException {\n        exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n        byte[] bytes = body.getBytes();\n        exchange.sendResponseHeaders(code, bytes.length);\n        exchange.getResponseBody().write(bytes);\n        exchange.close();\n    }\n}",
+  "environment": {
+    "description": "Same application deployed in 'userdata' namespace on the same Istio 1.19 mesh, but with PeerAuthentication set to STRICT mTLS for the namespace. An AuthorizationPolicy named 'deny-cross-ns-internal' is applied with a DENY action matching requests where source.namespace is not 'userdata' AND the path prefix is '/internal/'. A second AuthorizationPolicy 'allow-admin-ns-only' uses ALLOW action requiring source.namespace=='admin-system' for paths matching '/internal/admin/*', with a catch-all DENY for unmatched. The Envoy sidecar intercepts all inbound traffic on port 3000 before it reaches the application container. Additionally, a Sidecar resource restricts egress to only './*' and 'istio-system/*' namespaces.",
+    "config": {
+      "kubernetes_namespace": "userdata",
+      "istio_version": "1.19",
+      "mtls_mode": "STRICT",
+      "peer_authentication": {
+        "name": "strict-mtls-userdata",
+        "namespace": "userdata",
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns-internal",
+          "namespace": "userdata",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "userdata"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "pathPrefix": [
+                        "/internal/"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-admin-ns-only",
+          "namespace": "userdata",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "admin-system"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "pathPrefix": [
+                        "/internal/admin/"
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "userdata"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "pathPrefix": [
+                        "/internal/health"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "sidecar_resource": {
+        "name": "restrict-egress",
+        "namespace": "userdata",
+        "spec": {
+          "egress": [
+            {
+              "hosts": [
+                "./*",
+                "istio-system/*"
+              ]
+            }
+          ]
+        }
+      },
+      "service_port": 3000,
+      "node_version": "18.17.0"
+    }
+  }
+}

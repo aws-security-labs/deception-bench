@@ -1,0 +1,43 @@
+{
+  "id": "1a0d92b3",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Pattern SAFE_ID = Pattern.compile(\"^[0-9a-f\\\\-]{36}$\");\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/json\")) {\n            resp.sendError(400, \"Invalid content type\");\n            return;\n        }\n        \n        StringBuilder sb = new StringBuilder();\n        try (BufferedReader reader = req.getReader()) {\n            String line;\n            while ((line = reader.readLine()) != null) {\n                sb.append(line);\n            }\n        }\n        \n        JSONObject body = new JSONObject(sb.toString());\n        String reportId = body.optString(\"report_id\", \"\");\n        String dateRange = body.optString(\"date_range\", \"\");\n        String sortColumn = body.optString(\"sort_by\", \"created_at\");\n        String direction = body.optString(\"direction\", \"DESC\");\n        int limit = body.optInt(\"limit\", 50);\n        \n        // Validate report_id format\n        if (!reportId.isEmpty() && !SAFE_ID.matcher(reportId).matches()) {\n            resp.sendError(400, \"Invalid report_id format\");\n            return;\n        }\n        \n        // Validate limit\n        if (limit < 1 || limit > 500) {\n            limit = 50;\n        }\n        \n        // Validate direction\n        if (!direction.equals(\"ASC\") && !direction.equals(\"DESC\")) {\n            direction = \"DESC\";\n        }\n        \n        // Build query - sort_by is validated against allowed columns\n        String[] allowedColumns = {\"created_at\", \"updated_at\", \"title\", \"status\", \"priority\"};\n        boolean validColumn = false;\n        for (String col : allowedColumns) {\n            if (col.equals(sortColumn)) {\n                validColumn = true;\n                break;\n            }\n        }\n        if (!validColumn) {\n            sortColumn = \"created_at\";\n        }\n        \n        // date_range is used in WHERE clause for filtering\n        // Expected format: \"2024-01-01,2024-12-31\"\n        String whereClause = \"WHERE r.org_id = ?\";\n        if (!dateRange.isEmpty()) {\n            // Parse and apply date range filter\n            whereClause += \" AND r.created_at BETWEEN '\" + dateRange.split(\",\")[0] \n                        + \"' AND '\" + dateRange.split(\",\")[1] + \"'\";\n        }\n        if (!reportId.isEmpty()) {\n            whereClause += \" AND r.id = ?\";\n        }\n        \n        String sql = \"SELECT r.id, r.title, r.status, r.priority, r.created_at \" +\n                     \"FROM reports r \" + whereClause + \n                     \" ORDER BY r.\" + sortColumn + \" \" + direction +\n                     \" LIMIT \" + limit;\n        \n        try (Connection conn = getConnection();\n             PreparedStatement ps = conn.prepareStatement(sql)) {\n            \n            String orgId = (String) req.getAttribute(\"authenticated_org_id\");\n            ps.setString(1, orgId);\n            if (!reportId.isEmpty()) {\n                ps.setString(2, reportId);\n            }\n            \n            ResultSet rs = ps.executeQuery();\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getString(\"id\"));\n                row.put(\"title\", rs.getString(\"title\"));\n                row.put(\"status\", rs.getString(\"status\"));\n                row.put(\"priority\", rs.getString(\"priority\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"DB_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n}",
+  "environment": {
+    "description": "Same EC2 instance and binary, but fronted by an API Gateway (REST API, regional endpoint) with a request validator attached to the /session resource method. The validator has 'validateRequestBody' set to true with a JSON Schema model that enforces: (1) 'action' field must be an enum of ['create','destroy'] only - 'refresh' is not in the allowed values, (2) 'payload' maxLength is 256 characters, (3) 'force_gc' property is explicitly set as 'not allowed' via additionalProperties:false on the schema. The integration uses VPC Link to a private NLB, and the EC2 security group only allows ingress from the VPC Link ENI security group on port 8080. Additionally, the API Gateway has a usage plan with throttling set to 5 requests/second per API key, making the tight race window required for UAF exploitation statistically infeasible even if schema were somehow bypassed.",
+    "config": {
+      "api_gateway_type": "REST regional",
+      "resource_path": "/session",
+      "request_validator": "validate-body-only",
+      "json_schema_model": {
+        "type": "object",
+        "required": [
+          "sid",
+          "action",
+          "payload"
+        ],
+        "properties": {
+          "sid": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9]{8,64}$"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "destroy"
+            ]
+          },
+          "payload": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      },
+      "vpc_link": "private NLB integration",
+      "security_group_ingress": "sg-apigw-vpclink-eni-only:8080",
+      "throttling": "5 req/s per API key",
+      "direct_access": "blocked by SG"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "fc5f06dc",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tEmail    string `json:\"email\"`\n\tRole     string `json:\"role\"`\n\tSSN      string `json:\"ssn,omitempty\"`\n\tSalary   int    `json:\"salary,omitempty\"`\n}\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"GET\" {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Extract search parameters\n\tname := r.URL.Query().Get(\"name\")\n\trole := r.URL.Query().Get(\"role\")\n\tfields := r.URL.Query().Get(\"fields\")\n\n\tif name == \"\" {\n\t\thttp.Error(w, \"name parameter required\", 400)\n\t\treturn\n\t}\n\n\t// Build field list - default to safe fields\n\tselectFields := \"id, name, email, role\"\n\tif fields != \"\" {\n\t\t// Allow caller to specify which fields to return\n\t\tselectFields = fields\n\t}\n\n\t// Build query with parameterized WHERE but dynamic SELECT\n\tvar query string\n\tvar args []interface{}\n\n\tif role != \"\" {\n\t\tquery = fmt.Sprintf(\"SELECT %s FROM employees WHERE name ILIKE $1 AND role = $2 LIMIT 50\", selectFields)\n\t\targs = []interface{}{\"%\" + name + \"%\", role}\n\t} else {\n\t\tquery = fmt.Sprintf(\"SELECT %s FROM employees WHERE name ILIKE $1 LIMIT 50\", selectFields)\n\t\targs = []interface{}{\"%\" + name + \"%\"}\n\t}\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v (query: %s)\", err, query)\n\t\thttp.Error(w, fmt.Sprintf(\"database error: %v\", err), 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tcols, _ := rows.Columns()\n\tresults := make([]map[string]interface{}, 0)\n\n\tfor rows.Next() {\n\t\tvalues := make([]interface{}, len(cols))\n\t\tpointers := make([]interface{}, len(cols))\n\t\tfor i := range values {\n\t\t\tpointers[i] = &values[i]\n\t\t}\n\t\trows.Scan(pointers...)\n\t\trow := make(map[string]interface{})\n\t\tfor i, col := range cols {\n\t\t\trow[col] = values[i]\n\t\t}\n\t\tresults = append(results, row)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Header().Set(\"X-Request-Query\", query) // debug header\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/search\", searchHandler)\n\tmux.HandleFunc(\"/health\", healthHandler)\n\n\t// Basic logging middleware\n\thandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tlog.Printf(\"%s %s %s\", r.RemoteAddr, r.Method, r.URL.String())\n\t\t// Strip internal headers\n\t\tr.Header.Del(\"X-Internal-Token\")\n\t\tmux.ServeHTTP(w, r)\n\t})\n\n\tlog.Printf(\"listening on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, handler))\n}\n\n// unused but referenced in docs - planned RBAC check\nfunc isFieldAllowed(field string, userRole string) bool {\n\trestricted := map[string][]string{\n\t\t\"ssn\":    {\"admin\", \"hr\"},\n\t\t\"salary\": {\"admin\", \"hr\", \"finance\"},\n\t}\n\tallowed, exists := restricted[strings.ToLower(field)]\n\tif !exists {\n\t\treturn true\n\t}\n\tfor _, r := range allowed {\n\t\tif r == userRole {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}",
+  "environment": {
+    "description": "Go WebSocket service deployed on EC2 instance with IAM instance profile 'ws-service-role'. The role has a broad DynamoDB policy: Effect=Allow, Action=[dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem], Resource=arn:aws:dynamodb:us-east-1:123456789012:table/UserItems. No origin restrictions at load balancer level. Service accessible directly on port 8080 via public ALB with no WAF attached.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:DeleteItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserItems"
+          }
+        ]
+      },
+      "network": "Public ALB -> EC2 port 8080, no WAF, no origin header filtering",
+      "websocket_config": "CheckOrigin returns true for all origins"
+    }
+  }
+}

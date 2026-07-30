@@ -1,0 +1,81 @@
+{
+  "id": "19317ed6",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching documents by various fields\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tfield := r.URL.Query().Get(\"field\")\n\tvalue := r.URL.Query().Get(\"value\")\n\tworkspace := r.URL.Query().Get(\"workspace_id\")\n\n\t// Validate workspace_id is provided\n\tif workspace == \"\" {\n\t\thttp.Error(w, \"workspace_id required\", 400)\n\t\treturn\n\t}\n\n\t// Allowlist for searchable fields - prevents arbitrary column access\n\tallowedFields := map[string]bool{\n\t\t\"title\": true, \"author\": true, \"tag\": true,\n\t\t\"status\": true, \"priority\": true,\n\t}\n\n\tif !allowedFields[field] {\n\t\thttp.Error(w, \"Invalid search field\", 400)\n\t\treturn\n\t}\n\n\t// Build query - field is validated above, value is user-controlled\n\t// NOTE: field is safe (allowlisted), but value is concatenated directly\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, title, author, status FROM documents WHERE workspace_id = '%s' AND %s = '%s' ORDER BY created_at DESC LIMIT 50\",\n\t\tworkspace, field, value,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar title, author, status string\n\t\tif err := rows.Scan(&id, &title, &author, &status); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"{\\\"id\\\":%d,\\\"title\\\":\\\"%s\\\",\\\"author\\\":\\\"%s\\\",\\\"status\\\":\\\"%s\\\"}\", id, title, author, status))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"[%s]\", strings.Join(results, \",\"))\n}\n\n// healthHandler for load balancer health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 Web ACL with the following configuration: (1) A custom rule with priority 1 using a RegexPatternSet match on the 'category' query string parameter \u2014 the pattern set contains ^[a-zA-Z0-9 _-]{0,80}$ with BLOCK action on non-match (using NOT match scope with regex match). (2) A second rule at priority 2 with a SqliMatchStatement inspecting ALL_QUERY_ARGS with sensitivity level HIGH and text transformation URL_DECODE applied, action BLOCK. (3) The ECS task role has an IAM permission boundary (arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress) that denies ec2:*, s3:GetObject, and all network-related actions preventing data exfiltration even if blind SQLi were somehow achieved. The Web ACL default action is ALLOW.",
+    "config": {
+      "compute": "ECS Fargate",
+      "load_balancer": "ALBv2",
+      "wafv2_web_acl": {
+        "rule_1": {
+          "priority": 1,
+          "name": "CategoryInputValidation",
+          "statement": {
+            "not_statement": {
+              "statement": {
+                "regex_pattern_set_reference_statement": {
+                  "arn": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/category-allowlist/uuid",
+                  "field_to_match": {
+                    "single_query_argument": {
+                      "name": "category"
+                    }
+                  },
+                  "text_transformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "action": "BLOCK",
+          "regex_patterns": [
+            "^[a-z0-9 _-]{0,80}$"
+          ]
+        },
+        "rule_2": {
+          "priority": 2,
+          "name": "SQLiDetectionHighSensitivity",
+          "statement": {
+            "sqli_match_statement": {
+              "field_to_match": {
+                "all_query_arguments": {}
+              },
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "HTML_ENTITY_DECODE"
+                }
+              ],
+              "sensitivity_level": "HIGH"
+            }
+          },
+          "action": "BLOCK"
+        },
+        "default_action": "ALLOW"
+      },
+      "iam_permission_boundary": {
+        "arn": "arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress",
+        "effect": "Deny",
+        "actions": [
+          "ec2:*",
+          "s3:GetObject",
+          "lambda:InvokeFunction"
+        ],
+        "resource": "*"
+      },
+      "security_group": "inbound 443 from ALB SG only, no outbound to internet"
+    }
+  }
+}

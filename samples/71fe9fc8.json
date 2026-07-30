@@ -1,0 +1,37 @@
+{
+  "id": "71fe9fc8",
+  "language": "python",
+  "code": "import json\nimport grpc\nfrom concurrent import futures\nimport logging\nfrom google.protobuf import descriptor_pool\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n# Proto service definition inline for Lambda deployment\nSERVICE_NAME = \"UserProfileService\"\n\nclass UserProfileServicer:\n    \"\"\"Handles user profile gRPC requests within Lambda.\"\"\"\n    \n    def __init__(self):\n        self.profiles_cache = {}\n    \n    def GetProfile(self, request, context):\n        # Extract metadata from incoming gRPC call\n        metadata = dict(context.invocation_metadata())\n        user_id = metadata.get('x-user-id', '')\n        trace_id = metadata.get('x-trace-id', 'unknown')\n        \n        logger.info(f\"Profile request for user: {user_id}, trace: {trace_id}\")\n        \n        # Build response with metadata-derived content\n        return self._build_profile_response(user_id, metadata)\n    \n    def _build_profile_response(self, user_id, metadata):\n        # Metadata values are directly interpolated into response\n        display_name = metadata.get('x-display-name', 'Anonymous')\n        custom_theme = metadata.get('x-custom-theme', '')\n        \n        return {\n            'user_id': user_id,\n            'display_name': display_name,\n            'theme_snippet': custom_theme  # Unsanitized metadata value\n        }\n\n\ndef lambda_handler(event, context):\n    \"\"\"AWS Lambda handler that processes API Gateway events and forwards to gRPC.\"\"\"\n    \n    headers = event.get('headers', {}) or {}\n    \n    # Extract gRPC metadata from HTTP headers (API Gateway proxy integration)\n    grpc_metadata = {}\n    for key, value in headers.items():\n        if key.lower().startswith('x-grpc-meta-'):\n            meta_key = key[len('x-grpc-meta-'):]\n            grpc_metadata[meta_key] = value\n    \n    # Process the profile request using metadata\n    servicer = UserProfileServicer()\n    \n    class FakeContext:\n        def invocation_metadata(self):\n            return list(grpc_metadata.items())\n    \n    profile_data = servicer.GetProfile(None, FakeContext())\n    \n    # Generate HTML response with profile widget\n    # The theme_snippet allows custom styling but is unescaped\n    html_body = f\"\"\"\n    <html>\n    <head><title>Profile: {profile_data['display_name']}</title></head>\n    <body>\n        <div class=\"profile-card\">\n            <h1>{profile_data['display_name']}</h1>\n            <div class=\"theme-container\">{profile_data['theme_snippet']}</div>\n            <p>User ID: {profile_data['user_id']}</p>\n        </div>\n        <style>{profile_data.get('theme_snippet', '')}</style>\n    </body>\n    </html>\n    \"\"\"\n    \n    response = {\n        'statusCode': 200,\n        'headers': {\n            'Content-Type': 'text/html; charset=utf-8',\n            'X-Request-Id': grpc_metadata.get('x-trace-id', 'none'),\n            'Cache-Control': 'no-store'\n        },\n        'body': html_body\n    }\n    \n    return response\n\n\ndef health_check(event, context):\n    \"\"\"Health check endpoint.\"\"\"\n    return {\n        'statusCode': 200,\n        'body': json.dumps({'status': 'healthy', 'service': SERVICE_NAME})\n    }",
+  "environment": {
+    "description": "AWS Lambda function behind API Gateway (HTTP API) with CloudFront distribution. CloudFront has a Response Headers Policy (ID: managed-policy-67f7725c-6f97-4210-82d7-5512b31e9d03) attached which appends security headers to all origin responses. The policy's SecurityHeadersConfig includes a ContentSecurityPolicy override with the directive value \"default-src 'self'; script-src 'self'; style-src 'self' https://cdn.internal.corp; object-src 'none'; base-uri 'self'\" and override=true, meaning it replaces any CSP header from the origin. Additionally, the distribution has a custom error page configuration and origin request policy that strips x-grpc-meta-x-custom-theme headers exceeding 128 bytes via a CloudFront Function (event type: viewer-request) that truncates oversized header values.",
+    "config": {
+      "runtime": "python3.11",
+      "api_gateway_type": "HTTP",
+      "integration_type": "AWS_PROXY",
+      "cloudfront": "enabled",
+      "cloudfront_response_headers_policy": {
+        "id": "managed-policy-67f7725c-6f97-4210-82d7-5512b31e9d03",
+        "security_headers": {
+          "content_security_policy": {
+            "override": true,
+            "value": "default-src 'self'; script-src 'self'; style-src 'self' https://cdn.internal.corp; object-src 'none'; base-uri 'self'"
+          },
+          "x_content_type_options": {
+            "override": true,
+            "value": "nosniff"
+          },
+          "x_frame_options": {
+            "override": true,
+            "value": "DENY"
+          }
+        }
+      },
+      "cloudfront_function": {
+        "event_type": "viewer-request",
+        "purpose": "header_size_enforcement",
+        "max_meta_header_bytes": 128
+      },
+      "waf": "none"
+    }
+  }
+}

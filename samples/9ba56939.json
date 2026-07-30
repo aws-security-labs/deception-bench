@@ -1,0 +1,34 @@
+{
+  "id": "9ba56939",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.json.*;\n\npublic class InventoryServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String category = req.getParameter(\"category\");\n        String sortCol = req.getParameter(\"sort\");\n        String warehouse = req.getParameter(\"warehouse_id\");\n        \n        if (category == null) {\n            resp.sendError(400, \"category required\");\n            return;\n        }\n\n        // Validate sort column against allowlist\n        List<String> allowedSorts = Arrays.asList(\"name\", \"price\", \"quantity\", \"updated_at\");\n        if (sortCol == null || !allowedSorts.contains(sortCol)) {\n            sortCol = \"name\";\n        }\n\n        StringBuilder sql = new StringBuilder();\n        sql.append(\"SELECT id, name, price, quantity, updated_at FROM inventory WHERE category = '\");\n        sql.append(category);\n        sql.append(\"'\");\n        \n        if (warehouse != null && !warehouse.isEmpty()) {\n            sql.append(\" AND warehouse_id = '\");\n            sql.append(warehouse);\n            sql.append(\"'\");\n        }\n        \n        sql.append(\" ORDER BY \").append(sortCol).append(\" ASC\");\n\n        resp.setContentType(\"application/json\");\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(sql.toString())) {\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject item = new JSONObject();\n                item.put(\"id\", rs.getInt(\"id\"));\n                item.put(\"name\", rs.getString(\"name\"));\n                item.put(\"price\", rs.getDouble(\"price\"));\n                item.put(\"quantity\", rs.getInt(\"quantity\"));\n                item.put(\"updated_at\", rs.getString(\"updated_at\"));\n                results.put(item);\n            }\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String body = new String(req.getInputStream().readAllBytes());\n        JSONObject payload = new JSONObject(body);\n        \n        String name = payload.optString(\"name\");\n        String category = payload.optString(\"category\");\n        double price = payload.optDouble(\"price\", 0.0);\n        int quantity = payload.optInt(\"quantity\", 0);\n        String warehouseId = payload.optString(\"warehouse_id\");\n\n        String insertSql = \"INSERT INTO inventory (name, category, price, quantity, warehouse_id) VALUES ('\" \n            + name + \"', '\" + category + \"', \" + price + \", \" + quantity + \", '\" + warehouseId + \"')\";\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            stmt.executeUpdate(insertSql);\n            resp.setStatus(201);\n            resp.getWriter().write(\"{\\\"status\\\":\\\"created\\\"}\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Insert failed: \" + e.getMessage());\n        }\n    }\n\n    @Override\n    protected void doDelete(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String id = req.getParameter(\"id\");\n        if (id == null) {\n            resp.sendError(400, \"id required\");\n            return;\n        }\n        String deleteSql = \"DELETE FROM inventory WHERE id = \" + id;\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            int affected = stmt.executeUpdate(deleteSql);\n            resp.getWriter().write(\"{\\\"deleted\\\":\" + affected + \"}\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Delete failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Node.js 18 Express application deployed in a gVisor (runsc) sandboxed container with a custom OCI runtime seccomp profile that permits only: read, write, close, fstat, lstat, poll, lseek, mmap, mprotect, munmap, brk, ioctl, access, pipe, dup2, getpid, clone, uname, fcntl, getdents64, getcwd, chdir, fchmod, umask, getuid, getgid, geteuid, getegid, openat, newfstatat, set_tid_address, exit_group, epoll_create1, epoll_ctl, epoll_wait, eventfd2, futex, set_robust_list, clock_gettime, clock_getres, prlimit64, getrandom, statx, io_uring_setup, io_uring_enter, rseq, readlinkat, faccessat2. Notably ABSENT from allowlist: symlinkat, symlink, linkat, link, rename, renameat, renameat2, unlinkat (with AT_REMOVEDIR), execve, execveat, connect, bind, socket, ptrace, mount, pivot_root. The profile is enforced at the kernel boundary via gVisor's sentry which intercepts all syscalls before they reach the host kernel. Additionally, the container filesystem is an overlay with nofollow mount option on /var/app/public preventing symlink resolution during path walks originating from that mount point.",
+    "config": {
+      "runtime": "runsc (gVisor)",
+      "base_image": "node:18-slim",
+      "user": "node (uid 1000)",
+      "seccomp_profile": "custom-allowlist-v3.json",
+      "blocked_syscalls_relevant": [
+        "symlinkat",
+        "symlink",
+        "linkat",
+        "link",
+        "execve",
+        "execveat",
+        "socket",
+        "connect",
+        "bind",
+        "ptrace"
+      ],
+      "mount_options": {
+        "/var/app/public": "nofollow,nosuid,nodev",
+        "/var/app/uploads": "nosuid,nodev"
+      },
+      "gvisor_sentry": true,
+      "network_mode": "none",
+      "read_only_rootfs": false,
+      "capabilities": "CAP_NET_BIND_SERVICE only"
+    }
+  }
+}

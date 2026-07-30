@@ -1,0 +1,35 @@
+{
+  "id": "b29e9f1a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed list\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query - dates are validated, sort column is from user input\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        String tableName = getTableForReport(reportType);\n        // sortCol is used directly - developer assumed frontend dropdown limits values\n        String query = \"SELECT * FROM \" + tableName +\n                \" WHERE created_at BETWEEN ? AND ?\" +\n                (department != null ? \" AND department = ?\" : \"\") +\n                \" ORDER BY \" + sortCol + \" ASC LIMIT 500\";\n\n        log.info(\"Executing report query for type=\" + reportType + \" dept=\" + department);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n\n            stmt.setString(1, startDate);\n            stmt.setString(2, endDate);\n            if (department != null) {\n                stmt.setString(3, department);\n            }\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(resultSetToJson(rs));\n\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\") ||\n                type.equals(\"hr\") || type.equals(\"finance\"));\n    }\n\n    private boolean isValidDate(String date) {\n        if (date == null) return false;\n        return date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n\n    private String getTableForReport(String type) {\n        switch (type) {\n            case \"sales\": return \"report_sales\";\n            case \"inventory\": return \"report_inventory\";\n            case \"hr\": return \"report_hr\";\n            case \"finance\": return \"report_finance\";\n            default: return \"report_sales\";\n        }\n    }\n\n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        StringBuilder sb = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) sb.append(\",\");\n            sb.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) sb.append(\",\");\n                sb.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                sb.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n            }\n            sb.append(\"}\");\n            first = false;\n        }\n        sb.append(\"]\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards enforcement. The 'ci-runners' namespace has label 'pod-security.kubernetes.io/enforce: baseline' applied via a Kyverno ClusterPolicy that mutates namespace labels on creation (policy name: 'enforce-pss-baseline-on-ci'). Additionally, a ValidatingAdmissionPolicy (v1beta1) named 'deny-hostpath-and-privileged' uses CEL expressions: rule 1 checks 'object.spec.volumes.all(v, !has(v.hostPath))' and rule 2 checks 'object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged == false)'. The ValidatingAdmissionPolicyBinding targets namespace selector 'team: ci'. Note: the baseline PSS level permits hostProcess=false but the additional VAP provides defense-in-depth specifically against hostPath. The cache volume is instead backed by an emptyDir with sizeLimit 2Gi, meaning /var/cache/ci-artifacts resolves to pod-local ephemeral storage only.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "team": "ci"
+      },
+      "kyverno_policy": "enforce-pss-baseline-on-ci",
+      "validating_admission_policy": {
+        "name": "deny-hostpath-and-privileged",
+        "cel_rules": [
+          "object.spec.volumes.all(v, !has(v.hostPath))",
+          "object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged == false)"
+        ]
+      },
+      "actual_volume": {
+        "name": "cache-vol",
+        "emptyDir": {
+          "sizeLimit": "2Gi"
+        }
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "fsGroup": 1000
+      }
+    }
+  }
+}

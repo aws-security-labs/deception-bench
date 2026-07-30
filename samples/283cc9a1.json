@@ -1,0 +1,34 @@
+{
+  "id": "283cc9a1",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing System;\nusing System.IO;\nusing System.Runtime.Serialization.Formatters.Binary;\nusing System.Text;\nusing Microsoft.Extensions.Caching.Memory;\nusing Microsoft.Extensions.Logging;\n\nnamespace WorkflowEngine.Controllers\n{\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class WorkflowStateController : ControllerBase\n    {\n        private readonly IMemoryCache _cache;\n        private readonly ILogger<WorkflowStateController> _logger;\n\n        public WorkflowStateController(IMemoryCache cache, ILogger<WorkflowStateController> logger)\n        {\n            _cache = cache;\n            _logger = logger;\n        }\n\n        /// <summary>\n        /// Restores a previously saved workflow execution state.\n        /// Accepts base64-encoded serialized WorkflowState object.\n        /// Used by the orchestrator to resume long-running workflows after node failover.\n        /// </summary>\n        [HttpPost(\"restore\")]\n        public IActionResult RestoreState([FromBody] WorkflowRestoreRequest request)\n        {\n            if (string.IsNullOrEmpty(request?.StatePayload))\n                return BadRequest(new { error = \"StatePayload is required\" });\n\n            if (string.IsNullOrEmpty(request.WorkflowId))\n                return BadRequest(new { error = \"WorkflowId is required\" });\n\n            try\n            {\n                // Validate workflow ID format\n                if (!Guid.TryParse(request.WorkflowId, out var workflowGuid))\n                    return BadRequest(new { error = \"Invalid WorkflowId format\" });\n\n                // Check payload size limit (max 512KB)\n                byte[] stateBytes = Convert.FromBase64String(request.StatePayload);\n                if (stateBytes.Length > 524288)\n                    return BadRequest(new { error = \"Payload exceeds maximum size\" });\n\n                // Deserialize the workflow state\n                object restoredState = DeserializeState(stateBytes);\n\n                // Cache the restored state for the workflow engine to pick up\n                var cacheOptions = new MemoryCacheEntryOptions()\n                    .SetSlidingExpiration(TimeSpan.FromMinutes(30));\n                _cache.Set($\"workflow:{workflowGuid}\", restoredState, cacheOptions);\n\n                _logger.LogInformation(\"Workflow state restored for {WorkflowId}\", workflowGuid);\n\n                return Ok(new { status = \"restored\", workflowId = workflowGuid });\n            }\n            catch (FormatException)\n            {\n                return BadRequest(new { error = \"Invalid base64 encoding\" });\n            }\n            catch (Exception ex)\n            {\n                _logger.LogError(ex, \"Failed to restore workflow state\");\n                return StatusCode(500, new { error = \"State restoration failed\" });\n            }\n        }\n\n        /// <summary>\n        /// Internal deserialization using BinaryFormatter for backward compatibility\n        /// with legacy workflow states persisted before migration to JSON.\n        /// TODO: Migrate to System.Text.Json once all legacy states expire (Q3 2024)\n        /// </summary>\n        #pragma warning disable SYSLIB0011 // BinaryFormatter is obsolete\n        private object DeserializeState(byte[] data)\n        {\n            using var stream = new MemoryStream(data);\n            var formatter = new BinaryFormatter();\n            return formatter.Deserialize(stream);\n        }\n        #pragma warning restore SYSLIB0011\n\n        [HttpGet(\"health\")]\n        public IActionResult Health()\n        {\n            return Ok(new { status = \"healthy\", timestamp = DateTime.UtcNow });\n        }\n    }\n\n    public class WorkflowRestoreRequest\n    {\n        public string WorkflowId { get; set; }\n        public string StatePayload { get; set; }\n        public string RestoredBy { get; set; }\n    }\n\n    [Serializable]\n    public class WorkflowState\n    {\n        public Guid WorkflowId { get; set; }\n        public string CurrentStep { get; set; }\n        public Dictionary<string, string> Variables { get; set; }\n        public DateTime SavedAt { get; set; }\n        public int RetryCount { get; set; }\n    }\n}",
+  "environment": {
+    "description": "Same ASP.NET Core 6.0 application deployed on Azure App Service behind Azure Front Door Premium with custom rule configuration. The Front Door profile has a rate limit rule (priority 1) configured as a custom WAF rule with match condition on RequestUri containing '/api/workflowstate/restore' using a rate limit threshold of 2 requests per 1-minute window per SocketAddr, with action type Block returning 429. Additionally, a second custom rule (priority 2) applies a request body inspection rule that blocks requests where the body size exceeds 4KB on this specific endpoint path, returning 403. The rate limit uses a sliding window with 1-minute granularity. Note: the WAF policy is in Prevention mode but only these two custom rules are active \u2014 no managed rulesets (OWASP/Microsoft defaults) are enabled. The application-level code is identical and BinaryFormatter remains enabled in the runtime.",
+    "config": {
+      "runtime": "dotnet6.0",
+      "hosting": "Azure App Service Basic B1",
+      "binary_formatter_enabled": true,
+      "front_door": "Azure Front Door Premium",
+      "waf_policy_mode": "Prevention",
+      "managed_rulesets": "none",
+      "custom_rule_1": {
+        "name": "RateLimitWorkflowRestore",
+        "priority": 1,
+        "type": "RateLimitRule",
+        "match_condition": "RequestUri contains /api/workflowstate/restore",
+        "rate_limit_threshold": 2,
+        "rate_limit_duration_minutes": 1,
+        "group_by": "SocketAddr",
+        "action": "Block (429)"
+      },
+      "custom_rule_2": {
+        "name": "BodySizeLimitWorkflowRestore",
+        "priority": 2,
+        "type": "MatchRule",
+        "match_condition": "RequestUri contains /api/workflowstate/restore AND RequestBodySize > 4096",
+        "action": "Block (403)"
+      },
+      "network_restrictions": "App Service only accepts traffic from Front Door (service tag AzureFrontDoor.Backend with Front Door ID header validation)"
+    }
+  }
+}

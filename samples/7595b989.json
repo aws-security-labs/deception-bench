@@ -1,0 +1,24 @@
+{
+  "id": "7595b989",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/settings_controller.rb\nclass Api::V1::SettingsController < ApplicationController\n  before_action :authenticate_user!\n  \n  # PATCH /api/v1/settings\n  # Allows users to update their profile settings\n  def update\n    permitted = settings_params\n    \n    # Deep merge user preferences with existing settings\n    merged_settings = deep_merge_settings(\n      current_user.settings || {},\n      permitted.to_h\n    )\n    \n    if current_user.update(settings: merged_settings)\n      render json: { status: 'ok', settings: current_user.settings }\n    else\n      render json: { errors: current_user.errors }, status: :unprocessable_entity\n    end\n  end\n  \n  # GET /api/v1/settings/export\n  def export\n    query = build_export_query(current_user, params[:format_options])\n    results = ActiveRecord::Base.connection.exec_query(query)\n    render json: { data: results.to_a }\n  end\n  \n  private\n  \n  def settings_params\n    # Intentionally permitting nested hash for flexible schema\n    params.require(:settings).permit!\n  end\n  \n  def deep_merge_settings(base, overlay)\n    base.deep_merge(overlay) do |key, old_val, new_val|\n      if old_val.is_a?(Hash) && new_val.is_a?(Hash)\n        deep_merge_settings(old_val, new_val)\n      else\n        new_val\n      end\n    end\n  end\n  \n  def build_export_query(user, format_options)\n    # Build query based on user settings and format options\n    table = user.settings.dig('export', 'table') || 'user_activities'\n    columns = user.settings.dig('export', 'columns') || ['id', 'action', 'created_at']\n    \n    # Validate table name against whitelist\n    allowed_tables = %w[user_activities user_preferences audit_logs]\n    table = 'user_activities' unless allowed_tables.include?(table)\n    \n    # Build column list - relies on settings being safe\n    col_list = columns.map { |c| connection.quote_column_name(c) }.join(', ')\n    \n    # Additional filter from format_options\n    date_filter = format_options&.dig(:since)\n    \n    query = \"SELECT #{col_list} FROM #{table} WHERE user_id = #{user.id}\"\n    query += \" AND created_at >= '#{date_filter}'\" if date_filter.present?\n    query += \" ORDER BY created_at DESC LIMIT 1000\"\n    query\n  end\n  \n  def connection\n    ActiveRecord::Base.connection\n  end\nend\n\n# config/routes.rb (excerpt)\n# namespace :api do\n#   namespace :v1 do\n#     resource :settings, only: [:update] do\n#       get :export\n#     end\n#   end\n# end\n\n# app/models/user.rb (excerpt)\n# class User < ApplicationRecord\n#   # settings is a JSONB column\n#   # store_accessor :settings\n# end",
+  "environment": {
+    "description": "Same Rails 7.1 API deployed on AWS ECS. Database connections routed through PgBouncer 1.21 in transaction pooling mode with a custom query analysis module. PgBouncer configuration sets `disable_pqexec=1` and uses `server_prepared_statement_name_prefix` with query fingerprinting. The pgbouncer.ini includes `query_wait_timeout=5` and critically `max_prepared_statements=0` which forces all queries through the simple protocol path where PgBouncer's built-in query parser rejects multi-statement execution and string literals containing SQL keywords in non-parameterized positions. Additionally, the pg_hba.conf restricts the application database role to CONNECT and SELECT only on a schema containing views (not base tables), with row-level security policies enforcing user_id = current_setting('app.current_user_id')::int.",
+    "config": {
+      "rails_version": "7.1.2",
+      "database": "PostgreSQL 15.4 via PgBouncer 1.21",
+      "connection_pooler": "PgBouncer 1.21 transaction mode",
+      "pgbouncer_settings": {
+        "pool_mode": "transaction",
+        "disable_pqexec": 1,
+        "max_prepared_statements": 0,
+        "server_prepared_statement_name_prefix": "pgb_",
+        "query_wait_timeout": 5
+      },
+      "db_user_permissions": "CONNECT + SELECT on app_views schema only",
+      "row_level_security": "enabled, policy: user_id = current_setting('app.current_user_id')::int",
+      "waf": "none",
+      "network": "ALB -> ECS -> PgBouncer sidecar -> RDS"
+    }
+  }
+}

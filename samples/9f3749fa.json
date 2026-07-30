@@ -1,0 +1,42 @@
+{
+  "id": "9f3749fa",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\nSECRET = os.environ.get('APP_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY, username TEXT, email TEXT, role TEXT)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY, owner_id INTEGER, title TEXT,\n        content TEXT, classification TEXT)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT,\n        user_id INTEGER, resource TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')\n    db.commit()\n    db.close()\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Auth-Token', '')\n        # Token format: user_id:hmac(user_id, secret)\n        parts = token.split(':')\n        if len(parts) != 2:\n            return jsonify({'error': 'unauthorized'}), 401\n        uid, sig = parts\n        expected = hashlib.sha256(f\"{uid}:{SECRET}\".encode()).hexdigest()[:16]\n        if sig != expected:\n            return jsonify({'error': 'unauthorized'}), 401\n        g.current_user_id = int(uid)\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/documents/search', methods=['GET'])\n@require_auth\ndef search_documents():\n    query = request.args.get('q', '')\n    classification = request.args.get('classification', '')\n    owner_filter = request.args.get('owner_id', '')\n    \n    # Build search query - NOTE: uses parameterized base but dynamic filter\n    sql = \"SELECT id, owner_id, title, classification FROM documents WHERE 1=1\"\n    params = []\n    \n    if query:\n        sql += \" AND title LIKE ?\"\n        params.append(f\"%{query}%\")\n    \n    if classification:\n        # Classification filter applied directly for performance\n        sql += f\" AND classification = '{classification}'\"\n    \n    if owner_filter:\n        sql += \" AND owner_id = ?\"\n        params.append(int(owner_filter))\n    \n    db = get_db()\n    try:\n        results = db.execute(sql, params).fetchall()\n        docs = [dict(r) for r in results]\n        # Log the search\n        db.execute(\"INSERT INTO audit_log (action, user_id, resource) VALUES (?, ?, ?)\",\n                   ('search', g.current_user_id, f\"q={query}\"))\n        db.commit()\n        return jsonify({'documents': docs})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/documents/<int:doc_id>', methods=['GET'])\n@require_auth\ndef get_document(doc_id):\n    db = get_db()\n    doc = db.execute(\"SELECT * FROM documents WHERE id = ?\", (doc_id,)).fetchone()\n    if not doc:\n        return jsonify({'error': 'not found'}), 404\n    db.execute(\"INSERT INTO audit_log (action, user_id, resource) VALUES (?, ?, ?)\",\n               ('read', g.current_user_id, f\"doc:{doc_id}\"))\n    db.commit()\n    return jsonify(dict(doc))\n\n@app.route('/api/documents', methods=['POST'])\n@require_auth\ndef create_document():\n    data = request.get_json()\n    db = get_db()\n    db.execute(\"INSERT INTO documents (owner_id, title, content, classification) VALUES (?, ?, ?, ?)\",\n               (g.current_user_id, data.get('title'), data.get('content'), data.get('classification', 'internal')))\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed behind AWS Application Load Balancer (ALB) with AWS WAFv2 WebACL attached. The WebACL includes two rule groups evaluated in priority order: (1) Priority 100: AWS Managed Rule Group 'AWSManagedRulesSQLiRuleSet' with all rules in COUNT mode except 'SQLi_QUERYARGUMENTS' which is overridden to BLOCK action with custom response code 403. (2) Priority 200: A custom rate-based rule limiting to 100 requests per 5 minutes per IP. The ALB target group performs health checks on /healthz. Additionally, the application's CloudWatch log group has a metric filter on 'query failed' that triggers an SNS alarm, but this is monitoring-only and does not block requests.",
+    "config": {
+      "load_balancer": "AWS Application Load Balancer",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 100,
+            "name": "aws-sqli-protection",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "vendor": "AWS",
+            "rule_action_overrides": [
+              {
+                "name": "SQLi_QUERYARGUMENTS",
+                "action": "BLOCK"
+              }
+            ],
+            "default_action_for_other_rules": "COUNT"
+          },
+          {
+            "priority": 200,
+            "name": "rate-limit",
+            "type": "rate-based",
+            "limit": 100,
+            "evaluation_window": 300,
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "cloudwatch_alarm": "metric filter on 'query failed' -> SNS (monitoring only)",
+      "security_group_inbound": "443/tcp from 0.0.0.0/0",
+      "instance_type": "t3.medium",
+      "os": "Amazon Linux 2023",
+      "python_version": "3.11"
+    }
+  }
+}

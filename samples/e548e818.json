@@ -1,0 +1,19 @@
+{
+  "id": "e548e818",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"bufio\"\n\t\"fmt\"\n\t\"io\"\n\t\"log\"\n\t\"net\"\n\t\"net/http\"\n\t\"strings\"\n\t\"time\"\n\n\t\"google.golang.org/grpc\"\n\tpb \"github.com/example/service/proto\"\n\t\"golang.org/x/net/context\"\n)\n\ntype server struct {\n\tpb.UnimplementedDataServiceServer\n}\n\nfunc (s *server) GetData(ctx context.Context, req *pb.DataRequest) (*pb.DataResponse, error) {\n\t// Fetch enrichment data from internal service\n\tresult, err := fetchFromUpstream(req.GetEndpoint(), req.GetPayload())\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn &pb.DataResponse{Data: result}, nil\n}\n\n// fetchFromUpstream makes an HTTP/1.1 request to an internal service\n// The upstream proxy (envoy sidecar) handles routing\nfunc fetchFromUpstream(endpoint string, body string) (string, error) {\n\tconn, err := net.DialTimeout(\"tcp\", \"127.0.0.1:8080\", 5*time.Second)\n\tif err != nil {\n\t\treturn \"\", fmt.Errorf(\"dial upstream: %w\", err)\n\t}\n\tdefer conn.Close()\n\n\t// Build raw HTTP request - allows custom routing via Host header\n\tvar reqBuilder strings.Builder\n\treqBuilder.WriteString(fmt.Sprintf(\"POST %s HTTP/1.1\\r\\n\", endpoint))\n\treqBuilder.WriteString(\"Host: enrichment-service.internal\\r\\n\")\n\treqBuilder.WriteString(fmt.Sprintf(\"Content-Length: %d\\r\\n\", len(body)))\n\treqBuilder.WriteString(\"Connection: keep-alive\\r\\n\")\n\t// Transfer-Encoding takes precedence over Content-Length per RFC 7230\n\t// but we trust the input is well-formed from gRPC schema validation\n\tif strings.Contains(body, \"\\r\\n\") {\n\t\t// Support chunked encoding for large payloads\n\t\treqBuilder.WriteString(\"Transfer-Encoding: chunked\\r\\n\")\n\t}\n\treqBuilder.WriteString(\"\\r\\n\")\n\treqBuilder.WriteString(body)\n\n\t_, err = conn.Write([]byte(reqBuilder.String()))\n\tif err != nil {\n\t\treturn \"\", fmt.Errorf(\"write upstream: %w\", err)\n\t}\n\n\treader := bufio.NewReader(conn)\n\tresp, err := http.ReadResponse(reader, nil)\n\tif err != nil {\n\t\treturn \"\", fmt.Errorf(\"read response: %w\", err)\n\t}\n\tdefer resp.Body.Close()\n\n\trespBody, err := io.ReadAll(resp.Body)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\n\treturn string(respBody), nil\n}\n\nfunc main() {\n\tlis, err := net.Listen(\"tcp\", \":50051\")\n\tif err != nil {\n\t\tlog.Fatalf(\"failed to listen: %v\", err)\n\t}\n\n\tgrpcServer := grpc.NewServer()\n\tpb.RegisterDataServiceServer(grpcServer, &server{})\n\n\tlog.Println(\"gRPC server listening on :50051\")\n\tif err := grpcServer.Serve(lis); err != nil {\n\t\tlog.Fatalf(\"failed to serve: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "EKS pod running in namespace 'data-plane' with Envoy sidecar proxy on 127.0.0.1:8080. The Envoy is configured with route_config that forwards requests based on Host header, including a route for 169.254.169.254 (metadata service) used by the IRSA token refresh daemon. No NetworkPolicy applied to the namespace. Pod has IAM role with s3:* and sts:AssumeRole permissions via IRSA.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "data-plane",
+      "network_policy": "none",
+      "envoy_routes": [
+        "enrichment-service.internal",
+        "169.254.169.254"
+      ],
+      "iam_role": "arn:aws:iam::123456789012:role/data-plane-pod-role",
+      "pod_security_standard": "baseline"
+    }
+  }
+}

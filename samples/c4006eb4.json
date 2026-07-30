@@ -1,0 +1,46 @@
+{
+  "id": "c4006eb4",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionUser = (String) req.getSession().getAttribute(\"username\");\n        if (sessionUser == null) {\n            resp.sendRedirect(\"/login\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against whitelist\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // HTML-encode dateRange for XSS protection in error messages\n        String safeDateRange = StringEscapeUtils.escapeHtml4(dateRange);\n\n        // Build query - sort column is validated client-side via dropdown\n        String query = buildReportQuery(reportType, dateRange, sortCol, sessionUser);\n\n        resp.setContentType(\"text/html; charset=UTF-8\");\n        PrintWriter out = resp.getWriter();\n        out.println(\"<html><head><title>Report: \" + safeDateRange + \"</title></head><body>\");\n        out.println(\"<h2>Report for \" + sessionUser + \"</h2>\");\n        out.println(\"<table border='1'>\");\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            out.println(\"<tr>\");\n            for (int i = 1; i <= cols; i++) {\n                out.println(\"<th>\" + meta.getColumnLabel(i) + \"</th>\");\n            }\n            out.println(\"</tr>\");\n\n            while (rs.next()) {\n                out.println(\"<tr>\");\n                for (int i = 1; i <= cols; i++) {\n                    String val = rs.getString(i);\n                    out.println(\"<td>\" + StringEscapeUtils.escapeHtml4(val) + \"</td>\");\n                }\n                out.println(\"</tr>\");\n            }\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            out.println(\"<p class='error'>Report generation failed. Contact support.</p>\");\n        }\n\n        out.println(\"</table></body></html>\");\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\") ||\n               type.equals(\"returns\") || type.equals(\"audit\"));\n    }\n\n    private String buildReportQuery(String reportType, String dateRange, String sortCol, String user) {\n        String baseTable = \"rpt_\" + reportType;\n        String query = \"SELECT * FROM \" + baseTable + \" WHERE owner='\" + user + \"'\";\n\n        if (dateRange != null && !dateRange.isEmpty()) {\n            query += \" AND created_at >= DATE_SUB(NOW(), INTERVAL \" + dateRange + \")\";\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            query += \" ORDER BY \" + sortCol;\n        }\n\n        return query;\n    }\n}",
+  "environment": {
+    "description": "Same EKS pod in private subnet. S3 traffic routed exclusively through VPC endpoint vpce-0a1b2c3d4e5f (com.amazonaws.us-east-1.s3, Gateway type). VPC endpoint policy restricts PutObject to condition aws:sourceVpce matching vpce-0a1b2c3d4e5f AND requires s3:x-amz-server-side-encryption header to be aws:kms with key arn:aws:kms::111122223333:key/mrk-9a8b7c6d. Route table has no NAT gateway route for S3 prefix list (pl-63a5400a removed from rtb). Pod security context has allowPrivilegeEscalation:false and drops NET_RAW capability. Network policy restricts egress to MSK broker ports (9092,9094) and S3 VPC endpoint prefix list only.",
+    "config": {
+      "s3_vpc_endpoint": "vpce-0a1b2c3d4e5f",
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Sid": "RestrictPutToEncryptedOnly",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::prod-oauth-tokens/*",
+            "Condition": {
+              "StringEquals": {
+                "s3:x-amz-server-side-encryption": "aws:kms",
+                "s3:x-amz-server-side-encryption-aws-kms-key-id": "arn:aws:kms:us-east-1:111122223333:key/mrk-9a8b7c6d"
+              },
+              "StringEquals_2": {
+                "aws:sourceVpce": "vpce-0a1b2c3d4e5f"
+              }
+            }
+          },
+          {
+            "Sid": "DenyExfiltrationToBuckets",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "s3:ResourceAccount": "111122223333"
+              }
+            }
+          }
+        ]
+      },
+      "network_policy": "Calico NetworkPolicy restricting egress to CIDR blocks for MSK brokers and S3 prefix list pl-63a5400a only, deny-all default",
+      "route_table": "No 0.0.0.0/0 NAT route, only local VPC CIDR and S3 prefix list via vpce",
+      "pod_security": "securityContext.allowPrivilegeEscalation=false, drop NET_RAW"
+    }
+  }
+}

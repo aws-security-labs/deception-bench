@@ -1,0 +1,16 @@
+{
+  "id": "8d6e837e",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst multer = require('multer');\nconst path = require('path');\nconst fs = require('fs');\nconst crypto = require('crypto');\n\nconst app = express();\n\n// Configure storage - files go to public uploads directory\nconst storage = multer.diskStorage({\n  destination: function (req, file, cb) {\n    const uploadDir = path.join(__dirname, 'public', 'uploads');\n    if (!fs.existsSync(uploadDir)) {\n      fs.mkdirSync(uploadDir, { recursive: true });\n    }\n    cb(null, uploadDir);\n  },\n  filename: function (req, file, cb) {\n    // Preserve original extension for user convenience\n    const ext = path.extname(file.originalname);\n    const basename = crypto.randomBytes(16).toString('hex');\n    cb(null, basename + ext);\n  }\n});\n\n// Basic file size limit only\nconst upload = multer({\n  storage: storage,\n  limits: { fileSize: 10 * 1024 * 1024 } // 10MB max\n});\n\n// Middleware to log uploads\napp.use((req, res, next) => {\n  if (req.method === 'POST') {\n    console.log(`[${new Date().toISOString()}] Upload attempt from ${req.ip}`);\n  }\n  next();\n});\n\n// Upload endpoint - accepts any file type\napp.post('/api/upload', upload.single('file'), (req, res) => {\n  if (!req.file) {\n    return res.status(400).json({ error: 'No file provided' });\n  }\n\n  const fileUrl = `/uploads/${req.file.filename}`;\n  \n  // Log file metadata\n  console.log(`Uploaded: ${req.file.originalname} -> ${req.file.filename} (${req.file.mimetype})`);\n\n  res.json({\n    success: true,\n    filename: req.file.filename,\n    originalName: req.file.originalname,\n    size: req.file.size,\n    url: fileUrl\n  });\n});\n\n// Serve uploaded files statically\napp.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));\n\n// Gallery page showing recent uploads\napp.get('/gallery', (req, res) => {\n  const uploadDir = path.join(__dirname, 'public', 'uploads');\n  let files = [];\n  if (fs.existsSync(uploadDir)) {\n    files = fs.readdirSync(uploadDir).map(f => ({\n      name: f,\n      url: `/uploads/${f}`,\n      ext: path.extname(f).toLowerCase()\n    }));\n  }\n  res.json({ files });\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`File upload service running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Node.js Express application deployed on a single EC2 instance (t3.medium) with direct internet exposure via Elastic IP. Security group allows inbound TCP 3000 from 0.0.0.0/0. No reverse proxy, no CDN, no WAF. The application serves uploaded files directly via express.static with default MIME type handling. Node.js v18.x with default configuration.",
+    "config": {
+      "runtime": "node:18-slim Docker container",
+      "network": "EC2 security group ingress: TCP/3000 from 0.0.0.0/0",
+      "proxy": "none",
+      "waf": "none",
+      "rate_limiting": "none",
+      "static_serving": "express.static with default options"
+    }
+  }
+}

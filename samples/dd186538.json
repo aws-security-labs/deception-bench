@@ -1,0 +1,36 @@
+{
+  "id": "dd186538",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this would verify JWT; here we decode payload\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/documents/search', extractTenant, async (req, res) => {\n  try {\n    const { q, category, sort_by, order, limit } = req.query;\n    \n    let baseQuery = `SELECT id, title, content_preview, category, created_at, owner_id \n                     FROM documents WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (q) {\n      baseQuery += ` AND (title ILIKE $${paramIdx} OR content_preview ILIKE $${paramIdx})`;\n      params.push(`%${q}%`);\n      paramIdx++;\n    }\n\n    if (category) {\n      baseQuery += ` AND category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    // Dynamic sort - vulnerable to SQL injection\n    const allowedColumns = ['title', 'created_at', 'category'];\n    const sortColumn = sort_by || 'created_at';\n    const sortOrder = order && order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';\n    \n    // Developer attempted validation but used includes() incorrectly\n    // This checks if the input CONTAINS an allowed column name, not equality\n    if (allowedColumns.some(col => sortColumn.includes(col))) {\n      baseQuery += ` ORDER BY ${sortColumn} ${sortOrder}`;\n    } else {\n      baseQuery += ` ORDER BY created_at DESC`;\n    }\n\n    const resultLimit = Math.min(parseInt(limit) || 25, 100);\n    baseQuery += ` LIMIT ${resultLimit}`;\n\n    const result = await pool.query(baseQuery, params);\n    \n    // Audit log\n    await pool.query(\n      'INSERT INTO audit_log (tenant_id, user_id, action, details, ts) VALUES ($1, $2, $3, $4, NOW())',\n      [req.tenantId, req.userId, 'document_search', JSON.stringify({ q, category, sort_by, results: result.rowCount })]\n    );\n\n    res.json({ documents: result.rows, total: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Export documents endpoint\napp.post('/api/v2/documents/export', extractTenant, async (req, res) => {\n  const { document_ids, format } = req.body;\n  if (!Array.isArray(document_ids) || document_ids.length === 0) {\n    return res.status(400).json({ error: 'document_ids required' });\n  }\n  \n  const placeholders = document_ids.map((_, i) => `$${i + 2}`).join(',');\n  const query = `SELECT * FROM documents WHERE tenant_id = $1 AND id IN (${placeholders})`;\n  const result = await pool.query(query, [req.tenantId, ...document_ids]);\n  \n  const exportId = crypto.randomUUID();\n  res.json({ export_id: exportId, count: result.rowCount, format: format || 'json' });\n});\n\napp.listen(3000, () => console.log('Document service listening on :3000'));",
+  "environment": {
+    "description": "Same NestJS microservice on ECS Fargate. The ALB has an associated AWS WAFv2 WebACL (regional scope) with a custom rule group priority 1 containing a ByteMatchStatement rule inspecting the request Body (first 8KB, content type APPLICATION_JSON) using the JsonBody match scope targeting All paths. The rule uses a RegexPatternSet reference matching field names: (isAdmin|role|accountStatus|apiKey|creditLimit) with SearchString in Values match and action BLOCK. Additionally, the WebACL includes AWS managed rule group AWSManagedRulesCommonRuleSet at priority 5 with SizeRestrictions_BODY rule in COUNT mode (not block). The custom rule group's ByteMatch uses FieldToMatch: JsonBody with MatchScope: ALL and InvalidFallbackBehavior: MATCH (meaning malformed JSON also gets blocked). CloudWatch metrics confirm the custom rule fires on payloads containing privilege-escalation field names.",
+    "config": {
+      "runtime": "Node.js 20 on ECS Fargate",
+      "load_balancer": "ALB with WAFv2 WebACL association (arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-api-acl/abc123)",
+      "waf_rules": [
+        {
+          "name": "BlockMassAssignmentFields",
+          "priority": 1,
+          "type": "custom_rule_group",
+          "statement": "ByteMatchStatement with JsonBody MatchScope:ALL inspecting field keys against RegexPatternSet containing: ^(isAdmin|role|accountStatus|apiKey|creditLimit)$",
+          "action": "BLOCK",
+          "invalid_fallback": "MATCH"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 5,
+          "type": "managed_rule_group",
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_BODY",
+              "action": "COUNT"
+            }
+          ]
+        }
+      ],
+      "database": "PostgreSQL 15 on RDS",
+      "network": "Private subnet, ALB in public subnet"
+    }
+  }
+}

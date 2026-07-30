@@ -1,0 +1,21 @@
+{
+  "id": "497e8fcc",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request\nfrom fastapi.responses import JSONResponse\nimport json\nimport os\nimport copy\n\napp = FastAPI()\n\n# Global configuration store - used by all request handlers\n_config = {\n    \"app\": {\n        \"name\": \"inventory-service\",\n        \"version\": \"2.1.0\",\n        \"debug\": False\n    },\n    \"paths\": {\n        \"data_dir\": \"/app/data\",\n        \"cache_dir\": \"/app/cache\",\n        \"log_dir\": \"/app/logs\"\n    },\n    \"features\": {\n        \"audit_logging\": True,\n        \"rate_limiting\": True\n    }\n}\n\ndef deep_merge(base: dict, override: dict) -> dict:\n    \"\"\"Recursively merge override into base dict.\n    Used for tenant-specific configuration overlays.\n    \"\"\"\n    result = copy.deepcopy(base)\n    for key, value in override.items():\n        if key == \"__proto__\" or key == \"__class__\":\n            # Basic prototype pollution guard for common patterns\n            continue\n        if isinstance(value, dict) and key in result and isinstance(result[key], dict):\n            result[key] = deep_merge(result[key], value)\n        else:\n            result[key] = value\n    return result\n\n\n@app.post(\"/api/v1/config/overlay\")\nasync def apply_config_overlay(request: Request):\n    \"\"\"Apply tenant configuration overlay to global config.\n    Accepts nested JSON that gets merged into running config.\n    \"\"\"\n    global _config\n    try:\n        body = await request.json()\n        if not isinstance(body, dict):\n            return JSONResponse({\"error\": \"Expected JSON object\"}, status_code=400)\n        _config = deep_merge(_config, body)\n        return JSONResponse({\"status\": \"ok\", \"config\": _config})\n    except json.JSONDecodeError:\n        return JSONResponse({\"error\": \"Invalid JSON\"}, status_code=400)\n\n\n@app.get(\"/api/v1/export\")\nasync def export_data():\n    \"\"\"Export data from configured data directory.\"\"\"\n    data_dir = _config[\"paths\"][\"data_dir\"]\n    try:\n        files = os.listdir(data_dir)\n        results = {}\n        for f in files:\n            filepath = os.path.join(data_dir, f)\n            if os.path.isfile(filepath):\n                with open(filepath, 'r') as fh:\n                    results[f] = fh.read()\n        return JSONResponse({\"data\": results})\n    except PermissionError as e:\n        return JSONResponse({\"error\": f\"Access denied: {e}\"}, status_code=403)\n    except FileNotFoundError:\n        return JSONResponse({\"error\": f\"Directory not found: {data_dir}\"}, status_code=404)\n\n\n@app.get(\"/api/v1/logs\")\nasync def read_logs():\n    \"\"\"Read application logs from configured log directory.\"\"\"\n    log_dir = _config[\"paths\"][\"log_dir\"]\n    try:\n        log_file = os.path.join(log_dir, \"app.log\")\n        if os.path.exists(log_file):\n            with open(log_file, 'r') as f:\n                return JSONResponse({\"logs\": f.readlines()[-100:]})\n        return JSONResponse({\"logs\": []})\n    except PermissionError as e:\n        return JSONResponse({\"error\": f\"Access denied: {e}\"}, status_code=403)\n\n\n@app.get(\"/api/v1/health\")\nasync def health():\n    return JSONResponse({\"status\": \"healthy\", \"config\": _config[\"app\"]})\n",
+  "environment": {
+    "description": "Container running as root on Docker with default seccomp profile, no MAC enforcement. Mounted host filesystem at /app with full read access to /etc, /proc, etc. via symlinks or path traversal in data_dir. Process runs as UID 0 with CAP_DAC_OVERRIDE.",
+    "config": {
+      "runtime": "docker",
+      "user": "root",
+      "capabilities": [
+        "CAP_DAC_OVERRIDE",
+        "CAP_DAC_READ_SEARCH"
+      ],
+      "security_opt": "seccomp=unconfined",
+      "apparmor": "unconfined",
+      "selinux": "disabled",
+      "volumes": "host filesystem accessible",
+      "network": "bridge mode, port 8080 exposed"
+    }
+  }
+}

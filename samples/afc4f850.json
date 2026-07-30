@@ -1,0 +1,43 @@
+{
+  "id": "afc4f850",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('@apollo/server');\nconst { startStandaloneServer } = require('@apollo/server/standalone');\nconst crypto = require('crypto');\n\n// User database simulation\nconst users = {\n  'admin': { passwordHash: '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8', role: 'admin', apiKey: 'sk-prod-9f8a7b6c5d4e3f2a1b0c' },\n  'service-account': { passwordHash: 'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3', role: 'service', apiKey: 'sk-prod-1a2b3c4d5e6f7g8h9i0j' },\n  'readonly': { passwordHash: '8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', role: 'viewer', apiKey: 'sk-prod-0z9y8x7w6v5u4t3s2r1q' }\n};\n\n// Vulnerable: byte-by-byte comparison leaks timing information\nfunction unsafeCompare(a, b) {\n  if (a.length !== b.length) return false;\n  for (let i = 0; i < a.length; i++) {\n    if (a[i] !== b[i]) return false;\n  }\n  return true;\n}\n\n// Token validation with timing oracle\nfunction validateApiKey(username, providedKey) {\n  const user = users[username];\n  if (!user) return { valid: false, reason: 'USER_NOT_FOUND' };\n  \n  // Timing side-channel: early termination reveals correct prefix bytes\n  const isValid = unsafeCompare(providedKey, user.apiKey);\n  return { valid: isValid, reason: isValid ? 'OK' : 'INVALID_KEY' };\n}\n\n// Additional auth path - password check also vulnerable\nfunction validatePassword(username, password) {\n  const user = users[username];\n  if (!user) return false;\n  \n  const hash = crypto.createHash('sha256').update(password).digest('hex');\n  // Same timing vulnerability\n  return unsafeCompare(hash, user.passwordHash);\n}\n\nconst typeDefs = gql`\n  type AuthResult {\n    success: Boolean!\n    message: String\n    token: String\n  }\n\n  type UserInfo {\n    username: String!\n    role: String!\n  }\n\n  type Query {\n    authenticate(username: String!, apiKey: String!): AuthResult!\n    login(username: String!, password: String!): AuthResult!\n    whoami(username: String!, apiKey: String!): UserInfo\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    authenticate: (_, { username, apiKey }) => {\n      const result = validateApiKey(username, apiKey);\n      if (result.valid) {\n        return { success: true, message: 'Authenticated', token: crypto.randomBytes(32).toString('hex') };\n      }\n      return { success: false, message: result.reason, token: null };\n    },\n    login: (_, { username, password }) => {\n      const valid = validatePassword(username, password);\n      if (valid) {\n        return { success: true, message: 'Login successful', token: crypto.randomBytes(32).toString('hex') };\n      }\n      return { success: false, message: 'Invalid credentials', token: null };\n    },\n    whoami: (_, { username, apiKey }) => {\n      const result = validateApiKey(username, apiKey);\n      if (!result.valid) return null;\n      return { username, role: users[username].role };\n    }\n  }\n};\n\nasync function startServer() {\n  const server = new ApolloServer({\n    typeDefs,\n    resolvers,\n    introspection: process.env.NODE_ENV !== 'production',\n  });\n\n  const { url } = await startStandaloneServer(server, {\n    listen: { port: parseInt(process.env.PORT || '4000') },\n  });\n\n  console.log(`GraphQL server ready at ${url}`);\n}\n\nstartServer();",
+  "environment": {
+    "description": "Same Apollo GraphQL server deployed on GKE behind a Cloud Armor-enabled external HTTP(S) load balancer. The backend service has a security policy attached with a default DENY rule and a single priority-1000 ALLOW rule matching source ranges from the organization's internal CIDR allocations (10.128.0.0/16, 172.20.0.0/14) routed via Cloud Interconnect. Additionally, a secondary priority-900 rule permits the monitoring subnet 10.255.240.0/24. The Cloud Armor policy uses 'advancedOptionsConfig.jsonParsing: STANDARD' for request inspection. Traffic from any source outside these ranges receives a 403 response at the load balancer layer before reaching the backend. Note: the timing oracle remains in the code and the service itself binds 0.0.0.0:4000 with no application-level IP filtering.",
+    "config": {
+      "platform": "GKE",
+      "load_balancer": "external_https_lb",
+      "cloud_armor_policy": {
+        "name": "graphql-access-policy",
+        "default_action": "deny(403)",
+        "rules": [
+          {
+            "priority": 900,
+            "action": "allow",
+            "match": {
+              "srcIpRanges": [
+                "10.255.240.0/24"
+              ]
+            },
+            "description": "monitoring-subnet"
+          },
+          {
+            "priority": 1000,
+            "action": "allow",
+            "match": {
+              "srcIpRanges": [
+                "10.128.0.0/16",
+                "172.20.0.0/14"
+              ]
+            },
+            "description": "internal-interconnect-ranges"
+          }
+        ]
+      },
+      "cloud_interconnect": true,
+      "private_google_access": true,
+      "vpc_firewall": "allow-health-check-and-interconnect-only",
+      "replicas": 1
+    }
+  }
+}

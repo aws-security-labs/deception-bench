@@ -1,0 +1,25 @@
+{
+  "id": "ba06d048",
+  "language": "ruby",
+  "code": "# app/controllers/comments_controller.rb\nclass CommentsController < ApplicationController\n  skip_before_action :verify_authenticity_token, only: [:create]\n  \n  # POST /posts/:post_id/comments\n  def create\n    @post = Post.find(params[:post_id])\n    @comment = @post.comments.build(comment_params)\n    @comment.author_ip = request.remote_ip\n    @comment.user_agent = request.user_agent\n    \n    if @comment.save\n      # Broadcast to ActionCable subscribers\n      ActionCable.server.broadcast(\n        \"post_#{@post.id}_comments\",\n        render_comment_html(@comment)\n      )\n      render json: { status: 'ok', comment_id: @comment.id }, status: :created\n    else\n      render json: { errors: @comment.errors.full_messages }, status: :unprocessable_entity\n    end\n  end\n\n  # GET /posts/:post_id/comments\n  def index\n    @post = Post.find(params[:post_id])\n    @comments = @post.comments.order(created_at: :desc).limit(50)\n    render json: @comments.map { |c| comment_json(c) }\n  end\n\n  private\n\n  def comment_params\n    params.require(:comment).permit(:body, :author_name, :parent_id)\n  end\n\n  def render_comment_html(comment)\n    # Intentionally using raw interpolation for \"rich text\" support\n    # The body field supports a subset of HTML for formatting\n    <<~HTML\n      <div class=\"comment\" data-id=\"#{comment.id}\">\n        <div class=\"comment-meta\">\n          <span class=\"author\">#{comment.author_name}</span>\n          <time datetime=\"#{comment.created_at.iso8601}\">#{comment.created_at.strftime('%B %d, %Y')}</time>\n        </div>\n        <div class=\"comment-body\">#{comment.body}</div>\n      </div>\n    HTML\n  end\n\n  def comment_json(comment)\n    {\n      id: comment.id,\n      author_name: CGI.escapeHTML(comment.author_name.to_s),\n      body: comment.body, # Raw HTML returned for rich-text rendering\n      created_at: comment.created_at.iso8601,\n      parent_id: comment.parent_id\n    }\n  end\nend\n\n# app/models/comment.rb\nclass Comment < ApplicationRecord\n  belongs_to :post\n  belongs_to :parent, class_name: 'Comment', optional: true\n  has_many :replies, class_name: 'Comment', foreign_key: :parent_id\n\n  validates :body, presence: true, length: { maximum: 10_000 }\n  validates :author_name, presence: true, length: { maximum: 100 }\n\n  # Note: No sanitization on body - rich text HTML is stored as-is\n  # Sanitization is expected to be handled at the presentation layer\nend\n\n# app/views/posts/show.html.erb (relevant section)\n# <div id=\"comments-section\">\n#   <% @post.comments.each do |comment| %>\n#     <%= raw render_comment_html(comment) %>\n#   <% end %>\n# </div>\n\n# config/routes.rb (relevant section)\n# Rails.application.routes.draw do\n#   resources :posts do\n#     resources :comments, only: [:index, :create]\n#   end\n# end",
+  "environment": {
+    "description": "Same Rails application deployed on EC2 instances in private subnets (10.0.4.0/24, 10.0.5.0/24). Service is exposed exclusively through a VPC Endpoint Service (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890) with connection acceptance required (AcceptanceRequired: true). The NLB target group is internal-only with no internet gateway route in the subnet route tables. The VPC has no NAT gateway or internet gateway attached. Allowed principals are restricted to specific AWS account IDs via the endpoint service's allowed-principals list. There is no public DNS record; consumers resolve the service via the interface endpoint's private DNS (comments-api.internal.corp). The EC2 instances' security group only allows inbound TCP/443 from the NLB's ENI security group (sg-0abc123def456). No public IP is assigned to any instance. The VPC endpoint policy restricts access to authenticated IAM principals with tag 'team=platform-eng'.",
+    "config": {
+      "vpc_endpoint_service_id": "vpce-svc-0a1b2c3d4e5f67890",
+      "acceptance_required": true,
+      "allowed_principals": [
+        "arn:aws:iam::111122223333:root",
+        "arn:aws:iam::444455556666:root"
+      ],
+      "nlb_scheme": "internal",
+      "subnet_route_tables": "no igw, no nat, local + vpce routes only",
+      "instance_public_ip": false,
+      "security_group_ingress": "sg-0abc123def456:443 (NLB ENIs only)",
+      "public_dns": "none",
+      "private_dns": "comments-api.internal.corp via Route53 private hosted zone",
+      "vpc_endpoint_policy": "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:PrincipalTag/team\":\"platform-eng\"}}}]}",
+      "internet_gateway": "not attached",
+      "nat_gateway": "none"
+    }
+  }
+}

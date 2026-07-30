@@ -1,0 +1,33 @@
+{
+  "id": "94db25c3",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery task for processing user-submitted feedback\nimport re\nfrom celery import Celery\nfrom sqlalchemy import create_engine, text\nfrom datetime import datetime\n\napp = Celery('feedback_worker', broker='redis://redis:6379/0')\nengine = create_engine('postgresql://app:app@db:5432/feedback_db')\n\n# Basic sanitization - strips script tags but allows other HTML for formatting\ndef sanitize_feedback(content):\n    \"\"\"Remove obvious script tags while preserving formatting HTML.\n    Users can submit rich-text feedback with bold, italic, links etc.\"\"\"\n    # Remove <script>...</script> blocks\n    cleaned = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.IGNORECASE | re.DOTALL)\n    # Remove javascript: protocol in href\n    cleaned = re.sub(r'javascript:', '', cleaned, flags=re.IGNORECASE)\n    return cleaned\n\n\ndef validate_email(email):\n    \"\"\"Basic email format validation\"\"\"\n    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$'\n    return re.match(pattern, email) is not None\n\n\n@app.task(bind=True, max_retries=3, default_retry_delay=60)\ndef process_feedback(self, feedback_data):\n    \"\"\"Process user feedback submission asynchronously.\n    \n    Stores sanitized feedback in the database for admin review.\n    Feedback is rendered in the admin dashboard with user formatting preserved.\n    \"\"\"\n    try:\n        user_email = feedback_data.get('email', '')\n        content = feedback_data.get('content', '')\n        category = feedback_data.get('category', 'general')\n        submitted_at = feedback_data.get('submitted_at', datetime.utcnow().isoformat())\n\n        if not validate_email(user_email):\n            return {'status': 'rejected', 'reason': 'invalid_email'}\n\n        if len(content) > 10000:\n            return {'status': 'rejected', 'reason': 'content_too_long'}\n\n        # Sanitize content - remove script tags but keep formatting\n        safe_content = sanitize_feedback(content)\n\n        # Store in database for admin dashboard rendering\n        with engine.connect() as conn:\n            conn.execute(\n                text(\"\"\"\n                    INSERT INTO feedback_entries \n                    (user_email, content, category, submitted_at, processed_at, status)\n                    VALUES (:email, :content, :category, :submitted_at, NOW(), 'pending_review')\n                \"\"\"),\n                {\n                    'email': user_email,\n                    'content': safe_content,\n                    'category': category,\n                    'submitted_at': submitted_at\n                }\n            )\n            conn.commit()\n\n        # Attempt to notify external webhook about new feedback\n        try:\n            import requests\n            requests.post(\n                'https://hooks.slack.com/services/T00/B00/xxxx',\n                json={'text': f'New feedback from {user_email} in {category}'},\n                timeout=5\n            )\n        except Exception:\n            # Webhook notification is best-effort\n            pass\n\n        return {'status': 'processed', 'email': user_email}\n\n    except Exception as exc:\n        self.retry(exc=exc)\n\n\n@app.task\ndef generate_feedback_report():\n    \"\"\"Generate weekly feedback summary - renders content as-is for admin view.\"\"\"\n    with engine.connect() as conn:\n        results = conn.execute(\n            text(\"SELECT content, user_email, category FROM feedback_entries WHERE status = 'pending_review' ORDER BY submitted_at DESC LIMIT 50\")\n        ).fetchall()\n    \n    # Template renders content with |safe filter in admin Jinja2 template\n    # {% for entry in entries %}\n    #   <div class=\"feedback-card\">\n    #     <p class=\"email\">{{ entry.user_email }}</p>\n    #     <div class=\"content\">{{ entry.content | safe }}</div>\n    #   </div>\n    # {% endfor %}\n    return {'entries_count': len(results), 'entries': [dict(r._mapping) for r in results]}",
+  "environment": {
+    "description": "Celery worker deployed in ECS Fargate task within an isolated private subnet (10.0.4.0/24) associated with route table rtb-0x9f2e1d. Route table contains only local VPC route (10.0.0.0/16 -> local) with no NAT gateway, no VPC endpoint for S3/external services, and no internet gateway route. Security group sg-0x7b4a2f attached to the Fargate ENI has egress rules limited to: TCP 5432 to sg-db (PostgreSQL), TCP 6379 to sg-redis (Redis broker), and implicit deny-all for other egress. Network ACL nacl-0x3d8e1a on the subnet has explicit DENY for all traffic to 0.0.0.0/0 except the VPC CIDR. The admin dashboard (separate service in subnet 10.0.2.0/24) renders feedback but admin sessions use HttpOnly + Secure cookies, and the dashboard ALB has no public-facing listeners - accessible only via AWS Client VPN endpoint with MFA-enforced IAM identity.",
+    "config": {
+      "vpc_id": "vpc-0x8a3b2c",
+      "worker_subnet": "subnet-isolated-0x4c (10.0.4.0/24)",
+      "route_table_id": "rtb-0x9f2e1d",
+      "route_table_routes": [
+        "10.0.0.0/16 -> local"
+      ],
+      "nat_gateway": "none",
+      "vpc_endpoints": "none configured for this subnet",
+      "security_group_id": "sg-0x7b4a2f",
+      "security_group_egress_rules": [
+        "TCP 5432 -> sg-db (10.0.3.0/24)",
+        "TCP 6379 -> sg-redis (10.0.3.0/24)",
+        "ALL TRAFFIC -> DENY (implicit)"
+      ],
+      "nacl_id": "nacl-0x3d8e1a",
+      "nacl_egress_rules": [
+        "100 ALLOW TCP to 10.0.0.0/16",
+        "200 DENY ALL to 0.0.0.0/0"
+      ],
+      "admin_dashboard_subnet": "10.0.2.0/24",
+      "admin_dashboard_access": "AWS Client VPN with MFA, no public ALB listener",
+      "admin_session_cookies": "HttpOnly=true, Secure=true, SameSite=Strict",
+      "jinja2_autoescape": false
+    }
+  }
+}

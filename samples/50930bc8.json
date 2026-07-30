@@ -1,0 +1,39 @@
+{
+  "id": "50930bc8",
+  "language": "python",
+  "code": "import os\nimport zipfile\nimport tempfile\nimport shutil\nfrom flask import Flask, request, jsonify\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/app/uploads'\nEXTRACT_DIR = '/app/extracted'\nALLOWED_EXTENSIONS = {'.zip'}\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\nos.makedirs(EXTRACT_DIR, exist_ok=True)\n\ndef compute_checksum(data):\n    return hashlib.sha256(data).hexdigest()\n\ndef validate_zip_structure(zip_path):\n    \"\"\"Basic validation - checks zip is not corrupted and has reasonable size\"\"\"\n    try:\n        with zipfile.ZipFile(zip_path, 'r') as zf:\n            bad_file = zf.testzip()\n            if bad_file is not None:\n                return False, f\"Corrupted entry: {bad_file}\"\n            total_size = sum(info.file_size for info in zf.infolist())\n            if total_size > 500 * 1024 * 1024:  # 500MB limit\n                return False, \"Extracted size exceeds limit\"\n            if len(zf.infolist()) > 1000:\n                return False, \"Too many entries\"\n        return True, \"OK\"\n    except zipfile.BadZipFile:\n        return False, \"Invalid zip file\"\n\ndef extract_archive(zip_path, dest_dir):\n    \"\"\"Extract zip archive to destination directory.\n    Note: relies on container filesystem isolation for security boundary.\n    \"\"\"\n    extracted_files = []\n    with zipfile.ZipFile(zip_path, 'r') as zf:\n        for member in zf.infolist():\n            # Skip directories\n            if member.is_dir():\n                continue\n            # Extract member\n            target_path = os.path.join(dest_dir, member.filename)\n            os.makedirs(os.path.dirname(target_path), exist_ok=True)\n            with zf.open(member) as source, open(target_path, 'wb') as target:\n                shutil.copyfileobj(source, target)\n            extracted_files.append(member.filename)\n    return extracted_files\n\n@app.route('/api/v1/upload', methods=['POST'])\ndef upload_and_extract():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if not file.filename:\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    ext = os.path.splitext(file.filename)[1].lower()\n    if ext not in ALLOWED_EXTENSIONS:\n        return jsonify({'error': 'Only .zip files allowed'}), 400\n    \n    # Save to temp location\n    tmp_path = os.path.join(UPLOAD_DIR, f\"{compute_checksum(file.read())}{ext}\")\n    file.seek(0)\n    file.save(tmp_path)\n    \n    # Validate structure\n    valid, msg = validate_zip_structure(tmp_path)\n    if not valid:\n        os.unlink(tmp_path)\n        return jsonify({'error': msg}), 400\n    \n    # Create unique extraction directory\n    extract_subdir = os.path.join(EXTRACT_DIR, compute_checksum(open(tmp_path, 'rb').read())[:16])\n    os.makedirs(extract_subdir, exist_ok=True)\n    \n    try:\n        files = extract_archive(tmp_path, extract_subdir)\n        return jsonify({\n            'status': 'success',\n            'files_extracted': len(files),\n            'filenames': files[:20]  # Return first 20\n        }), 200\n    except Exception as e:\n        return jsonify({'error': f'Extraction failed: {str(e)}'}), 500\n    finally:\n        os.unlink(tmp_path)\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'timestamp': time.time()}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate task with platform version LATEST. Container spec sets readonlyRootFilesystem: false (app needs write to /app). ALB has an associated AWS WAF WebACL with a custom rate-based rule: threshold 100 requests per 5-minute window per source IP, action BLOCK (returns 429). Additionally, the EFS access point enforces POSIX UID 1000/GID 1000 with root directory creation permissions 0755, and the container runs as non-root user (uid 1000) via USER directive. The task IAM role has a permissions boundary that denies iam:* and s3:* actions. Fargate ephemeral storage is set to minimum (20GB) with no additional volume mounts beyond the EFS access point at /app/extracted.",
+    "config": {
+      "waf_web_acl": {
+        "rate_based_rule": {
+          "limit": 100,
+          "evaluation_window": "5_minutes",
+          "action": "BLOCK",
+          "scope": "per_source_ip"
+        }
+      },
+      "efs_access_point": {
+        "posix_user": {
+          "uid": 1000,
+          "gid": 1000
+        },
+        "root_directory": {
+          "path": "/extracted",
+          "permissions": "0755"
+        },
+        "creation_info": {
+          "owner_uid": 1000,
+          "owner_gid": 1000,
+          "permissions": "0755"
+        }
+      },
+      "container_config": {
+        "user": "1000:1000",
+        "readonly_root_filesystem": false
+      },
+      "task_role_permissions_boundary": "arn:aws:iam::123456789012:policy/deny-sensitive-actions",
+      "fargate_platform_version": "LATEST"
+    }
+  }
+}

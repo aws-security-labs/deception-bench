@@ -1,0 +1,58 @@
+{
+  "id": "b800e70a",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, session\nimport psycopg2\nimport psycopg2.extras\nimport hashlib\nimport os\nimport re\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret-key-change-me')\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'apppass')\n\ndef get_db():\n    conn = psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS,\n        cursor_factory=psycopg2.extras.RealDictCursor\n    )\n    return conn\n\ndef sanitize_order(order_val):\n    # Only allow basic column names for ORDER BY\n    if order_val and re.match(r'^[a-zA-Z_]+$', order_val):\n        return order_val\n    return 'id'\n\n@app.route('/api/products', methods=['GET'])\ndef list_products():\n    category = request.args.get('category', '')\n    sort_by = sanitize_order(request.args.get('sort', 'id'))\n    direction = request.args.get('dir', 'ASC')\n    \n    # Validate direction\n    if direction.upper() not in ('ASC', 'DESC'):\n        direction = 'ASC'\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    if category:\n        # Parameterized query for category filter\n        query = f\"SELECT id, name, price, category, stock FROM products WHERE category = %s ORDER BY {sort_by} {direction}\"\n        cur.execute(query, (category,))\n    else:\n        query = f\"SELECT id, name, price, category, stock FROM products ORDER BY {sort_by} {direction}\"\n        cur.execute(query)\n    \n    products = cur.fetchall()\n    cur.close()\n    conn.close()\n    return jsonify(products)\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    q = request.args.get('q', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '999999')\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build search query - uses ILIKE with parameterized value\n    # but min/max price are interpolated for \"performance\" (legacy code)\n    query = (\n        \"SELECT id, name, price, category, stock FROM products \"\n        \"WHERE name ILIKE %s \"\n        f\"AND price >= {min_price} \"\n        f\"AND price <= {max_price} \"\n        \"ORDER BY price ASC\"\n    )\n    cur.execute(query, (f'%{q}%',))\n    \n    results = cur.fetchall()\n    cur.close()\n    conn.close()\n    return jsonify(results)\n\n@app.route('/api/admin/inventory', methods=['POST'])\ndef update_inventory():\n    if not session.get('is_admin'):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    data = request.get_json()\n    product_id = data.get('product_id')\n    new_stock = data.get('stock')\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"UPDATE products SET stock = %s WHERE id = %s\",\n        (new_stock, product_id)\n    )\n    conn.commit()\n    cur.close()\n    conn.close()\n    return jsonify({'status': 'updated'})\n\n@app.route('/api/admin/report', methods=['GET'])\ndef admin_report():\n    if not session.get('is_admin'):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    report_type = request.args.get('type', 'summary')\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    if report_type == 'summary':\n        cur.execute(\"SELECT category, COUNT(*), AVG(price) FROM products GROUP BY category\")\n    elif report_type == 'low_stock':\n        cur.execute(\"SELECT * FROM products WHERE stock < 10\")\n    else:\n        cur.execute(\"SELECT * FROM products LIMIT 50\")\n    \n    results = cur.fetchall()\n    cur.close()\n    conn.close()\n    return jsonify(results)\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate task and container image deployed identically, but the task definition specifies linuxParameters with a custom seccomp profile loaded via the 'seccompProfile' field (type: 'Localhost', localhostProfile pointing to a profile baked into the AMI at /etc/seccomp/restricted.json). The profile is based on the default Docker seccomp profile but additionally DENIES the 'execve' and 'execveat' syscalls (SCMP_ACT_ERRNO with errno EPERM). The Python interpreter itself is already running (launched before the profile takes effect via the ECS agent's container init), but any subprocess.run/Popen/os.system call that attempts to fork+exec a child process will receive EPERM. Additionally, the task definition sets 'readonlyRootFilesystem: true' with only an ephemeral volume mounted at /tmp with a 10MB size limit (configured via tmpfs mount in the volumes section). The NLB and security group configuration remain identical to the exploitable environment.",
+    "config": {
+      "compute": "ECS Fargate",
+      "container_user": "root",
+      "load_balancer": "NLB (Layer 4, TCP passthrough)",
+      "security_group": "inbound TCP/8080 from 0.0.0.0/0",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "volumes": [
+          {
+            "name": "tmp-ephemeral",
+            "host": {}
+          }
+        ],
+        "mountPoints": [
+          {
+            "sourceVolume": "tmp-ephemeral",
+            "containerPath": "/tmp",
+            "readOnly": false
+          }
+        ],
+        "tmpfs": [
+          {
+            "containerPath": "/tmp",
+            "size": 10
+          }
+        ],
+        "linuxParameters": {
+          "seccompProfile": {
+            "type": "Localhost",
+            "localhostProfile": "/etc/seccomp/restricted.json"
+          },
+          "initProcessEnabled": true
+        }
+      },
+      "seccomp_profile_content": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      },
+      "network_mode": "awsvpc",
+      "outbound": "NAT Gateway, unrestricted egress"
+    }
+  }
+}

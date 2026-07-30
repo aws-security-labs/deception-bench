@@ -1,0 +1,44 @@
+{
+  "id": "582c74cf",
+  "language": "python",
+  "code": "import os\nimport subprocess\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# Configuration\nUPLOAD_DIR = '/var/lib/app/uploads'\nALLOWED_EXTENSIONS = {'.txt', '.csv', '.json', '.xml'}\nMAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB\n\ndef sanitize_filename(filename):\n    \"\"\"Remove directory traversal attempts but allow the filename through.\"\"\"\n    # Strip leading/trailing whitespace\n    filename = filename.strip()\n    # Remove null bytes\n    filename = filename.replace('\\x00', '')\n    # Collapse multiple dots (but not single dots in extensions)\n    while '..' in filename:\n        filename = filename.replace('..', '.')\n    return filename\n\ndef get_file_metadata(filepath):\n    \"\"\"Use 'file' command to get MIME type metadata.\"\"\"\n    try:\n        result = subprocess.run(\n            ['file', '--mime-type', filepath],\n            capture_output=True, text=True, timeout=5\n        )\n        return result.stdout.strip()\n    except subprocess.TimeoutExpired:\n        return 'unknown'\n\n@app.route('/api/files/process', methods=['POST'])\ndef process_file():\n    \"\"\"Process an uploaded file with a user-specified post-processing command.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    filename = sanitize_filename(uploaded.filename)\n    ext = os.path.splitext(filename)[1].lower()\n    \n    if ext not in ALLOWED_EXTENSIONS:\n        return jsonify({'error': f'Extension {ext} not allowed'}), 400\n    \n    filepath = os.path.join(UPLOAD_DIR, filename)\n    uploaded.save(filepath)\n    \n    # Get metadata\n    mime_info = get_file_metadata(filepath)\n    \n    # User can specify a post-processing filter\n    filter_cmd = request.form.get('filter', '')\n    output = ''\n    \n    if filter_cmd:\n        # Apply the filter command to the uploaded file\n        # Intended usage: 'grep pattern', 'head -n 10', 'wc -l', etc.\n        full_cmd = f\"{filter_cmd} {filepath}\"\n        try:\n            proc = subprocess.run(\n                full_cmd,\n                shell=True,\n                capture_output=True,\n                text=True,\n                timeout=30,\n                cwd=UPLOAD_DIR\n            )\n            output = proc.stdout[:4096]  # Limit output size\n        except subprocess.TimeoutExpired:\n            output = 'Command timed out'\n        except Exception as e:\n            output = f'Error: {str(e)}'\n    \n    return jsonify({\n        'filename': filename,\n        'mime': mime_info,\n        'size': os.path.getsize(filepath),\n        'filter_output': output\n    })\n\n@app.route('/api/files/list', methods=['GET'])\ndef list_files():\n    \"\"\"List uploaded files.\"\"\"\n    try:\n        files = os.listdir(UPLOAD_DIR)\n        return jsonify({'files': files})\n    except OSError:\n        return jsonify({'files': []})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application on Ubuntu 22.04 ECS Fargate task (linux/amd64, platform version 1.4.0). Task definition specifies a read-only root filesystem (readonlyRootFilesystem: true) with a single tmpfs volume mounted at /var/lib/app/uploads (size 64MB, mount options: noexec,nosuid,nodev). The ECS task execution role has no additional permissions beyond ECR pull and CloudWatch Logs. The task role has zero attached policies (arn:aws:iam::ACCOUNT:role/app-task-role with empty permission set). Container runs as non-root user 1000 with linuxParameters.capabilities.drop set to ALL and linuxParameters.capabilities.add containing only NET_BIND_SERVICE. Fargate platform version 1.4.0 enforces the default seccomp profile which blocks execve-family calls from forked children when the parent process has CAP_SYS_ADMIN dropped (which it is, since all caps are dropped). Additionally, the tmpfs noexec mount flag prevents execution of any binaries written to the uploads directory.",
+    "config": {
+      "platform": "AWS ECS Fargate, platform version 1.4.0",
+      "os": "Ubuntu 22.04 LTS (container image)",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "volumes": [
+          {
+            "name": "uploads-tmpfs",
+            "mountPoint": "/var/lib/app/uploads",
+            "tmpfs": {
+              "size": 64,
+              "mountOptions": [
+                "noexec",
+                "nosuid",
+                "nodev"
+              ]
+            }
+          }
+        ],
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ],
+            "add": [
+              "NET_BIND_SERVICE"
+            ]
+          }
+        },
+        "user": "1000"
+      },
+      "task_role_policies": [],
+      "network_mode": "awsvpc",
+      "security_group_inbound": "TCP 8080 from VPC CIDR only (10.0.0.0/16)",
+      "alb_integration": "Internal ALB with no WAF attached"
+    }
+  }
+}

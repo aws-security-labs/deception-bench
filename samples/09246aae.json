@@ -1,0 +1,66 @@
+{
+  "id": "09246aae",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String format = req.getParameter(\"fmt\");\n\n        // Validate report type against allowed list\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query based on report type\n        String baseQuery = getBaseQuery(reportType);\n        StringBuilder query = new StringBuilder(baseQuery);\n\n        // Apply filters - dates are validated\n        if (startDate != null && startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            query.append(\" AND created_at >= '\").append(startDate).append(\"'\");\n        }\n        if (endDate != null && endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            query.append(\" AND created_at <= '\").append(endDate).append(\"'\");\n        }\n\n        // Department filter - used for scoping\n        if (department != null && !department.isEmpty()) {\n            query.append(\" AND department = '\").append(department).append(\"'\");\n        }\n\n        // Order by clause\n        String orderBy = req.getParameter(\"sort\");\n        if (orderBy != null && !orderBy.isEmpty()) {\n            query.append(\" ORDER BY \").append(orderBy);\n        }\n\n        log.info(\"Executing report query for type: \" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n\n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(30);\n\n            ResultSet rs = stmt.executeQuery(query.toString());\n            resp.setContentType(getContentType(format));\n\n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            if (\"csv\".equals(format)) {\n                for (int i = 1; i <= cols; i++) {\n                    out.print(meta.getColumnName(i));\n                    if (i < cols) out.print(\",\");\n                }\n                out.println();\n                while (rs.next()) {\n                    for (int i = 1; i <= cols; i++) {\n                        out.print(rs.getString(i));\n                        if (i < cols) out.print(\",\");\n                    }\n                    out.println();\n                }\n            } else {\n                out.println(\"<table>\");\n                out.println(\"<tr>\");\n                for (int i = 1; i <= cols; i++) {\n                    out.println(\"<th>\" + meta.getColumnName(i) + \"</th>\");\n                }\n                out.println(\"</tr>\");\n                while (rs.next()) {\n                    out.println(\"<tr>\");\n                    for (int i = 1; i <= cols; i++) {\n                        out.println(\"<td>\" + rs.getString(i) + \"</td>\");\n                    }\n                    out.println(\"</tr>\");\n                }\n                out.println(\"</table>\");\n            }\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\")\n                || type.equals(\"hr\") || type.equals(\"finance\"));\n    }\n\n    private String getBaseQuery(String type) {\n        switch (type) {\n            case \"sales\": return \"SELECT id, amount, region, created_at FROM sales_reports WHERE 1=1\";\n            case \"inventory\": return \"SELECT id, sku, qty, warehouse, created_at FROM inventory_reports WHERE 1=1\";\n            case \"hr\": return \"SELECT id, emp_name, action, created_at FROM hr_reports WHERE 1=1\";\n            case \"finance\": return \"SELECT id, account, balance, created_at FROM finance_reports WHERE 1=1\";\n            default: return \"SELECT 1\";\n        }\n    }\n\n    private String getContentType(String format) {\n        return \"csv\".equals(format) ? \"text/csv\" : \"text/html\";\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EKS with IRSA. The pod service account is bound to an IAM role whose DynamoDB permission includes leading-key condition constraints via dynamodb:LeadingKeys and a StringEquals condition on dynamodb:LeadingKeys matching ${aws:PrincipalTag/tenant_id}. The role's trust policy sets the tenant_id principal tag from the OIDC token claim 'custom:tenant'. Additionally, the IAM policy includes a Deny statement with condition StringNotEquals on dynamodb:LeadingKeys vs the tagged tenant, ensuring cross-tenant GetItem calls return AccessDenied regardless of the partition key supplied in the request. The gRPC upstream service runs with an Envoy sidecar (Istio mesh) that strips any metadata header matching the pattern 'x-ctx-*' or 'x-route-*' before forwarding to the application container, configured via EnvoyFilter resource with operation REMOVE for request headers matching the regex '^x-(ctx|route)-'. The Istio AuthorizationPolicy requires a valid JWT with matching tenant claim before allowing traffic to the user-service pod.",
+    "config": {
+      "iam_policy": {
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "dynamodb:GetItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/user-profiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/tenant_id}"
+                ]
+              }
+            }
+          },
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:GetItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/user-profiles",
+            "Condition": {
+              "StringNotEquals": {
+                "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant_id}"
+              }
+            }
+          }
+        ]
+      },
+      "envoy_filter": {
+        "operation": "REMOVE",
+        "header_regex": "^x-(ctx|route)-.*$",
+        "applied_to": "SIDECAR_INBOUND"
+      },
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "requestPrincipals": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[tenant]",
+                "values": [
+                  "*"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "irsa_oidc_claim_mapping": "custom:tenant -> aws:PrincipalTag/tenant_id"
+    }
+  }
+}

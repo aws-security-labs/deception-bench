@@ -1,0 +1,23 @@
+{
+  "id": "d278c620",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\n\ttmpl = template.Must(template.New(\"results\").Parse(`\n<html><body>\n<h2>Search Results for: {{.Query}}</h2>\n<table>\n{{range .Results}}\n<tr><td>{{.Name}}</td><td>{{.Email}}</td><td>{{.Department}}</td></tr>\n{{end}}\n</table>\n</body></html>`))\n}\n\ntype Employee struct {\n\tName       string\n\tEmail      string\n\tDepartment string\n}\n\ntype PageData struct {\n\tQuery   string\n\tResults []Employee\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tdept := r.URL.Query().Get(\"dept\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", 400)\n\t\treturn\n\t}\n\n\t// Build query with department filter\n\tsqlQuery := fmt.Sprintf(\n\t\t\"SELECT name, email, department FROM employees WHERE name ILIKE '%%%s%%'\",\n\t\tquery,\n\t)\n\n\tif dept != \"\" {\n\t\tsqlQuery += fmt.Sprintf(\" AND department = '%s'\", dept)\n\t}\n\n\trows, err := db.Query(sqlQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Employee\n\tfor rows.Next() {\n\t\tvar emp Employee\n\t\tif err := rows.Scan(&emp.Name, &emp.Email, &emp.Department); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, emp)\n\t}\n\n\tdata := PageData{Query: query, Results: results}\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/search\", searchHandler)\n\tmux.HandleFunc(\"/health\", healthHandler)\n\n\t// Basic request logging middleware\n\thandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tlog.Printf(\"%s %s %s\", r.RemoteAddr, r.Method, r.URL.String())\n\t\t// Reject requests with bodies > 1MB\n\t\tif r.ContentLength > 1<<20 {\n\t\t\thttp.Error(w, \"Request too large\", 413)\n\t\t\treturn\n\t\t}\n\t\t// Only allow GET for search\n\t\tif strings.HasPrefix(r.URL.Path, \"/search\") && r.Method != \"GET\" {\n\t\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\t\treturn\n\t\t}\n\t\tmux.ServeHTTP(w, r)\n\t})\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, handler))\n}",
+  "environment": {
+    "description": "Flask application deployed on an EC2 instance (Amazon Linux 2, t3.medium) behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. ALB has no AWS WAF WebACL associated. The application is exposed at https://internal-tools.example.com/api/* and accessible to any authenticated corporate user via Okta SSO at the ALB level (OIDC action), but the /api/users/search and /api/reports/export endpoints pass query parameters directly to SQLite without parameterization.",
+    "config": {
+      "infrastructure": "AWS ALB -> EC2 (Flask/Gunicorn)",
+      "alb_waf_webacl": "none",
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "condition": "path-pattern /api/*",
+          "action": "authenticate-oidc then forward to target-group"
+        }
+      ],
+      "security_group_inbound": "443/tcp from 0.0.0.0/0",
+      "network_acl": "default (allow all)",
+      "ec2_instance_role": "arn:aws:iam::111122223333:role/app-basic-role",
+      "sqlite_path": "/var/data/users.db"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "id": "bac0e460",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"sync\"\n\t\"unsafe\"\n\n\t\"github.com/Shopify/sarama\"\n)\n\n// MessageBuffer holds raw message pointers for batch processing\ntype MessageBuffer struct {\n\tmu       sync.Mutex\n\tbuffers  []unsafe.Pointer\n\tfreed    map[int]bool\n\tbatchSize int\n}\n\nfunc NewMessageBuffer(batchSize int) *MessageBuffer {\n\treturn &MessageBuffer{\n\t\tbuffers:   make([]unsafe.Pointer, 0, batchSize),\n\t\tfreed:     make(map[int]bool),\n\t\tbatchSize: batchSize,\n\t}\n}\n\n// AllocMessage allocates a C-style buffer for zero-copy message processing\nfunc (mb *MessageBuffer) AllocMessage(data []byte) int {\n\tmb.mu.Lock()\n\tdefer mb.mu.Unlock()\n\tbuf := C_malloc(len(data))\n\tcopy((*[1 << 30]byte)(buf)[:len(data)], data)\n\tmb.buffers = append(mb.buffers, buf)\n\treturn len(mb.buffers) - 1\n}\n\n// ReleaseMessage frees a message buffer by index\nfunc (mb *MessageBuffer) ReleaseMessage(idx int) {\n\tmb.mu.Lock()\n\tdefer mb.mu.Unlock()\n\tif idx >= 0 && idx < len(mb.buffers) && mb.buffers[idx] != nil {\n\t\tC_free(mb.buffers[idx])\n\t\tmb.freed[idx] = true\n\t\t// BUG: pointer not nil'd after free, enabling double-free\n\t}\n}\n\n// FlushBatch releases all buffers in the current batch\nfunc (mb *MessageBuffer) FlushBatch() {\n\tmb.mu.Lock()\n\tdefer mb.mu.Unlock()\n\tfor i, buf := range mb.buffers {\n\t\tif buf != nil {\n\t\t\t// Double-free: doesn't check mb.freed map\n\t\t\tC_free(buf)\n\t\t}\n\t}\n\tmb.buffers = mb.buffers[:0]\n\tmb.freed = make(map[int]bool)\n}\n\n// Consumer handles Kafka message consumption\ntype Consumer struct {\n\tbuffer  *MessageBuffer\n\thandler func([]byte) error\n}\n\nfunc (c *Consumer) Setup(_ sarama.ConsumerGroupSession) error   { return nil }\nfunc (c *Consumer) Cleanup(_ sarama.ConsumerGroupSession) error { return nil }\n\nfunc (c *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {\n\tfor msg := range claim.Messages() {\n\t\tidx := c.buffer.AllocMessage(msg.Value)\n\t\tif err := c.handler(msg.Value); err != nil {\n\t\t\t// On error, release individual message\n\t\t\tc.buffer.ReleaseMessage(idx)\n\t\t\tlog.Printf(\"handler error for offset %d: %v\", msg.Offset, err)\n\t\t\tcontinue\n\t\t}\n\t\tsession.MarkMessage(msg, \"\")\n\t\t// Periodic flush triggers double-free for already-released messages\n\t\tif idx > 0 && idx%c.buffer.batchSize == 0 {\n\t\t\tc.buffer.FlushBatch()\n\t\t}\n\t}\n\treturn nil\n}\n\n// AdminHandler exposes batch flush via HTTP for operational use\nfunc (c *Consumer) AdminHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\taction := r.URL.Query().Get(\"action\")\n\tswitch action {\n\tcase \"flush\":\n\t\tc.buffer.FlushBatch()\n\t\tfmt.Fprintf(w, \"batch flushed\")\n\tcase \"release\":\n\t\t// Allows releasing arbitrary index - can trigger double-free\n\t\tidx := 0\n\t\tfmt.Sscanf(r.URL.Query().Get(\"idx\"), \"%d\", &idx)\n\t\tc.buffer.ReleaseMessage(idx)\n\t\tfmt.Fprintf(w, \"released %d\", idx)\n\tdefault:\n\t\thttp.Error(w, \"unknown action\", http.StatusBadRequest)\n\t}\n}\n\nfunc main() {\n\tbuffer := NewMessageBuffer(64)\n\tconsumer := &Consumer{\n\t\tbuffer: buffer,\n\t\thandler: func(data []byte) error {\n\t\t\tif len(data) > 1048576 {\n\t\t\t\treturn fmt.Errorf(\"message too large\")\n\t\t\t}\n\t\t\treturn nil\n\t\t},\n\t}\n\n\thttp.HandleFunc(\"/admin/buffer\", consumer.AdminHandler)\n\tgo func() {\n\t\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n\t}()\n\n\tconfig := sarama.NewConfig()\n\tconfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin\n\tconfig.Consumer.Offsets.Initial = sarama.OffsetNewest\n\n\tgroup, err := sarama.NewConsumerGroup([]string{\"kafka:9092\"}, \"stream-processor\", config)\n\tif err != nil {\n\t\tlog.Fatalf(\"consumer group: %v\", err)\n\t}\n\tdefer group.Close()\n\n\tctx := context.Background()\n\tfor {\n\t\tif err := group.Consume(ctx, []string{\"events\"}, consumer); err != nil {\n\t\t\tlog.Printf(\"consume error: %v\", err)\n\t\t}\n\t}\n}",
+  "environment": {
+    "description": "Same pod deployed behind an Istio ingress gateway (envoy 1.28) with PeerAuthentication policy in STRICT mode on the namespace. The gateway's DestinationRule specifies tls.mode: ISTIO_MUTUAL with a custom trust domain (cluster.local). Additionally, an AuthorizationPolicy on the workload requires requestPrincipals matching 'cluster.local/ns/operations/sa/admin-controller' for paths prefixed with /admin/*. The Kafka cluster uses SASL_SSL with ACLs restricting WRITE on topic 'events' to principal 'User:ingestion-service'. The pod's ServiceAccount token is projected with audience 'istio-ca' and 1h expiry. Note: the envoy sidecar terminates mTLS but the application container still listens on localhost:8080 - traffic reaches the admin endpoint only after passing through the sidecar's listener filter chain which enforces the peer certificate validation against the mesh CA root.",
+    "config": {
+      "service_mesh": "istio-1.20",
+      "peer_authentication": "STRICT",
+      "authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/operations/sa/admin-controller"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/admin/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "destination_rule_tls": "ISTIO_MUTUAL",
+      "kafka_security": "SASL_SSL",
+      "kafka_acl": "ALLOW User:ingestion-service WRITE on topic events",
+      "envoy_version": "1.28.1",
+      "pod_security_standard": "restricted",
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

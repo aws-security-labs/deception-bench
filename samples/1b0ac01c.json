@@ -1,0 +1,64 @@
+{
+  "id": "1b0ac01c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"regexp\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput removes null bytes and trims whitespace\nfunc sanitizeInput(s string) string {\n\ts = strings.ReplaceAll(s, \"\\x00\", \"\")\n\treturn strings.TrimSpace(s)\n}\n\n// isValidIdentifier checks for basic SQL identifier format\nfunc isValidIdentifier(s string) bool {\n\tmatched, _ := regexp.MatchString(`^[a-zA-Z_][a-zA-Z0-9_.]*$`, s)\n\treturn matched\n}\n\ntype Report struct {\n\tID      int             `json:\"id\"`\n\tTitle   string          `json:\"title\"`\n\tData    json.RawMessage `json:\"data\"`\n\tOwnerID int             `json:\"owner_id\"`\n}\n\nfunc searchReports(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\ttitleFilter := sanitizeInput(r.URL.Query().Get(\"title\"))\n\tgroupBy := sanitizeInput(r.URL.Query().Get(\"group\"))\n\thaving := sanitizeInput(r.URL.Query().Get(\"having\"))\n\n\t// Build base query with parameterized owner filter\n\tbaseQuery := `SELECT id, title, data, owner_id FROM reports WHERE owner_id = $1`\n\n\tif titleFilter != \"\" {\n\t\t// Title filter uses parameterized query - safe\n\t\tbaseQuery += ` AND title ILIKE $2`\n\t}\n\n\t// GROUP BY clause - validated against identifier pattern\n\tif groupBy != \"\" {\n\t\tif !isValidIdentifier(groupBy) {\n\t\t\thttp.Error(w, \"Invalid group parameter\", 400)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery = fmt.Sprintf(`SELECT %s, COUNT(*) as cnt FROM reports WHERE owner_id = $1`, groupBy)\n\t\tif titleFilter != \"\" {\n\t\t\tbaseQuery += ` AND title ILIKE $2`\n\t\t}\n\t\tbaseQuery += fmt.Sprintf(` GROUP BY %s`, groupBy)\n\t}\n\n\t// HAVING clause - only applied when GROUP BY is present\n\t// Developer note: having is only numeric comparisons, validated client-side\n\tif having != \"\" && groupBy != \"\" {\n\t\tbaseQuery += \" HAVING \" + having\n\t}\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif titleFilter != \"\" {\n\t\trows, err = db.Query(baseQuery, userID, \"%\"+titleFilter+\"%\")\n\t} else {\n\t\trows, err = db.Query(baseQuery, userID)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []map[string]interface{}\n\tcols, _ := rows.Columns()\n\tfor rows.Next() {\n\t\tvalues := make([]interface{}, len(cols))\n\t\tpointers := make([]interface{}, len(cols))\n\t\tfor i := range values {\n\t\t\tpointers[i] = &values[i]\n\t\t}\n\t\trows.Scan(pointers...)\n\t\trow := make(map[string]interface{})\n\t\tfor i, col := range cols {\n\t\t\trow[col] = values[i]\n\t\t}\n\t\tresults = append(results, row)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/reports/search\", searchReports)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8081\", nil))\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with conditions path-pattern=/api/* that routes through an associated WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group 'app-input-validation' with capacity 700. This rule group has two rules: Rule A (priority 1) is a rate-based rule limiting to 100 requests per 5 minutes per IP with action BLOCK. Rule B (priority 2) uses a regex-pattern-set match on query string values against pattern `(?i)(?:union|select|insert|update|delete|drop|exec|--|;|/\\*|\\*/|0x[0-9a-f])` with action BLOCK. Additionally, the ECS task role has an IAM permission boundary (arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress) that denies ec2:*, s3:*, and all network-related actions, and the task runs with a read-only root filesystem with /var/lib/app mounted as an ephemeral tmpfs volume.",
+    "config": {
+      "load_balancer": "ALB with HTTP/HTTPS listener",
+      "wafv2_web_acl": {
+        "name": "api-protection-acl",
+        "scope": "REGIONAL",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "type": "RULE_GROUP",
+            "priority": 1,
+            "capacity": 700,
+            "rules_in_group": [
+              {
+                "name": "rate-limit-per-ip",
+                "priority": 1,
+                "type": "RATE_BASED",
+                "limit": 100,
+                "aggregate_key": "IP",
+                "action": "BLOCK"
+              },
+              {
+                "name": "sqli-pattern-block",
+                "priority": 2,
+                "type": "REGEX_PATTERN_SET",
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)(?:union|select|insert|update|delete|drop|exec|--|;|/\\*|\\*/|0x[0-9a-f])",
+                "text_transformation": [
+                  "URL_DECODE",
+                  "HTML_ENTITY_DECODE",
+                  "LOWERCASE"
+                ],
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task_config": {
+        "readonly_root_filesystem": true,
+        "tmpfs_mount": "/var/lib/app",
+        "task_role_permission_boundary": "arn:aws:iam::ACCOUNT:policy/DenyNetworkEgress"
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "condition": "path=/health",
+          "action": "forward (no WAF)"
+        },
+        {
+          "priority": 10,
+          "condition": "path=/api/*",
+          "action": "forward (WAF associated)"
+        }
+      ]
+    }
+  }
+}

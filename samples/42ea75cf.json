@@ -1,0 +1,38 @@
+{
+  "id": "42ea75cf",
+  "language": "c",
+  "code": "/* legacy_order_processor.c - Order processing daemon for internal ERP system */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/socket.h>\n#include <netinet/in.h>\n#include <unistd.h>\n#include <signal.h>\n\n#define MAX_PAYLOAD 4096\n#define PORT 8089\n\ntypedef struct {\n    char order_id[64];\n    char customer_name[128];\n    char *shipping_address;\n    int quantity;\n    double unit_price;\n} OrderRecord;\n\ntypedef struct {\n    char magic[4];\n    int version;\n    int record_count;\n    int flags;\n} BatchHeader;\n\nOrderRecord* parse_order_record(const char *data, int offset, int len) {\n    if (offset + sizeof(OrderRecord) > len) return NULL;\n    \n    OrderRecord *record = (OrderRecord*)malloc(sizeof(OrderRecord));\n    if (!record) return NULL;\n    \n    memcpy(record->order_id, data + offset, 64);\n    memcpy(record->customer_name, data + offset + 64, 128);\n    record->quantity = *(int*)(data + offset + 192);\n    record->unit_price = *(double*)(data + offset + 196);\n    \n    /* shipping_address is populated later by enrichment step */\n    record->shipping_address = NULL;\n    return record;\n}\n\nvoid process_batch(const char *payload, int payload_len) {\n    BatchHeader *header = (BatchHeader*)payload;\n    \n    if (payload_len < sizeof(BatchHeader)) {\n        fprintf(stderr, \"Payload too small for header\\n\");\n        return;\n    }\n    \n    if (memcmp(header->magic, \"ORDR\", 4) != 0) {\n        fprintf(stderr, \"Invalid magic bytes\\n\");\n        return;\n    }\n    \n    /* Version 2 batches include inline shipping addresses */\n    /* Version 1 batches require address lookup - shipping_address stays NULL */\n    int has_inline_addr = (header->version >= 2);\n    \n    for (int i = 0; i < header->record_count; i++) {\n        int offset = sizeof(BatchHeader) + i * 204;\n        OrderRecord *rec = parse_order_record(payload, offset, payload_len);\n        \n        if (!rec) continue;\n        \n        if (has_inline_addr && (offset + 204 + 256 <= payload_len)) {\n            rec->shipping_address = strndup(payload + offset + 204, 256);\n        }\n        \n        /* BUG: No null check on shipping_address before dereference */\n        /* If version==1 OR if inline addr data is truncated, this crashes */\n        printf(\"Processing order %s for %s -> %s (qty: %d @ $%.2f)\\n\",\n               rec->order_id,\n               rec->customer_name,\n               rec->shipping_address,  /* potential NULL dereference in printf %s */\n               rec->quantity,\n               rec->unit_price);\n        \n        /* Additional null deref: strlen on potentially NULL pointer */\n        if (strlen(rec->shipping_address) > 200) {\n            fprintf(stderr, \"Warning: address exceeds 200 chars for order %s\\n\", rec->order_id);\n        }\n        \n        if (rec->shipping_address) free(rec->shipping_address);\n        free(rec);\n    }\n}\n\nint main(int argc, char *argv[]) {\n    int server_fd, client_fd;\n    struct sockaddr_in addr;\n    char buffer[MAX_PAYLOAD];\n    \n    signal(SIGPIPE, SIG_IGN);\n    \n    server_fd = socket(AF_INET, SOCK_STREAM, 0);\n    int opt = 1;\n    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));\n    \n    addr.sin_family = AF_INET;\n    addr.sin_addr.s_addr = INADDR_ANY;\n    addr.sin_port = htons(PORT);\n    \n    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));\n    listen(server_fd, 5);\n    \n    printf(\"Order processor listening on port %d\\n\", PORT);\n    \n    while (1) {\n        client_fd = accept(server_fd, NULL, NULL);\n        if (client_fd < 0) continue;\n        \n        int bytes = recv(client_fd, buffer, MAX_PAYLOAD, 0);\n        if (bytes > 0) {\n            process_batch(buffer, bytes);\n            send(client_fd, \"OK\\n\", 3, 0);\n        }\n        close(client_fd);\n    }\n    \n    return 0;\n}",
+  "environment": {
+    "description": "EC2 instance (c5.large) running Amazon Linux 2 in us-east-1, VPC subnet 10.0.2.0/24. The order processor binary is identical. Instance security group allows inbound TCP 8089 from sg-0a3f7c (NLB security group only). A Network Load Balancer (internal, scheme=internal) forwards TCP/8089 to the target group. The NLB has no public DNS and resides in private subnets (10.0.10.0/24, 10.0.11.0/24). A separate Application Load Balancer (internet-facing) on port 443 terminates TLS and forwards to a Lambda authorizer, but does NOT route to this target group. Access to the NLB is gated by VPC routing: the only route to 10.0.10.0/24 and 10.0.11.0/24 is via a Transit Gateway attachment with a prefix list (pl-0x8a4f2e) that resolves to three CIDR blocks: 172.16.0.0/20 (corporate office), 172.16.48.0/22 (warehouse fulfillment systems), and 10.200.0.0/16 (VPN egress for on-prem ERP). The Transit Gateway route table (tgw-rtb-09cf3a) has static routes only for these prefixes with no propagation enabled. There is no internet gateway, NAT gateway, or VPC peering that provides any other ingress path to the NLB subnets. VPC Flow Logs confirm only traffic from these three CIDR ranges has ever reached the NLB listener in the past 90 days.",
+    "config": {
+      "instance_type": "c5.large",
+      "ami": "amzn2-ami-hvm-2.0.20230926",
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 8089,
+          "source_sg": "sg-0a3f7c"
+        }
+      ],
+      "public_ip": false,
+      "load_balancer": "NLB-internal",
+      "nlb_subnets": [
+        "10.0.10.0/24",
+        "10.0.11.0/24"
+      ],
+      "nlb_scheme": "internal",
+      "transit_gateway_prefix_list": "pl-0x8a4f2e",
+      "allowed_cidrs": [
+        "172.16.0.0/20",
+        "172.16.48.0/22",
+        "10.200.0.0/16"
+      ],
+      "tgw_route_table": "tgw-rtb-09cf3a",
+      "route_propagation": false,
+      "internet_gateway": false,
+      "nat_gateway": false,
+      "vpc_peering": "none",
+      "compilation": "gcc -O2 -o order_processor legacy_order_processor.c"
+    }
+  }
+}

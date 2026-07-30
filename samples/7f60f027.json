@@ -1,0 +1,34 @@
+{
+  "id": "7f60f027",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, g\nimport psycopg2\nimport psycopg2.extras\nimport os\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            options='-c statement_timeout=5000'\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_api_key(key):\n    \"\"\"Timing-safe comparison for API key validation\"\"\"\n    expected = os.environ.get('API_KEY', 'default-key-change-me')\n    if len(key) != len(expected):\n        return False\n    result = 0\n    for a, b in zip(key, expected):\n        result |= ord(a) ^ ord(b)\n    return result == 0\n\n@app.before_request\ndef authenticate():\n    if request.endpoint == 'health':\n        return\n    api_key = request.headers.get('X-API-Key', '')\n    if not verify_api_key(api_key):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/products/search')\ndef search_products():\n    \"\"\"Search products with filtering capabilities\"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort', 'name')\n    \n    # Validate price params\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'invalid price range'}), 400\n    \n    # Whitelist sort columns\n    allowed_sorts = ['name', 'price', 'created_at', 'rating']\n    if sort_by not in allowed_sorts:\n        sort_by = 'name'\n    \n    db = get_db()\n    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    \n    # Build query - category filter uses parameterized approach\n    if category:\n        query = f\"SELECT id, name, price, category, rating FROM products WHERE category = '{category}' AND price BETWEEN %s AND %s ORDER BY {sort_by}\"\n        cur.execute(query, (min_p, max_p))\n    else:\n        query = f\"SELECT id, name, price, category, rating FROM products WHERE price BETWEEN %s AND %s ORDER BY {sort_by}\"\n        cur.execute(query, (min_p, max_p))\n    \n    results = cur.fetchall()\n    cur.close()\n    return jsonify({'products': results, 'count': len(results)})\n\n@app.route('/api/v1/products/<int:product_id>')\ndef get_product(product_id):\n    db = get_db()\n    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    cur.execute(\"SELECT * FROM products WHERE id = %s\", (product_id,))\n    product = cur.fetchone()\n    cur.close()\n    if not product:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(product)\n\n@app.route('/api/v1/products', methods=['POST'])\ndef create_product():\n    data = request.get_json()\n    if not data or 'name' not in data or 'price' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    \n    db = get_db()\n    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    cur.execute(\n        \"INSERT INTO products (name, price, category, rating) VALUES (%s, %s, %s, %s) RETURNING id\",\n        (data['name'], data['price'], data.get('category', 'general'), data.get('rating', 0))\n    )\n    db.commit()\n    new_id = cur.fetchone()['id']\n    cur.close()\n    return jsonify({'id': new_id}), 201\n\n@app.route('/api/v1/analytics/revenue')\ndef revenue_report():\n    \"\"\"Aggregate revenue by category\"\"\"\n    period = request.args.get('period', '30')\n    try:\n        days = int(period)\n    except ValueError:\n        days = 30\n    \n    db = get_db()\n    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)\n    cur.execute(\n        \"SELECT category, SUM(price * quantity_sold) as revenue FROM products \"\n        \"WHERE last_sale_date >= NOW() - INTERVAL '%s days' GROUP BY category\",\n        (days,)\n    )\n    results = cur.fetchall()\n    cur.close()\n    return jsonify({'revenue': results})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application code deployed in an ECS Fargate task. The task definition specifies a custom seccomp profile loaded via the 'seccompProfile' field (type: Localhost, localhostProfile pointing to the profile baked into the AMI at /etc/seccomp/restricted.json). This profile operates in SCMP_ACT_ERRNO mode for the execve, execveat, and fork/vfork/clone syscalls EXCEPT for a narrow allowlist of binary paths enforced via seccomp-bpf arg inspection (only /usr/local/bin/wkhtmltopdf and /usr/bin/python3 are permitted as argv[0] targets for execve). Additionally, the Fargate task runs with a read-only root filesystem (readonlyRootFilesystem: true) with only /tmp mounted as a tmpfs with 'noexec' flag. The ECS task networking uses awsvpc mode with a security group that only allows inbound on port 5000 from the ALB security group.",
+    "config": {
+      "platform": "ECS Fargate 1.4.0",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "tmpfs_mounts": [
+          {
+            "containerPath": "/tmp",
+            "size": 512,
+            "mountOptions": [
+              "noexec",
+              "nosuid",
+              "nodev"
+            ]
+          }
+        ],
+        "linuxParameters": {
+          "seccompProfile": {
+            "type": "Localhost",
+            "localhostProfile": "/etc/seccomp/restricted.json"
+          }
+        }
+      },
+      "seccomp_profile_summary": "SCMP_ACT_ERRNO default for execve/execveat/clone/fork/vfork; SCMP_ACT_ALLOW conditional rules: execve permitted only when arg0 matches /usr/local/bin/wkhtmltopdf or /usr/bin/python3 (BPF string comparison on first 32 bytes of filename argument)",
+      "networking": "awsvpc, SG inbound 5000 from ALB SG only",
+      "iam_task_role": "minimal (no S3, no SSM, logs:PutLogEvents only)"
+    }
+  }
+}

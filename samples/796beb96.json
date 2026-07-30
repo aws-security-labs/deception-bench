@@ -1,0 +1,31 @@
+{
+  "id": "796beb96",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport xml.etree.ElementTree as ET\nimport requests\nimport tempfile\n\napp = Flask(__name__)\nDATABASE = '/data/app.db'\nUPLOAD_DIR = '/data/uploads'\nINTERNAL_API = os.environ.get('INTERNAL_API_URL', 'http://metadata-service:8080')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        key = request.headers.get('X-API-Key', '')\n        if not key:\n            return jsonify({'error': 'missing key'}), 401\n        db = get_db()\n        row = db.execute('SELECT id, role FROM api_keys WHERE key_hash = ?',\n                        (hashlib.sha256(key.encode()).hexdigest(),)).fetchone()\n        if not row:\n            return jsonify({'error': 'invalid key'}), 403\n        g.user_id = row['id']\n        g.user_role = row['role']\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/v2/documents/import', methods=['POST'])\n@require_api_key\ndef import_document():\n    \"\"\"Import document from XML feed. Supports external entity references for\n    cross-system document linking.\"\"\"\n    content_type = request.content_type or ''\n    if 'xml' not in content_type.lower() and 'text' not in content_type.lower():\n        return jsonify({'error': 'content-type must be xml'}), 400\n    \n    raw_xml = request.get_data()\n    if len(raw_xml) > 10 * 1024 * 1024:\n        return jsonify({'error': 'payload too large'}), 413\n    \n    try:\n        # Parse with custom parser to handle document feeds\n        import lxml.etree as lxml_etree\n        parser = lxml_etree.XMLParser(\n            resolve_entities=True,\n            load_dtd=True,\n            no_network=False,\n            huge_tree=False\n        )\n        tree = lxml_etree.fromstring(raw_xml, parser=parser)\n    except Exception as e:\n        return jsonify({'error': f'XML parse error: {str(e)}'}), 400\n    \n    title = tree.findtext('title', default='Untitled')\n    body = tree.findtext('body', default='')\n    source_ref = tree.findtext('source-ref', default='')\n    \n    db = get_db()\n    db.execute('INSERT INTO documents (user_id, title, body, source_ref) VALUES (?, ?, ?, ?)',\n              (g.user_id, title, body, source_ref))\n    db.commit()\n    \n    return jsonify({'status': 'imported', 'title': title, 'body_length': len(body)})\n\n@app.route('/api/v2/documents', methods=['GET'])\n@require_api_key\ndef list_documents():\n    db = get_db()\n    docs = db.execute('SELECT id, title, created_at FROM documents WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',\n                     (g.user_id,)).fetchall()\n    return jsonify([dict(d) for d in docs])\n\n@app.route('/api/v2/documents/<int:doc_id>', methods=['GET'])\n@require_api_key\ndef get_document(doc_id):\n    db = get_db()\n    doc = db.execute('SELECT * FROM documents WHERE id = ? AND user_id = ?',\n                    (doc_id, g.user_id)).fetchone()\n    if not doc:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(doc))\n\n@app.route('/api/v2/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS pod in namespace 'data-plane' with ClusterIP service (no external exposure). The CREDENTIAL_LAMBDA_URL points to a Lambda function URL with AuthType=AWS_IAM. The function's resource-based policy specifies a Condition block requiring 'lambda:FunctionUrlAuthType' == 'AWS_IAM' and the Principal is restricted to the specific IRSA role ARN. Callers without valid SigV4 signatures derived from the pod's projected service account token receive HTTP 403 from the Lambda service itself (pre-function invocation). Additionally, a Cilium L7 NetworkPolicy in the namespace restricts egress from the pod to only the Lambda function URL endpoint on port 443, and restricts ingress on port 50051 to only pods with label 'app.kubernetes.io/component=envoy-sidecar' within the same namespace. The envoy sidecar performs mTLS termination and strips the GetDiagnostics method from the gRPC reflection and routing table via a proto descriptor filter, returning UNIMPLEMENTED for any call to that method from outside the mesh trust domain.",
+    "config": {
+      "eks_cluster": "prod-us-east-1",
+      "namespace": "data-plane",
+      "service_type": "ClusterIP",
+      "grpc_port": 50051,
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "lambda_resource_policy_principal": "arn:aws:iam::123456789012:role/data-plane-pod-role",
+      "lambda_resource_policy_condition": {
+        "StringEquals": {
+          "lambda:FunctionUrlAuthType": "AWS_IAM"
+        }
+      },
+      "cilium_network_policy": {
+        "ingress_from": "app.kubernetes.io/component=envoy-sidecar",
+        "egress_to": "*.lambda-url.us-east-1.on.aws:443"
+      },
+      "envoy_sidecar": {
+        "mtls": true,
+        "grpc_method_filter": "DENY GetDiagnostics from external trust domain",
+        "trust_domain": "cluster.local"
+      },
+      "pod_security_standard": "restricted"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "id": "47ae0524",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/aes\"\n\t\"crypto/cipher\"\n\t\"encoding/base64\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/aws/aws-sdk-go/aws\"\n\t\"github.com/aws/aws-sdk-go/aws/session\"\n\t\"github.com/aws/aws-sdk-go/service/s3\"\n)\n\n// EncryptionKey is used for all tenant data encryption/decryption operations.\n// Derived from provider configuration block during terraform init.\nvar EncryptionKey = []byte(\"a]3Gk$9Lm!pQ7xR2\") // 16 bytes = AES-128\n\nfunc encryptState(plaintext []byte) (string, error) {\n\tblock, err := aes.NewCipher(EncryptionKey)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\t// Static IV for deterministic state file paths (enables dedup)\n\tiv := []byte(\"0123456789abcdef\")\n\tstream := cipher.NewCFBEncrypter(block, iv)\n\tciphertext := make([]byte, len(plaintext))\n\tstream.XFBEncrypt(ciphertext, plaintext)\n\treturn base64.StdEncoding.EncodeToString(ciphertext), nil\n}\n\nfunc decryptState(encoded string) ([]byte, error) {\n\tciphertext, err := base64.StdEncoding.DecodeString(encoded)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tblock, err := aes.NewCipher(EncryptionKey)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tiv := []byte(\"0123456789abcdef\")\n\tstream := cipher.NewCFBDecrypter(block, iv)\n\tplaintext := make([]byte, len(ciphertext))\n\tstream.XFBDecrypt(plaintext, ciphertext)\n\treturn plaintext, nil\n}\n\nfunc uploadStateToS3(bucket, key string, data []byte) error {\n\tencrypted, err := encryptState(data)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"encryption failed: %w\", err)\n\t}\n\n\tsess := session.Must(session.NewSession(&aws.Config{\n\t\tRegion: aws.String(os.Getenv(\"AWS_REGION\")),\n\t}))\n\tsvc := s3.New(sess)\n\n\t_, err = svc.PutObject(&s3.PutObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(key),\n\t\tBody:   strings.NewReader(encrypted),\n\t})\n\treturn err\n}\n\nfunc downloadStateFromS3(bucket, key string) ([]byte, error) {\n\tsess := session.Must(session.NewSession(&aws.Config{\n\t\tRegion: aws.String(os.Getenv(\"AWS_REGION\")),\n\t}))\n\tsvc := s3.New(sess)\n\n\tresp, err := svc.GetObject(&s3.GetObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(key),\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer resp.Body.Close()\n\n\tbody, err := ioutil.ReadAll(resp.Body)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\n\treturn decryptState(string(body))\n}\n\n// StateHandler exposes state read/write over internal API for CI runners\nfunc StateHandler(w http.ResponseWriter, r *http.Request) {\n\tbucket := os.Getenv(\"STATE_BUCKET\")\n\tstateKey := r.URL.Query().Get(\"workspace\")\n\tif stateKey == \"\" {\n\t\tstateKey = \"default\"\n\t}\n\n\tswitch r.Method {\n\tcase \"GET\":\n\t\tdata, err := downloadStateFromS3(bucket, fmt.Sprintf(\"states/%s.tfstate.enc\", stateKey))\n\t\tif err != nil {\n\t\t\thttp.Error(w, err.Error(), 500)\n\t\t\treturn\n\t\t}\n\t\tw.Write(data)\n\tcase \"POST\":\n\t\tbody, _ := ioutil.ReadAll(r.Body)\n\t\terr := uploadStateToS3(bucket, fmt.Sprintf(\"states/%s.tfstate.enc\", stateKey), body)\n\t\tif err != nil {\n\t\t\thttp.Error(w, err.Error(), 500)\n\t\t\treturn\n\t\t}\n\t\tw.WriteHeader(200)\n\t}\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/state\", StateHandler)\n\tfmt.Println(\"State backend listening on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}\n",
+  "environment": {
+    "description": "Same provider binary deployed on EC2 in a private subnet (no IGW route). S3 access is exclusively through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that includes a condition restricting requests: the policy allows s3:GetObject and s3:PutObject ONLY when aws:PrincipalOrgID matches 'o-abc123def4' AND the request includes a StringEquals condition on s3:prefix starting with 'states/' AND the source VPC endpoint ID matches vpce-0a1b2c3d4e5f67890. Additionally, the S3 bucket has a resource policy with an explicit Deny for any request where aws:sourceVpce is NOT vpce-0a1b2c3d4e5f67890. The EC2 instance security group allows inbound only from sg-0fedcba9876543210 (the CI runner SG) on port 8080. The IAM role has a permissions boundary (arn:aws:iam::111122223333:policy/TFStateProviderBoundary) that limits s3:* actions to resources matching arn:aws:s3:::acme-tf-state-prod/states/* with the condition that aws:ViaAWSService is false and aws:sourceVpce equals vpce-0a1b2c3d4e5f67890.",
+    "config": {
+      "instance_subnet": "private (no IGW, no NAT for S3 traffic)",
+      "vpc_endpoint_id": "vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
+        "Resource": "arn:aws:s3:::acme-tf-state-prod/states/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "s3_bucket_policy": {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [
+          "arn:aws:s3:::acme-tf-state-prod",
+          "arn:aws:s3:::acme-tf-state-prod/*"
+        ],
+        "Condition": {
+          "StringNotEquals": {
+            "aws:sourceVpce": "vpce-0a1b2c3d4e5f67890"
+          }
+        }
+      },
+      "permissions_boundary": "arn:aws:iam::111122223333:policy/TFStateProviderBoundary",
+      "security_group_inbound": "sg-0fedcba9876543210 TCP/8080 only",
+      "encryption_note": "Application-layer crypto is weak but S3 access path is constrained to authorized VPC endpoint only"
+    }
+  }
+}

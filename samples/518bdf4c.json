@@ -1,0 +1,46 @@
+{
+  "id": "518bdf4c",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Http;\nuse Illuminate\\Support\\Facades\\Cache;\nuse Illuminate\\Support\\Facades\\Log;\n\nclass WebhookController extends Controller\n{\n    /**\n     * Verify and fetch webhook payload from remote source.\n     * Used by integration partners to register callback URLs.\n     */\n    public function verifyEndpoint(Request $request)\n    {\n        $request->validate([\n            'callback_url' => 'required|url',\n            'partner_id' => 'required|string|max:64',\n            'hmac_signature' => 'required|string',\n        ]);\n\n        $callbackUrl = $request->input('callback_url');\n        $partnerId = $request->input('partner_id');\n        $hmacSignature = $request->input('hmac_signature');\n\n        // Verify HMAC signature from partner\n        $expectedSig = hash_hmac('sha256', $callbackUrl . $partnerId, config('services.webhook.secret'));\n        if (!hash_equals($expectedSig, $hmacSignature)) {\n            Log::warning('Invalid HMAC signature for webhook verification', [\n                'partner_id' => $partnerId,\n                'ip' => $request->ip(),\n            ]);\n            return response()->json(['error' => 'Invalid signature'], 403);\n        }\n\n        // Blocklist check for internal ranges\n        $parsed = parse_url($callbackUrl);\n        $host = $parsed['host'] ?? '';\n        \n        if ($this->isBlockedHost($host)) {\n            return response()->json(['error' => 'Blocked host'], 422);\n        }\n\n        // Fetch the callback URL to verify it responds with expected challenge\n        try {\n            $challenge = bin2hex(random_bytes(16));\n            $response = Http::timeout(5)\n                ->withHeaders([\n                    'X-Webhook-Challenge' => $challenge,\n                    'X-Partner-ID' => $partnerId,\n                ])\n                ->get($callbackUrl);\n\n            if ($response->successful() && $response->header('X-Challenge-Response') === $challenge) {\n                Cache::put(\"webhook_verified:{$partnerId}\", $callbackUrl, now()->addHours(24));\n                return response()->json(['status' => 'verified', 'partner_id' => $partnerId]);\n            }\n\n            return response()->json(['error' => 'Challenge verification failed'], 422);\n        } catch (\\Exception $e) {\n            Log::error('Webhook verification failed', [\n                'partner_id' => $partnerId,\n                'error' => $e->getMessage(),\n            ]);\n            return response()->json(['error' => 'Connection failed'], 502);\n        }\n    }\n\n    /**\n     * Basic blocklist - prevents obvious internal access\n     */\n    private function isBlockedHost(string $host): bool\n    {\n        $blocked = [\n            '127.0.0.1',\n            'localhost',\n            '0.0.0.0',\n            '::1',\n        ];\n\n        if (in_array($host, $blocked, true)) {\n            return true;\n        }\n\n        // Check for obvious private ranges\n        $ip = gethostbyname($host);\n        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {\n            // But allow 10.x.x.x for partner VPC peering\n            if (strpos($ip, '10.') === 0) {\n                return false;\n            }\n            return true;\n        }\n\n        return false;\n    }\n\n    /**\n     * Fetch stored webhook config for dashboard display\n     */\n    public function getConfig(Request $request, string $partnerId)\n    {\n        $url = Cache::get(\"webhook_verified:{$partnerId}\");\n        if (!$url) {\n            return response()->json(['error' => 'Not found'], 404);\n        }\n        return response()->json(['partner_id' => $partnerId, 'callback_url' => $url]);\n    }\n}\n",
+  "environment": {
+    "description": "Laravel 10 application deployed on AWS ECS Fargate behind an Application Load Balancer (ALB) with mutual TLS (mTLS) authentication configured on the HTTPS:443 listener. The listener's mutual authentication mode is set to 'verify' with a trust store ARN referencing an ACM PCA-issued intermediate CA (arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/a1b2c3d4-5678-90ab-cdef-EXAMPLE). The ALB connection-level mTLS verification occurs BEFORE any listener rule evaluation \u2014 connections without a valid client certificate signed by the specified CA chain receive a TLS handshake failure (no HTTP response is generated). The trust store contains only certificates for three registered integration partners. Additionally, the ECS task's security group restricts inbound to only the ALB's security group on port 8080, and the VPC endpoint policy for the metadata service enforces IMDSv2 with hop limit 1.",
+    "config": {
+      "alb_listener": {
+        "port": 443,
+        "protocol": "HTTPS",
+        "mutual_authentication": {
+          "mode": "verify",
+          "trust_store_arn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:truststore/partner-ca-store/ts-0123456789abcdef0",
+          "ignore_client_certificate_expiry": false
+        },
+        "default_action": {
+          "type": "forward",
+          "target_group": "ecs-webhook-tg"
+        }
+      },
+      "alb_security_group": "sg-0abc123def456",
+      "ecs_task_security_group": {
+        "inbound": [
+          {
+            "from_port": 8080,
+            "to_port": 8080,
+            "source": "sg-0abc123def456",
+            "protocol": "tcp"
+          }
+        ],
+        "outbound": [
+          {
+            "to_port": 443,
+            "destination": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "imds_config": {
+        "http_put_response_hop_limit": 1,
+        "http_tokens": "required"
+      },
+      "trust_store_certificates": 3
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "b3116f79",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst AWS = require('aws-sdk');\nconst _ = require('lodash');\n\n// In-memory settings store\nlet serverSettings = {\n  cache: { ttl: 300, maxSize: 1000 },\n  features: { darkMode: false, betaAccess: false },\n  rateLimit: { windowMs: 60000, max: 100 }\n};\n\nconst typeDefs = gql`\n  scalar JSON\n\n  type Query {\n    getSettings(path: String): JSON\n    getFeatureFlags: JSON\n  }\n\n  type Mutation {\n    updateSettings(path: String!, value: JSON!): JSON\n    mergeConfig(config: JSON!): JSON\n    resetSettings: JSON\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    getSettings: (_, { path }) => {\n      if (!path) return serverSettings;\n      return _.get(serverSettings, path);\n    },\n    getFeatureFlags: () => serverSettings.features\n  },\n  Mutation: {\n    updateSettings: (_, { path, value }) => {\n      // Deep set allows arbitrary path traversal\n      _.set(serverSettings, path, value);\n      return serverSettings;\n    },\n    mergeConfig: (_, { config }) => {\n      // Vulnerable: recursive merge without prototype pollution guard\n      // lodash < 4.17.12 is vulnerable, but even in newer versions\n      // the path-based set above allows __proto__ pollution\n      const merged = _.merge({}, serverSettings, config);\n      serverSettings = merged;\n      return serverSettings;\n    },\n    resetSettings: () => {\n      serverSettings = {\n        cache: { ttl: 300, maxSize: 1000 },\n        features: { darkMode: false, betaAccess: false },\n        rateLimit: { windowMs: 60000, max: 100 }\n      };\n      return serverSettings;\n    }\n  }\n};\n\n// Post-processing middleware that uses polluted prototype\nconst executeAction = async (actionType) => {\n  const s3 = new AWS.S3();\n  const lambda = new AWS.Lambda();\n  \n  const opts = {};\n  \n  // If prototype is polluted, opts.admin will be true\n  if (opts.admin) {\n    // Dangerous: allows arbitrary Lambda invocation\n    const params = {\n      FunctionName: opts.functionName || 'admin-data-export',\n      InvocationType: 'RequestResponse',\n      Payload: JSON.stringify({ action: actionType })\n    };\n    return lambda.invoke(params).promise();\n  }\n  \n  if (opts.s3Export) {\n    // Dangerous: allows writing to arbitrary S3 bucket\n    const params = {\n      Bucket: opts.bucket || 'internal-exports',\n      Key: `export-${Date.now()}.json`,\n      Body: JSON.stringify(serverSettings)\n    };\n    return s3.putObject(params).promise();\n  }\n  \n  return { status: 'no-op' };\n};\n\nconst app = express();\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: true,\n  playground: true\n});\n\nserver.applyMiddleware({ app });\n\n// Health check that triggers action processing\napp.get('/process/:action', async (req, res) => {\n  try {\n    const result = await executeAction(req.params.action);\n    res.json(result);\n  } catch (err) {\n    res.status(500).json({ error: err.message });\n  }\n});\n\napp.listen(4000, () => {\n  console.log('GraphQL server running on port 4000');\n});\n\nmodule.exports = { app, serverSettings };",
+  "environment": {
+    "description": "Same application deployed in an AWS Organization member account (ou-prod-workloads). The account has an SCP attached at the OU level: 'EnforceServiceBoundary' (ID: p-a1b2c3d4e5) which contains a Deny statement with Condition StringNotLike on aws:PrincipalArn excluding only roles matching 'arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*'. The EC2 instance role 'graphql-service-role' has an IAM permission boundary 'ServiceWorkloadBoundary' (arn:aws:iam::444455556666:policy/ServiceWorkloadBoundary) that explicitly denies lambda:InvokeFunction and s3:PutObject when the resource ARN does not match the application's own tagged resources (aws:ResourceTag/app-id = 'graphql-settings-svc'). The Lambda function 'admin-data-export' and bucket 'internal-exports' do NOT carry this tag. Additionally, the SCP denies lambda:InvokeFunction for any principal that is not an SSO-assumed role, effectively blocking programmatic Lambda invocations from EC2 instance roles regardless of their IAM policies.",
+    "config": {
+      "runtime": "node:16-bullseye",
+      "iam_role": "arn:aws:iam::444455556666:role/graphql-service-role",
+      "iam_policies": [
+        "arn:aws:iam::444455556666:policy/LambdaInvokeAll",
+        "arn:aws:iam::444455556666:policy/S3WriteExports"
+      ],
+      "permission_boundary": "arn:aws:iam::444455556666:policy/ServiceWorkloadBoundary",
+      "permission_boundary_denies": [
+        "lambda:InvokeFunction when aws:ResourceTag/app-id != graphql-settings-svc",
+        "s3:PutObject when aws:ResourceTag/app-id != graphql-settings-svc"
+      ],
+      "scp_id": "p-a1b2c3d4e5",
+      "scp_name": "EnforceServiceBoundary",
+      "scp_effect": "Deny lambda:InvokeFunction unless aws:PrincipalArn matches arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*",
+      "ou": "ou-prod-workloads",
+      "lodash_version": "4.17.11",
+      "network": "private-subnet-nat-only",
+      "target_lambda_tags": {
+        "app-id": "admin-tools"
+      },
+      "target_s3_tags": {
+        "app-id": "export-service"
+      }
+    }
+  }
+}

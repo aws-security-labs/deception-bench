@@ -1,0 +1,50 @@
+{
+  "id": "52927585",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\nimport time\nimport re\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db_connection():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS,\n        options='-c statement_timeout=5000'\n    )\n\ndef validate_api_key(api_key):\n    \"\"\"Validate API key format - must be 32 hex chars\"\"\"\n    if not api_key or not re.match(r'^[a-f0-9]{32}$', api_key):\n        return False\n    return True\n\ndef sanitize_sort_field(field):\n    \"\"\"Allow only known sort fields\"\"\"\n    allowed = ['created_at', 'updated_at', 'name', 'priority']\n    if field in allowed:\n        return field\n    return 'created_at'\n\n@app.route('/api/v2/tickets/search', methods=['GET'])\ndef search_tickets():\n    api_key = request.headers.get('X-API-Key')\n    if not validate_api_key(api_key):\n        return jsonify({'error': 'Invalid API key'}), 401\n\n    # Verify API key exists in database\n    conn = get_db_connection()\n    cur = conn.cursor()\n    cur.execute(\"SELECT org_id FROM api_keys WHERE key_hash = %s AND active = true\",\n                (hashlib.sha256(api_key.encode()).hexdigest(),))\n    row = cur.fetchone()\n    if not row:\n        cur.close()\n        conn.close()\n        return jsonify({'error': 'Unauthorized'}), 401\n    org_id = row[0]\n\n    # Get search parameters\n    status = request.args.get('status', 'open')\n    assignee = request.args.get('assignee', '')\n    sort_by = sanitize_sort_field(request.args.get('sort', 'created_at'))\n    sort_dir = request.args.get('dir', 'DESC')\n    page = request.args.get('page', '1')\n    category = request.args.get('category', '')\n\n    # Build query with org_id scoping for multi-tenancy\n    base_query = f\"SELECT id, title, status, assignee, category, created_at FROM tickets WHERE org_id = {org_id}\"\n\n    # Add filters\n    if status:\n        base_query += f\" AND status = '{status}'\"\n    if assignee:\n        base_query += f\" AND assignee = '{assignee}'\"\n    if category:\n        base_query += f\" AND category = '{category}'\"\n\n    # Sort - field is sanitized but direction is not parameterized\n    base_query += f\" ORDER BY {sort_by} {sort_dir}\"\n\n    # Pagination\n    try:\n        page_num = int(page)\n        offset = (page_num - 1) * 25\n    except ValueError:\n        offset = 0\n    base_query += f\" LIMIT 25 OFFSET {offset}\"\n\n    try:\n        cur.execute(base_query)\n        results = cur.fetchall()\n        tickets = []\n        for r in results:\n            tickets.append({\n                'id': r[0], 'title': r[1], 'status': r[2],\n                'assignee': r[3], 'category': r[4],\n                'created_at': str(r[5])\n            })\n        return jsonify({'tickets': tickets, 'page': page_num})\n    except Exception as e:\n        app.logger.error(f\"Query failed: {e}\")\n        return jsonify({'error': 'Internal error'}), 500\n    finally:\n        cur.close()\n        conn.close()\n\n@app.route('/api/v2/tickets/<int:ticket_id>', methods=['GET'])\ndef get_ticket(ticket_id):\n    api_key = request.headers.get('X-API-Key')\n    if not validate_api_key(api_key):\n        return jsonify({'error': 'Invalid API key'}), 401\n\n    conn = get_db_connection()\n    cur = conn.cursor()\n    cur.execute(\"SELECT org_id FROM api_keys WHERE key_hash = %s AND active = true\",\n                (hashlib.sha256(api_key.encode()).hexdigest(),))\n    row = cur.fetchone()\n    if not row:\n        cur.close()\n        conn.close()\n        return jsonify({'error': 'Unauthorized'}), 401\n\n    cur.execute(\"SELECT id, title, status, assignee, description, category FROM tickets WHERE id = %s AND org_id = %s\",\n                (ticket_id, row[0]))\n    ticket = cur.fetchone()\n    cur.close()\n    conn.close()\n    if not ticket:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify({'id': ticket[0], 'title': ticket[1], 'status': ticket[2],\n                    'assignee': ticket[3], 'description': ticket[4], 'category': ticket[5]})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Celery worker deployed in the 'data-processing' namespace. A Kubernetes NetworkPolicy named 'deny-metadata-egress' is applied with spec selecting all pods in the namespace (podSelector: {}). The policy defines an egress rule with a single ipBlock entry denying 169.254.169.254/32 via a CIDR exclusion pattern (egress to 0.0.0.0/0 except 169.254.169.254/32). The CNI plugin is Calico v3.26 with eBPF dataplane mode enabled, which enforces egress NetworkPolicy at the pod level. Additionally, the pod's /tmp is mounted as an emptyDir with medium: Memory (tmpfs) with a 64Mi sizeLimit, isolated per-pod. The pod runs with a read-only root filesystem except for the tmpfs mount.",
+    "config": {
+      "kubernetes_namespace": "data-processing",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress",
+          "namespace": "data-processing"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "0.0.0.0/0",
+                    "except": [
+                      "169.254.169.254/32"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cni_plugin": "calico-v3.26-ebpf",
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "fsGroup": 1000,
+        "readOnlyRootFilesystem": true
+      },
+      "tmp_volume": {
+        "type": "emptyDir",
+        "medium": "Memory",
+        "sizeLimit": "64Mi"
+      }
+    }
+  }
+}

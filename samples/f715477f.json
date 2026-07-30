@@ -1,0 +1,111 @@
+{
+  "id": "f715477f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"sync\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\ntype DiagnosticService struct {\n\tmu      sync.Mutex\n\tclients map[*websocket.Conn]bool\n}\n\nfunc NewDiagnosticService() *DiagnosticService {\n\treturn &DiagnosticService{\n\t\tclients: make(map[*websocket.Conn]bool),\n\t}\n}\n\n// handleDiagnostic processes real-time diagnostic commands from operators\nfunc (ds *DiagnosticService) handleDiagnostic(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tds.mu.Lock()\n\tds.clients[conn] = true\n\tds.mu.Unlock()\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tds.mu.Lock()\n\t\t\tdelete(ds.clients, conn)\n\t\t\tds.mu.Unlock()\n\t\t\tbreak\n\t\t}\n\n\t\tcmd := string(message)\n\t\tresult := ds.executeProbe(cmd)\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(result))\n\t}\n}\n\n// executeProbe runs network diagnostic probes for the operator console\n// Supported: ping, traceroute, dig, nslookup\nfunc (ds *DiagnosticService) executeProbe(input string) string {\n\tparts := strings.Fields(input)\n\tif len(parts) < 2 {\n\t\treturn \"error: usage: <command> <target>\"\n\t}\n\n\tcommand := parts[0]\n\tallowedCommands := map[string]bool{\n\t\t\"ping\":       true,\n\t\t\"traceroute\": true,\n\t\t\"dig\":        true,\n\t\t\"nslookup\":   true,\n\t}\n\n\tif !allowedCommands[command] {\n\t\treturn fmt.Sprintf(\"error: command '%s' not permitted\", command)\n\t}\n\n\ttarget := strings.Join(parts[1:], \" \")\n\n\t// Construct the shell command for execution\n\t// Using sh -c to handle complex arguments like dig options\n\tfullCmd := fmt.Sprintf(\"%s %s\", command, target)\n\tout, err := exec.Command(\"sh\", \"-c\", fullCmd).CombinedOutput()\n\tif err != nil {\n\t\treturn fmt.Sprintf(\"probe failed: %s\\n%s\", err.Error(), string(out))\n\t}\n\n\treturn string(out)\n}\n\n// healthCheck provides liveness probe endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tds := NewDiagnosticService()\n\n\thttp.HandleFunc(\"/ws/diagnostic\", ds.handleDiagnostic)\n\thttp.HandleFunc(\"/healthz\", healthCheck)\n\n\tlog.Println(\"diagnostic-service starting on :8080\")\n\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tlog.Fatalf(\"server error: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Same EKS cluster but the pod runs in namespace 'monitoring-restricted'. A Cilium CiliumNetworkPolicy (not native Kubernetes NetworkPolicy) with entity-based selectors is applied. The policy uses 'toEntities' with a deny rule, but Cilium's entity resolution for link-local addresses depends on the 'enable-remote-node-identity' helm value being set to true (which it is in this cluster's values.yaml but not visible in the policy manifest itself). Additionally, a secondary native K8s NetworkPolicy exists that allows egress only to kube-dns on port 53/UDP and to the API server CIDR 10.0.0.0/16, but this policy alone would not block metadata access since 169.254.169.254 could be argued to fall outside its explicit allow list only if the CNI correctly interprets the implicit deny semantics (which varies by CNI implementation). The cluster also runs kube-proxy in iptables mode with a custom iptables rule on nodes dropping packets to 169.254.169.254 from pod CIDRs, managed via a DaemonSet running in kube-system.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "monitoring-restricted",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "restrict-diagnostic-egress",
+          "namespace": "monitoring-restricted"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "diagnostic-service"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.0.0/16"
+              ]
+            }
+          ]
+        }
+      },
+      "native_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "diagnostic-egress-base",
+          "namespace": "monitoring-restricted"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "diagnostic-service"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "kube-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 53,
+                  "protocol": "UDP"
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "10.0.0.0/16"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "node_iptables_daemonset": "drops-metadata-from-pod-cidrs",
+      "cilium_helm_values": {
+        "enable-remote-node-identity": true
+      },
+      "pod_security_standard": "baseline",
+      "metadata_service": "IMDSv1 enabled on nodes"
+    }
+  }
+}

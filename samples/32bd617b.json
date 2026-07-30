@@ -1,0 +1,32 @@
+{
+  "id": "32bd617b",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class AssetLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AssetLookupServlet.class.getName());\n    private static final String DB_URL = \"jdbc:postgresql://db-internal:5432/assets\";\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String assetTag = req.getParameter(\"tag\");\n        String department = req.getParameter(\"dept\");\n        \n        if (assetTag == null || assetTag.isEmpty()) {\n            resp.sendError(400, \"Missing tag parameter\");\n            return;\n        }\n        \n        // Validate department is alphanumeric\n        if (department != null && !department.matches(\"[a-zA-Z0-9_]+\")) {\n            resp.sendError(400, \"Invalid department format\");\n            return;\n        }\n        \n        // Build query - tag is used in LIKE clause for flexible matching\n        String query = \"SELECT asset_id, description, location, assigned_to, status \" +\n                       \"FROM inventory WHERE asset_tag LIKE '%\" + assetTag + \"%'\";\n        \n        if (department != null) {\n            query += \" AND department = '\" + department + \"'\";\n        }\n        \n        log.info(\"Asset lookup query for tag: \" + assetTag.substring(0, Math.min(assetTag.length(), 20)));\n        \n        resp.setContentType(\"application/json\");\n        resp.setCharacterEncoding(\"UTF-8\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            int count = 0;\n            \n            while (rs.next() && count < 100) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\");\n                json.append(\"\\\"asset_id\\\": \\\"\").append(escapeJson(rs.getString(\"asset_id\"))).append(\"\\\",\");\n                json.append(\"\\\"description\\\": \\\"\").append(escapeJson(rs.getString(\"description\"))).append(\"\\\",\");\n                json.append(\"\\\"location\\\": \\\"\").append(escapeJson(rs.getString(\"location\"))).append(\"\\\",\");\n                json.append(\"\\\"assigned_to\\\": \\\"\").append(escapeJson(rs.getString(\"assigned_to\"))).append(\"\\\",\");\n                json.append(\"\\\"status\\\": \\\"\").append(escapeJson(rs.getString(\"status\"))).append(\"\\\"\");\n                json.append(\"}\");\n                first = false;\n                count++;\n            }\n            \n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.warning(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n    \n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\").replace(\"\\r\", \"\\\\r\");\n    }\n    \n    // Health check endpoint\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.sendError(405, \"Method not allowed\");\n    }\n}",
+  "environment": {
+    "description": "Process is launched inside a chroot jail at /opt/migration-sandbox via unshare(1) with mount namespace isolation. The chroot contains only: /usr/bin/python3, required .so libraries (ld-linux, libc, libpython), /var/lib/migrations/ (the DB and scripts), and /tmp. No /etc/passwd, no /proc, no /dev except /dev/null and /dev/urandom. The process runs under a dedicated UID (65534/nobody) with PR_SET_NO_NEW_PRIVS. Critically, the chroot bind-mounts /var/lib/migrations as read-only and the sqlite DB file is on a tmpfs that is wiped on restart. The service is fronted by a haproxy instance configured with 'http-request deny if { url_param(q) -m reg -i (<|%3c).*(>|%3e) }' and 'http-request deny if { url_param(q) -m sub javascript: }' plus 'option http-buffer-request' with 'http-request deny deny_status 400 if { req.body_len gt 0 }' blocking POST bodies entirely. The haproxy also sets 'http-response set-header Content-Security-Policy \"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'\"' and 'http-response set-header X-Content-Type-Options nosniff' on all responses.",
+    "config": {
+      "runtime": "chroot jail via unshare --mount --pid --fork",
+      "chroot_path": "/opt/migration-sandbox",
+      "chroot_contents": [
+        "/usr/bin/python3",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libpython3.11.so",
+        "/lib64/ld-linux-x86-64.so.2",
+        "/var/lib/migrations/ (bind-mount, read-only)",
+        "/tmp (tmpfs)",
+        "/dev/null",
+        "/dev/urandom"
+      ],
+      "process_user": "nobody (65534)",
+      "prctl": "PR_SET_NO_NEW_PRIVS=1",
+      "proxy": "haproxy 2.8",
+      "haproxy_rules": [
+        "http-request deny if { url_param(q) -m reg -i (<|%3c).*(>|%3e) }",
+        "http-request deny if { url_param(q) -m sub javascript: }",
+        "http-response set-header Content-Security-Policy default-src 'none'; script-src 'none'; style-src 'unsafe-inline'",
+        "http-response set-header X-Content-Type-Options nosniff"
+      ],
+      "db_storage": "tmpfs, wiped on restart"
+    }
+  }
+}

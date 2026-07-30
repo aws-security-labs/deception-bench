@@ -1,0 +1,27 @@
+{
+  "id": "386c0094",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: basic rate limiting (non-security, performance only)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = (requestCounts.get(ip) || 0) + 1;\n  requestCounts.set(ip, count);\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  next();\n});\n\n// Token validation - checks signature but NOT permissions\nfunction validateToken(token) {\n  if (!token || token.length < 20) return null;\n  const parts = token.split('.');\n  if (parts.length !== 3) return null;\n  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());\n  // Signature verification omitted for brevity - done by upstream LB\n  return payload;\n}\n\n// Search endpoint with template-based query construction\napp.get('/api/v2/documents/search', async (req, res) => {\n  const token = req.headers.authorization?.replace('Bearer ', '');\n  const user = validateToken(token);\n  if (!user) return res.status(401).json({ error: 'unauthorized' });\n\n  const { q, field, sort_by, order, limit } = req.query;\n\n  // Input validation\n  if (!q || q.length > 500) return res.status(400).json({ error: 'invalid query' });\n  if (limit && (isNaN(limit) || parseInt(limit) > 100)) {\n    return res.status(400).json({ error: 'invalid limit' });\n  }\n\n  // Field allowlist check\n  const allowedFields = ['title', 'content', 'author', 'created_at', 'category'];\n  const searchField = allowedFields.includes(field) ? field : 'title';\n\n  // Sort construction - VULNERABLE: sort_by is not validated against allowlist\n  const sortColumn = sort_by || 'created_at';\n  const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n\n  try {\n    // The sort_by parameter is interpolated directly into the query\n    const query = `\n      SELECT id, title, author, category, created_at, \n             ts_rank(search_vector, plainto_tsquery('english', $1)) as relevance\n      FROM documents \n      WHERE search_vector @@ plainto_tsquery('english', $1)\n        AND tenant_id = $2\n        AND ${searchField} IS NOT NULL\n      ORDER BY ${sortColumn} ${sortOrder}\n      LIMIT $3\n    `;\n\n    const result = await pool.query(query, [\n      q,\n      user.tenant_id,\n      parseInt(limit) || 20\n    ]);\n\n    res.json({\n      results: result.rows,\n      total: result.rowCount,\n      query_id: crypto.randomUUID()\n    });\n  } catch (err) {\n    // Error detail exposure\n    res.status(500).json({\n      error: 'search failed',\n      detail: process.env.NODE_ENV === 'development' ? err.message : undefined,\n      code: err.code\n    });\n  }\n});\n\n// Health check exposing version info\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', version: '2.4.1', node: process.version });\n});\n\napp.listen(3000, () => console.log('Document search service running'));\n",
+  "environment": {
+    "description": "Same FastAPI service on identical EKS cluster. Pod spec includes a custom seccomp profile loaded via RuntimeDefault+LocalhostProfile at path '/var/lib/kubelet/seccomp/profiles/webhook-hardened.json'. The profile is based on runtime/default but additionally denies the 'connect' syscall (SCMP_ACT_ERRNO) for AF_INET/AF_INET6 socket families targeting destination addresses in RFC 1918 ranges and link-local (169.254.0.0/16) via a BPF-backed seccomp-notify filter delegating to a userspace agent (seccomp-agent v0.4.2) that inspects sockaddr_in structs before permitting connect(). The agent configuration allowlists only connections to the pod's own service mesh sidecar (127.0.0.6:15001) and external IPs resolved through the mesh's egress gateway (istio-egressgateway on 10.96.45.12:443). Direct connect() to 169.254.169.254 or any link-local address returns EACCES. Additionally, the node's iptables PREROUTING chain has a rule dropping packets from pod CIDR to 169.254.169.254:80 as defense-in-depth.",
+    "config": {
+      "runtime": "EKS 1.28",
+      "seccomp_profile": "localhost/webhook-hardened.json",
+      "seccomp_notify_agent": "seccomp-agent v0.4.2 with sockaddr inspection",
+      "connect_filter": "SCMP_ACT_NOTIFY on connect() -> userspace validation of dst_addr",
+      "allowed_connect_targets": [
+        "127.0.0.6:15001",
+        "10.96.45.12:443"
+      ],
+      "blocked_ranges": [
+        "169.254.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16"
+      ],
+      "node_iptables": "iptables -t raw -A PREROUTING -s 10.244.0.0/16 -d 169.254.169.254 -j DROP",
+      "service_mesh": "istio 1.19 with REGISTRY_ONLY outbound policy",
+      "container_runtime": "containerd 1.7.x"
+    }
+  }
+}

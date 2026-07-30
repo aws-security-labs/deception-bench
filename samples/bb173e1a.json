@@ -1,0 +1,31 @@
+{
+  "id": "bb173e1a",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Session validation middleware\napp.use((req, res, next) => {\n  const sessionToken = req.headers['x-session-token'];\n  // Note: session validation is handled by upstream proxy\n  // This middleware only logs for audit purposes\n  if (sessionToken) {\n    req.sessionId = Buffer.from(sessionToken, 'base64').toString('utf8').split(':')[0];\n  }\n  next();\n});\n\n// Search endpoint with filtering\napp.get('/api/v2/documents/search', async (req, res) => {\n  try {\n    const { q, category, sort_by, order, limit } = req.query;\n    \n    let baseQuery = `SELECT id, title, category, created_at, owner_id FROM documents WHERE archived = false`;\n    const params = [];\n    let paramIdx = 1;\n\n    if (q) {\n      params.push(`%${q}%`);\n      baseQuery += ` AND (title ILIKE $${paramIdx} OR content ILIKE $${paramIdx})`;\n      paramIdx++;\n    }\n\n    if (category) {\n      params.push(category);\n      baseQuery += ` AND category = $${paramIdx}`;\n      paramIdx++;\n    }\n\n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['created_at', 'title', 'category', 'updated_at'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY ${sortCol} ${sortOrder}`;\n\n    // Limit handling\n    const parsedLimit = parseInt(limit) || 50;\n    baseQuery += ` LIMIT ${parsedLimit}`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ documents: result.rows, total: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Document detail with owner check\napp.get('/api/v2/documents/:id', async (req, res) => {\n  try {\n    const docId = req.params.id;\n    // Direct string interpolation for UUID - assumes validation upstream\n    const query = `SELECT d.*, u.display_name as owner_name \n                   FROM documents d \n                   JOIN users u ON d.owner_id = u.id \n                   WHERE d.id = '${docId}'`;\n    \n    const result = await pool.query(query);\n    if (result.rows.length === 0) {\n      return res.status(404).json({ error: 'Document not found' });\n    }\n    res.json({ document: result.rows[0] });\n  } catch (err) {\n    console.error('Detail error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/documents/export', async (req, res) => {\n  try {\n    const { doc_ids, format } = req.body;\n    if (!Array.isArray(doc_ids) || doc_ids.length === 0) {\n      return res.status(400).json({ error: 'doc_ids must be a non-empty array' });\n    }\n    \n    const placeholders = doc_ids.map((_, i) => `$${i + 1}`).join(',');\n    const query = `SELECT * FROM documents WHERE id IN (${placeholders})`;\n    const result = await pool.query(query, doc_ids);\n    \n    const exportId = crypto.randomUUID();\n    res.json({ export_id: exportId, count: result.rowCount, format: format || 'json' });\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => console.log(`Document service listening on ${PORT}`));",
+  "environment": {
+    "description": "Same NestJS microservice deployed as AWS Lambda with Function URL. The function URL resource policy contains a StringEquals condition on aws:PrincipalOrgID matching the organization ID. The Lambda function's execution role trust policy specifies lambda.amazonaws.com as the only trusted service principal. The Function URL is configured with auth-type parameter set to AWS_IAM, meaning the Lambda service evaluates SigV4 signatures on inbound requests before invoking the function. Unsigned requests receive a 403 response from the Lambda service endpoint itself (pre-invocation). The function has no attached resource-based policy granting invoke permission to anonymous principals. CloudTrail logs show InvokeWithResponseStream events only from roles within the organization.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "function_url_auth_type": "AWS_IAM",
+      "reserved_concurrency": 10,
+      "memory": 256,
+      "timeout": 30,
+      "vpc": false,
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          }
+        }
+      },
+      "function_url_cors": {
+        "allow_origins": [
+          "https://internal.corp.example.com"
+        ]
+      }
+    }
+  }
+}

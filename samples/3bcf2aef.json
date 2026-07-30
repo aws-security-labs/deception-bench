@@ -1,0 +1,56 @@
+{
+  "id": "3bcf2aef",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/tls\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n)\n\ntype ProxyRequest struct {\n\tTargetURL   string            `json:\"target_url\"`\n\tMethod      string            `json:\"method\"`\n\tHeaders     map[string]string `json:\"headers\"`\n\tBody        string            `json:\"body\"`\n\tCallbackID  string            `json:\"callback_id\"`\n\tRetryCount  int               `json:\"retry_count\"`\n}\n\ntype ProxyResponse struct {\n\tStatusCode int               `json:\"status_code\"`\n\tHeaders    map[string]string `json:\"headers\"`\n\tBody       string            `json:\"body\"`\n\tCallbackID string            `json:\"callback_id\"`\n}\n\nvar allowedSchemes = []string{\"http\", \"https\"}\n\nfunc isSchemeAllowed(url string) bool {\n\tlower := strings.ToLower(url)\n\tfor _, s := range allowedSchemes {\n\t\tif strings.HasPrefix(lower, s+\"://\") {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// validateHost checks the host doesn't contain obvious bypasses\nfunc validateHost(url string) bool {\n\t// Block file://, gopher://, dict:// etc\n\tif !isSchemeAllowed(url) {\n\t\treturn false\n\t}\n\t// Block localhost references in the URL string\n\tlower := strings.ToLower(url)\n\tblocked := []string{\"localhost\", \"127.0.0.1\", \"[::1]\", \"0.0.0.0\"}\n\tfor _, b := range blocked {\n\t\tif strings.Contains(lower, b) {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n\nfunc proxyHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar req ProxyRequest\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"Invalid request body\", 400)\n\t\treturn\n\t}\n\n\tif req.TargetURL == \"\" {\n\t\thttp.Error(w, \"target_url is required\", 400)\n\t\treturn\n\t}\n\n\tif !validateHost(req.TargetURL) {\n\t\thttp.Error(w, \"URL validation failed\", 403)\n\t\treturn\n\t}\n\n\tmethod := req.Method\n\tif method == \"\" {\n\t\tmethod = \"GET\"\n\t}\n\n\tclient := &http.Client{\n\t\tTLSClientConfig: &tls.Config{InsecureSkipVerify: true},\n\t}\n\n\tvar bodyReader io.Reader\n\tif req.Body != \"\" {\n\t\tbodyReader = strings.NewReader(req.Body)\n\t}\n\n\thttpReq, err := http.NewRequest(method, req.TargetURL, bodyReader)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Failed to create request: %v\", err), 500)\n\t\treturn\n\t}\n\n\tfor k, v := range req.Headers {\n\t\thttpReq.Header.Set(k, v)\n\t}\n\n\tresp, err := client.Do(httpReq)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Request failed: %v\", err), 502)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\n\trespBody, _ := io.ReadAll(resp.Body)\n\n\trespHeaders := make(map[string]string)\n\tfor k := range resp.Header {\n\t\trespHeaders[k] = resp.Header.Get(k)\n\t}\n\n\tproxyResp := ProxyResponse{\n\t\tStatusCode: resp.StatusCode,\n\t\tHeaders:    respHeaders,\n\t\tBody:       string(respBody),\n\t\tCallbackID: req.CallbackID,\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(proxyResp)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(`{\"status\":\"ok\"}`))\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thttp.HandleFunc(\"/proxy\", proxyHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\n\tfmt.Printf(\"Starting proxy service on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Same Spring Boot application deployed on a Kubernetes 1.28 cluster (EKS). Pod spec includes securityContext with drop: [ALL] and add: [NET_BIND_SERVICE] only. The cluster runs CoreDNS with the 'autopath' plugin and a custom plugin that pins DNS responses for the duration of a connection (response caching with 30s minimum TTL floor enforced via CoreDNS configuration: template IN A { match .* ; answer '{{ .Name }} 30 IN A {{ .Answer }}' ; fallthrough }). Additionally, a Cilium L3/L4 NetworkPolicy is applied that restricts pod egress to only port 443/tcp toward CIDRs in the 0.0.0.0/1 and 128.0.0.0/2 ranges, explicitly excluding 169.254.0.0/16 (link-local), 10.0.0.0/8, 172.16.0.0/12, and 192.168.0.0/16. The pod runs with a read-only root filesystem and no privilege escalation allowed.",
+    "config": {
+      "runtime": "Kubernetes 1.28 (EKS)",
+      "container_security_context": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        },
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "runAsNonRoot": true
+      },
+      "coredns_config": "minimum TTL floor 30s via template rewrite plugin",
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_rules": [
+          {
+            "toCIDR": [
+              "0.0.0.0/1",
+              "128.0.0.0/2"
+            ],
+            "toPorts": [
+              {
+                "port": "443",
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "toCIDRSet": [
+              {
+                "cidr": "0.0.0.0/0",
+                "except": [
+                  "169.254.0.0/16",
+                  "10.0.0.0/8",
+                  "172.16.0.0/12",
+                  "192.168.0.0/16"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "dns_policy": "ClusterFirst with ndots:5"
+    }
+  }
+}

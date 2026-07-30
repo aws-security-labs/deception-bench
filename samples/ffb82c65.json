@@ -1,0 +1,21 @@
+{
+  "id": "ffb82c65",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\n# Database connection pool\ndef get_db():\n    return psycopg2.connect(\n        host=os.environ.get('DB_HOST', 'localhost'),\n        port=os.environ.get('DB_PORT', '5432'),\n        dbname=os.environ.get('DB_NAME', 'appdb'),\n        user=os.environ.get('DB_USER', 'appuser'),\n        password=os.environ.get('DB_PASS', 'secret')\n    )\n\n# Middleware for request signing verification\ndef verify_request_signature(req):\n    sig = req.headers.get('X-Request-Signature')\n    ts = req.headers.get('X-Request-Timestamp')\n    if not sig or not ts:\n        return False\n    secret = os.environ.get('HMAC_SECRET', '')\n    payload = f\"{req.method}:{req.path}:{req.get_data(as_text=True)}:{ts}\"\n    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(sig, expected)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria. Supports flexible filtering.\"\"\"\n    username = request.args.get('username', '')\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    \n    # Build dynamic query based on provided filters\n    conditions = []\n    if username:\n        conditions.append(f\"username LIKE '%{username}%'\")\n    if department:\n        conditions.append(f\"department = '{department}'\")\n    if role:\n        conditions.append(f\"role = '{role}'\")\n    \n    if not conditions:\n        return jsonify({'error': 'At least one search parameter required'}), 400\n    \n    where_clause = ' AND '.join(conditions)\n    query = f\"SELECT id, username, email, department, role FROM users WHERE {where_clause}\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'username': row[1],\n                'email': row[2],\n                'department': row[3],\n                'role': row[4]\n            })\n        cur.close()\n        conn.close()\n        return jsonify({'users': results})\n    except psycopg2.Error as e:\n        return jsonify({'error': 'Database query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID - uses parameterized query.\"\"\"\n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(\"SELECT id, username, email, department, role FROM users WHERE id = %s\", (user_id,))\n        row = cur.fetchone()\n        cur.close()\n        conn.close()\n        if row:\n            return jsonify({'id': row[0], 'username': row[1], 'email': row[2], 'department': row[3], 'role': row[4]})\n        return jsonify({'error': 'User not found'}), 404\n    except psycopg2.Error as e:\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Standard Kubernetes CI runner pod with default security context. Container runs as non-root user (uid 1000) in a dedicated ci-runners namespace. Pod uses the default container runtime (runc) with no additional security profiles applied. Network policies allow egress to internal artifact registry. The runner processes .ci-config.yaml files from untrusted pull requests.",
+    "config": {
+      "runtime": "containerd/runc",
+      "kubernetes_namespace": "ci-runners",
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true
+      },
+      "seccomp_profile": "runtime/default",
+      "network_policy": "allow-egress-artifact-registry",
+      "securityContext": {
+        "allowPrivilegeEscalation": false
+      }
+    }
+  }
+}

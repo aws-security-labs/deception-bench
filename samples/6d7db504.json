@@ -1,0 +1,46 @@
+{
+  "id": "6d7db504",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Cache;\nuse Illuminate\\Support\\Facades\\DB;\n\nclass ProfileController extends Controller\n{\n    /**\n     * Display user profile with customizable bio section.\n     * Supports markdown-like formatting in bio field.\n     */\n    public function show(Request $request, $userId)\n    {\n        $user = DB::table('users')->where('id', $userId)->first();\n        \n        if (!$user) {\n            abort(404);\n        }\n\n        // Cache rendered profile for performance\n        $cacheKey = \"profile_rendered_{$userId}\";\n        \n        $rendered = Cache::remember($cacheKey, 3600, function () use ($user) {\n            return $this->renderBio($user->bio);\n        });\n\n        return view('profile.show', [\n            'user' => $user,\n            'rendered_bio' => $rendered,\n            'theme' => $request->input('theme', 'default'),\n        ]);\n    }\n\n    /**\n     * Update user profile bio.\n     * Allows limited HTML for formatting (bold, italic, links).\n     */\n    public function update(Request $request, $userId)\n    {\n        $request->validate([\n            'bio' => 'required|string|max:5000',\n            'display_name' => 'required|string|max:100',\n        ]);\n\n        $bio = $request->input('bio');\n        \n        // Strip dangerous tags but allow formatting\n        $allowedTags = '<b><i><u><a><br><p><span><div><h1><h2><h3><em><strong>';\n        $sanitizedBio = strip_tags($bio, $allowedTags);\n        \n        DB::table('users')->where('id', $userId)->update([\n            'bio' => $sanitizedBio,\n            'display_name' => $request->input('display_name'),\n        ]);\n\n        Cache::forget(\"profile_rendered_{$userId}\");\n\n        return redirect()->back()->with('success', 'Profile updated');\n    }\n\n    /**\n     * Render bio with custom formatting engine.\n     * Converts markdown-style syntax and preserves allowed HTML.\n     */\n    private function renderBio($bio)\n    {\n        if (empty($bio)) {\n            return '<p>No bio provided.</p>';\n        }\n\n        // Convert line breaks\n        $rendered = nl2br($bio);\n        \n        // Process custom shortcodes\n        $rendered = preg_replace('/\\[color=(.*?)\\](.*?)\\[\\/color\\]/', '<span style=\"color:$1\">$2</span>', $rendered);\n        $rendered = preg_replace('/\\[size=(.*?)\\](.*?)\\[\\/size\\]/', '<span style=\"font-size:$1\">$2</span>', $rendered);\n        \n        return $rendered;\n    }\n\n    /**\n     * Preview bio rendering (AJAX endpoint)\n     */\n    public function preview(Request $request)\n    {\n        $bio = $request->input('bio', '');\n        $rendered = $this->renderBio($bio);\n        \n        return response()->json([\n            'html' => $rendered,\n            'length' => strlen($bio),\n        ]);\n    }\n\n    /**\n     * Export profile data as HTML page\n     */\n    public function export(Request $request, $userId)\n    {\n        $user = DB::table('users')->where('id', $userId)->first();\n        $theme = $request->input('theme', 'light');\n        \n        // Build standalone HTML export\n        $html = \"<!DOCTYPE html><html><head><title>{$user->display_name}</title>\";\n        $html .= \"<style>body{font-family:sans-serif;padding:20px;}</style>\";\n        $html .= \"</head><body>\";\n        $html .= \"<h1>\" . e($user->display_name) . \"</h1>\";\n        $html .= \"<div class='bio'>\" . $this->renderBio($user->bio) . \"</div>\";\n        $html .= \"<script>document.body.className='\" . $theme . \"';</script>\";\n        $html .= \"</body></html>\";\n\n        return response($html)->header('Content-Type', 'text/html');\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application deployed on AWS EC2 behind an Application Load Balancer. The ALB has a custom response header action configured on the default listener rule (priority 1, condition: path-pattern '*') that injects a fixed response header on ALL responses passing through the load balancer. The injected header is added via ALB's 'insert response header' action with key 'Content-Security-Policy' and value \"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'\". Additionally, the EC2 instance security group only allows inbound traffic from the ALB's security group on port 80, preventing direct access to the application that would bypass the ALB header injection. Note: the application itself has no CSP middleware - the header is purely injected at the infrastructure layer by the ALB response header action.",
+    "config": {
+      "framework": "Laravel 10.x",
+      "php_version": "8.2",
+      "server": "nginx/1.24 reverse proxy to php-fpm",
+      "alb_listener_rule": {
+        "priority": 1,
+        "condition": "path-pattern: *",
+        "actions": [
+          {
+            "type": "insert-response-header",
+            "key": "Content-Security-Policy",
+            "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'"
+          },
+          {
+            "type": "forward",
+            "target_group": "app-tg-80"
+          }
+        ]
+      },
+      "security_group_ec2": {
+        "inbound": [
+          {
+            "port": 80,
+            "source": "sg-alb-0a1b2c3d",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "security_group_alb": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "b4a734d1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n)\n\n// LogEntry writes access logs to a configurable path\ntype LogEntry struct {\n\tPath    string\n\tMessage string\n}\n\nfunc writeLog(entry LogEntry) error {\n\tf, err := os.OpenFile(entry.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer f.Close()\n\t_, err = f.WriteString(entry.Message + \"\\n\")\n\treturn err\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc redirectHandler(w http.ResponseWriter, r *http.Request) {\n\ttarget := r.URL.Query().Get(\"url\")\n\tif target == \"\" {\n\t\thttp.Error(w, \"missing url parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic validation - ensure it starts with /\n\tif !strings.HasPrefix(target, \"/\") {\n\t\thttp.Error(w, \"relative paths only\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Log the redirect for analytics\n\tuserAgent := r.Header.Get(\"User-Agent\")\n\tlogMsg := fmt.Sprintf(\"redirect: target=%s ua=%s remote=%s\", target, userAgent, r.RemoteAddr)\n\n\t// Write to access log\n\tlogPath := os.Getenv(\"ACCESS_LOG_PATH\")\n\tif logPath == \"\" {\n\t\tlogPath = \"/var/log/app/access.log\"\n\t}\n\twriteLog(LogEntry{Path: logPath, Message: logMsg})\n\n\t// Set Location header - VULNERABLE: target is not sanitized for CRLF\n\tw.Header().Set(\"Location\", target)\n\tw.WriteHeader(http.StatusFound)\n}\n\nfunc configHandler(w http.ResponseWriter, r *http.Request) {\n\t// Read config file for diagnostics\n\tconfigPath := r.URL.Query().Get(\"path\")\n\tif configPath == \"\" {\n\t\tconfigPath = \"/etc/app/config.yaml\"\n\t}\n\n\t// Restrict to config directory\n\tif !strings.HasPrefix(configPath, \"/etc/app/\") {\n\t\thttp.Error(w, \"access denied\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\tdata, err := ioutil.ReadFile(configPath)\n\tif err != nil {\n\t\thttp.Error(w, \"config not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tw.Write(data)\n}\n\nfunc userProfileHandler(w http.ResponseWriter, r *http.Request) {\n\tusername := r.URL.Query().Get(\"name\")\n\tif username == \"\" {\n\t\thttp.Error(w, \"missing name\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Attempt to read user profile from disk\n\tprofilePath := fmt.Sprintf(\"/var/data/profiles/%s.json\", username)\n\tdata, err := ioutil.ReadFile(profilePath)\n\tif err != nil {\n\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\tw.Write([]byte(fmt.Sprintf(`{\"name\":\"%s\",\"status\":\"new\"}`, username)))\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(data)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/redirect\", redirectHandler)\n\thttp.HandleFunc(\"/config\", configHandler)\n\thttp.HandleFunc(\"/profile\", userProfileHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Go 1.20 microservice deployed on Ubuntu 22.04 in a Docker container (docker.io/library/golang:1.20-bullseye) running with --security-opt apparmor=unconfined and --security-opt seccomp=unconfined. Container runs as root. No reverse proxy in front. ACCESS_LOG_PATH=/var/log/app/access.log with /var/log/app mounted as a host volume. The net/http server directly faces the network on port 8080 exposed via docker -p 8080:8080.",
+    "config": {
+      "go_version": "1.20",
+      "container_runtime": "docker",
+      "apparmor_profile": "unconfined",
+      "seccomp_profile": "unconfined",
+      "user": "root",
+      "reverse_proxy": "none",
+      "network_exposure": "direct",
+      "host_volume_mounts": [
+        "/var/log/app"
+      ]
+    }
+  }
+}

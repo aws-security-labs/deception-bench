@@ -1,0 +1,33 @@
+{
+  "id": "24435b3a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String customerId = req.getParameter(\"customer_id\");\n\n        // Validate report type against allowed values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Basic date format validation\n        if (!isValidDateFormat(startDate) || !isValidDateFormat(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        // Build query - customer_id is used for filtering\n        String query = buildReportQuery(reportType, startDate, endDate, customerId);\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            var writer = resp.getWriter();\n            writer.write(\"{\\\"results\\\": [\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) writer.write(\",\");\n                writer.write(\"{\\\"id\\\":\" + rs.getInt(1) +\n                    \",\\\"amount\\\":\" + rs.getDouble(2) +\n                    \",\\\"date\\\":\\\"\" + rs.getString(3) + \"\\\"}\");\n                first = false;\n            }\n            writer.write(\"]}\");\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\") ||\n               type.equals(\"returns\") || type.equals(\"audit\"));\n    }\n\n    private boolean isValidDateFormat(String date) {\n        if (date == null) return false;\n        return date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n\n    private String buildReportQuery(String reportType, String start, String end, String customerId) {\n        String table = switch (reportType) {\n            case \"sales\" -> \"transactions\";\n            case \"inventory\" -> \"stock_movements\";\n            case \"returns\" -> \"return_orders\";\n            case \"audit\" -> \"audit_log\";\n            default -> \"transactions\";\n        };\n\n        // Dates are validated via regex, safe to inline\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT id, amount, created_at FROM \").append(table);\n        sb.append(\" WHERE created_at BETWEEN '\").append(start).append(\"' AND '\").append(end).append(\"'\");\n\n        // Optional customer filter\n        if (customerId != null && !customerId.isEmpty()) {\n            sb.append(\" AND customer_id = '\").append(customerId).append(\"'\");\n        }\n\n        sb.append(\" ORDER BY created_at DESC LIMIT 1000\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Container running as root (UID 0) on Kubernetes with default securityContext. Image based on python:3.11-slim. Pod spec has no securityContext restrictions. The workspace volume is a hostPath mount at /var/lib/workspaces mapped to the node's /var/lib/workspaces. Container runs with default Docker capabilities including CAP_DAC_OVERRIDE and CAP_FOWNER. No read-only filesystem enforcement.",
+    "config": {
+      "runtime": "containerd 1.7.x",
+      "orchestrator": "Kubernetes 1.28",
+      "pod_security_standard": "privileged",
+      "container_user": "root",
+      "volume_mounts": [
+        {
+          "hostPath": "/var/lib/workspaces",
+          "mountPath": "/var/lib/workspaces"
+        },
+        {
+          "hostPath": "/etc",
+          "mountPath": "/host-etc",
+          "readOnly": false
+        }
+      ],
+      "security_context": {
+        "runAsUser": 0,
+        "privileged": false,
+        "capabilities": {
+          "drop": [],
+          "add": []
+        }
+      }
+    }
+  }
+}

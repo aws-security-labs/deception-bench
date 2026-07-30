@@ -1,0 +1,38 @@
+{
+  "id": "486f98fa",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-Authenticated-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tclassFilter := r.URL.Query().Get(\"class\")\n\n\t// Validate sort field against allowlist\n\tallowedSorts := map[string]bool{\"title\": true, \"id\": true, \"created_at\": true}\n\tif sortField == \"\" || !allowedSorts[sortField] {\n\t\tsortField = \"id\"\n\t}\n\n\t// Build query - parameterized for search term\n\tbaseQuery := \"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = $1\"\n\targs := []interface{}{userID}\n\n\tif query != \"\" {\n\t\tbaseQuery += \" AND (title ILIKE $2 OR content ILIKE $2)\"\n\t\targs = append(args, \"%\"+query+\"%\")\n\t}\n\n\t// Classification filter - constructed via string interpolation for\n\t// compatibility with legacy enum handling in pg driver\n\tif classFilter != \"\" {\n\t\t// NOTE: classFilter is expected to be one of: public, internal, confidential, secret\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = '%s'\", classFilter)\n\t}\n\n\tbaseQuery += \" ORDER BY \" + sortField + \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"db unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\n// auditMiddleware logs access patterns\nfunc auditMiddleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\t// Redact query params in log to avoid leaking search terms\n\t\tpath := r.URL.Path\n\t\tlog.Printf(\"access: method=%s path=%s remote=%s\", r.Method, path, r.RemoteAddr)\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/documents/search\", searchDocuments)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\t// Strip trailing slashes\n\thandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tr.URL.Path = strings.TrimRight(r.URL.Path, \"/\")\n\t\tauditMiddleware(mux).ServeHTTP(w, r)\n\t})\n\n\tlog.Printf(\"listening on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, handler))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2 in a private subnet (no IGW). The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to COUNT (not BLOCK), (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, and (3) a custom rule group with a single RegexPatternSet rule matching request URI path '/api/users/search' that inspects SingleQueryArgument 'value' against pattern `(?i)(?:'|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)` with action BLOCK and priority 0. CloudWatch metric namespace 'WAF/SQLiBlocks' publishes match counts. The ALB access logs are shipped to S3 with a lifecycle policy.",
+    "config": {
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "COUNT"
+            }
+          ]
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none"
+        },
+        {
+          "priority": 3,
+          "name": "CustomSQLiBlockRule",
+          "scope": "SingleQueryArgument:value on URI /api/users/search",
+          "regex_pattern": "(?i)(?:'|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)",
+          "action": "BLOCK"
+        }
+      ],
+      "network": "private subnet, no IGW, NAT gateway for egress only",
+      "security_group_inbound": "ALB SG only (no direct public access to tasks)"
+    }
+  }
+}

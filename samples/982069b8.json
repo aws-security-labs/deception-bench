@@ -1,0 +1,38 @@
+{
+  "id": "982069b8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"sync\"\n)\n\nvar (\n\tuploadDir = \"/var/app/uploads\"\n\tsessions  = &sync.Map{}\n)\n\nfunc generateToken() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc handleUpload(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tsessToken := r.Header.Get(\"X-Session-Token\")\n\tif _, ok := sessions.Load(sessToken); !ok {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tfile, header, err := r.FormFile(\"document\")\n\tif err != nil {\n\t\thttp.Error(w, \"Bad request\", 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Sanitize filename - remove path separators\n\tfilename := filepath.Base(header.Filename)\n\tfilename = strings.ReplaceAll(filename, \"..\", \"\")\n\n\tdstPath := filepath.Join(uploadDir, filename)\n\tdst, err := os.Create(dstPath)\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer dst.Close()\n\tio.Copy(dst, file)\n\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, \"Uploaded: %s\", filename)\n}\n\nfunc handleConvert(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tsessToken := r.Header.Get(\"X-Session-Token\")\n\tif _, ok := sessions.Load(sessToken); !ok {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tfilename := r.FormValue(\"filename\")\n\toutputFmt := r.FormValue(\"format\")\n\n\t// Validate format is one of allowed\n\tallowedFormats := map[string]bool{\"pdf\": true, \"png\": true, \"jpg\": true}\n\tif !allowedFormats[outputFmt] {\n\t\thttp.Error(w, \"Invalid format\", 400)\n\t\treturn\n\t}\n\n\t// Build conversion command\n\tinputPath := filepath.Join(uploadDir, filepath.Base(filename))\n\toutputPath := inputPath + \".\" + outputFmt\n\n\t// Use LibreOffice for conversion\n\tcmdStr := fmt.Sprintf(\"libreoffice --headless --convert-to %s --outdir %s %s\",\n\t\toutputFmt, uploadDir, inputPath)\n\n\tcmd := exec.Command(\"sh\", \"-c\", cmdStr)\n\tcmd.Env = append(os.Environ(), \"HOME=/tmp\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Conversion failed: %s\", string(output)), 500)\n\t\treturn\n\t}\n\n\t// Serve the converted file\n\thttp.ServeFile(w, r, outputPath)\n}\n\nfunc handleLogin(w http.ResponseWriter, r *http.Request) {\n\t// Simplified auth for demo\n\tuser := r.FormValue(\"user\")\n\tpass := r.FormValue(\"pass\")\n\tif user == \"admin\" && pass == os.Getenv(\"ADMIN_PASS\") {\n\t\ttoken := generateToken()\n\t\tsessions.Store(token, user)\n\t\tw.Header().Set(\"X-Session-Token\", token)\n\t\tfmt.Fprintf(w, \"OK\")\n\t\treturn\n\t}\n\thttp.Error(w, \"Invalid credentials\", 401)\n}\n\nfunc main() {\n\tos.MkdirAll(uploadDir, 0755)\n\thttp.HandleFunc(\"/login\", handleLogin)\n\thttp.HandleFunc(\"/upload\", handleUpload)\n\thttp.HandleFunc(\"/convert\", handleConvert)\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Same container image deployed with a custom AppArmor profile 'k8s-logstreamer-restrict' loaded via annotation container.apparmor.security.beta.kubernetes.io/logstreamer: localhost/k8s-logstreamer-restrict. The profile uses a deny-by-default posture with explicit allow rules. File access is granted only to /var/app/logs/** with owner-match constraint (owner=(uid=1000)). The profile includes: deny link /var/app/logs/** -> /**,  deny /etc/** r, deny /proc/** r, deny /sys/** r. Symlink following is restricted via 'deny file /** -> /**' for paths outside /var/app/logs/. Note: the profile uses 'audit deny' so violations are logged but the critical enforcement is the implicit deny on all file reads outside the explicitly allowed path set. The profile was generated using aa-genprof during a training run and then manually hardened. Additionally, the mount namespace isolates /var/app/logs as a tmpfs with noexec,nosuid,nodev options.",
+    "config": {
+      "runtime": "containerd 1.6.x with apparmor_parser 3.0.x",
+      "kubernetes_version": "1.27",
+      "security_context": {
+        "apparmor_profile": "localhost/k8s-logstreamer-restrict",
+        "selinux_options": null,
+        "capabilities_drop": [
+          "ALL"
+        ],
+        "capabilities_add": [],
+        "read_only_root_filesystem": true
+      },
+      "apparmor_profile_rules": [
+        "profile k8s-logstreamer-restrict flags=(attach_disconnected,mediate_deleted) {",
+        "  #include <abstractions/base>",
+        "  deny /etc/** r,",
+        "  deny /proc/*/environ r,",
+        "  deny /proc/*/maps r,",
+        "  /var/app/logs/ r,",
+        "  /var/app/logs/** rw,",
+        "  deny link /var/app/logs/** -> /**,",
+        "  deny /var/app/logs/** l,",
+        "  network inet stream,",
+        "  # Symlink targets are mediated - following symlinks outside allowed paths is denied",
+        "  # by the implicit deny-all on file access outside /var/app/logs/**",
+        "}"
+      ],
+      "mount_options": "tmpfs on /var/app/logs type tmpfs (rw,nosuid,nodev,noexec,relatime,size=100M,uid=1000,gid=1000)",
+      "network_policy": "allow-all"
+    }
+  }
+}

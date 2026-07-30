@@ -1,0 +1,34 @@
+{
+  "id": "aceb9686",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype AuditEntry struct {\n\tUserID    string `json:\"user_id\"`\n\tAction    string `json:\"action\"`\n\tResource  string `json:\"resource\"`\n\tTimestamp string `json:\"timestamp\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchAuditLogs allows operators to search audit entries\n// Query parameter 'filter' supports field:value syntax\nfunc searchAuditLogs(w http.ResponseWriter, r *http.Request) {\n\tapiKey := r.Header.Get(\"X-Service-Key\")\n\tif apiKey == \"\" || !validateServiceKey(apiKey) {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tfilterParam := r.URL.Query().Get(\"filter\")\n\tif filterParam == \"\" {\n\t\thttp.Error(w, \"filter parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Parse filter - expected format: \"field:value\"\n\tparts := strings.SplitN(filterParam, \":\", 2)\n\tif len(parts) != 2 {\n\t\thttp.Error(w, \"invalid filter format, use field:value\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tfieldName := parts[0]\n\tfieldValue := parts[1]\n\n\t// Whitelist allowed fields\n\tallowedFields := map[string]bool{\n\t\t\"user_id\": true, \"action\": true, \"resource\": true, \"timestamp\": true,\n\t}\n\tif !allowedFields[fieldName] {\n\t\thttp.Error(w, \"invalid filter field\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - fieldName is validated above, fieldValue is user-controlled\n\tquery := fmt.Sprintf(\"SELECT user_id, action, resource, timestamp FROM audit_log WHERE %s = '%s' ORDER BY timestamp DESC LIMIT 100\", fieldName, fieldValue)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []AuditEntry\n\tfor rows.Next() {\n\t\tvar entry AuditEntry\n\t\tif err := rows.Scan(&entry.UserID, &entry.Action, &entry.Resource, &entry.Timestamp); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, entry)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc validateServiceKey(key string) bool {\n\t// In production, validates against HashiCorp Vault\n\texpected := os.Getenv(\"SERVICE_API_KEY\")\n\treturn key == expected\n}\n\n// healthCheck endpoint for LB probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/audit/search\", searchAuditLogs)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"starting audit-query-service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound 443 from 0.0.0.0/0 to ALB, ALB SG to instance on 8080. No additional AWS WAF WebACL is associated with the ALB. Instance runs the Flask app via gunicorn with 4 workers. SQLite database stored on local EBS volume. CloudWatch basic monitoring enabled but no custom log parsing or alerting on SQL errors.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_web_acl": null
+      },
+      "ec2": {
+        "instance_type": "t3.medium",
+        "security_group_inbound": [
+          {
+            "port": 8080,
+            "source": "sg-alb"
+          }
+        ],
+        "os": "amazon-linux-2"
+      },
+      "monitoring": {
+        "cloudwatch_logs": true,
+        "custom_metric_filters": []
+      }
+    }
+  }
+}

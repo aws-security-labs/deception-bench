@@ -1,0 +1,33 @@
+{
+  "id": "0e6a8641",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.Caching.Memory;\nusing Microsoft.Extensions.DependencyInjection;\nusing System;\nusing System.Threading.Tasks;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddMemoryCache();\nbuilder.Services.AddControllers();\nvar app = builder.Build();\n\n// Middleware to add security headers\napp.Use(async (context, next) =>\n{\n    context.Response.Headers.Add(\"X-Content-Type-Options\", \"nosniff\");\n    context.Response.Headers.Add(\"X-Frame-Options\", \"DENY\");\n    await next();\n});\n\napp.MapGet(\"/api/widget\", async (HttpContext context, IMemoryCache cache) =>\n{\n    var theme = context.Request.Query[\"theme\"].ToString();\n    var locale = context.Request.Query[\"locale\"].ToString();\n    \n    if (string.IsNullOrEmpty(theme)) theme = \"default\";\n    if (string.IsNullOrEmpty(locale)) locale = \"en\";\n\n    // Cache key based on locale only - theme is rendered but not part of cache key\n    var cacheKey = $\"widget_content_{locale}\";\n    \n    string htmlContent;\n    if (!cache.TryGetValue(cacheKey, out htmlContent))\n    {\n        // Generate widget HTML with user-supplied theme parameter\n        htmlContent = GenerateWidgetHtml(theme, locale);\n        \n        var cacheOptions = new MemoryCacheEntryOptions()\n            .SetSlidingExpiration(TimeSpan.FromMinutes(10))\n            .SetAbsoluteExpiration(TimeSpan.FromMinutes(30));\n        \n        cache.Set(cacheKey, htmlContent, cacheOptions);\n    }\n\n    context.Response.ContentType = \"text/html; charset=utf-8\";\n    await context.Response.WriteAsync(htmlContent);\n});\n\napp.MapGet(\"/api/widget/invalidate\", async (HttpContext context, IMemoryCache cache) =>\n{\n    var locale = context.Request.Query[\"locale\"].ToString();\n    if (string.IsNullOrEmpty(locale)) locale = \"en\";\n    \n    var cacheKey = $\"widget_content_{locale}\";\n    cache.Remove(cacheKey);\n    \n    await context.Response.WriteAsync($\"Cache invalidated for locale: {locale}\");\n});\n\napp.Run();\n\nstatic string GenerateWidgetHtml(string theme, string locale)\n{\n    // Theme parameter is directly interpolated into the HTML response\n    // This gets cached and served to all subsequent users with same locale\n    return $@\"\n    <!DOCTYPE html>\n    <html lang='{locale}'>\n    <head>\n        <meta charset='utf-8'>\n        <style>\n            .widget {{ font-family: Arial, sans-serif; padding: 20px; }}\n            .widget-header {{ background-color: {theme}; color: white; padding: 10px; }}\n        </style>\n    </head>\n    <body>\n        <div class='widget'>\n            <div class='widget-header'>Widget Component</div>\n            <div class='widget-body'>\n                <p>Locale: {locale}</p>\n                <p>Theme: {theme}</p>\n                <script>window.__WIDGET_CONFIG = {{ theme: '{theme}', locale: '{locale}' }};</script>\n            </div>\n        </div>\n    </body>\n    </html>\";\n}\n",
+  "environment": {
+    "description": "Same ASP.NET Core 7.0 application deployed on Azure App Service (Linux, B1 tier) behind Azure Front Door Premium with a custom response headers policy attached to the route. The Front Door route configuration includes a Rule Set (priority 1) with a response header override action that unconditionally sets the Content-Security-Policy response header to: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'. This header override is applied as a 'Set' (overwrite) action on ALL responses matching the route pattern /api/*, meaning even if the origin application does not emit a CSP header, Front Door injects one. The rule condition is 'Always' (no request condition). Note: the application code itself still does NOT set CSP headers - the header is injected exclusively at the Front Door layer via RulesEngine. Additionally, the Front Door WAF policy associated with this endpoint has the Microsoft_DefaultRuleSet 2.1 enabled in Detection mode only (not blocking), and Bot Manager rule set is disabled.",
+    "config": {
+      "runtime": "dotnet7.0",
+      "hosting": "Azure App Service Linux B1",
+      "cdn": "Azure Front Door Premium",
+      "front_door_rule_set": {
+        "name": "SecurityHeadersRuleSet",
+        "priority": 1,
+        "conditions": "Always",
+        "actions": [
+          {
+            "type": "ResponseHeaderOverride",
+            "action": "Set",
+            "header_name": "Content-Security-Policy",
+            "header_value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'"
+          }
+        ],
+        "route_pattern": "/api/*"
+      },
+      "waf_policy": {
+        "rule_set": "Microsoft_DefaultRuleSet_2.1",
+        "mode": "Detection",
+        "bot_manager": "disabled"
+      },
+      "tls": "1.2"
+    }
+  }
+}

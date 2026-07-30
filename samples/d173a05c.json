@@ -1,0 +1,29 @@
+{
+  "id": "d173a05c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=db.internal port=5432 user=webapp dbname=inventory sslmode=require\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput removes obvious dangerous characters but allows business logic chars\nfunc sanitizeInput(input string) string {\n\t// Remove null bytes and control characters\n\tinput = strings.ReplaceAll(input, \"\\x00\", \"\")\n\t// Limit length to prevent buffer issues\n\tif len(input) > 200 {\n\t\tinput = input[:200]\n\t}\n\treturn input\n}\n\n// validateCategory checks category is alphanumeric with hyphens\nfunc validateCategory(cat string) bool {\n\tfor _, c := range cat {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn len(cat) > 0 && len(cat) <= 50\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tname := r.URL.Query().Get(\"name\")\n\twarehouse := r.URL.Query().Get(\"warehouse\")\n\n\tif !validateCategory(category) {\n\t\thttp.Error(w, \"Invalid category\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tname = sanitizeInput(name)\n\twarehouse = sanitizeInput(warehouse)\n\n\t// Build query - category is validated, name uses parameterized query\n\t// warehouse is used in a COMMENT for audit logging purposes\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, quantity, price FROM inventory WHERE category = '%s' AND name ILIKE $1 /* warehouse: %s */\",\n\t\tcategory, warehouse,\n\t)\n\n\trows, err := db.Query(query, \"%\"+name+\"%\")\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar itemName string\n\t\tvar quantity int\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &itemName, &quantity, &price); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Fprintf(w, \"%d | %s | %d | %.2f\\n\", id, itemName, quantity, price)\n\t}\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Same Laravel 10.x application on Ubuntu 22.04 with PHP 8.2 and php-intl. However, the php-fpm worker pool operates under a custom AppArmor profile (usr.sbin.php-fpm8.2-docapp) loaded in enforce mode. The profile specifies: owner /var/www/app/storage/documents/** r, owner /var/www/app/storage/documents/ r, /var/www/app/storage/logs/** w, /tmp/** rw, and deny /** rwlx as the final catch-all. The profile uses 'file' capability restrictions and explicitly does NOT include any 'include <abstractions/base>' or 'include <abstractions/nameservice>' directives that would grant broader filesystem reads. The profile was generated via aa-genprof during normal application operation and then manually hardened by removing glob patterns. Note: the profile allows reading within the documents directory subtree only, so path traversal attempts that resolve outside /var/www/app/storage/documents/ are denied at the kernel level regardless of POSIX DAC permissions.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "php_version": "8.2",
+      "php_extensions": [
+        "intl",
+        "mbstring"
+      ],
+      "web_server": "nginx + php-fpm",
+      "apparmor_profile": "usr.sbin.php-fpm8.2-docapp",
+      "apparmor_mode": "enforce",
+      "profile_rules": [
+        "owner /var/www/app/storage/documents/** r",
+        "owner /var/www/app/storage/documents/ r",
+        "/var/www/app/storage/logs/** w",
+        "/tmp/** rw",
+        "deny /** rwlx"
+      ],
+      "profile_notes": "No abstractions included; generated via aa-genprof then hardened",
+      "laravel_version": "10.x",
+      "selinux": "disabled"
+    }
+  }
+}

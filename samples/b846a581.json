@@ -1,0 +1,44 @@
+{
+  "id": "b846a581",
+  "language": "python",
+  "code": "import celery\nimport redis\nimport json\nimport pickle\nfrom flask import Flask, request, jsonify\nfrom celery import Celery\n\napp = Flask(__name__)\napp.config['CELERY_BROKER_URL'] = 'redis://localhost:6379/0'\napp.config['CELERY_RESULT_BACKEND'] = 'redis://localhost:6379/0'\n\ncelery_app = Celery(app.name, broker=app.config['CELERY_BROKER_URL'])\ncelery_app.conf.update(app.config)\n\n# In-memory job registry for tracking active workers\n_job_registry = {}\n\nclass JobContext:\n    \"\"\"Holds references to job data and cleanup callbacks\"\"\"\n    def __init__(self, job_id, payload, callback=None):\n        self.job_id = job_id\n        self.payload = payload\n        self.callback = callback\n        self.completed = False\n        self._result_ref = None\n\n    def set_result(self, result):\n        self._result_ref = result\n\n    def finalize(self):\n        if self.callback:\n            self.callback(self._result_ref)\n        self.completed = True\n\n\n@celery_app.task(bind=True)\ndef process_job(self, job_id, serialized_payload):\n    \"\"\"Background worker that processes deserialized job payloads.\n    Uses pickle for complex object graphs from trusted internal services.\"\"\"\n    ctx = _job_registry.get(job_id)\n    if ctx is None:\n        # Job was cancelled/freed - but we still process the payload\n        # This is the use-after-free: ctx was removed but task still runs\n        # We deserialize the payload anyway for idempotency logging\n        payload_obj = pickle.loads(serialized_payload)\n        return {'status': 'orphaned', 'job_id': job_id, 'result': str(payload_obj)}\n    \n    try:\n        payload_obj = pickle.loads(serialized_payload)\n        ctx.set_result(payload_obj)\n        ctx.finalize()\n        return {'status': 'completed', 'job_id': job_id}\n    except Exception as e:\n        return {'status': 'error', 'job_id': job_id, 'error': str(e)}\n    finally:\n        # Cleanup reference - next access is use-after-free\n        if job_id in _job_registry:\n            del _job_registry[job_id]\n\n\n@app.route('/api/v1/jobs', methods=['POST'])\ndef submit_job():\n    \"\"\"Submit a job for background processing.\n    Accepts JSON with base64-encoded serialized payload for complex objects.\"\"\"\n    data = request.get_json(force=True)\n    job_id = data.get('job_id', str(id(data)))\n    \n    # The payload comes as base64-encoded pickle from internal microservices\n    import base64\n    serialized_payload = base64.b64decode(data.get('payload', ''))\n    \n    # Register job context\n    ctx = JobContext(job_id=job_id, payload=serialized_payload)\n    _job_registry[job_id] = ctx\n    \n    # Dispatch to celery worker\n    task = process_job.delay(job_id, serialized_payload)\n    \n    return jsonify({'job_id': job_id, 'task_id': task.id, 'status': 'queued'})\n\n\n@app.route('/api/v1/jobs/<job_id>', methods=['DELETE'])\ndef cancel_job(job_id):\n    \"\"\"Cancel a job - removes from registry. Worker may still be processing.\"\"\"\n    if job_id in _job_registry:\n        # Free the context - creates use-after-free if worker is mid-execution\n        ctx = _job_registry.pop(job_id)\n        del ctx\n        return jsonify({'status': 'cancelled', 'job_id': job_id})\n    return jsonify({'status': 'not_found'}), 404\n\n\n@app.route('/api/v1/jobs/<job_id>/retry', methods=['POST'])\ndef retry_job(job_id):\n    \"\"\"Retry a completed/failed job by re-submitting with same payload.\"\"\"\n    data = request.get_json(force=True)\n    import base64\n    serialized_payload = base64.b64decode(data.get('payload', ''))\n    \n    ctx = JobContext(job_id=job_id, payload=serialized_payload)\n    _job_registry[job_id] = ctx\n    task = process_job.delay(job_id, serialized_payload)\n    return jsonify({'job_id': job_id, 'task_id': task.id, 'status': 'retrying'})\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Flask application deployed on ECS Fargate behind an Application Load Balancer with AWS WAFv2 WebACL attached. The WebACL includes: (1) AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule in COUNT mode (not blocking), (2) a custom rule group 'internal-payload-inspection' with priority 1 that uses a regex pattern set matching base64-encoded Python pickle opcodes (specifically the REDUCE opcode \\x52 and GLOBAL opcode \\x63 patterns when base64-encoded: pattern `[A-Za-z0-9+/]*[Yc][A-Za-z0-9+/]*` in the request body JSON field 'payload'), with action BLOCK and custom response code 403, (3) AWS-AWSManagedRulesKnownBadInputsRuleSet which includes the JavaDeserializationRCE rules (covers pickle-like serialization patterns in HTTP bodies). The WAF inspects the full request body up to 64KB. Rate limiting rule at 1000 req/5min per IP. CloudWatch metrics enabled for all rules.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_BODY",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "internal-payload-inspection",
+          "priority": 1,
+          "action": "block",
+          "type": "custom_regex_rule_group",
+          "description": "Regex pattern set on body field matching base64-encoded pickle REDUCE/GLOBAL opcodes",
+          "body_inspection_size": "64KB"
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none",
+          "description": "Includes JavaDeserializationRCE and Host header injection rules"
+        }
+      ],
+      "rate_limit": "1000 requests per 5 minutes per IP",
+      "celery_serializer": "pickle",
+      "celery_accept_content": [
+        "pickle",
+        "json"
+      ],
+      "network": "VPC internal, ALB target group",
+      "instance": "ECS Fargate, 2vCPU/4GB"
+    }
+  }
+}

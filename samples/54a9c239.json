@@ -1,0 +1,67 @@
+{
+  "id": "54a9c239",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.*;\nimport com.sun.net.httpserver.*;\n\npublic class ConfigService {\n\n    private static final Map<String, String> configCache = new HashMap<>();\n    private static String dataDir = \"/opt/app/data\";\n\n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);\n        server.createContext(\"/api/config/import\", new ImportHandler());\n        server.createContext(\"/api/config/export\", new ExportHandler());\n        server.createContext(\"/api/health\", new HealthHandler());\n        server.setExecutor(null);\n        server.start();\n        System.out.println(\"ConfigService started on :8080\");\n    }\n\n    static class ImportHandler implements HttpHandler {\n        public void handle(HttpExchange exchange) throws IOException {\n            if (!\"POST\".equals(exchange.getRequestMethod())) {\n                exchange.sendResponseHeaders(405, 0);\n                exchange.close();\n                return;\n            }\n            String contentType = exchange.getRequestHeaders().getFirst(\"Content-Type\");\n            if (contentType == null || !contentType.contains(\"xml\")) {\n                exchange.sendResponseHeaders(415, 0);\n                exchange.close();\n                return;\n            }\n            // Auth check: require internal service token\n            String authToken = exchange.getRequestHeaders().getFirst(\"X-Service-Token\");\n            if (authToken == null || !authToken.equals(System.getenv(\"SERVICE_TOKEN\"))) {\n                exchange.sendResponseHeaders(401, 0);\n                exchange.close();\n                return;\n            }\n            try {\n                InputStream body = exchange.getRequestBody();\n                SAXParserFactory factory = SAXParserFactory.newInstance();\n                // Developer note: we tried disabling DTDs but it broke legacy config format\n                // factory.setFeature(\"http://apache.org/xml/features/disallow-doctype-decl\", true);\n                SAXParser parser = factory.newSAXParser();\n                ConfigHandler handler = new ConfigHandler();\n                parser.parse(body, handler);\n                configCache.putAll(handler.getEntries());\n                String resp = \"{\\\"imported\\\": \" + handler.getEntries().size() + \"}\";\n                exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n                exchange.sendResponseHeaders(200, resp.length());\n                exchange.getResponseBody().write(resp.getBytes());\n            } catch (Exception e) {\n                String err = \"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\";\n                exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n                exchange.sendResponseHeaders(400, err.length());\n                exchange.getResponseBody().write(err.getBytes());\n            }\n            exchange.close();\n        }\n    }\n\n    static class ExportHandler implements HttpHandler {\n        public void handle(HttpExchange exchange) throws IOException {\n            StringBuilder sb = new StringBuilder(\"<?xml version=\\\"1.0\\\"?>\\n<config>\\n\");\n            for (Map.Entry<String, String> e : configCache.entrySet()) {\n                sb.append(\"  <entry key=\\\"\").append(e.getKey()).append(\"\\\">\");\n                sb.append(e.getValue()).append(\"</entry>\\n\");\n            }\n            sb.append(\"</config>\");\n            byte[] resp = sb.toString().getBytes();\n            exchange.getResponseHeaders().set(\"Content-Type\", \"application/xml\");\n            exchange.sendResponseHeaders(200, resp.length);\n            exchange.getResponseBody().write(resp);\n            exchange.close();\n        }\n    }\n\n    static class HealthHandler implements HttpHandler {\n        public void handle(HttpExchange exchange) throws IOException {\n            String resp = \"{\\\"status\\\":\\\"ok\\\",\\\"configs\\\":\" + configCache.size() + \"}\";\n            exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n            exchange.sendResponseHeaders(200, resp.length());\n            exchange.getResponseBody().write(resp.getBytes());\n            exchange.close();\n        }\n    }\n\n    static class ConfigHandler extends DefaultHandler {\n        private Map<String, String> entries = new HashMap<>();\n        private String currentKey;\n        private StringBuilder currentValue = new StringBuilder();\n\n        public void startElement(String uri, String localName, String qName, Attributes attrs) {\n            if (\"entry\".equals(qName)) {\n                currentKey = attrs.getValue(\"key\");\n                currentValue = new StringBuilder();\n            }\n        }\n\n        public void characters(char[] ch, int start, int length) {\n            currentValue.append(ch, start, length);\n        }\n\n        public void endElement(String uri, String localName, String qName) {\n            if (\"entry\".equals(qName) && currentKey != null) {\n                entries.put(currentKey, currentValue.toString().trim());\n            }\n        }\n\n        public Map<String, String> getEntries() { return entries; }\n    }\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB in a private subnet. The ALB has an AWS WAFv2 WebACL attached with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'app-input-validation' with a single RegexPatternSet rule matching request URI path '/api/users/search' that inspects SingleQueryArgument 'value' against pattern '(?i)(?:union|select|insert|update|delete|drop|;|--|/\\*|\\*/|0x[0-9a-f]+|char\\(|concat\\()' with action BLOCK and priority 1, (3) AWSManagedRulesKnownBadInputsRuleSet in BLOCK mode. The ECS task role has no S3 or SSM permissions. Container runs with read-only root filesystem; /var/lib/app is an ephemeral tmpfs volume. ALB access logs are shipped to CloudWatch.",
+    "config": {
+      "compute": "ecs_fargate",
+      "network": "private_subnet_alb_only",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 10,
+            "override_action": "none",
+            "rule_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "count"
+              }
+            ]
+          },
+          {
+            "name": "app-input-validation",
+            "priority": 5,
+            "type": "custom_rule_group",
+            "rules": [
+              {
+                "name": "block-sqli-search-value",
+                "priority": 1,
+                "statement": {
+                  "regex_pattern_set_match": {
+                    "field_to_match": {
+                      "single_query_argument": {
+                        "name": "value"
+                      }
+                    },
+                    "text_transformations": [
+                      {
+                        "priority": 0,
+                        "type": "URL_DECODE"
+                      },
+                      {
+                        "priority": 1,
+                        "type": "LOWERCASE"
+                      }
+                    ],
+                    "regex_pattern_set": "(?:union|select|insert|update|delete|drop|;|--|/\\*|\\*/|0x[0-9a-f]+|char\\(|concat\\()"
+                  }
+                },
+                "action": "block",
+                "scope": "matches_uri_path_/api/users/search"
+              }
+            ]
+          },
+          {
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "priority": 20,
+            "override_action": "none"
+          }
+        ]
+      },
+      "task_role_permissions": "minimal_ecs_exec_only",
+      "filesystem": "read_only_root_tmpfs_data"
+    }
+  }
+}

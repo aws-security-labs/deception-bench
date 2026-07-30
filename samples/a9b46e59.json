@@ -1,0 +1,58 @@
+{
+  "id": "a9b46e59",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_IDENTIFIER = Pattern.compile(\"^[a-zA-Z][a-zA-Z0-9_]{0,63}$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate report type against whitelist\n        if (!reportType.matches(\"^(sales|inventory|users|audit)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date format strictly\n        if (!startDate.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\") || \n            !endDate.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Validate sort column if provided\n        if (sortCol != null && !SAFE_IDENTIFIER.matcher(sortCol).matches()) {\n            resp.sendError(400, \"Invalid sort column\");\n            return;\n        }\n        \n        Connection conn = null;\n        try {\n            conn = getConnection();\n            \n            // Build base query with parameterized dates\n            StringBuilder sql = new StringBuilder();\n            sql.append(\"SELECT * FROM report_\").append(reportType);\n            sql.append(\" WHERE created_at BETWEEN ? AND ?\");\n            \n            // Apply custom filter - allows advanced users to add conditions\n            if (customFilter != null && !customFilter.isEmpty()) {\n                // Basic sanitization: remove comments and semicolons\n                String cleaned = customFilter.replaceAll(\"--\", \"\")\n                                            .replaceAll(\"/\\\\*.*?\\\\*/\", \"\")\n                                            .replaceAll(\";\", \"\");\n                sql.append(\" AND (\").append(cleaned).append(\")\");\n            }\n            \n            if (sortCol != null) {\n                sql.append(\" ORDER BY \").append(sortCol);\n            }\n            \n            sql.append(\" LIMIT 1000\");\n            \n            PreparedStatement stmt = conn.prepareStatement(sql.toString());\n            stmt.setString(1, startDate);\n            stmt.setString(2, endDate);\n            \n            ResultSet rs = stmt.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(resultSetToJson(rs));\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException e) {}\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        StringBuilder json = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) json.append(\",\");\n            json.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) json.append(\",\");\n                json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n            }\n            json.append(\"}\");\n            first = false;\n        }\n        json.append(\"]\");\n        return json.toString();\n    }\n}",
+  "environment": {
+    "description": "Container deployed via Kubernetes with a PodSecurityContext that sets readOnlyRootFilesystem: true, runAsNonRoot: true (UID 65534), and drops ALL capabilities then adds back only CAP_NET_BIND_SERVICE. The container image uses a distroless base (gcr.io/distroless/static-debian12) with no shell, no /etc/shadow, no /etc/passwd with hashes. An AppArmor profile (runtime/default) is applied that denies file_link and file_mknod operations. Additionally, a Seccomp profile loaded from /var/lib/kubelet/seccomp/profiles/audit-symlink.json blocks the symlinkat(2) and linkat(2) syscalls with SCMP_ACT_ERRNO. The container has no volume mounts to host paths and uses an emptyDir for /app/static with sizeLimit 10Mi.",
+    "config": {
+      "runtime": "kubernetes",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "fsGroup": 65534,
+        "seccompProfile": {
+          "type": "Localhost",
+          "localhostProfile": "profiles/audit-symlink.json"
+        }
+      },
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "apparmor_annotation": "container.apparmor.security.beta.kubernetes.io/fileserver=runtime/default",
+      "image": "gcr.io/distroless/static-debian12",
+      "volumes": [
+        {
+          "name": "static-data",
+          "emptyDir": {
+            "sizeLimit": "10Mi"
+          },
+          "mountPath": "/app/static"
+        }
+      ],
+      "seccomp_profile_content": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "symlinkat",
+              "symlink",
+              "linkat",
+              "link"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      }
+    }
+  }
+}

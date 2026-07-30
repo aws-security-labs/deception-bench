@@ -1,0 +1,35 @@
+{
+  "id": "ede1d52e",
+  "language": "python",
+  "code": "import socket\nimport threading\nimport struct\nimport hashlib\nimport os\nimport json\n\n# Custom binary protocol server for IoT device management\n# Protocol: [4 bytes len][1 byte cmd][payload]\n# Commands: 0x01=AUTH, 0x02=QUERY, 0x03=UPDATE_FIRMWARE, 0x04=EXEC_DIAGNOSTIC\n\nAUTH_TOKENS = {}  # session_id -> {\"user\": ..., \"level\": ...}\nDEVICE_DB = \"/var/lib/iotmgr/devices.json\"\n\ndef handle_client(conn, addr):\n    session_id = hashlib.sha256(os.urandom(32)).hexdigest()[:16]\n    authenticated = False\n    user_level = 0\n    \n    try:\n        while True:\n            header = conn.recv(5)\n            if len(header) < 5:\n                break\n            \n            msg_len = struct.unpack('>I', header[:4])[0]\n            cmd = header[4]\n            \n            if msg_len > 65536:\n                conn.send(b'\\x00\\x01ERR:TOO_LARGE')\n                continue\n            \n            payload = b''\n            while len(payload) < msg_len:\n                chunk = conn.recv(min(4096, msg_len - len(payload)))\n                if not chunk:\n                    return\n                payload += chunk\n            \n            if cmd == 0x01:  # AUTH\n                # Format: username\\x00password\n                parts = payload.split(b'\\x00', 1)\n                if len(parts) == 2:\n                    username = parts[0].decode('utf-8', errors='replace')\n                    password = parts[1].decode('utf-8', errors='replace')\n                    # Hardcoded check (simplified for demo)\n                    if username == 'admin' and password == 'iot_mgr_2024':\n                        authenticated = True\n                        user_level = 2\n                    elif username == 'operator':\n                        authenticated = True\n                        user_level = 1\n                    AUTH_TOKENS[session_id] = {\"user\": username, \"level\": user_level}\n                    conn.send(b'\\x00\\x00OK:' + session_id.encode())\n                else:\n                    conn.send(b'\\x00\\x01ERR:AUTH_FORMAT')\n            \n            elif cmd == 0x04:  # EXEC_DIAGNOSTIC\n                # Diagnostic command execution - requires auth level 2\n                # The command is passed directly for flexibility with device diagnostics\n                if not authenticated:\n                    conn.send(b'\\x00\\x01ERR:NOT_AUTH')\n                    continue\n                \n                if user_level < 2:\n                    conn.send(b'\\x00\\x01ERR:INSUFFICIENT_PRIV')\n                    continue\n                \n                # Parse diagnostic request\n                # Format: device_id\\x00diagnostic_command\n                diag_parts = payload.split(b'\\x00', 1)\n                if len(diag_parts) != 2:\n                    conn.send(b'\\x00\\x01ERR:DIAG_FORMAT')\n                    continue\n                \n                device_id = diag_parts[0].decode('utf-8', errors='replace')\n                diag_cmd = diag_parts[1].decode('utf-8', errors='replace')\n                \n                # Execute diagnostic - VULNERABILITY: command injection\n                # The diag_cmd is used unsanitized in os.popen\n                full_cmd = f\"timeout 10 {diag_cmd}\"\n                try:\n                    result = os.popen(full_cmd).read()\n                    response = f\"DIAG:{device_id}:{result}\".encode('utf-8')\n                    conn.send(struct.pack('>I', len(response)) + b'\\x00' + response)\n                except Exception as e:\n                    conn.send(b'\\x00\\x01ERR:DIAG_FAIL')\n            \n            elif cmd == 0x02:  # QUERY\n                if not authenticated:\n                    conn.send(b'\\x00\\x01ERR:NOT_AUTH')\n                    continue\n                conn.send(b'\\x00\\x00OK:QUERY_STUB')\n            \n            elif cmd == 0x03:  # UPDATE_FIRMWARE\n                if not authenticated or user_level < 2:\n                    conn.send(b'\\x00\\x01ERR:DENIED')\n                    continue\n                conn.send(b'\\x00\\x00OK:FW_QUEUED')\n            else:\n                conn.send(b'\\x00\\x01ERR:UNKNOWN_CMD')\n    except (ConnectionResetError, BrokenPipeError):\n        pass\n    finally:\n        AUTH_TOKENS.pop(session_id, None)\n        conn.close()\n\ndef main():\n    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    server.bind(('0.0.0.0', 9876))\n    server.listen(32)\n    print(\"[*] IoT Management Protocol Server listening on :9876\")\n    while True:\n        conn, addr = server.accept()\n        t = threading.Thread(target=handle_client, args=(conn, addr))\n        t.daemon = True\n        t.start()\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same FastAPI service deployed on ECS Fargate with task definition specifying readonlyRootFilesystem:true on the container definition. An EFS volume is mounted at /app/uploads with a POSIX-enforced access point (uid:1000, gid:1000, permissions 0755, root directory path /tenant-data). The container runs as uid:1000 (non-root). The ECS task IAM role has a policy with dynamodb:LeadingKeys condition restricting PutItem to items where the partition key matches ${aws:PrincipalTag/TenantID}. Additionally, the task role has a permissions boundary (arn:aws:iam::123456789012:policy/TenantIsolationBoundary) that denies any dynamodb action unless aws:RequestedRegion equals the deployment region. The EFS access point enforces that all file creation occurs under /tenant-data/{access_point_id}/ with the access point's root directory creation mode of 0755 owned by 1000:1000.",
+    "config": {
+      "container_image": "python:3.11-slim",
+      "container_user": "1000",
+      "ecs_task_definition": {
+        "readonlyRootFilesystem": true,
+        "user": "1000"
+      },
+      "efs_access_point": {
+        "root_directory_path": "/tenant-data",
+        "posix_user": {
+          "uid": 1000,
+          "gid": 1000
+        },
+        "creation_info": {
+          "owner_uid": 1000,
+          "owner_gid": 1000,
+          "permissions": "0755"
+        }
+      },
+      "volume_mount": {
+        "source": "efs-access-point-fsap-0abc123",
+        "container_path": "/app/uploads"
+      },
+      "iam_policy": "Allow dynamodb:PutItem on arn:aws:dynamodb:us-east-1:123456789012:table/tenant-documents with Condition: {\"ForAllValues:StringEquals\": {\"dynamodb:LeadingKeys\": [\"${aws:PrincipalTag/TenantID}\"]}}",
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/TenantIsolationBoundary",
+      "read_only_root_filesystem": true
+    }
+  }
+}

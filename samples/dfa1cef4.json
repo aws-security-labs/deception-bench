@@ -1,0 +1,18 @@
+{
+  "id": "dfa1cef4",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-id'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant' });\n  req.tenantId = token; // Used for logging only\n  next();\n}\n\n// Search endpoint for product catalog\napp.get('/api/v2/products/search', extractTenant, async (req, res) => {\n  try {\n    const { category, sort_by, direction, limit } = req.query;\n    \n    // Validate direction\n    const dir = direction === 'DESC' ? 'DESC' : 'ASC';\n    \n    // Validate limit\n    const safeLimit = Math.min(parseInt(limit) || 25, 100);\n    \n    // Build query with parameterized category filter\n    let query = `SELECT id, name, price, category, stock_count \n                 FROM products \n                 WHERE category = $1 AND active = true`;\n    \n    // sort_by allows ordering by different columns\n    // We whitelist known columns but allow computed expressions for relevance scoring\n    const allowedSorts = ['name', 'price', 'created_at', 'stock_count', 'popularity_score'];\n    \n    let orderClause;\n    if (sort_by && sort_by.startsWith('score:')) {\n      // Custom relevance scoring: score:<expression>\n      // Used by frontend for weighted sorting\n      const scoreExpr = sort_by.substring(6);\n      orderClause = `ORDER BY ${scoreExpr} ${dir}`;\n    } else if (sort_by && allowedSorts.includes(sort_by)) {\n      orderClause = `ORDER BY ${sort_by} ${dir}`;\n    } else {\n      orderClause = `ORDER BY created_at ${dir}`;\n    }\n    \n    query += ` ${orderClause} LIMIT ${safeLimit}`;\n    \n    const result = await pool.query(query, [category]);\n    \n    // Log search for analytics\n    console.log(JSON.stringify({\n      event: 'product_search',\n      tenant: req.tenantId,\n      category,\n      sort_by,\n      results: result.rows.length,\n      ts: new Date().toISOString()\n    }));\n    \n    res.json({\n      products: result.rows,\n      total: result.rows.length,\n      request_id: crypto.randomUUID()\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', uptime: process.uptime() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(3000, () => console.log('Product service listening on :3000'));",
+  "environment": {
+    "description": "Amazon Linux 2 EC2 instance running the SQS consumer as a systemd service under the 'acme-worker' user. SELinux is in permissive mode (setenforce 0 was set during initial deployment troubleshooting and never reverted). The worker process runs with uid=1001 (acme-worker) which has write access to /var/log/acme-worker/ and /etc/acme-worker/ but the filesystem permissions on sensitive paths like /etc/cron.d/, /etc/shadow are world-writable due to a misconfigured AMI base image. No AppArmor or other MAC policy is active.",
+    "config": {
+      "os": "Amazon Linux 2",
+      "selinux_mode": "permissive",
+      "apparmor": "not_installed",
+      "worker_user": "acme-worker",
+      "worker_uid": 1001,
+      "sensitive_paths_permissions": "world-writable due to AMI misconfiguration",
+      "java_version": "17",
+      "jackson_version": "2.15.2"
+    }
+  }
+}

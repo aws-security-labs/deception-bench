@@ -1,0 +1,41 @@
+{
+  "id": "36cff9e5",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom filter: strip obvious attack patterns but allow legitimate queries\n    private String sanitizeInput(String input) {\n        if (input == null) return null;\n        // Remove comment sequences\n        input = input.replaceAll(\"/\\\\*.*?\\\\*/\", \"\");\n        // Remove double-dash comments\n        input = input.replaceAll(\"--\", \"\");\n        // Collapse multiple spaces\n        input = input.replaceAll(\"\\\\s+\", \" \");\n        return input.trim();\n    }\n    \n    private boolean isValidDateRange(String start, String end) {\n        // Loose validation - accepts YYYY-MM-DD but doesn't enforce strictly\n        Pattern p = Pattern.compile(\".*\\\\d{4}.*\");\n        return (start != null && p.matcher(start).matches() && \n                end != null && p.matcher(end).matches());\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = sanitizeInput(req.getParameter(\"start\"));\n        String endDate = sanitizeInput(req.getParameter(\"end\"));\n        String department = sanitizeInput(req.getParameter(\"dept\"));\n        String sortCol = sanitizeInput(req.getParameter(\"sort\"));\n        \n        if (!isValidDateRange(startDate, endDate)) {\n            resp.sendError(400, \"Invalid date range\");\n            return;\n        }\n        \n        // Whitelist report types\n        if (!\"sales\".equals(reportType) && !\"inventory\".equals(reportType) \n            && !\"hr\".equals(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        String table = reportType + \"_reports\";\n        \n        // Build query - sort column is validated against known columns\n        String[] allowedSorts = {\"date\", \"amount\", \"name\", \"id\", \"department\"};\n        boolean sortValid = false;\n        if (sortCol != null) {\n            for (String s : allowedSorts) {\n                if (s.equalsIgnoreCase(sortCol)) { sortValid = true; break; }\n            }\n        }\n        \n        String query;\n        if (department != null && !department.isEmpty()) {\n            // Vulnerable: department is concatenated despite sanitizeInput\n            query = \"SELECT id, date, amount, name, department FROM \" + table +\n                    \" WHERE date BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\" +\n                    \" AND department = '\" + department + \"'\";\n        } else {\n            query = \"SELECT id, date, amount, name, department FROM \" + table +\n                    \" WHERE date BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\";\n        }\n        \n        if (sortValid) {\n            query += \" ORDER BY \" + sortCol;\n        }\n        \n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            out.print(\"[\\n\");\n            boolean first = true;\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.print(\", \");\n                    out.print(\"\\\"\" + meta.getColumnName(i) + \"\\\": \");\n                    out.print(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                out.print(\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.29 cluster with namespace-level Pod Security Standards label 'pod-security.kubernetes.io/enforce: baseline' applied. Additionally, a Kyverno ClusterPolicy 'restrict-volume-types' denies any pod spec containing hostPath volumes with a match on all namespaces except kube-system. The container image is distroless (gcr.io/distroless/static-debian12) and the pod spec sets securityContext.runAsNonRoot: true with runAsUser: 65534. An OPA Gatekeeper ConstraintTemplate 'K8sPSPHostFilesystem' is also active with parameter 'allowedHostPaths: []' (empty - no hostPath allowed). The container filesystem is read-only (readOnlyRootFilesystem: true) with only an emptyDir volume mounted at /tmp/uploads and /var/www/static.",
+    "config": {
+      "kubernetes_version": "1.29",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.29"
+      },
+      "kyverno_policy": "restrict-volume-types: deny hostPath in all namespaces except kube-system",
+      "gatekeeper_constraint": "K8sPSPHostFilesystem with allowedHostPaths: []",
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "type": "emptyDir",
+          "mountPath": "/tmp/uploads"
+        },
+        {
+          "type": "emptyDir",
+          "mountPath": "/var/www/static"
+        }
+      ],
+      "seccomp_profile": "RuntimeDefault",
+      "service_type": "ClusterIP",
+      "network_policy": "deny-egress-except-dns"
+    }
+  }
+}

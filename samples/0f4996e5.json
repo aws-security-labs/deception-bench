@@ -1,0 +1,38 @@
+{
+  "id": "0f4996e5",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class AssetInventoryServlet extends HttpServlet {\n    private static final String DB_URL = \"jdbc:postgresql://localhost:5432/inventory\";\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String action = req.getParameter(\"action\");\n        if (\"search\".equals(action)) {\n            handleSearch(req, resp);\n        } else if (\"detail\".equals(action)) {\n            handleDetail(req, resp);\n        } else {\n            resp.sendError(400, \"Unknown action\");\n        }\n    }\n\n    private void handleSearch(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String category = req.getParameter(\"category\");\n        String location = req.getParameter(\"location\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        // Basic input length check\n        if (category != null && category.length() > 64) {\n            resp.sendError(400, \"Category too long\");\n            return;\n        }\n        \n        // Build query - category is parameterized but sortCol is not\n        StringBuilder sql = new StringBuilder(\n            \"SELECT asset_id, name, category, location, value FROM assets WHERE 1=1\");\n        \n        if (category != null && !category.isEmpty()) {\n            sql.append(\" AND category = ?\");\n        }\n        if (location != null && !location.isEmpty()) {\n            sql.append(\" AND location = ?\");\n        }\n        \n        // Sort column - validated against allowlist... but with a flaw\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Developer intended to validate but used contains() instead of equals()\n            String[] allowed = {\"name\", \"category\", \"location\", \"value\", \"asset_id\"};\n            boolean valid = false;\n            for (String col : allowed) {\n                if (sortCol.contains(col)) {\n                    valid = true;\n                    break;\n                }\n            }\n            if (valid) {\n                sql.append(\" ORDER BY \" + sortCol);\n            }\n        }\n        \n        resp.setContentType(\"application/json\");\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql.toString())) {\n            int paramIdx = 1;\n            if (category != null && !category.isEmpty()) {\n                stmt.setString(paramIdx++, category);\n            }\n            if (location != null && !location.isEmpty()) {\n                stmt.setString(paramIdx++, location);\n            }\n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"asset_id\", rs.getString(\"asset_id\"));\n                row.put(\"name\", rs.getString(\"name\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                row.put(\"location\", rs.getString(\"location\"));\n                row.put(\"value\", rs.getDouble(\"value\"));\n                results.put(row);\n            }\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    private void handleDetail(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String assetId = req.getParameter(\"id\");\n        if (assetId == null || !assetId.matches(\"^[A-Z]{2}-\\\\d{6}$\")) {\n            resp.sendError(400, \"Invalid asset ID format\");\n            return;\n        }\n        resp.setContentType(\"application/json\");\n        String sql = \"SELECT * FROM assets WHERE asset_id = ?\";\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            stmt.setString(1, assetId);\n            ResultSet rs = stmt.executeQuery();\n            if (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"asset_id\", rs.getString(\"asset_id\"));\n                row.put(\"name\", rs.getString(\"name\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                row.put(\"location\", rs.getString(\"location\"));\n                row.put(\"value\", rs.getDouble(\"value\"));\n                row.put(\"notes\", rs.getString(\"notes\"));\n                resp.getWriter().write(row.toString());\n            } else {\n                resp.sendError(404, \"Asset not found\");\n            }\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Go 1.20 Gin application deployed on EC2 behind an Application Load Balancer (ALB). The ALB has an associated AWS WAFv2 Web ACL with the following configuration: a custom rule group with priority 1 containing a RegexPatternSet match condition on URI query string components inspecting for the byte sequences \\x0d, \\x0a, %0d, %0a, %0D, %0A in a SizeConstraint with ComparisonOperator GT 0, combined with a separate rule using the AWS managed rule group AWSManagedRulesCommonRuleSet with the rule 'GenericRFI_QUERYARGUMENTS' and 'CrossSiteScripting_QUERYARGUMENTS' in COUNT mode only. The custom regex rule has action BLOCK. Note: the ALB itself normalizes certain header characters but the WAF rule fires on the raw query string before ALB processing. TextTransformation applied: URL_DECODE followed by NONE (dual pass). The Web ACL default action is ALLOW.",
+    "config": {
+      "runtime": "Go 1.20.3",
+      "framework": "gin-gonic/gin v1.9.0",
+      "infrastructure": "AWS EC2 t3.medium, Application Load Balancer",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/crlf-protection-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "BlockCRLFInQueryString",
+          "priority": 1,
+          "action": "BLOCK",
+          "statement": {
+            "type": "RegexPatternSetReferenceStatement",
+            "field_to_match": "ALL_QUERY_ARGUMENTS",
+            "regex_pattern_set": "(%0[dDaA]|\\\\x0[dDaA]|\\r|\\n)",
+            "text_transformations": [
+              "URL_DECODE",
+              "NONE"
+            ]
+          }
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 2,
+          "override_action": "COUNT",
+          "managed_rule_group": "AWS-AWSManagedRulesCommonRuleSet"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "alb_config": "internet-facing, HTTP/2 enabled, idle timeout 60s"
+    }
+  }
+}

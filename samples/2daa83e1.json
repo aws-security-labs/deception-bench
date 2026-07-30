@@ -1,0 +1,36 @@
+{
+  "id": "2daa83e1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID    int     `json:\"id\"`\n\tName  string  `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string  `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeOrder attempts to prevent injection in ORDER BY clauses\nfunc sanitizeOrder(input string) string {\n\t// Strip comments and semicolons\n\tinput = strings.ReplaceAll(input, \"--\", \"\")\n\tinput = strings.ReplaceAll(input, \";\", \"\")\n\tinput = strings.ReplaceAll(input, \"/*\", \"\")\n\treturn input\n}\n\n// validateCategory checks category against known values\nfunc validateCategory(cat string) bool {\n\tvalid := []string{\"electronics\", \"clothing\", \"food\", \"toys\", \"books\"}\n\tfor _, v := range valid {\n\t\tif strings.EqualFold(v, cat) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tdir := r.URL.Query().Get(\"dir\")\n\n\tif category == \"\" {\n\t\tcategory = \"electronics\"\n\t}\n\n\tif !validateCategory(category) {\n\t\thttp.Error(w, \"invalid category\", 400)\n\t\treturn\n\t}\n\n\tif dir == \"\" {\n\t\tdir = \"ASC\"\n\t}\n\tdir = strings.ToUpper(dir)\n\tif dir != \"ASC\" && dir != \"DESC\" {\n\t\tdir = \"ASC\"\n\t}\n\n\t// Default sort column\n\tif sortCol == \"\" {\n\t\tsortCol = \"name\"\n\t}\n\n\t// Apply sanitization to sort column\n\tsortCol = sanitizeOrder(sortCol)\n\n\t// Build query - category is validated, sort is \"sanitized\"\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, price, sku FROM products WHERE category = $1 ORDER BY %s %s LIMIT 50\",\n\t\tsortCol, dir,\n\t)\n\n\trows, err := db.Query(query, category)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Same application deployed identically but the EC2 instance runs within a VPC whose subnet route table has no internet gateway route (egress only via NAT for package updates). Access is exclusively through AWS API Gateway (REST API type) with a VPC Link to a Network Load Balancer. The API Gateway resource /api/users/search has a request validator enabled with a mapping template that applies URL-decoding normalization and then enforces a regex constraint on the 'q' query string parameter: pattern ^[a-zA-Z0-9@.\\-_ ]{0,64}$ (validated server-side by API Gateway before forwarding). Additionally, the API Gateway has a usage plan with throttling (10 req/s burst, 5 req/s sustained) and requires an x-api-key header tied to a registered client. The method request parameters define 'q' and 'field' as required with the caching TTL of 0 (no caching, just validation).",
+    "config": {
+      "api_gateway": {
+        "type": "REST",
+        "endpoint_type": "REGIONAL",
+        "vpc_link": "to NLB in private subnet",
+        "request_validator": "Validate query string parameters and headers",
+        "resource_/api/users/search_GET": {
+          "method.request.querystring.q": {
+            "required": true,
+            "regex_pattern": "^[a-zA-Z0-9@.\\-_ ]{0,64}$"
+          },
+          "method.request.querystring.field": {
+            "required": true
+          },
+          "integration": "VPC_LINK HTTP_PROXY"
+        }
+      },
+      "usage_plan": {
+        "throttle_rate": 5,
+        "throttle_burst": 10,
+        "api_key_required": true
+      },
+      "network": {
+        "subnet": "private, no IGW route",
+        "nat_gateway": "for outbound package updates only",
+        "nlb": "internal, target group pointing to app on port 8080"
+      }
+    }
+  }
+}

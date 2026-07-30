@@ -1,0 +1,38 @@
+{
+  "id": "d690a56b",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport sys\nfrom flask import Flask, request, jsonify\nimport psycopg2\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nSECRET_KEY = os.environ.get('SECRET_KEY', 'changeme')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, dbname=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report by running a system command with user-specified format.\"\"\"\n    auth_header = request.headers.get('X-Auth-Token', '')\n    expected = hmac.new(SECRET_KEY.encode(), b'report-access', hashlib.sha256).hexdigest()\n    # Note: timing-safe compare not used here (potential timing attack)\n    if auth_header != expected:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'missing body'}), 400\n\n    report_id = data.get('report_id', '')\n    output_format = data.get('format', 'pdf')\n\n    # Validate report_id is numeric\n    if not report_id or not str(report_id).isdigit():\n        return jsonify({'error': 'invalid report_id'}), 400\n\n    # Fetch report metadata from database\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT title, template_path FROM reports WHERE id = %s\", (report_id,))\n    row = cur.fetchone()\n    cur.close()\n    conn.close()\n\n    if not row:\n        return jsonify({'error': 'report not found'}), 404\n\n    title, template_path = row\n\n    # Build the report generation command\n    # output_format is used directly in the command string\n    output_file = f\"/tmp/reports/report_{report_id}.{output_format}\"\n    cmd = f\"wkhtmltopdf --title '{title}' /app/templates/{template_path} {output_file}\"\n\n    try:\n        result = subprocess.run(\n            cmd, shell=True, capture_output=True, timeout=30,\n            env={**os.environ, 'DISPLAY': ''}\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'generation failed', 'detail': result.stderr.decode()[:200]}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'timeout'}), 504\n\n    return jsonify({'status': 'ok', 'path': output_file})\n\n\n@app.route('/api/reports/list', methods=['GET'])\ndef list_reports():\n    \"\"\"List available reports for the authenticated user.\"\"\"\n    user_id = request.args.get('user_id', '')\n    if not user_id:\n        return jsonify({'error': 'missing user_id'}), 400\n\n    conn = get_db()\n    cur = conn.cursor()\n    # Parameterized query - safe from SQLi\n    cur.execute(\n        \"SELECT id, title, created_at FROM reports WHERE owner_id = %s ORDER BY created_at DESC\",\n        (user_id,)\n    )\n    rows = cur.fetchall()\n    cur.close()\n    conn.close()\n\n    return jsonify({'reports': [{'id': r[0], 'title': r[1], 'created': str(r[2])} for r in rows]})\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\n\nif __name__ == '__main__':\n    os.makedirs('/tmp/reports', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "FastAPI service on ECS Fargate in private subnet (us-east-1). S3 traffic is forced through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that includes a condition block: aws:PrincipalOrgID must match o-abc123def4 AND the s3:prefix must begin with 'uploads/' AND aws:SourceVpc must equal vpc-0fedcba987654. The endpoint policy also has an explicit Deny for any PutObject where s3:x-amz-server-side-encryption is absent (enforcing SSE). The container's /tmp is an ephemeral 20GB volume (not shared) with noexec mount option applied via ECS task definition volumeConfiguration. The task IAM role has a permissions boundary (arn:aws:iam::111222333444:policy/BoundaryNoTmpExfil) that denies s3:PutObject unless aws:RequestedRegion equals us-east-1 and the object key matches 'uploads/*'. Route tables have no route to NAT for S3 prefix list - all S3 traffic must traverse the VPC endpoint.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "root",
+      "tmp_mount": "ephemeral task storage, noexec, not shared",
+      "s3_access": "Gateway VPC Endpoint vpce-0a1b2c3d4e5f67890 only",
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": [
+          "s3:PutObject"
+        ],
+        "Resource": "arn:aws:s3:::user-uploads-prod/uploads/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4",
+            "aws:SourceVpc": "vpc-0fedcba987654"
+          },
+          "StringLike": {
+            "s3:prefix": "uploads/*"
+          },
+          "StringNotEquals": {
+            "s3:x-amz-server-side-encryption": ""
+          }
+        }
+      },
+      "explicit_deny_in_endpoint": "Deny PutObject without SSE header",
+      "permissions_boundary": "arn:aws:iam::111222333444:policy/BoundaryNoTmpExfil",
+      "route_table": "no NAT route for S3 prefix list pl-63a5400a",
+      "volume_config": "ephemeral, noexec, task-scoped"
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "3a9f743a",
+  "language": "python",
+  "code": "# service/admin_proxy.py - Internal admin operations proxy for ECS Fargate microservice\nimport os\nimport json\nimport subprocess\nimport requests\nfrom flask import Flask, request, jsonify\nfrom functools import wraps\n\napp = Flask(__name__)\n\n# Service discovery endpoint for internal mesh communication\nMETADATA_URI = os.environ.get('ECS_CONTAINER_METADATA_URI_V4', 'http://169.254.170.2/v4')\nADMIN_SERVICE_URL = os.environ.get('ADMIN_SERVICE_URL', 'http://admin-service.admin-namespace.svc.cluster.local:8080')\nTASK_ROLE_CREDENTIAL_URI = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', '')\n\ndef get_task_metadata():\n    \"\"\"Fetch ECS task metadata for service identity\"\"\"\n    try:\n        resp = requests.get(f\"{METADATA_URI}/task\", timeout=2)\n        return resp.json()\n    except Exception:\n        return {}\n\ndef verify_internal_caller(f):\n    \"\"\"Verify request comes from internal mesh - checks X-Forwarded-For header\"\"\"\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        forwarded = request.headers.get('X-Forwarded-For', '')\n        # Trust internal 10.x.x.x range\n        if forwarded and forwarded.split(',')[0].strip().startswith('10.'):\n            return f(*args, **kwargs)\n        # Also allow if mesh identity header present (set by envoy sidecar)\n        mesh_identity = request.headers.get('X-Mesh-Identity', '')\n        if mesh_identity:\n            return f(*args, **kwargs)\n        return jsonify({'error': 'unauthorized'}), 403\n    return decorated\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'healthy'})\n\n@app.route('/api/v1/admin/execute', methods=['POST'])\n@verify_internal_caller\ndef execute_admin_operation():\n    \"\"\"Execute admin operation - intended for admin-namespace services only.\n    Forwards commands to the admin service for privileged operations.\"\"\"\n    data = request.get_json()\n    if not data or 'operation' not in data:\n        return jsonify({'error': 'missing operation'}), 400\n    \n    operation = data['operation']\n    params = data.get('params', {})\n    \n    # Route to appropriate handler\n    if operation == 'restart_service':\n        service_name = params.get('service_name', '')\n        # VULNERABILITY: command injection via service_name parameter\n        result = subprocess.run(\n            f\"aws ecs update-service --cluster production --service {service_name} --force-new-deployment\",\n            shell=True, capture_output=True, text=True, timeout=30\n        )\n        return jsonify({'stdout': result.stdout, 'stderr': result.stderr, 'rc': result.returncode})\n    \n    elif operation == 'scale_service':\n        service_name = params.get('service_name', '')\n        count = params.get('desired_count', 1)\n        result = subprocess.run(\n            f\"aws ecs update-service --cluster production --service {service_name} --desired-count {count}\",\n            shell=True, capture_output=True, text=True, timeout=30\n        )\n        return jsonify({'stdout': result.stdout, 'stderr': result.stderr, 'rc': result.returncode})\n    \n    elif operation == 'get_credentials':\n        # Fetch temporary credentials from task role\n        try:\n            cred_resp = requests.get(\n                f\"http://169.254.170.2{TASK_ROLE_CREDENTIAL_URI}\", timeout=5\n            )\n            return jsonify(cred_resp.json())\n        except Exception as e:\n            return jsonify({'error': str(e)}), 500\n    \n    elif operation == 'proxy_request':\n        # Forward arbitrary request to admin service\n        target_path = params.get('path', '/')\n        method = params.get('method', 'GET')\n        body = params.get('body', {})\n        resp = requests.request(method, f\"{ADMIN_SERVICE_URL}{target_path}\", json=body, timeout=10)\n        return jsonify({'status': resp.status_code, 'body': resp.text})\n    \n    return jsonify({'error': 'unknown operation'}), 400\n\n@app.route('/api/v1/debug/env', methods=['GET'])\n@verify_internal_caller\ndef debug_env():\n    \"\"\"Debug endpoint - returns filtered environment variables\"\"\"\n    safe_keys = ['ECS_CLUSTER', 'AWS_REGION', 'SERVICE_NAME', 'MESH_NAMESPACE']\n    env = {k: os.environ.get(k, '') for k in safe_keys}\n    env['task_arn'] = get_task_metadata().get('TaskARN', 'unknown')\n    return jsonify(env)\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate cluster with App Mesh integration and Istio control plane. Envoy sidecars enforce STRICT mTLS between all services. An AuthorizationPolicy resource is applied at the mesh level with a 'deny' action for source principals not matching 'cluster.local/ns/admin-namespace/sa/*'. However, the policy uses a custom 'when' condition checking request.headers[x-source-namespace] which is populated by a Lua filter in the EnvoyFilter resource (mesh-wide) that extracts namespace from the validated SPIFFE URI in the peer certificate. The Lua filter runs at the AUTHN phase before the AUTHZ phase. Additionally, the ECS task definition has a read-only root filesystem and drops all Linux capabilities except NET_BIND_SERVICE. The task IAM role has a permission boundary (AdminProxyBoundary) that includes a Deny statement for ecs:* when aws:RequestedRegion is not 'us-east-1', though the cluster operates in us-east-1.",
+    "config": {
+      "ecs_cluster": "production",
+      "mesh_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-admin",
+          "namespace": "worker-namespace"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "admin-namespace"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/v1/admin/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "envoy_filter": {
+        "name": "namespace-extraction-lua",
+        "phase": "AUTHN",
+        "description": "Extracts namespace from validated SPIFFE peer cert URI, sets x-source-namespace header"
+      },
+      "peer_authentication": "STRICT",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ],
+            "add": [
+              "NET_BIND_SERVICE"
+            ]
+          }
+        },
+        "user": "1000:1000"
+      },
+      "task_role_permission_boundary": "arn:aws:iam::123456789012:policy/AdminProxyBoundary",
+      "network_policy": "awsvpc with security group allowing only mesh traffic on port 15006/15001"
+    }
+  }
+}

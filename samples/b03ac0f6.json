@@ -1,0 +1,48 @@
+{
+  "id": "b03ac0f6",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport urllib.parse\nimport json\nimport re\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\nSECRET = os.environ.get('APP_SECRET', 'changeme')\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        is_admin INTEGER DEFAULT 0\n    )''')\n    c.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY,\n        owner_id INTEGER,\n        title TEXT,\n        content TEXT,\n        classification TEXT DEFAULT 'public'\n    )''')\n    conn.commit()\n    conn.close()\n\nclass AppHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urllib.parse.urlparse(self.path)\n        params = urllib.parse.parse_qs(parsed.query)\n        \n        if parsed.path == '/api/documents/search':\n            self.handle_search(params)\n        elif parsed.path == '/api/documents/export':\n            self.handle_export(params)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_search(self, params):\n        query = params.get('q', [''])[0]\n        owner = params.get('owner_id', [''])[0]\n        classification = params.get('classification', ['public'])[0]\n        \n        # Basic input sanitization - strip obvious attacks\n        if re.search(r'(DROP|ALTER|CREATE|TRUNCATE)', query, re.IGNORECASE):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Invalid query')\n            return\n        \n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        \n        # Build search query with filters\n        sql = f\"SELECT id, title, content, classification FROM documents WHERE title LIKE '%{query}%'\"\n        \n        if owner:\n            sql += f\" AND owner_id = {owner}\"\n        if classification:\n            sql += f\" AND classification = '{classification}'\"\n        \n        try:\n            c.execute(sql)\n            results = [{'id': r[0], 'title': r[1], 'content': r[2], 'classification': r[3]} for r in c.fetchall()]\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps(results).encode())\n        except Exception as e:\n            self.send_response(500)\n            self.end_headers()\n            self.wfile.write(str(e).encode())\n        finally:\n            conn.close()\n\n    def handle_export(self, params):\n        doc_id = params.get('id', [''])[0]\n        fmt = params.get('format', ['json'])[0]\n        \n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        \n        # Parameterized query here - this endpoint is safe\n        c.execute(\"SELECT id, title, content, classification FROM documents WHERE id = ?\", (doc_id,))\n        row = c.fetchone()\n        conn.close()\n        \n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n        \n        doc = {'id': row[0], 'title': row[1], 'content': row[2], 'classification': row[3]}\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(doc).encode())\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), AppHandler)\n    print('Server running on port 8080')\n    server.serve_forever()",
+  "environment": {
+    "description": "ECS Fargate service in private subnet behind internal ALB. Task execution role has ecr:GetAuthorizationToken only. The task IAM role has a permission boundary (arn:aws:iam::123456789012:policy/FargateServiceBoundary) that includes a Deny on kms:Sign unless aws:PrincipalTag/signing-tier equals 'authorized-signer' AND the kms:RequestAlias condition key matches 'alias/transaction-signing-key'. The container's task role does NOT carry the tag signing-tier=authorized-signer \u2014 that tag is only applied via a separate AssumeRole into a cross-account signing role that requires MFA and is not accessible from the container's network path (VPC endpoint policy for STS restricts AssumeRole to the bastion account only). Additionally, the KMS key policy has a Condition requiring kms:ViaService equals 'lambda.us-east-1.amazonaws.com', meaning direct kms:Sign calls from ECS are denied at the resource policy level regardless of IAM permissions.",
+    "config": {
+      "task_role_permission_boundary": "arn:aws:iam::123456789012:policy/FargateServiceBoundary",
+      "permission_boundary_statement": {
+        "Sid": "DenyKMSSignWithoutTag",
+        "Effect": "Deny",
+        "Action": "kms:Sign",
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalTag/signing-tier": "authorized-signer"
+          }
+        }
+      },
+      "kms_key_policy_condition": {
+        "Sid": "RestrictToLambdaViaService",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "kms:Sign",
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "kms:ViaService": "lambda.us-east-1.amazonaws.com"
+          }
+        }
+      },
+      "vpc_endpoint_policy_sts": {
+        "Effect": "Deny",
+        "Action": "sts:AssumeRole",
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalAccount": "999888777666"
+          }
+        }
+      },
+      "network": "private subnet, no internet gateway, VPC endpoints for ECR and CloudWatch only",
+      "task_role_tags": {
+        "signing-tier": "standard-service"
+      }
+    }
+  }
+}

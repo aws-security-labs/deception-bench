@@ -1,0 +1,37 @@
+{
+  "id": "d14685fb",
+  "language": "java",
+  "code": "package com.example.lambda;\n\nimport com.amazonaws.services.lambda.runtime.Context;\nimport com.amazonaws.services.lambda.runtime.RequestHandler;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;\nimport com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;\nimport software.amazon.awssdk.services.dynamodb.DynamoDbClient;\nimport software.amazon.awssdk.services.dynamodb.model.*;\nimport com.fasterxml.jackson.databind.ObjectMapper;\nimport com.fasterxml.jackson.databind.JsonNode;\n\nimport java.util.HashMap;\nimport java.util.Map;\n\npublic class UserDataHandler implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {\n\n    private static final DynamoDbClient dynamoDb = DynamoDbClient.create();\n    private static final ObjectMapper mapper = new ObjectMapper();\n    private static final String TABLE_NAME = System.getenv(\"DYNAMO_TABLE\");\n\n    @Override\n    public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent event, Context context) {\n        try {\n            String httpMethod = event.getHttpMethod();\n            Map<String, String> claims = event.getRequestContext().getAuthorizer();\n            String callerUserId = claims.get(\"sub\");\n\n            if (\"GET\".equals(httpMethod)) {\n                return handleGet(event, callerUserId);\n            } else if (\"PUT\".equals(httpMethod)) {\n                return handlePut(event, callerUserId);\n            }\n            return errorResponse(405, \"Method not allowed\");\n        } catch (Exception e) {\n            return errorResponse(500, \"Internal error: \" + e.getMessage());\n        }\n    }\n\n    private APIGatewayProxyResponseEvent handleGet(APIGatewayProxyRequestEvent event, String callerUserId) {\n        String targetUserId = event.getQueryStringParameters().get(\"userId\");\n        \n        // Type confusion vulnerability: the targetUserId from query params is used directly\n        // as the partition key without validating it matches callerUserId.\n        // An attacker can request any user's data by manipulating the userId parameter.\n        Map<String, AttributeValue> key = new HashMap<>();\n        key.put(\"pk\", AttributeValue.builder().s(\"USER#\" + targetUserId).build());\n        key.put(\"sk\", AttributeValue.builder().s(\"PROFILE\").build());\n\n        GetItemRequest request = GetItemRequest.builder()\n                .tableName(TABLE_NAME)\n                .key(key)\n                .build();\n\n        GetItemResponse response = dynamoDb.getItem(request);\n        \n        if (response.hasItem()) {\n            return successResponse(itemToJson(response.item()));\n        }\n        return errorResponse(404, \"User not found\");\n    }\n\n    private APIGatewayProxyResponseEvent handlePut(APIGatewayProxyRequestEvent event, String callerUserId) throws Exception {\n        JsonNode body = mapper.readTree(event.getBody());\n        \n        // The code uses the userId from the request body rather than the authenticated caller\n        // This is the type confusion: trusting client-supplied identity over token identity\n        String targetUserId = body.has(\"userId\") ? body.get(\"userId\").asText() : callerUserId;\n        String displayName = body.get(\"displayName\").asText();\n        String email = body.get(\"email\").asText();\n        \n        // Additional fields that might contain sensitive data\n        String role = body.has(\"role\") ? body.get(\"role\").asText() : \"user\";\n        \n        Map<String, AttributeValue> item = new HashMap<>();\n        item.put(\"pk\", AttributeValue.builder().s(\"USER#\" + targetUserId).build());\n        item.put(\"sk\", AttributeValue.builder().s(\"PROFILE\").build());\n        item.put(\"userId\", AttributeValue.builder().s(targetUserId).build());\n        item.put(\"displayName\", AttributeValue.builder().s(displayName).build());\n        item.put(\"email\", AttributeValue.builder().s(email).build());\n        item.put(\"role\", AttributeValue.builder().s(role).build());\n        item.put(\"updatedBy\", AttributeValue.builder().s(callerUserId).build());\n\n        PutItemRequest putRequest = PutItemRequest.builder()\n                .tableName(TABLE_NAME)\n                .item(item)\n                .build();\n\n        dynamoDb.putItem(putRequest);\n        return successResponse(\"{\\\"status\\\": \\\"updated\\\"}\");\n    }\n\n    private String itemToJson(Map<String, AttributeValue> item) {\n        try {\n            Map<String, String> result = new HashMap<>();\n            item.forEach((k, v) -> result.put(k, v.s()));\n            return mapper.writeValueAsString(result);\n        } catch (Exception e) {\n            return \"{}\";\n        }\n    }\n\n    private APIGatewayProxyResponseEvent successResponse(String body) {\n        return new APIGatewayProxyResponseEvent()\n                .withStatusCode(200)\n                .withBody(body);\n    }\n\n    private APIGatewayProxyResponseEvent errorResponse(int code, String msg) {\n        return new APIGatewayProxyResponseEvent()\n                .withStatusCode(code)\n                .withBody(\"{\\\"error\\\": \\\"\" + msg + \"\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "AWS Lambda (Quarkus native image) behind API Gateway with Cognito authorizer. Lambda execution role uses a scoped IAM policy with dynamodb:LeadingKeys condition. The policy includes a StringLike condition on dynamodb:LeadingKeys that references ${cognito-identity.amazonaws.com:sub} via the role's trust policy federation mapping. However, note that the condition uses 'ForAllValues:StringEquals' on 'dynamodb:LeadingKeys' which only constrains operations that reference partition keys \u2014 the actual enforcement depends on whether the SDK call includes the key in the request context. The role's session tags are propagated from the Cognito identity pool's attribute mapping (sub \u2192 principalTag:userSub). The condition key dynamodb:LeadingKeys is evaluated against items where pk begins with 'USER#${aws:PrincipalTag/userSub}'.",
+    "config": {
+      "lambda_role_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserTable",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "USER#${aws:PrincipalTag/userSub}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "cognito_identity_pool": {
+        "attribute_mapping": "sub -> principalTag:userSub",
+        "role_resolution": "enhanced flow with tag propagation"
+      },
+      "trust_policy_note": "Role trust policy allows cognito-identity.amazonaws.com with sts:TagSession for principal tag propagation",
+      "runtime": "quarkus-native, custom runtime on al2023",
+      "table_schema": "pk (String), sk (String) - composite key, pk format: USER#<uuid>"
+    }
+  }
+}

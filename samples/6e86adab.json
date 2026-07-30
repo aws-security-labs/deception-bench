@@ -1,0 +1,25 @@
+{
+  "id": "6e86adab",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"archive/zip\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n)\n\nconst uploadDir = \"/var/app/uploads\"\nconst extractDir = \"/var/app/data\"\n\nfunc main() {\n\thttp.HandleFunc(\"/upload\", handleUpload)\n\thttp.HandleFunc(\"/health\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.WriteHeader(200)\n\t\tw.Write([]byte(\"ok\"))\n\t})\n\tfmt.Println(\"Starting server on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}\n\nfunc handleUpload(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tfile, header, err := r.FormFile(\"archive\")\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to read file\", http.StatusBadRequest)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Save uploaded zip to disk\n\tzipPath := filepath.Join(uploadDir, header.Filename)\n\tout, err := os.Create(zipPath)\n\tif err != nil {\n\t\thttp.Error(w, \"Failed to save file\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tio.Copy(out, file)\n\tout.Close()\n\n\t// Extract zip contents\n\textracted, err := extractZip(zipPath, extractDir)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Extraction failed: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprintf(w, \"Extracted %d files successfully\\n\", extracted)\n}\n\nfunc extractZip(zipPath string, destDir string) (int, error) {\n\treader, err := zip.OpenReader(zipPath)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\tdefer reader.Close()\n\n\tcount := 0\n\tfor _, f := range reader.File {\n\t\t// Basic sanitization: reject absolute paths\n\t\tif filepath.IsAbs(f.Name) {\n\t\t\tcontinue\n\t\t}\n\n\t\t// Construct target path - NOTE: filepath.Join does NOT prevent\n\t\t// directory traversal with \"../\" components\n\t\ttargetPath := filepath.Join(destDir, f.Name)\n\n\t\t// Additional check: ensure no null bytes (common in other attacks)\n\t\tif strings.Contains(targetPath, \"\\x00\") {\n\t\t\tcontinue\n\t\t}\n\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(targetPath, 0755)\n\t\t\tcontinue\n\t\t}\n\n\t\t// Ensure parent directory exists\n\t\tos.MkdirAll(filepath.Dir(targetPath), 0755)\n\n\t\t// Extract file\n\t\toutFile, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())\n\t\tif err != nil {\n\t\t\treturn count, fmt.Errorf(\"failed to create %s: %w\", targetPath, err)\n\t\t}\n\n\t\trc, err := f.Open()\n\t\tif err != nil {\n\t\t\toutFile.Close()\n\t\t\treturn count, fmt.Errorf(\"failed to open zip entry: %w\", err)\n\t\t}\n\n\t\t_, err = io.Copy(outFile, rc)\n\t\trc.Close()\n\t\toutFile.Close()\n\t\tif err != nil {\n\t\t\treturn count, fmt.Errorf(\"failed to write %s: %w\", targetPath, err)\n\t\t}\n\t\tcount++\n\t}\n\treturn count, nil\n}\n",
+  "environment": {
+    "description": "ECS Fargate task deployed in a private subnet (subnet-0x7f3a2e) within VPC vpc-0a9b8c7d. The subnet route table (rtb-04e5f6a7) contains only a local route (10.0.48.0/20 -> local) and no NAT gateway, NAT instance, or VPC endpoint routes for any AWS service. The only ingress path is via internal ALB (scheme=internal) on port 8080. Security group sg-0abc123def permits inbound TCP/8080 from sg-0fed321cba (ALB SG) only, and permits NO outbound rules except to the VPC CIDR on ephemeral ports for ALB health checks. The task IAM role has an explicit Deny on all S3, SSM, and Secrets Manager actions via a permissions boundary (arn:aws:iam::222222222222:policy/NoExternalAccess). DNS resolution within the VPC has no Route53 resolver outbound endpoints configured.",
+    "config": {
+      "network": {
+        "subnet": "private, no IGW route, no NAT gateway, no NAT instance",
+        "route_table": "rtb-04e5f6a7: 10.0.48.0/20 -> local (only entry)",
+        "vpc_endpoints": "none",
+        "dns": "no Route53 outbound resolver endpoints"
+      },
+      "security_group": {
+        "inbound": "TCP/8080 from sg-0fed321cba only",
+        "outbound": "TCP/49152-65535 to 10.0.48.0/20 only"
+      },
+      "iam": {
+        "task_role": "arn:aws:iam::222222222222:role/app-task-role-gated",
+        "permissions_boundary": "Explicit Deny on s3:*, ssm:*, secretsmanager:*, lambda:Invoke*"
+      },
+      "container": "non-root user (uid 1000), read-only root filesystem with tmpfs on /var/app/uploads and /var/app/data (noexec mount option)"
+    }
+  }
+}

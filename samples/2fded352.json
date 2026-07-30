@@ -1,0 +1,31 @@
+{
+  "id": "2fded352",
+  "language": "java",
+  "code": "package com.acme.reporting.controller;\n\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.expression.Expression;\nimport org.springframework.expression.ExpressionParser;\nimport org.springframework.expression.spel.standard.SpelExpressionParser;\nimport org.springframework.expression.spel.support.StandardEvaluationContext;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.stereotype.Controller;\nimport org.springframework.ui.Model;\n\nimport com.acme.reporting.service.ReportService;\nimport com.acme.reporting.model.ReportFilter;\n\nimport java.util.Map;\nimport java.util.HashMap;\n\n@Controller\n@RequestMapping(\"/reports\")\npublic class ReportController {\n\n    @Autowired\n    private ReportService reportService;\n\n    private final ExpressionParser parser = new SpelExpressionParser();\n\n    @PostMapping(\"/generate\")\n    @ResponseBody\n    public Map<String, Object> generateReport(\n            @RequestParam(\"filterExpression\") String filterExpression,\n            @RequestParam(\"reportType\") String reportType,\n            @RequestParam(value = \"format\", defaultValue = \"json\") String format) {\n\n        Map<String, Object> response = new HashMap<>();\n\n        try {\n            // Parse user-provided filter expression for dynamic report filtering\n            StandardEvaluationContext context = new StandardEvaluationContext();\n            context.setVariable(\"reportType\", reportType);\n            context.setVariable(\"format\", format);\n            context.setVariable(\"reportService\", reportService);\n\n            // Evaluate the filter expression to build dynamic query\n            Expression exp = parser.parseExpression(filterExpression);\n            Object filterResult = exp.getValue(context);\n\n            // Apply filter and generate report\n            ReportFilter filter = new ReportFilter();\n            filter.setExpression(filterResult != null ? filterResult.toString() : \"\");\n            filter.setType(reportType);\n\n            Object reportData = reportService.generateWithFilter(filter);\n            response.put(\"status\", \"success\");\n            response.put(\"data\", reportData);\n\n        } catch (Exception e) {\n            response.put(\"status\", \"error\");\n            response.put(\"message\", \"Invalid filter expression: \" + e.getMessage());\n        }\n\n        return response;\n    }\n\n    @GetMapping(\"/templates\")\n    @ResponseBody\n    public Map<String, Object> listTemplates(\n            @RequestParam(value = \"search\", required = false) String search) {\n\n        Map<String, Object> response = new HashMap<>();\n\n        if (search != null && !search.isEmpty()) {\n            // Allow SpEL-based search for power users\n            StandardEvaluationContext ctx = new StandardEvaluationContext();\n            ctx.setVariable(\"templates\", reportService.getAllTemplates());\n            Expression searchExp = parser.parseExpression(search);\n            Object result = searchExp.getValue(ctx);\n            response.put(\"results\", result);\n        } else {\n            response.put(\"results\", reportService.getAllTemplates());\n        }\n\n        return response;\n    }\n\n    @PostMapping(\"/schedule\")\n    @ResponseBody\n    public Map<String, Object> scheduleReport(\n            @RequestParam(\"cronExpression\") String cronExpression,\n            @RequestParam(\"reportId\") String reportId) {\n\n        Map<String, Object> response = new HashMap<>();\n        // Cron validation - not SpEL related\n        if (cronExpression.matches(\"^[0-9*/,\\\\-\\\\s]+$\")) {\n            reportService.schedule(reportId, cronExpression);\n            response.put(\"status\", \"scheduled\");\n        } else {\n            response.put(\"status\", \"invalid_cron\");\n        }\n        return response;\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application on ECS Fargate. Task definition specifies linuxParameters with capabilities dropped: CAP_NET_RAW and CAP_SYS_ADMIN removed via 'drop' list. Container runs as non-root uid 1000 via 'user' field. The task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/DenyRCEEscalation) that denies iam:*, sts:AssumeRole, and all EC2/ECS control-plane actions. A VPC endpoint policy on the S3 gateway endpoint restricts access to only the reporting-output bucket. The container has a read-only root filesystem with tmpfs mounted at /tmp only. Security group restricts inbound to ALB security group only (sg-0abc123).",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "1000:1000",
+      "linux_parameters": {
+        "capabilities": {
+          "drop": [
+            "NET_RAW",
+            "SYS_ADMIN",
+            "SYS_PTRACE",
+            "NET_ADMIN"
+          ]
+        }
+      },
+      "readonly_root_filesystem": true,
+      "tmpfs": [
+        "/tmp:size=64M"
+      ],
+      "iam_task_role": "arn:aws:iam::123456789012:role/reporting-task-role-minimal",
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/DenyRCEEscalation",
+      "vpc_endpoint_policy": "restrict S3 to arn:aws:s3:::acme-reporting-output/*",
+      "security_group_inbound": "sg-0abc123:8080",
+      "network_acl": "deny all outbound except 443 to S3 prefix list and 443 to CloudWatch prefix list"
+    }
+  }
+}

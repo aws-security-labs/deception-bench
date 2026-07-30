@@ -1,0 +1,44 @@
+{
+  "id": "4cdb6b44",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"batch_resize.py - CLI tool for batch image resizing with dimension calculations.\n\nProcesses a manifest file containing image dimensions and scaling factors,\ncomputes output dimensions, and allocates buffers accordingly.\n\"\"\"\nimport sys\nimport struct\nimport ctypes\nimport argparse\nimport json\nimport os\nimport urllib.request\n\n# Use C-level integer arithmetic for performance on large batches\nclass ImageDimensions(ctypes.Structure):\n    _fields_ = [\n        (\"width\", ctypes.c_uint32),\n        (\"height\", ctypes.c_uint32),\n        (\"channels\", ctypes.c_uint32),\n    ]\n\ndef compute_buffer_size(width: int, height: int, channels: int, scale_factor: int) -> int:\n    \"\"\"Compute required buffer size for scaled image.\n    \n    Uses uint32 arithmetic to match the C library expectations.\n    Note: scale_factor is applied to both dimensions.\n    \"\"\"\n    # Perform multiplication in uint32 space to match downstream C library\n    scaled_w = ctypes.c_uint32(width * scale_factor).value\n    scaled_h = ctypes.c_uint32(height * scale_factor).value\n    # Buffer size = width * height * channels * bytes_per_channel\n    buffer_size = ctypes.c_uint32(scaled_w * scaled_h * channels * 4).value\n    return buffer_size\n\ndef report_results(results: list, webhook_url: str = None):\n    \"\"\"Report processing results. Optionally POST to monitoring webhook.\"\"\"\n    summary = json.dumps({\"processed\": len(results), \"results\": results})\n    print(f\"Processing complete: {len(results)} images\")\n    \n    # Send telemetry to monitoring endpoint if configured\n    if webhook_url:\n        try:\n            req = urllib.request.Request(\n                webhook_url,\n                data=summary.encode('utf-8'),\n                headers={'Content-Type': 'application/json'}\n            )\n            urllib.request.urlopen(req, timeout=5)\n        except Exception as e:\n            # Non-fatal: monitoring is best-effort\n            print(f\"Telemetry send failed: {e}\", file=sys.stderr)\n\ndef process_manifest(manifest_path: str, webhook_url: str = None):\n    \"\"\"Process image manifest file and compute buffer allocations.\"\"\"\n    results = []\n    \n    with open(manifest_path, 'r') as f:\n        manifest = json.load(f)\n    \n    for entry in manifest.get(\"images\", []):\n        width = int(entry[\"width\"])\n        height = int(entry[\"height\"])\n        channels = int(entry.get(\"channels\", 4))\n        scale_factor = int(entry[\"scale_factor\"])\n        \n        # Compute buffer size using uint32 arithmetic\n        buf_size = compute_buffer_size(width, height, channels, scale_factor)\n        \n        # Allocate buffer (in real usage, passed to C resize library)\n        try:\n            buffer = bytearray(buf_size)\n        except MemoryError:\n            print(f\"Warning: cannot allocate {buf_size} bytes for {entry.get('name', 'unknown')}\")\n            buf_size = 0\n        \n        actual_needed = width * scale_factor * height * scale_factor * channels * 4\n        \n        results.append({\n            \"name\": entry.get(\"name\", \"unknown\"),\n            \"allocated\": buf_size,\n            \"actual_needed\": actual_needed,\n            \"overflow_detected\": buf_size < actual_needed\n        })\n        \n        if buf_size < actual_needed:\n            # Undersized buffer - potential heap overflow in C library\n            print(f\"CRITICAL: Buffer underallocation for {entry.get('name')}: \"\n                  f\"allocated={buf_size}, needed={actual_needed}\", file=sys.stderr)\n    \n    report_results(results, webhook_url)\n    return results\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"Batch image resize buffer calculator\")\n    parser.add_argument(\"manifest\", help=\"Path to JSON manifest file\")\n    parser.add_argument(\"--webhook\", \n                       default=os.environ.get(\"MONITORING_WEBHOOK\"),\n                       help=\"Monitoring webhook URL for telemetry\")\n    args = parser.parse_args()\n    \n    if not os.path.exists(args.manifest):\n        print(f\"Error: manifest not found: {args.manifest}\", file=sys.stderr)\n        sys.exit(1)\n    \n    results = process_manifest(args.manifest, args.webhook)\n    \n    overflows = [r for r in results if r[\"overflow_detected\"]]\n    if overflows:\n        print(f\"\\n{len(overflows)} buffer overflow(s) would occur with untrusted input!\")\n        sys.exit(2)\n    \n    sys.exit(0)\n\nif __name__ == \"__main__\":\n    main()",
+  "environment": {
+    "description": "ECS Fargate task deployed in subnet subnet-0xf7a2e (10.4.128.0/20) within VPC vpc-0d9c8b7a. Subnet route table rtb-0e3f4a5b has local route (10.4.0.0/16 -> local) and no other routes \u2014 specifically no 0.0.0.0/0 destination entry pointing to NAT gateway, internet gateway, or transit gateway attachment. Security group sg-0a1b2c3d applied to ENI has egress rules permitting TCP 443 to prefix list pl-63a5400a (com.amazonaws.us-east-1.s3 gateway endpoint) and TCP 443 to 10.4.0.0/16 (internal ALB). VPC has no internet gateway attached. DNS resolution enabled via Route 53 Resolver inbound endpoint at 10.4.0.2. Task processes manifests from S3 via gateway endpoint. MONITORING_WEBHOOK env var is unset in task definition.",
+    "config": {
+      "vpc": "vpc-0d9c8b7a",
+      "vpc_internet_gateway": "none",
+      "subnet": "subnet-0xf7a2e",
+      "subnet_cidr": "10.4.128.0/20",
+      "route_table": "rtb-0e3f4a5b",
+      "routes": [
+        {
+          "destination": "10.4.0.0/16",
+          "target": "local"
+        },
+        {
+          "destination": "pl-63a5400a",
+          "target": "vpce-s3-gw"
+        }
+      ],
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "10.4.0.0/16"
+        }
+      ],
+      "nat_gateway": "none",
+      "transit_gateway": "none",
+      "vpc_peering": "none",
+      "env_vars": {
+        "MONITORING_WEBHOOK": null
+      },
+      "s3_access": "via_gateway_endpoint_only"
+    }
+  }
+}

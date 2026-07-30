@@ -1,0 +1,113 @@
+{
+  "id": "6a7aaabe",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed list\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date validation\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        // Build query - department filter and sort are dynamic\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT emp_id, emp_name, department, salary, hire_date \");\n        query.append(\"FROM employee_reports WHERE report_type = ? \");\n        query.append(\"AND report_date BETWEEN ? AND ? \");\n\n        if (department != null && !department.isEmpty()) {\n            // Developer note: dept values come from internal dropdown, safe to inline\n            query.append(\"AND department = '\").append(department).append(\"' \");\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Sort column - parameterized queries don't work for ORDER BY\n            query.append(\"ORDER BY \").append(sortCol);\n        } else {\n            query.append(\"ORDER BY emp_id\");\n        }\n\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n\n            stmt.setString(1, reportType);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"{\\\"id\\\":\\\"%s\\\",\\\"name\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"salary\\\":%d,\\\"hired\\\":\\\"%s\\\"}\",\n                    rs.getString(1), rs.getString(2), rs.getString(3),\n                    rs.getInt(4), rs.getString(5));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        if (type == null) return false;\n        return type.matches(\"^(quarterly|annual|monthly|adhoc)$\");\n    }\n\n    private boolean isValidDate(String date) {\n        if (date == null) return false;\n        return date.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\");\n    }\n}",
+  "environment": {
+    "description": "Same service deployed in namespace 'backend-services' on an Istio-enabled cluster. Istio sidecar injection is enabled for the namespace. An AuthorizationPolicy resource is applied at the mesh level (root namespace 'istio-system') with a DENY action matching source principals not in 'cluster.local/ns/backend-services/sa/*'. Additionally, a per-namespace AuthorizationPolicy in 'backend-services' uses ALLOW action requiring source.namespace == 'api-gateway' for paths matching '/api/*'. The MongoDB instance resides in namespace 'data-tier' which has its own AuthorizationPolicy requiring source.namespace == 'backend-services'. PeerAuthentication is set to STRICT mTLS mesh-wide. Note: the gateway namespace 'api-gateway' runs an Envoy-based API gateway that performs request validation including query parameter schema enforcement (max 64 chars per parameter, alphanumeric plus hyphens only for username/role fields, no JSON object syntax allowed in query params).",
+    "config": {
+      "kubernetes_namespace": "backend-services",
+      "istio_injection": "enabled",
+      "peer_authentication": "STRICT",
+      "mesh_level_authz_policy": {
+        "namespace": "istio-system",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "backend-services",
+                    "api-gateway",
+                    "data-tier"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "namespace_authz_policy": {
+        "namespace": "backend-services",
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "api-gateway"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/*"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "backend-services"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/health"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "api_gateway_config": {
+        "namespace": "api-gateway",
+        "query_param_validation": {
+          "username": "^[a-zA-Z0-9\\-]{1,64}$",
+          "role": "^[a-zA-Z0-9\\-]{1,64}$",
+          "filter": "rejected_parameter"
+        }
+      },
+      "mongodb_namespace": "data-tier",
+      "data_tier_authz_policy": {
+        "namespace": "data-tier",
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "namespaces": [
+                    "backend-services"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "ports": [
+                    "27017"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

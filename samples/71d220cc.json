@@ -1,0 +1,28 @@
+{
+  "id": "71d220cc",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-id'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant' });\n  req.tenantId = token; // Used for logging only\n  next();\n}\n\n// Search endpoint for product catalog\napp.get('/api/v2/products/search', extractTenant, async (req, res) => {\n  try {\n    const { category, sort_by, direction, limit } = req.query;\n    \n    // Validate direction\n    const dir = direction === 'DESC' ? 'DESC' : 'ASC';\n    \n    // Validate limit\n    const safeLimit = Math.min(parseInt(limit) || 25, 100);\n    \n    // Build query with parameterized category filter\n    let query = `SELECT id, name, price, category, stock_count \n                 FROM products \n                 WHERE category = $1 AND active = true`;\n    \n    // sort_by allows ordering by different columns\n    // We whitelist known columns but allow computed expressions for relevance scoring\n    const allowedSorts = ['name', 'price', 'created_at', 'stock_count', 'popularity_score'];\n    \n    let orderClause;\n    if (sort_by && sort_by.startsWith('score:')) {\n      // Custom relevance scoring: score:<expression>\n      // Used by frontend for weighted sorting\n      const scoreExpr = sort_by.substring(6);\n      orderClause = `ORDER BY ${scoreExpr} ${dir}`;\n    } else if (sort_by && allowedSorts.includes(sort_by)) {\n      orderClause = `ORDER BY ${sort_by} ${dir}`;\n    } else {\n      orderClause = `ORDER BY created_at ${dir}`;\n    }\n    \n    query += ` ${orderClause} LIMIT ${safeLimit}`;\n    \n    const result = await pool.query(query, [category]);\n    \n    // Log search for analytics\n    console.log(JSON.stringify({\n      event: 'product_search',\n      tenant: req.tenantId,\n      category,\n      sort_by,\n      results: result.rows.length,\n      ts: new Date().toISOString()\n    }));\n    \n    res.json({\n      products: result.rows,\n      total: result.rows.length,\n      request_id: crypto.randomUUID()\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', uptime: process.uptime() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(3000, () => console.log('Product service listening on :3000'));",
+  "environment": {
+    "description": "Same Amazon Linux 2 EC2 instance running the identical SQS consumer JAR. The instance uses a custom SELinux policy module 'acme_worker_t' compiled from a Type Enforcement (.te) file that confines the java process launched by the systemd unit to the acme_worker_t domain. The policy specifies: allow acme_worker_t acme_log_t:file { create write append getattr }; allow acme_worker_t acme_conf_t:file { read write create getattr }; allow acme_worker_t acme_conf_t:dir { search add_name write }; with file contexts mapping /var/log/acme-worker(/.*)? to acme_log_t and /etc/acme-worker(/.*)? to acme_conf_t. All other file types are denied by default (no allow rule). SELinux is in enforcing mode (getenforce returns Enforcing). The policy was loaded via semodule -i acme_worker.pp. Additionally, the systemd unit includes SELinuxContext=system_u:system_r:acme_worker_t:s0 to ensure domain transition. Note: the normalize() call in the code does NOT prevent path traversal to paths outside the labeled directories, but the MAC policy denies the write syscall at kernel level regardless of DAC permissions.",
+    "config": {
+      "os": "Amazon Linux 2",
+      "selinux_mode": "enforcing",
+      "selinux_policy_module": "acme_worker_t",
+      "allowed_write_contexts": [
+        "acme_log_t",
+        "acme_conf_t"
+      ],
+      "file_context_mappings": {
+        "/var/log/acme-worker(/.*)?": "acme_log_t",
+        "/etc/acme-worker(/.*)?": "acme_conf_t"
+      },
+      "denied_by_default": true,
+      "systemd_selinux_context": "system_u:system_r:acme_worker_t:s0",
+      "apparmor": "not_installed",
+      "worker_user": "acme-worker",
+      "worker_uid": 1001,
+      "java_version": "17",
+      "jackson_version": "2.15.2"
+    }
+  }
+}

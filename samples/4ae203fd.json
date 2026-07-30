@@ -1,0 +1,41 @@
+{
+  "id": "4ae203fd",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class UserProfileServlet extends HttpServlet {\n    private static final Pattern SAFE_FIELD_PATTERN = Pattern.compile(\"^[a-zA-Z_]+$\");\n    private String dbUrl;\n    private String dbUser;\n    private String dbPass;\n\n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        dbUrl = System.getenv(\"DB_JDBC_URL\");\n        dbUser = System.getenv(\"DB_USER\");\n        dbPass = System.getenv(\"DB_PASS\");\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String userId = req.getParameter(\"user_id\");\n        String sortCol = req.getParameter(\"sort\");\n        String sortDir = req.getParameter(\"dir\");\n\n        if (userId == null || !userId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid user_id\");\n            return;\n        }\n\n        // Validate sort column against whitelist\n        Set<String> allowedCols = Set.of(\"username\", \"email\", \"created_at\", \"last_login\");\n        if (sortCol == null || !allowedCols.contains(sortCol)) {\n            sortCol = \"created_at\";\n        }\n\n        // Validate sort direction - developer believes this is safe since\n        // it's constrained to short strings and used after ORDER BY\n        if (sortDir == null) {\n            sortDir = \"ASC\";\n        }\n        // Normalize: trim whitespace, limit length to prevent abuse\n        sortDir = sortDir.trim();\n        if (sortDir.length() > 200) {\n            sortDir = \"ASC\";\n        }\n\n        resp.setContentType(\"application/json\");\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {\n            // user_id is validated numeric, sortCol is whitelisted\n            // sortDir cannot be parameterized in ORDER BY clause per JDBC spec\n            String sql = \"SELECT user_id, username, email, created_at, last_login \" +\n                         \"FROM user_profiles WHERE department_id = (\" +\n                         \"SELECT department_id FROM users WHERE user_id = \" + userId + \") \" +\n                         \"ORDER BY \" + sortCol + \" \" + sortDir;\n\n            try (Statement stmt = conn.createStatement();\n                 ResultSet rs = stmt.executeQuery(sql)) {\n                JSONArray results = new JSONArray();\n                while (rs.next()) {\n                    JSONObject row = new JSONObject();\n                    row.put(\"user_id\", rs.getInt(\"user_id\"));\n                    row.put(\"username\", rs.getString(\"username\"));\n                    row.put(\"email\", rs.getString(\"email\"));\n                    row.put(\"created_at\", rs.getString(\"created_at\"));\n                    row.put(\"last_login\", rs.getString(\"last_login\"));\n                    results.put(row);\n                }\n                resp.getWriter().write(results.toString());\n            }\n        } catch (SQLException e) {\n            // Log full error for debugging - includes query for troubleshooting\n            System.err.println(\"SQL Error: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        // Profile update endpoint - uses parameterized queries\n        String userId = req.getParameter(\"user_id\");\n        String email = req.getParameter(\"email\");\n        if (userId == null || !userId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400);\n            return;\n        }\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {\n            PreparedStatement ps = conn.prepareStatement(\n                \"UPDATE user_profiles SET email = ? WHERE user_id = ?\");\n            ps.setString(1, email);\n            ps.setInt(2, Integer.parseInt(userId));\n            ps.executeUpdate();\n            resp.setStatus(200);\n        } catch (SQLException e) {\n            resp.sendError(500);\n        }\n    }\n}",
+  "environment": {
+    "description": "Same CLI binary distributed internally. LaunchDarkly project 'oauth-cli-prod' has the flag 'oauth-cli-strict-redirect-validation' configured with a targeting rule: default variation is TRUE (index 0) for all contexts matching kind='service'. The flag's off-variation is also set to variation index 0 (TRUE), meaning even if targeting is toggled off, the SDK returns TRUE. The fallback value in code is FALSE but the LD relay proxy (running as sidecar on each developer machine via corporate MDM-enforced daemon at localhost:8030) ensures the SDK always connects and retrieves the server-side TRUE value. Additionally, the LD project has a prerequisite flag 'kill-legacy-oauth-paths' that must evaluate TRUE before 'oauth-cli-strict-redirect-validation' can be evaluated, and 'kill-legacy-oauth-paths' is permanently enabled with no off state configured.",
+    "config": {
+      "LD_SDK_KEY": "sdk-prod-abc123",
+      "ld_relay_proxy": "localhost:8030 (MDM-enforced, always-on daemon)",
+      "ld_flag_oauth-cli-strict-redirect-validation": {
+        "targeting": "ON",
+        "default_variation": 0,
+        "off_variation": 0,
+        "variations": [
+          true,
+          false
+        ],
+        "prerequisite_flags": [
+          "kill-legacy-oauth-paths"
+        ],
+        "context_targets": [
+          {
+            "kind": "service",
+            "variation": 0
+          }
+        ]
+      },
+      "ld_flag_kill-legacy-oauth-paths": {
+        "targeting": "ON",
+        "default_variation": 0,
+        "off_variation": 0,
+        "variations": [
+          true,
+          false
+        ]
+      },
+      "mdm_policy": "Corporate MDM ensures relay proxy daemon runs continuously",
+      "OAUTH_CLIENT_ID": "0oa8x7k2j3mNpQrSt"
+    }
+  }
+}

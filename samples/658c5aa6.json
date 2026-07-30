@@ -1,0 +1,42 @@
+{
+  "id": "658c5aa6",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\nSECRET_KEY = os.environ.get('SECRET_KEY', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DB_PATH)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DB_PATH)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (1, 'admin', 'admin@corp.internal', 'admin', 'sk_live_admin_9f8e7d6c')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (2, 'svc_billing', 'billing@corp.internal', 'service', 'sk_live_billing_a1b2c3d4')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query with user-supplied value\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    api_key = 'sk_live_' + hashlib.sha256(os.urandom(32)).hexdigest()[:16]\n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, api_key) VALUES (?, ?, ?)',\n            (data['username'], data['email'], api_key)\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/api/audit', methods=['GET'])\ndef get_audit_log():\n    \"\"\"Retrieve audit log entries.\"\"\"\n    limit = request.args.get('limit', '50')\n    db = get_db()\n    # Note: limit is parameterized via string formatting for legacy compat\n    query = f\"SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT {limit}\"\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)\n",
+  "environment": {
+    "description": "Application deployed identically but fronted by AWS CloudFront distribution with Lambda@Edge viewer-request function. The Lambda@Edge function implements a custom request normalization layer: it decodes all percent-encoded sequences in query string values, then applies a recursive token analysis that rejects any request where the decoded query string value contains a sequence matching the pattern of SQL syntax tokens (specifically: the function maintains a DFA that detects transitions between SQL keyword tokens like UNION/SELECT/FROM/WHERE/OR/AND followed by non-alphanumeric separators and subsequent identifiers, rejecting with 403 if the DFA reaches an accepting state). Additionally, the CloudFront distribution has a response header policy that strips any error detail fields from 5xx responses (preventing information disclosure from failed injection attempts). The origin is configured as a VPC origin with security group restricting inbound only from CloudFront managed prefix list, so direct access to the EC2 instance is not possible.",
+    "config": {
+      "infrastructure": "AWS EC2 t3.medium, Amazon Linux 2 (same AMI/code)",
+      "cdn": "CloudFront distribution with custom origin (VPC origin via AWS PrivateLink)",
+      "lambda_edge": {
+        "event_type": "viewer-request",
+        "function_description": "Query string normalization + DFA-based SQL token sequence detection",
+        "action_on_match": "return 403 Forbidden immediately",
+        "coverage": "all query string parameter values after full URL decoding (handles double-encoding, unicode normalization)",
+        "dfa_tokens_detected": [
+          "UNION",
+          "SELECT",
+          "INSERT",
+          "UPDATE",
+          "DELETE",
+          "DROP",
+          "FROM",
+          "WHERE",
+          "OR",
+          "AND",
+          "HAVING",
+          "GROUP BY",
+          "ORDER BY",
+          "--",
+          "/*",
+          "*/",
+          ";"
+        ],
+        "detection_logic": "Rejects if decoded value contains any SQL keyword token (case-insensitive) adjacent to operator characters or followed by identifier patterns"
+      },
+      "response_policy": "Custom response headers policy strips 'detail' field from JSON error responses via CloudFront Functions on viewer-response",
+      "network_restriction": "EC2 security group inbound: only from com.amazonaws.global.cloudfront.origin-facing prefix list on port 8080",
+      "waf": "none (intentionally not using AWS WAF; protection is via Lambda@Edge custom logic)",
+      "database": "SQLite local file at /data/app.db"
+    }
+  }
+}

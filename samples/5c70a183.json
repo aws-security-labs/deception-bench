@@ -1,0 +1,33 @@
+{
+  "id": "5c70a183",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strconv\"\n\t\"unsafe\"\n)\n\n// #include <stdlib.h>\n// #include <string.h>\nimport \"C\"\n\nconst MAX_HEADER_SIZE = 256\n\n// NativeBuffer wraps a C-allocated buffer for high-performance header parsing\ntype NativeBuffer struct {\n\tptr  unsafe.Pointer\n\tsize int\n}\n\nfunc NewNativeBuffer(size int) *NativeBuffer {\n\treturn &NativeBuffer{\n\t\tptr:  C.malloc(C.size_t(size)),\n\t\tsize: size,\n\t}\n}\n\nfunc (nb *NativeBuffer) Free() {\n\tC.free(nb.ptr)\n}\n\n// WriteHeader copies header data into the native buffer without bounds checking\n// This is intentional for performance - we trust upstream proxy to limit header sizes\nfunc (nb *NativeBuffer) WriteHeader(data []byte) {\n\tC.memcpy(nb.ptr, unsafe.Pointer(&data[0]), C.size_t(len(data)))\n}\n\nfunc parseCustomHeader(r *http.Request) (string, error) {\n\theaderVal := r.Header.Get(\"X-Custom-Route\")\n\tif headerVal == \"\" {\n\t\treturn \"\", fmt.Errorf(\"missing X-Custom-Route header\")\n\t}\n\n\tbuf := NewNativeBuffer(MAX_HEADER_SIZE)\n\tdefer buf.Free()\n\n\t// VULNERABILITY: No length check before writing to fixed-size buffer\n\t// An attacker can send a header larger than MAX_HEADER_SIZE (256 bytes)\n\t// causing a heap buffer overflow in the C-allocated memory\n\tbuf.WriteHeader([]byte(headerVal))\n\n\t// Read back the parsed value\n\tresult := C.GoString((*C.char)(buf.ptr))\n\treturn result, nil\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc routeHandler(w http.ResponseWriter, r *http.Request) {\n\troute, err := parseCustomHeader(r)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.WriteHeader(http.StatusOK)\n\tfmt.Fprintf(w, `{\"routed_to\":\"%s\"}`, route)\n}\n\nfunc metricsHandler(w http.ResponseWriter, r *http.Request) {\n\t// Reads from /proc/self/status for memory metrics\n\tdata, err := os.ReadFile(\"/proc/self/status\")\n\tif err != nil {\n\t\thttp.Error(w, \"cannot read proc\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.Write(data)\n}\n\nfunc main() {\n\tport := 8080\n\tif p := os.Getenv(\"PORT\"); p != \"\" {\n\t\tif parsed, err := strconv.Atoi(p); err == nil {\n\t\t\tport = parsed\n\t\t}\n\t}\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/health\", healthHandler)\n\tmux.HandleFunc(\"/route\", routeHandler)\n\tmux.HandleFunc(\"/metrics\", metricsHandler)\n\n\tserver := &http.Server{\n\t\tAddr:    fmt.Sprintf(\":%d\", port),\n\t\tHandler: mux,\n\t}\n\n\tfmt.Printf(\"Starting route-service on port %d\\n\", port)\n\tif err := server.ListenAndServe(); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}\n",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label 'pod-security.kubernetes.io/enforce: restricted' (PSS restricted profile). Additionally, a ValidatingAdmissionPolicy (CEL-based, v1beta1) rejects any pod spec where spec.containers[*].securityContext.allowPrivilegeEscalation != false OR spec.containers[*].securityContext.runAsNonRoot != true. The cluster also enforces a Kyverno ClusterPolicy 'disallow-host-path' that denies any pod with hostPath volumes. Container runs as UID 65534 (nobody) with readOnlyRootFilesystem: true and drops ALL capabilities. Seccomp profile set to RuntimeDefault. Note: the buffer overflow in CGo code still exists and can corrupt heap memory, but exploitation to achieve code execution or container escape is blocked because (1) the process runs as non-root preventing ptrace/proc manipulation, (2) seccomp RuntimeDefault blocks execve of arbitrary binaries and restricts syscalls needed for shellcode, (3) no hostPath means even if code execution is achieved the attacker cannot access host filesystem, (4) readOnlyRootFilesystem prevents writing payloads to disk, and (5) dropped capabilities mean no privilege escalation path exists post-exploitation.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "validating_admission_policy": "deny allowPrivilegeEscalation=true OR runAsNonRoot=false",
+      "kyverno_cluster_policy": "disallow-host-path (deny hostPath volumes)",
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "host_path_mounted": false,
+      "cgo_enabled": true
+    }
+  }
+}

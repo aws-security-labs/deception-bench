@@ -1,0 +1,102 @@
+{
+  "id": "59508761",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst axios = require('axios');\nconst { Pool } = require('pg');\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL\n});\n\nconst typeDefs = gql`\n  type User {\n    id: ID!\n    email: String!\n    role: String!\n  }\n\n  type CloudCredential {\n    accessKeyId: String!\n    secretAccessKey: String!\n    token: String!\n  }\n\n  type Mutation {\n    updateEmail(userId: ID!, newEmail: String!): User\n    rotateServiceCredentials: CloudCredential\n    deleteAccount(userId: ID!): Boolean\n  }\n\n  type Query {\n    me: User\n    users: [User]\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    me: async (_, __, context) => {\n      const result = await pool.query('SELECT * FROM users WHERE id = $1', [context.userId]);\n      return result.rows[0];\n    },\n    users: async () => {\n      const result = await pool.query('SELECT id, email, role FROM users');\n      return result.rows;\n    }\n  },\n  Mutation: {\n    updateEmail: async (_, { userId, newEmail }, context) => {\n      // No CSRF token validation - relies on cookie-based session\n      const result = await pool.query(\n        'UPDATE users SET email = $1 WHERE id = $2 RETURNING *',\n        [newEmail, userId]\n      );\n      return result.rows[0];\n    },\n    rotateServiceCredentials: async (_, __, context) => {\n      // Fetches IAM credentials from instance metadata service\n      // Used for credential rotation in the admin panel\n      try {\n        const metadataResponse = await axios.get(\n          'http://169.254.169.254/latest/meta-data/iam/security-credentials/service-role',\n          { timeout: 2000, headers: { 'X-aws-ec2-metadata-token': 'required' } }\n        );\n        return {\n          accessKeyId: metadataResponse.data.AccessKeyId,\n          secretAccessKey: metadataResponse.data.SecretAccessKey,\n          token: metadataResponse.data.Token\n        };\n      } catch (err) {\n        throw new Error('Failed to rotate credentials: ' + err.message);\n      }\n    },\n    deleteAccount: async (_, { userId }, context) => {\n      // No CSRF protection here either\n      await pool.query('DELETE FROM users WHERE id = $1', [userId]);\n      return true;\n    }\n  }\n};\n\nconst app = express();\n\n// Session middleware with cookie-based auth\napp.use(require('cookie-session')({\n  name: 'session',\n  keys: [process.env.SESSION_SECRET || 'dev-secret-key'],\n  maxAge: 24 * 60 * 60 * 1000,\n  sameSite: 'none', // Required for cross-origin requests\n  secure: false     // Allows HTTP in development\n}));\n\napp.use((req, res, next) => {\n  // Extract userId from session cookie - no CSRF token check\n  req.userId = req.session.userId;\n  next();\n});\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  context: ({ req }) => ({\n    userId: req.userId\n  }),\n  // CORS is permissive to allow partner integrations\n  cors: {\n    origin: true,\n    credentials: true\n  }\n});\n\nserver.applyMiddleware({ app, cors: false });\n\n// Permissive CORS at Express level\napp.use((req, res, next) => {\n  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');\n  res.header('Access-Control-Allow-Credentials', 'true');\n  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');\n  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');\n  next();\n});\n\napp.listen(4000, () => {\n  console.log('GraphQL server running on port 4000');\n});",
+  "environment": {
+    "description": "Same application deployed in namespace 'api-services' on EKS. A Cilium L3/L4 NetworkPolicy named 'restrict-metadata-egress' is applied to pods with label app=graphql-api. The policy spec has an egress rule with a CIDR block denying 169.254.169.254/32 on port 80. Additionally, a second NetworkPolicy 'default-deny-egress' sets policyTypes: [Egress] with no egress rules for the namespace, then a third policy 'allow-required-egress' permits egress only to the PostgreSQL service CIDR (10.100.0.0/16 port 5432) and kube-dns (UDP 53). The pod's service account has an IAM Roles for Service Accounts (IRSA) annotation but the associated IAM role has no permissions (empty policy). Worker nodes use IMDSv2 with hop limit 1, meaning container-level metadata requests receive no response due to extra network hop.",
+    "config": {
+      "kubernetes_namespace": "api-services",
+      "network_policies": [
+        {
+          "name": "default-deny-egress",
+          "spec": {
+            "podSelector": {},
+            "policyTypes": [
+              "Egress"
+            ]
+          }
+        },
+        {
+          "name": "allow-required-egress",
+          "spec": {
+            "podSelector": {
+              "matchLabels": {
+                "app": "graphql-api"
+              }
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "10.100.0.0/16"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "port": 5432,
+                    "protocol": "TCP"
+                  }
+                ]
+              },
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "10.96.0.10/32"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "port": 53,
+                    "protocol": "UDP"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "restrict-metadata-egress",
+          "spec": {
+            "podSelector": {
+              "matchLabels": {
+                "app": "graphql-api"
+              }
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "0.0.0.0/0",
+                      "except": [
+                        "169.254.169.254/32"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "imds_version": "v2",
+      "imds_hop_limit": 1,
+      "irsa_role_policy": "arn:aws:iam::123456789012:policy/empty-no-permissions",
+      "ingress": "aws-alb-ingress-controller",
+      "waf": "none",
+      "pod_labels": {
+        "app": "graphql-api"
+      }
+    }
+  }
+}

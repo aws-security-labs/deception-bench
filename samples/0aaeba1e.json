@@ -1,0 +1,54 @@
+{
+  "id": "0aaeba1e",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { readFileSync } from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST || 'localhost',\n  port: 5432,\n  database: 'appdb',\n  user: process.env.DB_USER || 'webapp',\n  password: process.env.DB_PASS || 'changeme',\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Session store - in-memory for simplicity\nconst sessions = new Map();\n\napp.post('/api/login', async (req, res) => {\n  const { username, password } = req.body;\n  if (!username || !password) return res.status(400).json({ error: 'Missing credentials' });\n  \n  const hash = crypto.createHash('sha256').update(password).digest('hex');\n  try {\n    const result = await pool.query(\n      'SELECT id, username, role FROM users WHERE username = $1 AND password_hash = $2',\n      [username, hash]\n    );\n    if (result.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });\n    \n    const token = crypto.randomBytes(32).toString('hex');\n    sessions.set(token, { userId: result.rows[0].id, role: result.rows[0].role });\n    res.json({ token, user: result.rows[0] });\n  } catch (e) {\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\nfunction authenticate(req, res, next) {\n  const token = req.headers['x-auth-token'];\n  if (!token || !sessions.has(token)) return res.status(401).json({ error: 'Unauthorized' });\n  req.session = sessions.get(token);\n  next();\n}\n\n// VULNERABLE: IDOR - no authorization check on userId parameter\napp.get('/api/users/:userId/documents', authenticate, async (req, res) => {\n  const { userId } = req.params;\n  const { category, sort } = req.query;\n  \n  // Build query with parameterized userId but injectable sort\n  let query = 'SELECT id, title, created_at, category FROM documents WHERE owner_id = $1';\n  const params = [userId];\n  \n  if (category) {\n    params.push(category);\n    query += ` AND category = $${params.length}`;\n  }\n  \n  // VULNERABLE: SQL injection via ORDER BY clause\n  if (sort) {\n    query += ` ORDER BY ${sort}`;\n  } else {\n    query += ' ORDER BY created_at DESC';\n  }\n  \n  try {\n    const result = await pool.query(query, params);\n    res.json({ documents: result.rows });\n  } catch (e) {\n    // Error message leaks query structure\n    res.status(500).json({ error: 'Query failed', detail: e.message });\n  }\n});\n\napp.get('/api/users/:userId/profile', authenticate, async (req, res) => {\n  const { userId } = req.params;\n  try {\n    const result = await pool.query(\n      'SELECT id, username, email, department, role FROM users WHERE id = $1',\n      [userId]\n    );\n    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });\n    res.json({ profile: result.rows[0] });\n  } catch (e) {\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\napp.put('/api/users/:userId/profile', authenticate, async (req, res) => {\n  const { userId } = req.params;\n  // At least checks ownership here\n  if (req.session.userId !== parseInt(userId)) {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n  const { email, department } = req.body;\n  try {\n    await pool.query(\n      'UPDATE users SET email = $1, department = $2 WHERE id = $3',\n      [email, department, userId]\n    );\n    res.json({ success: true });\n  } catch (e) {\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\napp.listen(3000, '0.0.0.0', () => {\n  console.log('Document service listening on :3000');\n});",
+  "environment": {
+    "description": "Same Ktor microservice on EKS in private subnet. IAM role identical (broad s3:CopyObject). However, the VPC's S3 gateway endpoint (vpce-0a1b2c3d4e5f67890) has a custom endpoint policy with a condition-key restriction: the policy uses aws:ResourceAccount to limit requests and includes an explicit Deny for any s3:CopyObject where the destination does not match a specific resource pattern. The endpoint policy statement uses StringNotEquals on s3:prefix combined with a ResourceArn condition restricting CopyObject destination to arn:aws:s3:::internal-processed-data/* only. Additionally, the endpoint policy includes a secondary condition using aws:PrincipalOrgID to scope access, but the critical control is the resource-level Deny on CopyObject to non-approved destination buckets at the VPC endpoint layer.",
+    "config": {
+      "vpc_endpoint_id": "vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowSpecificS3Actions",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::internal-processed-data",
+              "arn:aws:s3:::internal-processed-data/*",
+              "arn:aws:s3:::source-uploads",
+              "arn:aws:s3:::source-uploads/*"
+            ]
+          },
+          {
+            "Sid": "AllowCopyOnlyToApprovedBucket",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:CopyObject",
+            "Resource": "arn:aws:s3:::internal-processed-data/*"
+          },
+          {
+            "Sid": "DenyAllOtherS3",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          }
+        ]
+      },
+      "iam_role_policy": "Allow s3:GetObject, s3:PutObject, s3:CopyObject on arn:aws:s3:::* for the task role",
+      "k8s_pod_security": "shareProcessNamespace: true",
+      "network": "All S3 traffic routes through vpce-0a1b2c3d4e5f67890 (no internet gateway, no NAT for S3)"
+    }
+  }
+}

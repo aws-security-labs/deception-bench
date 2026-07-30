@@ -1,0 +1,45 @@
+{
+  "id": "3c326089",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-id'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant' });\n  req.tenantId = token;\n  next();\n}\n\n// Audit log helper\nasync function auditLog(action, tenantId, details) {\n  const id = crypto.randomUUID();\n  await pool.query(\n    'INSERT INTO audit_log (id, action, tenant_id, details, created_at) VALUES ($1, $2, $3, $4, NOW())',\n    [id, action, tenantId, JSON.stringify(details)]\n  );\n}\n\n// Search invoices with flexible filtering\napp.get('/api/invoices/search', extractTenant, async (req, res) => {\n  try {\n    const { status, min_amount, max_amount, date_from, date_to, sort_by, order } = req.query;\n    \n    let query = `SELECT id, invoice_number, amount, status, due_date, description \n                 FROM invoices WHERE tenant_id = '${req.tenantId}'`;\n    \n    if (status) {\n      query += ` AND status = '${status}'`;\n    }\n    if (min_amount) {\n      query += ` AND amount >= ${parseFloat(min_amount)}`;\n    }\n    if (max_amount) {\n      query += ` AND amount <= ${parseFloat(max_amount)}`;\n    }\n    if (date_from) {\n      query += ` AND due_date >= '${date_from}'`;\n    }\n    if (date_to) {\n      query += ` AND due_date <= '${date_to}'`;\n    }\n    \n    // Sort handling\n    const allowedSorts = ['amount', 'due_date', 'status', 'invoice_number'];\n    if (sort_by && allowedSorts.includes(sort_by)) {\n      const direction = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${direction}`;\n    } else {\n      query += ' ORDER BY due_date DESC';\n    }\n    \n    query += ' LIMIT 100';\n    \n    const result = await pool.query(query);\n    await auditLog('invoice_search', req.tenantId, { filters: req.query });\n    res.json({ invoices: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Get invoice detail\napp.get('/api/invoices/:id', extractTenant, async (req, res) => {\n  try {\n    const result = await pool.query(\n      'SELECT * FROM invoices WHERE id = $1 AND tenant_id = $2',\n      [req.params.id, req.tenantId]\n    );\n    if (result.rows.length === 0) {\n      return res.status(404).json({ error: 'Not found' });\n    }\n    res.json(result.rows[0]);\n  } catch (err) {\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Create invoice\napp.post('/api/invoices', extractTenant, async (req, res) => {\n  try {\n    const { amount, description, due_date } = req.body;\n    const id = crypto.randomUUID();\n    const invoice_number = `INV-${Date.now()}`;\n    await pool.query(\n      `INSERT INTO invoices (id, tenant_id, invoice_number, amount, description, due_date, status)\n       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,\n      [id, req.tenantId, invoice_number, amount, description, due_date]\n    );\n    await auditLog('invoice_create', req.tenantId, { invoice_id: id });\n    res.status(201).json({ id, invoice_number });\n  } catch (err) {\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\napp.listen(3000, () => console.log('Invoice service running on :3000'));",
+  "environment": {
+    "description": "Same application deployed on EC2 behind ALB. AWS WAFv2 WebACL is associated with the ALB. The WebACL includes a custom rule group 'card-service-input-validation' with priority 1 that inspects query string parameters using a RegexPatternSet matching common vm/eval breakout patterns (this\\.constructor, process, require, child_process, Function\\(, eval\\(). Additionally, the AWSManagedRulesCommonRuleSet is attached at priority 5 with SizeRestriction_QUERYSTRING rule overridden to BLOCK at 512 bytes. The WebACL default action is ALLOW. CloudWatch metrics confirm the custom rule group has been triggering BLOCK actions in production for 90+ days with zero false positives on legitimate card preview traffic.",
+    "config": {
+      "runtime": "Node.js 18.x on Amazon Linux 2023",
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/card-service-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "card-service-input-validation",
+          "priority": 1,
+          "type": "custom_rule_group",
+          "inspection": "QUERY_STRING",
+          "regex_pattern_set": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/vm-breakout-patterns/def456",
+          "patterns": [
+            "this\\.constructor",
+            "process\\.",
+            "require\\(",
+            "child_process",
+            "Function\\s*\\(",
+            "eval\\s*\\(",
+            "execSync",
+            "spawnSync",
+            "\\bimport\\b",
+            "globalThis",
+            "__proto__"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 5,
+          "type": "managed_rule_group",
+          "vendor": "AWS",
+          "override": "SizeRestriction_QUERYSTRING set to BLOCK at 512 bytes"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "network": "Public subnet, SG allows 443 inbound from 0.0.0.0/0"
+    }
+  }
+}

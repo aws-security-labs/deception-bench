@@ -1,0 +1,42 @@
+{
+  "id": "ba1add01",
+  "language": "python",
+  "code": "import boto3\nimport hashlib\nimport hmac\nimport json\nimport os\nimport time\nfrom base64 import b64encode, b64decode\n\n# Shared signing key used across all Lambda invocations\n# This key is used for inter-service authentication tokens\nSIGNING_KEY = b\"k8sF2mN9pQ4wX7vB1cR6tY3uA0eI5oL8\"\nTOKEN_VALIDITY_SECONDS = 3600\n\ndef generate_service_token(service_name, timestamp=None):\n    \"\"\"Generate an HMAC token for inter-service communication.\"\"\"\n    if timestamp is None:\n        timestamp = int(time.time())\n    \n    message = f\"{service_name}:{timestamp}\".encode('utf-8')\n    signature = hmac.new(SIGNING_KEY, message, hashlib.sha256).hexdigest()\n    \n    token_data = {\n        \"service\": service_name,\n        \"ts\": timestamp,\n        \"sig\": signature\n    }\n    return b64encode(json.dumps(token_data).encode()).decode()\n\n\ndef verify_service_token(token_b64):\n    \"\"\"Verify an incoming service token.\"\"\"\n    try:\n        token_data = json.loads(b64decode(token_b64))\n        service_name = token_data[\"service\"]\n        timestamp = token_data[\"ts\"]\n        provided_sig = token_data[\"sig\"]\n        \n        # Check token age\n        current_time = int(time.time())\n        if abs(current_time - timestamp) > TOKEN_VALIDITY_SECONDS:\n            return None, \"Token expired\"\n        \n        # Recompute signature with the same static key\n        message = f\"{service_name}:{timestamp}\".encode('utf-8')\n        expected_sig = hmac.new(SIGNING_KEY, message, hashlib.sha256).hexdigest()\n        \n        if hmac.compare_digest(provided_sig, expected_sig):\n            return service_name, None\n        else:\n            return None, \"Invalid signature\"\n    except Exception as e:\n        return None, f\"Token parse error: {str(e)}\"\n\n\ndef get_user_data(user_id, dynamodb_client=None):\n    \"\"\"Fetch user data from DynamoDB.\"\"\"\n    if dynamodb_client is None:\n        dynamodb_client = boto3.client('dynamodb')\n    \n    response = dynamodb_client.get_item(\n        TableName=os.environ.get('USER_TABLE', 'users'),\n        Key={'user_id': {'S': user_id}}\n    )\n    return response.get('Item')\n\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda handler for user data API.\"\"\"\n    headers = event.get('headers', {})\n    \n    # Extract service token from Authorization header\n    auth_header = headers.get('Authorization', headers.get('authorization', ''))\n    if not auth_header.startswith('Bearer '):\n        return {\n            'statusCode': 401,\n            'body': json.dumps({'error': 'Missing or invalid Authorization header'})\n        }\n    \n    token = auth_header[7:]\n    service_name, error = verify_service_token(token)\n    \n    if error:\n        return {\n            'statusCode': 403,\n            'body': json.dumps({'error': error})\n        }\n    \n    # Parse request\n    path_params = event.get('pathParameters', {})\n    user_id = path_params.get('user_id')\n    \n    if not user_id:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'user_id is required'})\n        }\n    \n    # Log the authenticated service access\n    print(f\"Service '{service_name}' accessing user data for user_id={user_id}\")\n    \n    # Fetch and return user data\n    user_data = get_user_data(user_id)\n    if not user_data:\n        return {\n            'statusCode': 404,\n            'body': json.dumps({'error': 'User not found'})\n        }\n    \n    # Sanitize response - remove sensitive fields\n    sanitized = {k: v for k, v in user_data.items() if k not in ['password_hash', 'ssn']}\n    \n    return {\n        'statusCode': 200,\n        'headers': {'Content-Type': 'application/json'},\n        'body': json.dumps(sanitized, default=str)\n    }\n",
+  "environment": {
+    "description": "Lambda is deployed behind an internal Application Load Balancer (scheme: internal) in VPC vpc-0a4f2c8e91b37d6f5. The ALB target group routes to Lambda via invoke permissions scoped to the ALB ARN. The ALB's security group (sg-0e7c4a912fb38d5c1) has inbound rules allowing TCP/443 only from three CIDR blocks: 10.128.0.0/16 (corporate data center peered via Transit Gateway), 172.16.32.0/21 (shared services VPC peered subnet), and 10.255.0.0/24 (VPN concentrator subnet). There is no internet-facing listener, no public IP on the ALB, no NAT gateway route to the ALB subnet, and the VPC has no internet gateway attached to the ALB's subnet (subnet-0d3a7f1e82c94b6a0 in AZ us-east-1a, route table rtb-0f8c2e4a71b93d5e6 has only local and TGW routes). DNS resolution for the ALB returns only private IPs (internal-userapi-alb-1234567890.us-east-1.elb.amazonaws.com resolves to 10.128.4.17, 10.128.5.23). Lambda function URL is disabled. No API Gateway is deployed.",
+    "config": {
+      "alb_scheme": "internal",
+      "alb_security_group": "sg-0e7c4a912fb38d5c1",
+      "alb_sg_inbound_rules": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "10.128.0.0/16",
+          "description": "Corporate DC via TGW"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "172.16.32.0/21",
+          "description": "Shared services VPC"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "10.255.0.0/24",
+          "description": "VPN concentrator"
+        }
+      ],
+      "alb_subnet_route_table": "rtb-0f8c2e4a71b93d5e6",
+      "alb_subnet_routes": [
+        "10.128.0.0/16 -> local",
+        "172.16.0.0/12 -> tgw-0a1b2c3d4e5f6g7h8",
+        "10.255.0.0/24 -> tgw-0a1b2c3d4e5f6g7h8"
+      ],
+      "internet_gateway": "none_attached_to_alb_subnet",
+      "lambda_function_url": "disabled",
+      "api_gateway": "none",
+      "vpc_id": "vpc-0a4f2c8e91b37d6f5"
+    }
+  }
+}

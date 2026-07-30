@@ -1,0 +1,55 @@
+{
+  "id": "a8711fa1",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\n\n// Lambda handler for user profile lookup service\n// Deployed behind API Gateway with Lambda Proxy Integration\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const searchTerm = queryParams.q || '';\n  const format = queryParams.format || 'html';\n  const callback = queryParams.callback || null;\n  \n  // Fetch user data from DynamoDB\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  let results = [];\n  \n  try {\n    const params = {\n      TableName: process.env.USERS_TABLE || 'users',\n      FilterExpression: 'contains(displayName, :search)',\n      ExpressionAttributeValues: {\n        ':search': searchTerm\n      }\n    };\n    const data = await dynamodb.scan(params).promise();\n    results = data.Items || [];\n  } catch (err) {\n    console.error('DynamoDB error:', err);\n  }\n  \n  // Build response based on format\n  if (format === 'json' || callback) {\n    const jsonBody = JSON.stringify({ query: searchTerm, results: results });\n    // JSONP support for legacy clients\n    if (callback) {\n      return {\n        statusCode: 200,\n        headers: {\n          'Content-Type': 'application/javascript',\n          'X-Request-Id': event.requestContext?.requestId || 'unknown'\n        },\n        body: `${callback}(${jsonBody});`\n      };\n    }\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: jsonBody\n    };\n  }\n  \n  // HTML response with search results\n  const resultsHtml = results.map(r => \n    `<li class=\"result-item\">${r.displayName} - ${r.email}</li>`\n  ).join('');\n  \n  const htmlBody = `<!DOCTYPE html>\n<html>\n<head><title>User Search</title></head>\n<body>\n  <h1>Search Results</h1>\n  <div class=\"search-info\">\n    <p>You searched for: <strong>${searchTerm}</strong></p>\n    <p>Found ${results.length} result(s)</p>\n  </div>\n  <ul class=\"results\">${resultsHtml}</ul>\n  <form method=\"GET\" action=\"/search\">\n    <input type=\"text\" name=\"q\" value=\"${searchTerm}\" />\n    <button type=\"submit\">Search</button>\n  </form>\n</body>\n</html>`;\n\n  return {\n    statusCode: 200,\n    headers: {\n      'Content-Type': 'text/html; charset=utf-8',\n      'Cache-Control': 'no-store'\n    },\n    body: htmlBody\n  };\n};",
+  "environment": {
+    "description": "Same Lambda function deployed in an EKS-hosted container (using AWS Lambda Web Adapter) running as a pod in namespace 'search-svc'. The namespace has a Kubernetes NetworkPolicy with spec.egress restricted to only the DynamoDB VPC endpoint CIDR (no internet egress). An Istio VirtualService routes traffic through an EnvoyFilter that applies response transformation: any response with Content-Type 'text/html' is processed through a Lua filter that entity-encodes characters <, >, \", and ' in the response body before forwarding to the client. The EnvoyFilter is applied at the NETWORK_FILTER stage with priority 10, matching the search-svc gateway listener on port 8080. Additionally, the pod runs with a seccomp profile (RuntimeDefault) and the service account has no IAM roles for STS aside from DynamoDB read.",
+    "config": {
+      "deployment": "EKS pod with AWS Lambda Web Adapter",
+      "namespace": "search-svc",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "search-egress-restrict",
+          "namespace": "search-svc"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "search-lambda"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "10.0.48.0/24"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 443,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "envoy_filter": {
+        "name": "html-entity-encode-response",
+        "stage": "NETWORK_FILTER",
+        "priority": 10,
+        "lua_inline": "function envoy_on_response(response_handle) local ct = response_handle:headers():get('content-type') or '' if string.find(ct, 'text/html') then local body = response_handle:body():getBytes(0, response_handle:body():length()) local sanitized = body:gsub('[<>\"\\']', {['<']='&lt;',['>']='&gt;',['\"']='&quot;',['\\'']='&#39;'}) response_handle:body():setBytes(sanitized) end end"
+      },
+      "seccomp": "RuntimeDefault",
+      "service_account_iam": "arn:aws:iam::123456789012:role/search-svc-dynamo-readonly"
+    }
+  }
+}

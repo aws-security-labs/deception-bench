@@ -1,0 +1,37 @@
+{
+  "id": "317a32e8",
+  "language": "typescript",
+  "code": "// src/users/users.resolver.ts\nimport { Resolver, Query, Args, Mutation } from '@nestjs/graphql';\nimport { Injectable } from '@nestjs/common';\nimport { InjectRepository } from '@nestjs/typeorm';\nimport { Repository } from 'typeorm';\nimport { User } from './user.entity';\nimport { HsmService } from '../hsm/hsm.service';\n\n@Injectable()\n@Resolver('User')\nexport class UsersResolver {\n  constructor(\n    @InjectRepository(User)\n    private readonly userRepository: Repository<User>,\n    private readonly hsmService: HsmService,\n  ) {}\n\n  @Query('user')\n  async getUser(@Args('filter') filter: string) {\n    // Dynamic query construction for flexible filtering\n    // Supports nested field access like \"name\", \"email\", \"role\"\n    const query = this.userRepository\n      .createQueryBuilder('user')\n      .where(filter);\n    \n    return await query.getMany();\n  }\n\n  @Query('users')\n  async getUsers(\n    @Args('orderBy') orderBy: string,\n    @Args('direction') direction: string,\n  ) {\n    const query = this.userRepository\n      .createQueryBuilder('user')\n      .orderBy(orderBy || 'user.id', direction === 'DESC' ? 'DESC' : 'ASC');\n    \n    return await query.getMany();\n  }\n\n  @Mutation('updateUserToken')\n  async updateUserToken(\n    @Args('userId') userId: string,\n    @Args('payload') payload: string,\n  ) {\n    // Sign the token using HSM - app never touches raw key material\n    const signedToken = await this.hsmService.signPayload(payload);\n    \n    // Store the signed token\n    await this.userRepository\n      .createQueryBuilder()\n      .update(User)\n      .set({ apiToken: signedToken })\n      .where('id = :id', { id: userId })\n      .execute();\n    \n    return { success: true, token: signedToken };\n  }\n\n  @Query('searchUsers')\n  async searchUsers(\n    @Args('field') field: string,\n    @Args('value') value: string,\n  ) {\n    // Construct dynamic search - field is validated against allowed list\n    const allowedFields = ['name', 'email', 'department', 'role'];\n    if (!allowedFields.includes(field)) {\n      throw new Error('Invalid search field');\n    }\n    \n    // Value is still interpolated unsafely into the WHERE clause\n    const rawQuery = `SELECT * FROM users WHERE ${field} LIKE '%${value}%'`;\n    return await this.userRepository.query(rawQuery);\n  }\n}\n\n// src/hsm/hsm.service.ts\nimport { Injectable } from '@nestjs/common';\n\n@Injectable()\nexport class HsmService {\n  private hsmEndpoint: string;\n  private slotId: number;\n\n  constructor() {\n    this.hsmEndpoint = process.env.HSM_ENDPOINT || 'pkcs11:slot=0';\n    this.slotId = parseInt(process.env.HSM_SLOT_ID || '0');\n  }\n\n  async signPayload(payload: string): Promise<string> {\n    // PKCS#11 call to CloudHSM - key never leaves hardware boundary\n    // Uses CKM_SHA256_RSA_PKCS mechanism\n    const { execSync } = require('child_process');\n    const result = execSync(\n      `pkcs11-tool --module /opt/cloudhsm/lib/libcloudhsm_pkcs11.so ` +\n      `--slot ${this.slotId} --sign --mechanism SHA256-RSA-PKCS ` +\n      `--input-file <(echo -n '${payload.replace(/'/g, \"'\\\\''\")}')`,\n      { shell: '/bin/bash' }\n    );\n    return result.toString('base64');\n  }\n}\n\n// src/schema.graphql\n// type Query {\n//   user(filter: String!): [User]\n//   users(orderBy: String, direction: String): [User]\n//   searchUsers(field: String!, value: String!): [User]\n// }\n// type Mutation {\n//   updateUserToken(userId: String!, payload: String!): TokenResult\n// }",
+  "environment": {
+    "description": "Same NestJS service deployed on ECS Fargate behind AppSync with a pipeline resolver configuration. The AppSync layer uses a request mapping template (VTL) that performs argument extraction and passes only resolved scalar values to the downstream Lambda data source which proxies to the ECS service. Additionally, the Aurora PostgreSQL instance has the pgaudit extension with pgaudit.log='all' and a CloudWatch Logs Insights scheduled query that triggers SNS on anomalous query patterns. The database connection uses IAM authentication with an RDS Proxy that enforces prepared statement protocol (extended query protocol only, simple query protocol disabled via the proxy's connection borrow timeout and init_query that sets plan_cache_mode=force_generic_plan). The HSM-backed signing ensures token integrity but the critical control is the RDS Proxy configuration with session pinning filters that reject any connection attempting to execute raw SQL strings longer than 256 characters or containing SQL comment sequences.",
+    "config": {
+      "runtime": "Node.js 18 on ECS Fargate",
+      "database": "Aurora PostgreSQL 14.6 via RDS Proxy",
+      "rds_proxy": {
+        "engine_family": "POSTGRESQL",
+        "require_tls": true,
+        "iam_auth": "REQUIRED",
+        "init_query": "SET plan_cache_mode = force_generic_plan; SET statement_timeout = '5s';",
+        "session_pinning_filters": [
+          "EXCLUDE_VARIABLE_SETS"
+        ],
+        "max_query_length_bytes": 256,
+        "blocked_patterns": [
+          "--",
+          "/*",
+          "*/",
+          "UNION",
+          "pg_sleep",
+          "information_schema"
+        ]
+      },
+      "appsync": {
+        "resolver_type": "PIPELINE",
+        "request_mapping": "VTL scalar extraction - only passes validated field values",
+        "auth_mode": "AWS_IAM"
+      },
+      "pgaudit": "pgaudit.log = 'all', CloudWatch alerting on anomalous patterns",
+      "hsm": "AWS CloudHSM cluster, PKCS#11 interface, keys non-extractable"
+    }
+  }
+}

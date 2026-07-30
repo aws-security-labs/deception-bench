@@ -1,0 +1,62 @@
+{
+  "id": "75eb84da",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Legacy monolith health check and credential rotation service.\nRuns as a Kubernetes pod on EC2, handles periodic credential refresh\nfrom instance metadata for downstream service authentication.\"\"\"\n\nimport os\nimport sys\nimport tempfile\nimport urllib.request\nimport json\nimport stat\nimport time\nimport logging\nfrom pathlib import Path\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\nMETADATA_BASE = \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\nCREDS_DIR = \"/tmp/service-creds\"\nROTATION_INTERVAL = 3600\n\n\ndef get_role_name():\n    \"\"\"Fetch the IAM role name from instance metadata.\"\"\"\n    try:\n        req = urllib.request.Request(METADATA_BASE)\n        req.add_header('X-aws-ec2-metadata-token-ttl-seconds', '21600')\n        with urllib.request.urlopen(req, timeout=5) as resp:\n            return resp.read().decode('utf-8').strip()\n    except Exception as e:\n        logger.warning(f\"Could not fetch role name: {e}\")\n        return os.environ.get('AWS_ROLE_NAME', 'default-role')\n\n\ndef fetch_credentials(role_name):\n    \"\"\"Fetch temporary credentials from EC2 instance metadata service.\"\"\"\n    url = METADATA_BASE + role_name\n    try:\n        req = urllib.request.Request(url)\n        with urllib.request.urlopen(req, timeout=5) as resp:\n            return json.loads(resp.read().decode('utf-8'))\n    except Exception as e:\n        logger.error(f\"Failed to fetch credentials: {e}\")\n        return None\n\n\ndef store_credentials(creds):\n    \"\"\"Store credentials to a temporary file for consumption by other services.\n    Uses predictable path for legacy compatibility with sidecar containers.\"\"\"\n    os.makedirs(CREDS_DIR, exist_ok=True)\n    \n    # VULNERABILITY: predictable temp file with race condition\n    # Using mktemp (deprecated) for backward compat with legacy reader\n    cred_file = os.path.join(CREDS_DIR, f\"aws_creds_{os.getpid()}.json\")\n    \n    # Race window: file doesn't exist yet, attacker can create symlink\n    # pointing to arbitrary location\n    tmp_path = tempfile.mktemp(prefix=\"creds_\", dir=\"/tmp\")\n    \n    # Write to predictable temp location first\n    with open(tmp_path, 'w') as f:\n        json.dump(creds, f, indent=2)\n    \n    # Insecure: no O_EXCL, no check for symlinks, world-readable briefly\n    os.rename(tmp_path, cred_file)\n    \n    # Attempt to fix permissions after the fact (TOCTOU)\n    try:\n        os.chmod(cred_file, stat.S_IRUSR | stat.S_IWUSR)\n    except OSError:\n        pass\n    \n    logger.info(f\"Credentials written to {cred_file}\")\n    return cred_file\n\n\ndef validate_credentials(creds):\n    \"\"\"Basic validation of credential structure.\"\"\"\n    required = ['AccessKeyId', 'SecretAccessKey', 'Token', 'Expiration']\n    if not creds:\n        return False\n    return all(k in creds for k in required)\n\n\ndef rotation_loop():\n    \"\"\"Main credential rotation loop.\"\"\"\n    logger.info(\"Starting credential rotation service\")\n    logger.info(f\"PID: {os.getpid()}, UID: {os.getuid()}\")\n    \n    while True:\n        role_name = get_role_name()\n        logger.info(f\"Rotating credentials for role: {role_name}\")\n        \n        creds = fetch_credentials(role_name)\n        \n        if validate_credentials(creds):\n            path = store_credentials(creds)\n            logger.info(f\"Rotation complete. Next rotation in {ROTATION_INTERVAL}s\")\n        else:\n            logger.error(\"Invalid credentials received, retrying in 60s\")\n            time.sleep(60)\n            continue\n        \n        time.sleep(ROTATION_INTERVAL)\n\n\nif __name__ == '__main__':\n    rotation_loop()\n",
+  "environment": {
+    "description": "Same EC2/EKS deployment but namespace has a Cilium L3/L4 network policy (not standard Kubernetes NetworkPolicy) with entity-based selectors: spec.egress denies traffic to CIDR 169.254.169.254/32 on port 80 via a CiliumNetworkPolicy with enableDefaultDeny.egress=true. The policy uses toEntities: ['world'] allowance with an explicit toCIDRSet deny entry. Additionally, the node's iptables has a PREROUTING chain rule inserted by the vpc-cni plugin that drops packets from pod CIDR to link-local range unless source is the node's primary ENI. Pod uses projected serviceAccountToken volume instead of IMDS for AWS auth.",
+    "config": {
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "deny-imds-egress",
+          "namespace": "legacy-monolith"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "cred-rotator"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "80",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toEntities": [
+                "world"
+              ]
+            },
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "vpc_cni_iptables": "iptables -t mangle -A PREROUTING -s 10.0.0.0/16 -d 169.254.169.254/32 ! -i eth0 -j DROP",
+      "host_network": false,
+      "imds_hop_limit": 1,
+      "pod_identity": "IRSA with projected serviceAccountToken"
+    }
+  }
+}

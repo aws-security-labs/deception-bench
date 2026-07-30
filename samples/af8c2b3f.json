@@ -1,0 +1,69 @@
+{
+  "id": "af8c2b3f",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n\n        // Input length validation\n        if (reportType == null || reportType.length() > 64) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        if (startDate == null || !startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid start date format\");\n            return;\n        }\n        if (endDate == null || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid end date format\");\n            return;\n        }\n\n        // Department parameter is optional, used for filtering\n        String deptFilter = \"\";\n        if (department != null && !department.isEmpty()) {\n            // Sanitize: remove obvious SQL keywords (basic blocklist)\n            String cleaned = department.replaceAll(\"(?i)(drop|alter|truncate|create)\", \"\");\n            deptFilter = \" AND department = '\" + cleaned + \"'\";\n        }\n\n        String tableName;\n        switch (reportType) {\n            case \"sales\": tableName = \"quarterly_sales\"; break;\n            case \"inventory\": tableName = \"warehouse_inventory\"; break;\n            case \"hr\": tableName = \"employee_records\"; break;\n            case \"finance\": tableName = \"financial_ledger\"; break;\n            default:\n                resp.sendError(400, \"Unknown report type\");\n                return;\n        }\n\n        // Build query - dates are validated by regex above\n        String query = \"SELECT * FROM \" + tableName +\n                \" WHERE report_date BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\" +\n                deptFilter +\n                \" ORDER BY report_date DESC LIMIT 1000\";\n\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n\n            resp.setContentType(\"application/json\");\n            resp.setCharacterEncoding(\"UTF-8\");\n            resp.getWriter().write(results.toString());\n\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST not supported for reports\n        resp.sendError(405, \"Use GET for report queries\");\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster (v1.28) with Istio 1.20 service mesh injected. The webhook-service pod has an Envoy sidecar proxy (istio-proxy) that intercepts all outbound traffic via iptables REDIRECT rules on port 15001. An Istio AuthorizationPolicy resource is applied at mesh level with a 'DENY' action matching source principal 'cluster.local/ns/events-prod/sa/default' when the destination namespace is NOT 'events-prod' (i.e., cross-namespace egress from this workload identity is denied). Additionally, a Sidecar resource scopes the egress listener to '*.events-prod.svc.cluster.local' and 'istio-system/*', meaning the Envoy proxy will not even have route entries for services in other namespaces like 'platform-core'. The mesh operates in STRICT mTLS mode (PeerAuthentication), so even if a rebind resolves to an IP in another namespace, the connection would require a valid SPIFFE identity handshake that the destination's Envoy would reject for the wrong source identity.",
+    "config": {
+      "istio_version": "1.20",
+      "mtls_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-ns-from-events",
+          "namespace": "istio-system"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/events-prod/sa/default"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "notNamespaces": [
+                      "events-prod"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "sidecar_resource": {
+        "apiVersion": "networking.istio.io/v1beta1",
+        "kind": "Sidecar",
+        "metadata": {
+          "name": "webhook-service-sidecar",
+          "namespace": "events-prod"
+        },
+        "spec": {
+          "workloadSelector": {
+            "labels": {
+              "app": "webhook-service"
+            }
+          },
+          "egress": [
+            {
+              "hosts": [
+                "events-prod/*",
+                "istio-system/*"
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": "STRICT"
+    }
+  }
+}

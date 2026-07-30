@@ -1,0 +1,36 @@
+{
+  "id": "eb80254d",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\n\npublic class ReportGeneratorServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customFilter = req.getParameter(\"filter\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        // Validate report type against whitelist\n        List<String> validTypes = Arrays.asList(\"sales\", \"inventory\", \"returns\", \"audit\");\n        if (!validTypes.contains(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date range format\n        if (dateRange != null && !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n        \n        // Build query using template system for report structure\n        String templateQuery = getTemplateForType(reportType);\n        \n        // Apply sort - validated against known columns\n        List<String> validSorts = Arrays.asList(\"created_at\", \"amount\", \"customer_id\", \"status\");\n        if (sortCol != null && !validSorts.contains(sortCol)) {\n            sortCol = \"created_at\";\n        }\n        \n        // Apply custom filter - this allows power users to add conditions\n        // Filter is expected to be a pre-built condition from the UI dropdown\n        String finalQuery = templateQuery;\n        if (customFilter != null && !customFilter.isEmpty()) {\n            // Sanitize: remove comments and semicolons\n            customFilter = customFilter.replaceAll(\"--\", \"\").replaceAll(\";\", \"\");\n            customFilter = customFilter.replaceAll(\"/\\\\*.*?\\\\*/\", \"\");\n            finalQuery = templateQuery + \" AND (\" + customFilter + \")\";\n        }\n        \n        if (sortCol != null) {\n            finalQuery += \" ORDER BY \" + sortCol + \" DESC\";\n        }\n        \n        finalQuery += \" LIMIT 1000\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(finalQuery)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"{\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.print(\",\");\n                    out.print(\"\\\"\" + meta.getColumnName(i) + \"\\\":\");\n                    out.print(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                out.print(\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query execution failed\");\n        }\n    }\n    \n    private String getTemplateForType(String type) {\n        switch (type) {\n            case \"sales\":\n                return \"SELECT id, customer_id, amount, status, created_at FROM orders WHERE 1=1\";\n            case \"inventory\":\n                return \"SELECT sku, name, quantity, warehouse, updated_at FROM inventory WHERE 1=1\";\n            case \"returns\":\n                return \"SELECT id, order_id, reason, status, created_at FROM returns WHERE 1=1\";\n            case \"audit\":\n                return \"SELECT id, user_id, action, target, created_at FROM audit_log WHERE 1=1\";\n            default:\n                return \"SELECT 1 WHERE 1=0\";\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Go microservice on EKS 1.28 in a dedicated VPC. pgBouncer sidecar in transaction pooling mode with prepared_statement_cache_size=0. Pods run in namespace 'webhook-prod' which has a Cilium CiliumNetworkPolicy with spec.egress containing a single toCIDRSet entry allowing only 0.0.0.0/0 with exceptCIDRs [169.254.169.254/32, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] and a toFQDNs matchPattern '*.customer-webhooks.example.com'. DNS proxy enforcement is enabled via Cilium's DNS-aware policy engine (hubble-relay confirms enforcement). Additionally, the EKS nodes have IMDS hop limit set to 1 (HttpPutResponseHopLimit=1) which prevents container-level metadata access even if network policy were bypassed.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "cni": "cilium-1.14.5",
+      "network_policy_engine": "cilium",
+      "cilium_dns_proxy": true,
+      "egress_policy": {
+        "toCIDRSet": [
+          {
+            "cidr": "0.0.0.0/0",
+            "exceptCIDRs": [
+              "169.254.169.254/32",
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16"
+            ]
+          }
+        ],
+        "toFQDNs": [
+          {
+            "matchPattern": "*.customer-webhooks.example.com"
+          }
+        ]
+      },
+      "imds_hop_limit": 1,
+      "pgbouncer_mode": "transaction",
+      "pod_security_standard": "restricted",
+      "hubble_enforcement_verified": true
+    }
+  }
+}

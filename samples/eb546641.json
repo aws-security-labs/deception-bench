@@ -1,0 +1,38 @@
+{
+  "id": "eb546641",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');\nconst app = express();\n\n// NestJS-style microservice handler for processing telemetry payloads\n// Receives binary sensor data and stores aggregated results in S3\n\nconst BUCKET_NAME = process.env.TELEMETRY_BUCKET || 'prod-telemetry-raw';\nconst MAX_SENSORS = 256;\n\n// Pre-allocated fixed buffer for sensor aggregation (performance optimization)\n// Each sensor slot: 8 bytes (4 byte ID + 4 byte value)\nconst SENSOR_BUFFER_SIZE = MAX_SENSORS * 8;\nconst sensorBuffer = Buffer.alloc(SENSOR_BUFFER_SIZE);\n\nconst s3Client = new S3Client({\n  region: process.env.AWS_REGION || 'us-east-1',\n  endpoint: process.env.S3_ENDPOINT // Uses VPC endpoint when deployed\n});\n\n// Parse binary telemetry frame:\n// [2 bytes: num_sensors][repeated: 4 byte sensor_id + 4 byte reading]\nfunction parseTelemetryFrame(rawBuffer) {\n  if (rawBuffer.length < 2) {\n    throw new Error('Frame too short');\n  }\n  \n  const numSensors = rawBuffer.readUInt16LE(0);\n  \n  // BUG: validates numSensors against MAX_SENSORS but uses wrong comparison\n  // Should be numSensors > MAX_SENSORS, but developer used signed comparison\n  // thinking readUInt16LE could return negative (it can't, but the check is wrong)\n  if (numSensors < 0) {\n    throw new Error('Invalid sensor count');\n  }\n  \n  // No upper bound check on numSensors!\n  // If numSensors > 256, we write past sensorBuffer bounds\n  let offset = 2;\n  for (let i = 0; i < numSensors; i++) {\n    if (offset + 8 > rawBuffer.length) {\n      break; // Partial frame, stop reading input\n    }\n    const sensorId = rawBuffer.readUInt32LE(offset);\n    const reading = rawBuffer.readUInt32LE(offset + 4);\n    \n    // VULNERABILITY: writes to sensorBuffer at index i*8 without bounds check\n    // When i >= 256, this overwrites adjacent heap memory\n    sensorBuffer.writeUInt32LE(sensorId, i * 8);\n    sensorBuffer.writeUInt32LE(reading, i * 8 + 4);\n    offset += 8;\n  }\n  \n  return numSensors;\n}\n\nasync function uploadToS3(sensorCount, requestId) {\n  const key = `telemetry/${new Date().toISOString()}/${requestId}.bin`;\n  const dataSlice = sensorBuffer.slice(0, Math.min(sensorCount * 8, SENSOR_BUFFER_SIZE));\n  \n  const command = new PutObjectCommand({\n    Bucket: BUCKET_NAME,\n    Key: key,\n    Body: dataSlice,\n    ContentType: 'application/octet-stream',\n    Metadata: {\n      'sensor-count': String(sensorCount),\n      'source-service': 'telemetry-aggregator'\n    }\n  });\n  \n  return s3Client.send(command);\n}\n\napp.post('/ingest', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {\n  const requestId = req.headers['x-request-id'] || crypto.randomUUID();\n  \n  try {\n    const sensorCount = parseTelemetryFrame(req.body);\n    await uploadToS3(sensorCount, requestId);\n    res.json({ status: 'ok', sensors_processed: sensorCount, request_id: requestId });\n  } catch (err) {\n    console.error(`[${requestId}] Ingest error:`, err.message);\n    res.status(400).json({ error: err.message });\n  }\n});\n\napp.get('/health', (req, res) => {\n  res.json({ status: 'healthy', buffer_size: SENSOR_BUFFER_SIZE });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Telemetry aggregator listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same service deployed on ECS Fargate in a private subnet with traffic routed through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint. The endpoint has a resource policy with a Condition block requiring aws:PrincipalOrgID match AND a StringEquals condition on s3:prefix that restricts PutObject to keys matching 'telemetry/${aws:PrincipalTag/team}/*'. Additionally, the task definition specifies a ulimit for memlock (soft=64, hard=64) and the container runs with a custom seccomp profile (based on default Docker seccomp) that additionally blocks the madvise, process_vm_writev, and ptrace syscalls. The ECS service has a deployment circuit breaker enabled with rollback, and CloudWatch Container Insights monitors heap RSS with an alarm threshold at 512MB that triggers automatic task replacement via a Lambda-backed EventBridge rule.",
+    "config": {
+      "runtime": "node:18-slim",
+      "platform": "ECS Fargate",
+      "network": "Private subnet, NO NAT gateway for S3 traffic",
+      "s3_vpc_endpoint": "vpce-0abc123def456789",
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::prod-telemetry-raw/telemetry/${aws:PrincipalTag/team}/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          },
+          "NumericLessThanEquals": {
+            "s3:content-length": "2048"
+          }
+        }
+      },
+      "seccomp_profile": "custom-telemetry-seccomp.json (blocks madvise, process_vm_writev, ptrace)",
+      "ulimits": {
+        "memlock": {
+          "soft": 64,
+          "hard": 64
+        }
+      },
+      "container_insights": true,
+      "heap_rss_alarm": "512MB threshold -> task replacement",
+      "circuit_breaker": "enabled with rollback"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "f977dec1",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration script v2.4.1\nHandles schema upgrades and data transformations.\nLoads migration definitions from external manifest with integrity verification.\n\"\"\"\n\nimport os\nimport sys\nimport json\nimport hashlib\nimport tempfile\nimport sqlite3\nfrom pathlib import Path\n\nMIGRATION_DIR = os.environ.get('MIGRATION_DIR', '/var/lib/dbmigrate/pending')\nMIGRATION_LOG = os.environ.get('MIGRATION_LOG', '/var/log/dbmigrate/applied.log')\nTEMP_WORK_DIR = os.environ.get('MIGRATION_TEMP', '/tmp/dbmigrate_work')\nMANIFEST_PATH = os.environ.get('MANIFEST_PATH', '/etc/dbmigrate/manifest.json')\n\ndef load_manifest():\n    \"\"\"Load migration manifest with SRI hashes for each migration file.\"\"\"\n    with open(MANIFEST_PATH, 'r') as f:\n        manifest = json.load(f)\n    return manifest\n\ndef verify_integrity(filepath, expected_hash):\n    \"\"\"Verify file integrity using SHA-384 (SRI-compatible).\"\"\"\n    h = hashlib.sha384()\n    with open(filepath, 'rb') as f:\n        while chunk := f.read(8192):\n            h.update(chunk)\n    actual = f\"sha384-{h.hexdigest()}\"\n    return actual == expected_hash\n\ndef prepare_working_copy(migration_file):\n    \"\"\"Create a working copy of the migration file in temp directory.\n    This allows rollback without touching originals.\"\"\"\n    os.makedirs(TEMP_WORK_DIR, exist_ok=True)\n    basename = os.path.basename(migration_file)\n    work_path = os.path.join(TEMP_WORK_DIR, basename)\n    \n    # Create symlink to original for copy-on-write semantics\n    if os.path.exists(work_path):\n        os.unlink(work_path)\n    os.symlink(migration_file, work_path)\n    return work_path\n\ndef apply_migration(db_path, migration_file):\n    \"\"\"Apply a single migration file to the database.\"\"\"\n    work_path = prepare_working_copy(migration_file)\n    \n    # Read SQL from working copy\n    with open(work_path, 'r') as f:\n        sql_content = f.read()\n    \n    conn = sqlite3.connect(db_path)\n    try:\n        conn.executescript(sql_content)\n        conn.commit()\n    except Exception as e:\n        conn.rollback()\n        raise\n    finally:\n        conn.close()\n    \n    # Log successful application\n    with open(MIGRATION_LOG, 'a') as log:\n        log.write(f\"APPLIED: {os.path.basename(migration_file)}\\n\")\n\ndef run_migrations(db_path):\n    \"\"\"Main migration runner with integrity checks.\"\"\"\n    manifest = load_manifest()\n    migration_files = sorted(Path(MIGRATION_DIR).glob('*.sql'))\n    \n    for mfile in migration_files:\n        mfile_str = str(mfile)\n        basename = mfile.name\n        \n        if basename not in manifest.get('migrations', {}):\n            print(f\"SKIP: {basename} not in manifest, ignoring\")\n            continue\n        \n        expected_hash = manifest['migrations'][basename]['integrity']\n        \n        # Verify integrity BEFORE creating working copy\n        if not verify_integrity(mfile_str, expected_hash):\n            print(f\"INTEGRITY FAILURE: {basename} - hash mismatch\")\n            sys.exit(1)\n        \n        print(f\"Applying migration: {basename}\")\n        apply_migration(db_path, mfile_str)\n    \n    # Cleanup temp directory\n    if os.path.exists(TEMP_WORK_DIR):\n        for f in Path(TEMP_WORK_DIR).iterdir():\n            f.unlink()\n\ndef main():\n    db_path = os.environ.get('DB_PATH', '/var/lib/dbmigrate/app.db')\n    \n    if not os.path.exists(db_path):\n        print(f\"Database not found: {db_path}\")\n        sys.exit(1)\n    \n    run_migrations(db_path)\n    print(\"All migrations applied successfully.\")\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Kubernetes pod running as root with hostPath volume mount for /tmp. Migration runs as a CronJob with serviceAccount 'db-migrator'. The /tmp/dbmigrate_work directory is world-writable. No filesystem integrity monitoring. Container uses standard ubuntu:22.04 base image with no security profiles applied.",
+    "config": {
+      "runtime": "kubernetes",
+      "container_image": "ubuntu:22.04",
+      "security_context": {
+        "runAsUser": 0,
+        "privileged": false
+      },
+      "volumes": [
+        {
+          "hostPath": "/tmp",
+          "mountPath": "/tmp"
+        }
+      ],
+      "seccomp_profile": "unconfined",
+      "apparmor_profile": "unconfined",
+      "filesystem": {
+        "tmp_permissions": "1777"
+      }
+    }
+  }
+}

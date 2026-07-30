@@ -1,0 +1,30 @@
+{
+  "id": "d5ae63bf",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/reports_controller.rb\nclass Api::V1::ReportsController < ApplicationController\n  before_action :authenticate_api_key!\n  before_action :validate_date_range, only: [:generate]\n\n  # POST /api/v1/reports/generate\n  # Generates custom reports with flexible filtering\n  def generate\n    filters = params[:filters] || {}\n    sort_col = params[:sort_by] || 'created_at'\n    sort_dir = params[:sort_dir] || 'DESC'\n    group_by = params[:group_by]\n\n    # Validate sort direction\n    sort_dir = 'DESC' unless %w[ASC DESC].include?(sort_dir.upcase)\n\n    # Build the report query with user-specified grouping and sorting\n    base_query = \"SELECT #{build_select_clause(group_by)}\"\n    base_query += \" FROM transactions\"\n    base_query += \" WHERE organization_id = #{current_organization.id}\"\n    base_query += build_date_filter(filters)\n    base_query += build_status_filter(filters)\n    base_query += \" GROUP BY #{group_by}\" if group_by.present?\n    base_query += \" ORDER BY #{sort_col} #{sort_dir}\"\n    base_query += \" LIMIT #{(params[:limit] || 100).to_i}\"\n\n    results = ActiveRecord::Base.connection.exec_query(base_query)\n\n    render json: {\n      data: results.to_a,\n      meta: { total: results.count, generated_at: Time.current }\n    }\n  end\n\n  private\n\n  def build_select_clause(group_by)\n    if group_by.present?\n      # Allow grouping by specific columns for aggregate reports\n      \"#{group_by}, COUNT(*) as count, SUM(amount) as total_amount\"\n    else\n      \"id, reference_number, amount, status, created_at, metadata\"\n    end\n  end\n\n  def build_date_filter(filters)\n    return '' unless filters[:start_date] && filters[:end_date]\n    start_date = ActiveRecord::Base.connection.quote(filters[:start_date])\n    end_date = ActiveRecord::Base.connection.quote(filters[:end_date])\n    \" AND created_at BETWEEN #{start_date} AND #{end_date}\"\n  end\n\n  def build_status_filter(filters)\n    return '' unless filters[:status].present?\n    statuses = Array(filters[:status]).map { |s| ActiveRecord::Base.connection.quote(s) }\n    \" AND status IN (#{statuses.join(',')})\"\n  end\n\n  def validate_date_range\n    if params.dig(:filters, :start_date) && params.dig(:filters, :end_date)\n      start_d = Date.parse(params[:filters][:start_date]) rescue nil\n      end_d = Date.parse(params[:filters][:end_date]) rescue nil\n      if start_d && end_d && (end_d - start_d) > 365\n        render json: { error: 'Date range cannot exceed 365 days' }, status: :unprocessable_entity\n      end\n    end\n  end\n\n  def authenticate_api_key!\n    api_key = request.headers['X-API-Key']\n    unless ApiKey.active.exists?(key: api_key)\n      render json: { error: 'Unauthorized' }, status: :unauthorized\n    end\n  end\n\n  def current_organization\n    @current_organization ||= ApiKey.find_by(key: request.headers['X-API-Key']).organization\n  end\nend\n\n# config/routes.rb (excerpt)\n# namespace :api do\n#   namespace :v1 do\n#     post 'reports/generate', to: 'reports#generate'\n#   end\n# end",
+  "environment": {
+    "description": "Rails 7.1 application deployed on ECS Fargate connecting through PgBouncer 1.21 in transaction pooling mode with a custom query inspection module. PgBouncer is configured with `disable_pqexec=1` and runs behind a sidecar proxy that enforces protocol-level prepared statement routing. The pgbouncer.ini sets `server_prepared_statements=yes` with `max_prepared_statements=0` which forces all queries through the extended query protocol parse/bind/execute cycle. Combined with a pg_query_inspector extension loaded via shared_preload_libraries on the RDS instance that rejects any query AST containing more than one statement or unexpected DDL/DML nodes not matching the registered query patterns for the application's prepared statement cache. The extension maintains a query shape allowlist populated during deployment via rake task that fingerprints all expected query patterns.",
+    "config": {
+      "database": "PostgreSQL 15 on RDS with pg_query_inspector extension",
+      "connection": "ECS task -> PgBouncer sidecar (port 6432) -> RDS (port 5432)",
+      "pooler": "PgBouncer 1.21 transaction mode",
+      "pgbouncer_settings": {
+        "pool_mode": "transaction",
+        "disable_pqexec": 1,
+        "server_prepared_statements": "yes",
+        "max_prepared_statements": 0
+      },
+      "pg_query_inspector": {
+        "mode": "enforce",
+        "allowlist_source": "deploy-time fingerprint via rake db:register_queries",
+        "reject_multi_statement": true,
+        "reject_unknown_shapes": true,
+        "log_rejections": true
+      },
+      "web_server": "Puma 6.4",
+      "rails_version": "7.1.3",
+      "waf": "none",
+      "prepared_statements": false
+    }
+  }
+}

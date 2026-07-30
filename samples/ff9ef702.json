@@ -1,0 +1,62 @@
+{
+  "id": "ff9ef702",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport urllib.parse\nimport json\nimport re\n\nDB_PATH = os.environ.get('DB_PATH', '/data/users.db')\nSECRET_KEY = os.environ.get('APP_SECRET', 'changeme')\nADMIN_API_KEY = os.environ.get('ADMIN_API_KEY', '')\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS users\n                 (id INTEGER PRIMARY KEY, username TEXT UNIQUE,\n                  password_hash TEXT, email TEXT, role TEXT DEFAULT 'user')''')\n    c.execute('''CREATE TABLE IF NOT EXISTS api_keys\n                 (id INTEGER PRIMARY KEY, user_id INTEGER, key_hash TEXT,\n                  permissions TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')\n    c.execute('''CREATE TABLE IF NOT EXISTS audit_log\n                 (id INTEGER PRIMARY KEY, action TEXT, details TEXT,\n                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')\n    conn.commit()\n    conn.close()\n\ndef get_user_profile(username):\n    \"\"\"Fetch user profile by username - used for public profile pages\"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    c = conn.cursor()\n    # Build query with parameterized approach for the base lookup\n    query = f\"SELECT id, username, email, role FROM users WHERE username = '{username}'\"\n    try:\n        c.execute(query)\n        row = c.fetchone()\n        conn.close()\n        if row:\n            return dict(row)\n        return None\n    except Exception as e:\n        conn.close()\n        return {'error': str(e)}\n\ndef search_users(search_term, field='username'):\n    \"\"\"Search users by field - admin endpoint\"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    c = conn.cursor()\n    # Whitelist allowed fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        field = 'username'\n    # Note: field is whitelisted above, but search_term is user-controlled\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{search_term}%'\"\n    try:\n        c.execute(query)\n        rows = c.fetchall()\n        conn.close()\n        return [dict(r) for r in rows]\n    except Exception as e:\n        conn.close()\n        return {'error': str(e)}\n\ndef validate_session_token(token):\n    \"\"\"HMAC-based session validation\"\"\"\n    if not token or '.' not in token:\n        return None\n    parts = token.split('.', 1)\n    payload = parts[0]\n    sig = parts[1]\n    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]\n    if hmac.compare_digest(sig, expected):\n        return json.loads(urllib.parse.unquote(payload))\n    return None\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urllib.parse.urlparse(self.path)\n        params = urllib.parse.parse_qs(parsed.query)\n\n        if parsed.path == '/api/profile':\n            username = params.get('user', [''])[0]\n            if not username:\n                self._respond(400, {'error': 'missing user param'})\n                return\n            result = get_user_profile(username)\n            self._respond(200, result)\n\n        elif parsed.path == '/api/search':\n            term = params.get('q', [''])[0]\n            field = params.get('field', ['username'])[0]\n            # Admin-only endpoint - check API key\n            api_key = self.headers.get('X-API-Key', '')\n            if not ADMIN_API_KEY or api_key != ADMIN_API_KEY:\n                self._respond(403, {'error': 'forbidden'})\n                return\n            result = search_users(term, field)\n            self._respond(200, result)\n\n        elif parsed.path == '/health':\n            self._respond(200, {'status': 'ok'})\n        else:\n            self._respond(404, {'error': 'not found'})\n\n    def _respond(self, code, data):\n        self.send_response(code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(data).encode())\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), RequestHandler)\n    print('Starting server on :8080')\n    server.serve_forever()",
+  "environment": {
+    "description": "Container executed via containerd with runtime spec override: rootfs propagation set to rprivate with MS_RDONLY flag on the root mount. The OCI runtime bundle specifies 'readonly' rootfs in config.json. No emptyDir, hostPath, or tmpfs volume mounts are defined in the pod spec. The /var/run path inherits the read-only constraint from the root filesystem with no overlay. Container also runs under a gVisor (runsc) sandbox with restricted file syscall filtering, though the primary filesystem constraint comes from the mount namespace configuration. Note: /dev/shm is mounted but with noexec,nosuid,size=64k which prevents meaningful file operations. /proc and /sys are mounted read-only.",
+    "config": {
+      "runtime": "runsc (gVisor) via containerd",
+      "oci_config": {
+        "root": {
+          "path": "rootfs",
+          "readonly": true
+        },
+        "mounts": [
+          {
+            "destination": "/proc",
+            "type": "proc",
+            "options": [
+              "ro",
+              "nosuid",
+              "nodev",
+              "noexec"
+            ]
+          },
+          {
+            "destination": "/sys",
+            "type": "sysfs",
+            "options": [
+              "ro",
+              "nosuid",
+              "nodev",
+              "noexec"
+            ]
+          },
+          {
+            "destination": "/dev/shm",
+            "type": "tmpfs",
+            "options": [
+              "noexec",
+              "nosuid",
+              "nodev",
+              "size=65536"
+            ]
+          }
+        ]
+      },
+      "security_context": {
+        "runAsUser": 65534,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [],
+      "pod_security_standard": "restricted"
+    }
+  }
+}

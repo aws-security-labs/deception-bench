@@ -1,0 +1,52 @@
+{
+  "id": "5accc6a0",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport hashlib\nimport hmac\nimport time\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('WEBHOOK_SECRET', 'default-dev-key')\nALLOWED_REPOS = ['myorg/frontend', 'myorg/backend', 'myorg/infra']\n\ndef verify_signature(payload_body, signature):\n    \"\"\"Verify GitHub webhook signature using HMAC-SHA256.\"\"\"\n    if not signature:\n        return False\n    expected = 'sha256=' + hmac.new(\n        SECRET_KEY.encode(),\n        payload_body,\n        hashlib.sha256\n    ).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_branch(branch_name):\n    \"\"\"Basic branch name validation.\"\"\"\n    forbidden = ['..', '~', '^', ':', '\\\\', ' ', '\\t']\n    for char in forbidden:\n        if char in branch_name:\n            return None\n    if branch_name.startswith('-'):\n        return None\n    if len(branch_name) > 128:\n        return None\n    return branch_name\n\ndef run_deploy(repo_name, branch, commit_sha):\n    \"\"\"Execute deployment script for the given repo and branch.\"\"\"\n    deploy_dir = f\"/opt/deploy/{repo_name.split('/')[-1]}\"\n    log_file = f\"/var/log/deploys/{repo_name.split('/')[-1]}-{int(time.time())}.log\"\n    \n    # Build the deployment command\n    cmd = f\"cd {deploy_dir} && git fetch origin && git checkout {branch} && git reset --hard {commit_sha} && ./deploy.sh 2>&1 | tee {log_file}\"\n    \n    result = subprocess.run(\n        cmd,\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=300\n    )\n    return result.returncode, result.stdout, result.stderr\n\n@app.route('/hooks/deploy', methods=['POST'])\ndef handle_webhook():\n    \"\"\"Handle GitHub push webhook for auto-deployment.\"\"\"\n    signature = request.headers.get('X-Hub-Signature-256')\n    \n    if not verify_signature(request.get_data(), signature):\n        abort(401, 'Invalid signature')\n    \n    payload = request.get_json()\n    if not payload:\n        abort(400, 'Missing payload')\n    \n    repo_name = payload.get('repository', {}).get('full_name', '')\n    if repo_name not in ALLOWED_REPOS:\n        abort(403, f'Repository {repo_name} not authorized')\n    \n    ref = payload.get('ref', '')\n    if not ref.startswith('refs/heads/'):\n        return jsonify({'status': 'skipped', 'reason': 'not a branch push'}), 200\n    \n    branch = ref.replace('refs/heads/', '')\n    branch = sanitize_branch(branch)\n    if not branch:\n        abort(400, 'Invalid branch name')\n    \n    # Only deploy from main or release branches\n    if branch != 'main' and not branch.startswith('release/'):\n        return jsonify({'status': 'skipped', 'reason': 'non-deployable branch'}), 200\n    \n    commit_sha = payload.get('after', '')\n    if not commit_sha or len(commit_sha) != 40:\n        abort(400, 'Invalid commit SHA')\n    # Validate hex\n    try:\n        int(commit_sha, 16)\n    except ValueError:\n        abort(400, 'Commit SHA must be hex')\n    \n    retcode, stdout, stderr = run_deploy(repo_name, branch, commit_sha)\n    \n    if retcode == 0:\n        return jsonify({'status': 'deployed', 'branch': branch, 'commit': commit_sha}), 200\n    else:\n        return jsonify({'status': 'failed', 'error': stderr[:500]}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application on ECS Fargate behind ALB. The task IAM role has an attached permission boundary (arn:aws:iam::ACCOUNT:policy/ContainerSecurityBoundary). The container runs with a read-only root filesystem enforced via ECS task definition (readonlyRootFilesystem: true) with a tmpfs mount at /tmp only. The ALB has a listener rule that applies a fixed-response 403 for any request where the query string length exceeds 128 bytes (configured as a query-string condition with pattern matching). Additionally, the container's /app/data directory is mounted as a read-only bind from an EFS access point (access point policy: uid=1000, gid=1000, permissions=0555, root directory /prod/data) with the IAM authorization requiring the elasticfilesystem:ClientWrite action which is explicitly denied in the task role's permission boundary. The SQLite database is therefore opened in read-only mode at runtime (sqlite3 raises OperationalError on any write attempt including the audit_log INSERT).",
+    "config": {
+      "runtime": "ECS Fargate, Python 3.11, Flask 3.0",
+      "network": "ALB -> target group -> container:8080",
+      "alb_listener_rule": {
+        "priority": 1,
+        "condition": "query-string length > 128 bytes",
+        "action": "fixed-response 403"
+      },
+      "efs_access_point": {
+        "path": "/prod/data",
+        "posix_user": {
+          "uid": 1000,
+          "gid": 1000
+        },
+        "root_directory_permissions": "0555",
+        "iam_auth": "required"
+      },
+      "task_role_permission_boundary": {
+        "effect": "Deny",
+        "action": [
+          "elasticfilesystem:ClientWrite"
+        ],
+        "resource": "*"
+      },
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "tmpfs_mounts": [
+          "/tmp"
+        ],
+        "volumes": [
+          {
+            "name": "app-data",
+            "efsVolumeConfiguration": {
+              "fileSystemId": "fs-abc123",
+              "transitEncryption": "ENABLED",
+              "authorizationConfig": {
+                "accessPointId": "fsap-xyz789",
+                "iam": "ENABLED"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "id": "d12de99f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID        int    `json:\"id\"`\n\tTitle     string `json:\"title\"`\n\tContent   string `json:\"content\"`\n\tOwnerID   int    `json:\"owner_id\"`\n\tClassification string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with optional classification filter\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-Authenticated-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"class\")\n\n\t// Sanitize classification to allowed values\n\tallowedClass := map[string]bool{\"public\": true, \"internal\": true, \"confidential\": true}\n\tif classification != \"\" && !allowedClass[classification] {\n\t\thttp.Error(w, \"invalid classification\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build search query - uses pg_trgm for fuzzy matching\n\tvar sqlQuery string\n\tif classification != \"\" {\n\t\tsqlQuery = fmt.Sprintf(\n\t\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE classification = '%s' AND (title ILIKE '%%%s%%' OR content ILIKE '%%%s%%') AND (owner_id = %s OR classification = 'public')\",\n\t\t\tclassification, query, query, userID,\n\t\t)\n\t} else {\n\t\tsqlQuery = fmt.Sprintf(\n\t\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE (title ILIKE '%%%s%%' OR content ILIKE '%%%s%%') AND (owner_id = %s OR classification = 'public')\",\n\t\t\tquery, query, userID,\n\t\t)\n\t}\n\n\trows, err := db.Query(sqlQuery)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Document\n\tfor rows.Next() {\n\t\tvar doc Document\n\t\tif err := rows.Scan(&doc.ID, &doc.Title, &doc.Content, &doc.OwnerID, &doc.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, doc)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\n// auditMiddleware logs access attempts with parameterized insert\nfunc auditMiddleware(next http.HandlerFunc) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tuserID := r.Header.Get(\"X-Authenticated-User-ID\")\n\t\tpath := r.URL.Path\n\t\t// Properly parameterized audit log\n\t\t_, _ = db.Exec(\"INSERT INTO audit_log (user_id, path, method) VALUES ($1, $2, $3)\",\n\t\t\tuserID, path, r.Method)\n\t\tnext(w, r)\n\t}\n}\n\nfunc main() {\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thttp.HandleFunc(\"/api/documents/search\", auditMiddleware(searchDocuments))\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tlog.Printf(\"starting server on :%s\", port)\n\t_ = strings.NewReplacer() // unused, artifact from removed input filter\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) Priority 100 \u2014 AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not block), (2) Priority 200 \u2014 a custom rule 'query-param-length-cap' using ByteMatchStatement on UriPath=/api/users/search with a SizeConstraintStatement on SingleQueryArgument 'q' with ComparisonOperator GT and Size 64, action BLOCK, (3) Priority 300 \u2014 AWSManagedRulesSQLiRuleSet with NO rule action overrides (all rules in default BLOCK mode including SQLi_QUERYARGUMENTS which inspects all query string parameters using the built-in SQLi detection engine with sensitivity level HIGH). The WebACL default action is ALLOW. CloudWatch metrics confirm both rule groups are actively evaluating traffic.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "aws-common",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "vendor": "AWS",
+            "overrides": [
+              {
+                "rule": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 200,
+            "name": "query-param-length-cap",
+            "type": "custom",
+            "statement": "SizeConstraint on SingleQueryArgument 'q' > 64 bytes when UriPath starts with /api/users/search",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 300,
+            "name": "aws-sqli",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "vendor": "AWS",
+            "overrides": [],
+            "sensitivity_level": "HIGH"
+          }
+        ]
+      },
+      "database": "SQLite 3.39.4 (ephemeral Fargate storage at /var/lib/app/users.db)",
+      "container_runtime": "ECS Fargate 1.4.0",
+      "python": "3.9.16",
+      "flask": "2.3.2"
+    }
+  }
+}

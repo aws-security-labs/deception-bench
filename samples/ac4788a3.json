@@ -1,0 +1,41 @@
+{
+  "id": "ac4788a3",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String action = req.getParameter(\"action\");\n        if (\"export\".equals(action)) {\n            handleExport(req, resp);\n        } else if (\"preview\".equals(action)) {\n            handlePreview(req, resp);\n        } else {\n            resp.sendError(400, \"Unknown action\");\n        }\n    }\n\n    private void handlePreview(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String templateId = req.getParameter(\"templateId\");\n        // templateId is validated as integer\n        if (templateId == null || !templateId.matches(\"\\\\d+\")) {\n            resp.sendError(400, \"Invalid templateId\");\n            return;\n        }\n        resp.setContentType(\"text/html\");\n        resp.getWriter().write(\"<html><body>Template \" +\n            StringEscapeUtils.escapeHtml4(templateId) + \" preview</body></html>\");\n    }\n\n    private void handleExport(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String filterExpr = req.getParameter(\"filter\");\n\n        // Validate reportType against whitelist\n        Set<String> validTypes = new HashSet<>(Arrays.asList(\n            \"sales\", \"inventory\", \"users\", \"audit\"));\n        if (reportType == null || !validTypes.contains(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate dateRange format\n        if (dateRange != null && !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        // Validate sort column against whitelist\n        Set<String> validSorts = new HashSet<>(Arrays.asList(\n            \"created_at\", \"amount\", \"name\", \"id\"));\n        if (sortCol != null && !validSorts.contains(sortCol)) {\n            sortCol = \"id\";\n        }\n\n        // Build query - filter is used for WHERE clause customization\n        String baseQuery = \"SELECT * FROM report_\" + reportType;\n        StringBuilder query = new StringBuilder(baseQuery);\n\n        if (dateRange != null) {\n            String[] parts = dateRange.split(\"_\");\n            query.append(\" WHERE created_at BETWEEN '\")\n                 .append(parts[0]).append(\"' AND '\").append(parts[1]).append(\"'\");\n        }\n\n        // The filter parameter allows advanced users to specify additional conditions\n        // It's appended after basic validation of parentheses balance\n        if (filterExpr != null && !filterExpr.isEmpty()) {\n            if (isBalancedParens(filterExpr)) {\n                if (dateRange != null) {\n                    query.append(\" AND \").append(filterExpr);\n                } else {\n                    query.append(\" WHERE \").append(filterExpr);\n                }\n            }\n        }\n\n        if (sortCol != null) {\n            query.append(\" ORDER BY \").append(sortCol);\n        }\n        query.append(\" LIMIT 1000\");\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query.toString())) {\n\n            resp.setContentType(\"text/csv\");\n            resp.setHeader(\"Content-Disposition\",\n                \"attachment; filename=report_\" + reportType + \".csv\");\n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            for (int i = 1; i <= cols; i++) {\n                out.print(meta.getColumnName(i));\n                if (i < cols) out.print(\",\");\n            }\n            out.println();\n            while (rs.next()) {\n                for (int i = 1; i <= cols; i++) {\n                    String val = rs.getString(i);\n                    out.print(val != null ? \"\\\"\" + val.replace(\"\\\"\", \"\\\"\\\"\") + \"\\\"\" : \"\");\n                    if (i < cols) out.print(\",\");\n                }\n                out.println();\n            }\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query error\");\n        }\n    }\n\n    private boolean isBalancedParens(String s) {\n        int count = 0;\n        for (char c : s.toCharArray()) {\n            if (c == '(') count++;\n            else if (c == ')') count--;\n            if (count < 0) return false;\n        }\n        return count == 0;\n    }\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with condition path-pattern /api/* that has an associated WAFv2 WebACL. The WebACL contains a single custom rule group with a RegexPatternSet-based rule that inspects QUERY_STRING with pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)` in BLOCK action with priority 1, plus a rate-based rule at 100 requests per 5 minutes per source IP at priority 2. (3) Priority 99: default action forward to target group. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc ENI security group which allows outbound only to pl-63a5400a (com.amazonaws.us-east-1.logs prefix list) on port 443.",
+    "config": {
+      "compute": "ECS Fargate, task CPU 512, memory 1024, platform version 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "sql-pattern-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)"
+              }
+            }
+          },
+          {
+            "name": "rate-limit",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "rate_based": {
+                "limit": 100,
+                "aggregate_key_type": "IP"
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "security_group_egress": "outbound 443 to pl-63a5400a only (CloudWatch Logs VPC endpoint)",
+      "vpc": "private subnets, no internet gateway, no NAT gateway"
+    }
+  }
+}

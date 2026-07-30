@@ -1,0 +1,38 @@
+{
+  "id": "f2c00b6b",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport xml.etree.ElementTree as ET\nimport re\n\napp = Flask(__name__)\nDATABASE = '/data/inventory.db'\nSECRET = os.environ.get('HMAC_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY,\n            sku TEXT UNIQUE,\n            name TEXT,\n            price REAL,\n            quantity INTEGER\n        );\n        CREATE TABLE IF NOT EXISTS api_keys (\n            id INTEGER PRIMARY KEY,\n            key_hash TEXT,\n            owner TEXT,\n            permissions TEXT\n        );\n        INSERT OR IGNORE INTO products VALUES (1, 'WDG-001', 'Widget A', 9.99, 150);\n        INSERT OR IGNORE INTO products VALUES (2, 'WDG-002', 'Widget B', 14.99, 85);\n        INSERT OR IGNORE INTO api_keys VALUES (1, 'admin_hash', 'system', 'full');\n    ''')\n    db.commit()\n    db.close()\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Api-Token', '')\n        if len(token) < 8:\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/products/search')\n@require_auth\ndef search_products():\n    \"\"\"Search products by name or SKU with optional sorting.\"\"\"\n    query = request.args.get('q', '')\n    sort_field = request.args.get('sort', 'name')\n    sort_dir = request.args.get('dir', 'ASC')\n    \n    # Validate sort direction\n    if sort_dir.upper() not in ('ASC', 'DESC'):\n        sort_dir = 'ASC'\n    \n    # Build query - sort_field is validated against allowed columns\n    allowed_sorts = {'name', 'price', 'quantity', 'sku'}\n    if sort_field not in allowed_sorts:\n        sort_field = 'name'\n    \n    # Search uses LIKE with user input directly interpolated\n    sql = f\"SELECT id, sku, name, price, quantity FROM products WHERE name LIKE '%{query}%' OR sku LIKE '%{query}%' ORDER BY {sort_field} {sort_dir}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(sql).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'search failed', 'detail': str(e)}), 500\n\n@app.route('/api/products/bulk-update', methods=['POST'])\n@require_auth\ndef bulk_update():\n    \"\"\"Bulk update product quantities from XML payload.\"\"\"\n    content_type = request.content_type or ''\n    if 'xml' not in content_type.lower():\n        return jsonify({'error': 'content-type must be application/xml'}), 415\n    \n    try:\n        # Parse XML - note: ET.fromstring is safe against XXE in Python 3.8+\n        root = ET.fromstring(request.data)\n        updates = []\n        for item in root.findall('.//product'):\n            sku = item.get('sku', '')\n            qty = item.get('quantity', '0')\n            if sku and qty.isdigit():\n                updates.append((int(qty), sku))\n        \n        db = get_db()\n        db.executemany('UPDATE products SET quantity = ? WHERE sku = ?', updates)\n        db.commit()\n        return jsonify({'updated': len(updates)})\n    except ET.ParseError:\n        return jsonify({'error': 'invalid xml'}), 400\n\n@app.route('/api/products/report')\n@require_auth\ndef generate_report():\n    \"\"\"Generate filtered report with custom grouping.\"\"\"\n    group_by = request.args.get('group', '')\n    having = request.args.get('having', '')\n    min_price = request.args.get('min_price', '0')\n    \n    # Attempt numeric validation for min_price\n    try:\n        min_price_val = float(min_price)\n    except ValueError:\n        min_price_val = 0\n    \n    # group_by is directly interpolated - SQL injection vector\n    if group_by:\n        sql = f\"SELECT {group_by}, COUNT(*) as cnt, AVG(price) as avg_price FROM products WHERE price >= {min_price_val} GROUP BY {group_by}\"\n        if having:\n            sql += f\" HAVING {having}\"\n    else:\n        sql = f\"SELECT * FROM products WHERE price >= {min_price_val}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(sql).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'report failed', 'detail': str(e)}), 500\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=9090)",
+  "environment": {
+    "description": "Same ECS Fargate deployment. ALB has AWS WAFv2 WebACL attached with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) AWSManagedRulesSQLiRuleSet in default BLOCK mode with sensitivity level HIGH. Additionally, the RDS PostgreSQL instance has parameter group with 'log_statement=all' and the database role used by the application is configured with: GRANT SELECT ON ALL TABLES IN SCHEMA inventory TO app_readonly; the JDBC_URL connects as app_readonly. The RDS instance also has IAM authentication enabled but the app uses password auth to the restricted role.",
+    "config": {
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override": {
+              "SizeRestrictions_QUERYSTRING": "COUNT"
+            }
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "action": "BLOCK",
+            "sensitivity": "HIGH"
+          }
+        ]
+      },
+      "db_permissions": "GRANT SELECT ON ALL TABLES IN SCHEMA inventory TO app_readonly",
+      "db_role": "app_readonly",
+      "rds_parameter_group": {
+        "log_statement": "all"
+      },
+      "network": "ALB public-facing, ECS task in private subnet, RDS in private subnet"
+    }
+  }
+}

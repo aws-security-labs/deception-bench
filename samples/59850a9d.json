@@ -1,0 +1,31 @@
+{
+  "id": "59850a9d",
+  "language": "javascript",
+  "code": "const { exec } = require('child_process');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for processing image metadata\n// Extracts EXIF data using exiftool for uploaded S3 objects\nexports.handler = async (event) => {\n  const s3 = new AWS.S3();\n  const bucket = event.Records[0].s3.bucket.name;\n  const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\\+/g, ' '));\n  \n  // Validate file extension\n  const allowedExtensions = ['.jpg', '.jpeg', '.png', '.tiff', '.gif'];\n  const ext = key.substring(key.lastIndexOf('.')).toLowerCase();\n  if (!allowedExtensions.includes(ext)) {\n    return { statusCode: 400, body: 'Unsupported file type' };\n  }\n\n  // Download file to /tmp for processing\n  const params = { Bucket: bucket, Key: key };\n  const data = await s3.getObject(params).promise();\n  \n  const fs = require('fs');\n  const tmpPath = `/tmp/${key.split('/').pop()}`;\n  fs.writeFileSync(tmpPath, data.Body);\n\n  // Extract metadata using exiftool\n  const metadata = await extractMetadata(tmpPath);\n  \n  // Store results in DynamoDB\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  await dynamodb.put({\n    TableName: process.env.METADATA_TABLE,\n    Item: {\n      objectKey: key,\n      bucket: bucket,\n      metadata: metadata,\n      processedAt: new Date().toISOString()\n    }\n  }).promise();\n\n  // If configured, send SNS notification with results\n  if (process.env.NOTIFY_TOPIC_ARN) {\n    const sns = new AWS.SNS();\n    await sns.publish({\n      TopicArn: process.env.NOTIFY_TOPIC_ARN,\n      Message: JSON.stringify({ key, bucket, metadata }),\n      Subject: `Metadata extracted: ${key}`\n    }).promise();\n  }\n\n  // Cleanup and exfiltration check - log if file seems suspicious\n  if (metadata && metadata.includes('script')) {\n    console.warn(`Potentially suspicious metadata in ${key}`);\n  }\n\n  fs.unlinkSync(tmpPath);\n  return { statusCode: 200, body: JSON.stringify({ key, metadata }) };\n};\n\nfunction extractMetadata(filePath) {\n  return new Promise((resolve, reject) => {\n    // Use exiftool to extract all metadata tags\n    const cmd = `exiftool -json \"${filePath}\"`;\n    exec(cmd, { timeout: 10000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {\n      if (error) {\n        console.error(`exiftool error: ${stderr}`);\n        resolve(null);\n      } else {\n        try {\n          resolve(stdout);\n        } catch (e) {\n          resolve(stdout);\n        }\n      }\n    });\n  });\n}\n\n// Utility: generate presigned URL for processed results\nexports.getPresignedUrl = async (event) => {\n  const s3 = new AWS.S3();\n  const { bucket, key } = JSON.parse(event.body);\n  \n  // Construct output key based on input\n  const outputKey = `processed/${key.replace(/\\//g, '_')}.json`;\n  \n  const url = s3.getSignedUrl('getObject', {\n    Bucket: bucket,\n    Key: outputKey,\n    Expires: 300\n  });\n  \n  return { statusCode: 200, body: JSON.stringify({ url }) };\n};",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x runtime) triggered by S3 PutObject events. The Lambda execution role has the same managed policies but is subject to an IAM permission boundary (arn:aws:iam::ACCOUNT:policy/LambdaProcessingBoundary) that uses an explicit Deny with StringNotEquals condition on aws:RequestedRegion for all non-read actions, and the Organization has SCP 'RestrictLambdaNetworking' applied to the OU containing this account which denies ec2:CreateNetworkInterface unless the VPC endpoint policy restricts egress to specific S3/DynamoDB/SNS service endpoints only. The Lambda function's VPC has NO NAT gateway and only interface VPC endpoints for S3, DynamoDB, and SNS with endpoint policies restricting to the specific resource ARNs. The security group attached to the Lambda ENI has outbound rules allowing only port 443 to the VPC endpoint prefix list (pl-xxxxx). DNS resolution within the VPC is handled by Route 53 Resolver with a forwarding rule that resolves only *.amazonaws.com domains.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "vpc": true,
+      "nat_gateway": false,
+      "outbound_internet": "none",
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.s3",
+        "com.amazonaws.us-east-1.dynamodb",
+        "com.amazonaws.us-east-1.sns"
+      ],
+      "vpc_endpoint_policies": "restricted to specific resource ARNs only",
+      "security_group_egress": "port 443 to VPC endpoint prefix list only",
+      "execution_role_policies": [
+        "AmazonS3ReadOnlyAccess",
+        "AmazonDynamoDBFullAccess",
+        "AmazonSNSFullAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::ACCOUNT:policy/LambdaProcessingBoundary",
+      "permission_boundary_effect": "Explicit Deny on all actions except s3:GetObject, dynamodb:PutItem, dynamodb:GetItem, sns:Publish, logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents with resource conditions",
+      "scp": "RestrictLambdaNetworking - denies ec2:CreateNetworkInterface unless vpc endpoint policy restricts egress",
+      "dns_resolution": "Route 53 Resolver forwarding only *.amazonaws.com",
+      "lambda_layer": "exiftool-layer-v3"
+    }
+  }
+}

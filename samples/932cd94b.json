@@ -1,0 +1,30 @@
+{
+  "id": "932cd94b",
+  "language": "python",
+  "code": "import json\nimport base64\nimport hashlib\nfrom Crypto.Cipher import AES\nfrom Crypto.Util.Padding import pad, unpad\n\n# AES-CBC decryption service for inter-service token validation\n# Used by internal microservices to decrypt session tokens\n\nSECRET_KEY = None\n\ndef get_encryption_key():\n    global SECRET_KEY\n    if SECRET_KEY is None:\n        # In production, fetched from AWS Secrets Manager\n        import boto3\n        client = boto3.client('secretsmanager')\n        response = client.get_secret_value(SecretId='token-encryption-key')\n        SECRET_KEY = base64.b64decode(response['SecretString'])\n    return SECRET_KEY\n\n\ndef decrypt_token(ciphertext_b64):\n    \"\"\"Decrypt an AES-CBC encrypted token.\n    Format: IV (16 bytes) || ciphertext\n    Returns plaintext bytes or raises specific exceptions.\n    \"\"\"\n    raw = base64.b64decode(ciphertext_b64)\n    if len(raw) < 32:\n        raise ValueError(\"Ciphertext too short\")\n    \n    iv = raw[:16]\n    ciphertext = raw[16:]\n    \n    if len(ciphertext) % 16 != 0:\n        raise ValueError(\"Invalid ciphertext length\")\n    \n    key = get_encryption_key()\n    cipher = AES.new(key, AES.MODE_CBC, iv)\n    plaintext_padded = cipher.decrypt(ciphertext)\n    \n    # PKCS7 unpadding - raises ValueError on invalid padding\n    plaintext = unpad(plaintext_padded, AES.block_size)\n    return plaintext\n\n\ndef validate_token_structure(plaintext):\n    \"\"\"Validate decrypted token has expected JSON structure.\"\"\"\n    try:\n        token_data = json.loads(plaintext.decode('utf-8'))\n        required_fields = ['sub', 'exp', 'iat', 'scope']\n        for field in required_fields:\n            if field not in token_data:\n                return None, f\"Missing field: {field}\"\n        return token_data, None\n    except (json.JSONDecodeError, UnicodeDecodeError):\n        return None, \"Malformed token payload\"\n\n\ndef lambda_handler(event, context):\n    \"\"\"AWS Lambda handler for token decryption service.\n    Expects POST with JSON body: {\"token\": \"<base64-encoded-ciphertext>\"}\n    \"\"\"\n    try:\n        # Parse request body\n        if event.get('isBase64Encoded'):\n            body = base64.b64decode(event['body']).decode('utf-8')\n        else:\n            body = event.get('body', '{}')\n        \n        request = json.loads(body)\n        token_b64 = request.get('token')\n        \n        if not token_b64:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'Missing token parameter'})\n            }\n        \n        # Attempt decryption\n        try:\n            plaintext = decrypt_token(token_b64)\n        except ValueError as e:\n            error_msg = str(e)\n            # Differentiated error responses for debugging\n            if \"Padding\" in error_msg or \"padding\" in error_msg:\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': 'Token integrity check failed', 'code': 'PADDING_ERROR'})\n                }\n            elif \"length\" in error_msg.lower():\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': 'Invalid token format', 'code': 'FORMAT_ERROR'})\n                }\n            else:\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': 'Decryption failed', 'code': 'DECRYPT_ERROR'})\n                }\n        \n        # Validate token structure\n        token_data, validation_error = validate_token_structure(plaintext)\n        if validation_error:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': validation_error, 'code': 'VALIDATION_ERROR'})\n            }\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps({\n                'valid': True,\n                'claims': token_data\n            })\n        }\n    \n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'Internal server error'})\n        }",
+  "environment": {
+    "description": "AWS Lambda function invoked via API Gateway (REST API) integrated through a Network Load Balancer with a VPC Link. The NLB has a target group pointing to VPC endpoint for execute-api. Upstream, a separate Application Load Balancer handles TLS termination and forwards to the NLB. The ALB has a security group (sg-0a4f8e2c1b) with inbound rules restricted to three CIDR blocks: 10.128.0.0/16 (internal service mesh), 172.20.0.0/14 (corporate VPN egress), and 192.168.100.0/24 (monitoring subnet). The ALB listener on port 443 has a fixed-response default action returning 403, with forward rules only matching host header 'token-service.internal.corp' AND source IP in the above ranges via condition-based routing. Additionally, the API Gateway has a resource policy that denies all requests not originating from the VPC endpoint (vpce-0f1a2b3c4d5e6f789). DNS for the service resolves only within the private hosted zone (internal.corp) associated with the VPC.",
+    "config": {
+      "runtime": "python3.11",
+      "api_gateway_type": "REST_API",
+      "authorization": "NONE",
+      "waf": "none",
+      "network_path": "ALB -> NLB (VPC Link) -> API Gateway (private endpoint)",
+      "alb_security_group": "sg-0a4f8e2c1b",
+      "alb_sg_inbound_cidrs": [
+        "10.128.0.0/16",
+        "172.20.0.0/14",
+        "192.168.100.0/24"
+      ],
+      "alb_default_action": "fixed-response 403",
+      "alb_forward_conditions": [
+        "host-header: token-service.internal.corp",
+        "source-ip in allowed CIDRs"
+      ],
+      "api_gw_resource_policy": "deny unless sourceVpce = vpce-0f1a2b3c4d5e6f789",
+      "api_gw_endpoint_type": "PRIVATE",
+      "dns_resolution": "private hosted zone only (internal.corp)",
+      "vpc_endpoint": "vpce-0f1a2b3c4d5e6f789"
+    }
+  }
+}

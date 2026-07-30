@@ -1,0 +1,69 @@
+{
+  "id": "01b312f8",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 10,\n  ssl: { rejectUnauthorized: true }\n});\n\n// Middleware: verify API key\napp.use(async (req, res, next) => {\n  const apiKey = req.headers['x-api-key'];\n  if (!apiKey) return res.status(401).json({ error: 'Missing API key' });\n  const hash = crypto.createHash('sha256').update(apiKey).digest('hex');\n  const result = await pool.query('SELECT org_id, tier FROM api_keys WHERE key_hash = $1 AND revoked = false', [hash]);\n  if (result.rows.length === 0) return res.status(403).json({ error: 'Invalid key' });\n  req.orgId = result.rows[0].org_id;\n  req.tier = result.rows[0].tier;\n  next();\n});\n\n// Rate limiting by tier\nconst rateLimits = { free: 10, pro: 100, enterprise: 1000 };\nconst counters = new Map();\napp.use((req, res, next) => {\n  const key = `${req.orgId}:${Math.floor(Date.now() / 60000)}`;\n  const count = (counters.get(key) || 0) + 1;\n  counters.set(key, count);\n  if (count > (rateLimits[req.tier] || 10)) {\n    return res.status(429).json({ error: 'Rate limit exceeded' });\n  }\n  next();\n});\n\n// Search endpoint with faceted filtering\napp.get('/api/v2/assets', async (req, res) => {\n  try {\n    const { category, region, status, sort_by, order, limit } = req.query;\n    \n    // Build base query with org isolation\n    let query = `SELECT id, name, category, region, status, value, last_audit \n                 FROM assets WHERE org_id = ${req.orgId}`;\n    \n    // Apply filters\n    if (category) {\n      const allowed = ['hardware', 'software', 'network', 'facility'];\n      if (allowed.includes(category)) {\n        query += ` AND category = '${category}'`;\n      }\n    }\n    \n    if (region) {\n      // Region codes validated against ISO 3166\n      query += ` AND region = '${region}'`;\n    }\n    \n    if (status) {\n      query += ` AND status = '${status}'`;\n    }\n    \n    // Sorting\n    const sortAllowlist = ['name', 'value', 'last_audit', 'created_at'];\n    if (sort_by && sortAllowlist.includes(sort_by)) {\n      const dir = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${dir}`;\n    } else {\n      query += ' ORDER BY name ASC';\n    }\n    \n    // Pagination\n    const lim = Math.min(parseInt(limit) || 25, 100);\n    query += ` LIMIT ${lim}`;\n    \n    const result = await pool.query(query);\n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Export endpoint - generates CSV\napp.get('/api/v2/assets/export', async (req, res) => {\n  try {\n    const result = await pool.query(\n      'SELECT id, name, category, region, status, value FROM assets WHERE org_id = $1',\n      [req.orgId]\n    );\n    const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n    res.setHeader('Content-Type', 'text/csv');\n    res.send(csv);\n  } catch (err) {\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\napp.listen(3000, () => console.log('Asset service running on :3000'));",
+  "environment": {
+    "description": "Same Flask application deployed identically on EC2 behind ALB. The ALB is associated with an AWS WAFv2 Web ACL. The Web ACL contains a single rule group reference: a custom rule group 'corp-api-input-validation' with priority 1 and override action none. This custom rule group contains two rules: (1) 'size-constraint-qs' which applies a SizeConstraintStatement on QueryString with ComparisonOperator GT and Size 64, action BLOCK; (2) 'regex-pattern-qs' which applies a RegexPatternSetReferenceStatement on QueryString using pattern set 'ps-sqli-union-subselect' (patterns: '(?i)union[\\s/\\*]+select', '(?i)select[\\s/\\*]+.*from[\\s/\\*]+', \"(?i)'[\\s]*or[\\s]*'\") with TextTransformation URL_DECODE priority 0 and LOWERCASE priority 1, action BLOCK. Web ACL default action is ALLOW. CloudWatch metrics enabled for both rules with sampled requests.",
+    "config": {
+      "alb_waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corp-api-protection/a1b2c3d4",
+      "rule_group": {
+        "name": "corp-api-input-validation",
+        "capacity": 30,
+        "rules": [
+          {
+            "name": "size-constraint-qs",
+            "priority": 1,
+            "statement": {
+              "SizeConstraintStatement": {
+                "FieldToMatch": {
+                  "QueryString": {}
+                },
+                "ComparisonOperator": "GT",
+                "Size": 64,
+                "TextTransformations": [
+                  {
+                    "Priority": 0,
+                    "Type": "NONE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "regex-pattern-qs",
+            "priority": 2,
+            "statement": {
+              "RegexPatternSetReferenceStatement": {
+                "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/ps-sqli-union-subselect/e5f6g7h8",
+                "FieldToMatch": {
+                  "QueryString": {}
+                },
+                "TextTransformations": [
+                  {
+                    "Priority": 0,
+                    "Type": "URL_DECODE"
+                  },
+                  {
+                    "Priority": 1,
+                    "Type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "regex_pattern_set": {
+        "name": "ps-sqli-union-subselect",
+        "patterns": [
+          "(?i)union[\\s/\\*]+select",
+          "(?i)select[\\s/\\*]+.*from[\\s/\\*]+",
+          "(?i)'[\\s]*or[\\s]*'"
+        ]
+      },
+      "web_acl_default_action": "ALLOW"
+    }
+  }
+}

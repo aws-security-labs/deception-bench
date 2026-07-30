@@ -1,0 +1,43 @@
+{
+  "id": "8841b249",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_session_token(token):\n    \"\"\"Verify HMAC-based session token: base64(user_id):timestamp:signature\"\"\"\n    try:\n        parts = token.split(':')\n        if len(parts) != 3:\n            return None\n        user_id, ts, sig = parts\n        if abs(time.time() - int(ts)) > 3600:\n            return None\n        expected = hmac.new(SECRET.encode(), f\"{user_id}:{ts}\".encode(), hashlib.sha256).hexdigest()\n        if hmac.compare_digest(expected, sig):\n            return user_id\n    except Exception:\n        return None\n    return None\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by name or department. Requires valid session.\"\"\"\n    auth = request.headers.get('X-Session-Token', '')\n    caller = verify_session_token(auth)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    query_param = request.args.get('q', '')\n    department = request.args.get('dept', '')\n    \n    # Build search query with filters\n    base_query = \"SELECT id, username, email, department FROM users WHERE 1=1\"\n    \n    if query_param:\n        # Search by username - using string formatting for LIKE pattern\n        base_query += f\" AND username LIKE '%{query_param}%'\"\n    \n    if department:\n        base_query += f\" AND department = '{department}'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'internal error'}), 500\n\n@app.route('/api/users/<int:user_id>/profile', methods=['GET'])\ndef get_profile(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    auth = request.headers.get('X-Session-Token', '')\n    caller = verify_session_token(auth)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    cursor = db.execute(\"SELECT id, username, email, department, role FROM users WHERE id = ?\", (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/admin/export', methods=['POST'])\ndef export_data():\n    \"\"\"Admin-only: export user data. Checks role from token.\"\"\"\n    auth = request.headers.get('X-Session-Token', '')\n    caller = verify_session_token(auth)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    cursor = db.execute(\"SELECT role FROM users WHERE id = ?\", (caller,))\n    row = cursor.fetchone()\n    if not row or row['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    \n    table = request.json.get('table', 'users')\n    # Restrict to allowed tables\n    allowed = ['users', 'departments', 'audit_log']\n    if table not in allowed:\n        return jsonify({'error': 'invalid table'}), 400\n    \n    cursor = db.execute(f\"SELECT * FROM {table}\")\n    results = [dict(row) for row in cursor.fetchall()]\n    return jsonify({'data': results})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) a custom rule group 'internal-geo-restrict' that blocks non-US source IPs with priority 50, (3) AWSManagedRulesKnownBadInputsRuleSet at priority 100. The WebACL default action is ALLOW. The ECS task role has no network egress except to the VPC endpoint for S3 (gateway endpoint) and CloudWatch Logs (interface endpoint). The container runs with a read-only root filesystem and the SQLite database is mounted from an EFS volume with encryption at rest. The task definition sets the container user to uid 1000 (non-root).",
+    "config": {
+      "load_balancer": "ALB with HTTPS listener, HTTP/2 enabled",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 10,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "action": "BLOCK",
+            "override": {
+              "SizeRestrictions_QUERYSTRING": "COUNT"
+            }
+          },
+          {
+            "priority": 50,
+            "name": "internal-geo-restrict",
+            "action": "BLOCK",
+            "scope": "non-US-source-IP"
+          },
+          {
+            "priority": 100,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": "private subnet, no internet gateway, egress only via VPC endpoints (S3 gateway, CloudWatch Logs interface)",
+      "ecs_task": {
+        "readonly_rootfs": true,
+        "user": "1000",
+        "no_new_privileges": true
+      },
+      "efs_mount": "/var/lib/app",
+      "sqlite_config": "SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION=0"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "id": "a6c504a5",
+  "language": "java",
+  "code": "package com.example.reporting;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.expression.ExpressionParser;\nimport org.springframework.expression.spel.standard.SpelExpressionParser;\nimport org.springframework.expression.spel.support.StandardEvaluationContext;\nimport org.springframework.expression.Expression;\nimport java.util.Map;\nimport java.util.HashMap;\n\n@SpringBootApplication\n@RestController\n@RequestMapping(\"/api/v2/reports\")\npublic class ReportFilterApplication {\n\n    private final ExpressionParser parser = new SpelExpressionParser();\n\n    public static void main(String[] args) {\n        SpringApplication.run(ReportFilterApplication.class, args);\n    }\n\n    // Internal report data store (simulated)\n    private Map<String, Object> getReportContext() {\n        Map<String, Object> ctx = new HashMap<>();\n        ctx.put(\"revenue\", 1500000);\n        ctx.put(\"quarter\", \"Q3\");\n        ctx.put(\"region\", \"EMEA\");\n        ctx.put(\"headcount\", 342);\n        ctx.put(\"margin\", 0.23);\n        return ctx;\n    }\n\n    /**\n     * Dynamic report filtering endpoint.\n     * Accepts a SpEL filter expression to evaluate against report metrics.\n     * Example: /api/v2/reports/filter?expr=revenue > 1000000\n     */\n    @GetMapping(\"/filter\")\n    public Map<String, Object> filterReport(@RequestParam(\"expr\") String filterExpression) {\n        StandardEvaluationContext context = new StandardEvaluationContext();\n        Map<String, Object> reportData = getReportContext();\n\n        // Set report variables into evaluation context\n        for (Map.Entry<String, Object> entry : reportData.entrySet()) {\n            context.setVariable(entry.getKey(), entry.getValue());\n        }\n\n        Map<String, Object> result = new HashMap<>();\n        try {\n            // Evaluate the user-provided expression\n            Expression expression = parser.parseExpression(filterExpression);\n            Object evalResult = expression.getValue(context);\n            result.put(\"filter_result\", evalResult);\n            result.put(\"expression\", filterExpression);\n            result.put(\"status\", \"success\");\n        } catch (Exception e) {\n            result.put(\"status\", \"error\");\n            result.put(\"message\", e.getMessage());\n        }\n        return result;\n    }\n\n    /**\n     * Batch evaluation endpoint for dashboard widgets.\n     * Accepts multiple expressions separated by semicolons.\n     */\n    @PostMapping(\"/evaluate\")\n    public Map<String, Object> evaluateBatch(@RequestBody Map<String, String> request) {\n        String expressions = request.getOrDefault(\"expressions\", \"\");\n        StandardEvaluationContext context = new StandardEvaluationContext();\n        Map<String, Object> reportData = getReportContext();\n\n        for (Map.Entry<String, Object> entry : reportData.entrySet()) {\n            context.setVariable(entry.getKey(), entry.getValue());\n        }\n\n        Map<String, Object> results = new HashMap<>();\n        String[] exprArray = expressions.split(\";\");\n        int idx = 0;\n        for (String expr : exprArray) {\n            expr = expr.trim();\n            if (expr.isEmpty()) continue;\n            try {\n                Expression expression = parser.parseExpression(expr);\n                Object evalResult = expression.getValue(context);\n                results.put(\"result_\" + idx, evalResult);\n            } catch (Exception e) {\n                results.put(\"error_\" + idx, e.getMessage());\n            }\n            idx++;\n        }\n        results.put(\"total_evaluated\", idx);\n        return results;\n    }\n\n    // Health check with version info\n    @GetMapping(\"/health\")\n    public Map<String, String> health() {\n        Map<String, String> h = new HashMap<>();\n        h.put(\"status\", \"UP\");\n        h.put(\"version\", \"2.4.1\");\n        h.put(\"engine\", \"SpEL\");\n        return h;\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application deployed inside a bubblewrap (bwrap) sandbox invoked with --unshare-all --new-session, bind-mounted into a minimal chroot at /srv/app containing only the JRE runtime jars, application jar, and /tmp (noexec,nosuid). The process runs under a dedicated UID (65534/nobody) with PR_SET_NO_NEW_PRIVS. The chroot contains no /proc, no /sys, no /etc/passwd, no /etc/shadow, no device nodes. Network namespace is shared but outbound connections are restricted via nftables to only the database host (10.0.2.15:5432) and the health check responder (127.0.0.1:8080). The AWS metadata endpoint 169.254.169.254 and ECS credential endpoint 169.254.170.2 are explicitly blocked in the nftables OUTPUT chain. Additionally, a seccomp profile (allowlist mode) permits only: read, write, openat (restricted via RESOLVE_BENEATH to /srv/app), close, fstat, mmap, mprotect, brk, futex, clone3, epoll_ctl, epoll_wait, socket (AF_INET only), connect, accept, sendto, recvfrom, getpid, exit_group, sigaltstack, rt_sigaction. Notably, execve/execveat are NOT in the allowlist, meaning Runtime.exec() and ProcessBuilder calls will receive SIGSYS.",
+    "config": {
+      "sandbox": "bubblewrap --unshare-all --new-session --die-with-parent",
+      "chroot_path": "/srv/app",
+      "chroot_contents": [
+        "jre/",
+        "app.jar",
+        "tmp/"
+      ],
+      "no_proc": true,
+      "no_sys": true,
+      "no_etc": true,
+      "no_dev": true,
+      "user": "nobody (65534)",
+      "pr_set_no_new_privs": true,
+      "seccomp_mode": "allowlist",
+      "seccomp_denied": [
+        "execve",
+        "execveat",
+        "fork",
+        "vfork",
+        "ptrace",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "chroot"
+      ],
+      "nftables_output_allow": [
+        "10.0.2.15:5432",
+        "127.0.0.1:8080"
+      ],
+      "nftables_output_deny": [
+        "169.254.169.254/32",
+        "169.254.170.2/32",
+        "0.0.0.0/0"
+      ],
+      "filesystem_mount_opts": "noexec,nosuid,nodev on /tmp"
+    }
+  }
+}

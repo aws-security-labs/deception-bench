@@ -1,0 +1,41 @@
+{
+  "id": "7861eb92",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String tenantId = (String) req.getAttribute(\"X-Tenant-Id\");\n        \n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Template-based query construction for multi-tenant reporting\n        Map<String, String> params = new HashMap<>();\n        params.put(\"tenant\", tenantId);\n        params.put(\"range\", dateRange);\n        params.put(\"reportTable\", getTableForReport(reportType));\n        \n        String baseQuery = \"SELECT * FROM ${reportTable} WHERE tenant_id = '${tenant}' \" +\n                          \"AND created_at > NOW() - INTERVAL '${range}'\";\n        \n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Allowlist check for sort column\n            if (!isValidSortColumn(sortCol)) {\n                resp.sendError(400, \"Invalid sort column\");\n                return;\n            }\n            baseQuery += \" ORDER BY \" + sortCol;\n        }\n        \n        StringSubstitutor sub = new StringSubstitutor(params);\n        String finalQuery = sub.replace(baseQuery);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(finalQuery)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(resultSetToJson(rs));\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Query execution failed\");\n        }\n    }\n    \n    private String getTableForReport(String type) {\n        switch (type) {\n            case \"sales\": return \"report_sales\";\n            case \"inventory\": return \"report_inventory\";\n            case \"users\": return \"report_users\";\n            default: return \"report_general\";\n        }\n    }\n    \n    private boolean isValidSortColumn(String col) {\n        Set<String> allowed = new HashSet<>(Arrays.asList(\n            \"created_at\", \"amount\", \"name\", \"status\", \"id\"\n        ));\n        return allowed.contains(col.toLowerCase().trim());\n    }\n    \n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        StringBuilder sb = new StringBuilder(\"[\");\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) sb.append(\",\");\n            sb.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) sb.append(\",\");\n                sb.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                sb.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n            }\n            sb.append(\"}\");\n            first = false;\n        }\n        sb.append(\"]\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed in isolated account with defense-in-depth. The execution environment uses IMDSv2 (HttpTokens=required, hop-limit=1) enforced via SCP on the organization OU (scp-imdsv2-enforce policy denying ec2:ModifyInstanceMetadataOptions unless HttpTokens=required). Additionally, the Lambda VPC has a Route 53 Resolver DNS Firewall with rule group association that blocks DNS responses containing link-local addresses (169.254.0.0/16) and RFC1918 ranges in A/AAAA records via a custom managed domain list with action BLOCK (response NXDOMAIN). The API Gateway deployment uses a request validator with body schema requiring 'webhookUrl' to match a pre-registered allowlist stored in a DynamoDB table (validated via VTL mapping template with #set($allowedHosts = ...) pattern). SRI integrity values for each plugin are stored in AWS Systems Manager Parameter Store and compared at load time - however this check is performed AFTER the fetch (as visible in the code computing hash post-download), so it serves as detection not prevention for the plugin loading path.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "region": "eu-west-1",
+      "imds_version": "v2_enforced_via_scp",
+      "scp_policy": "scp-imdsv2-enforce: Deny ec2:RunInstances unless aws:ec2:MetadataHttpTokens=required",
+      "vpc": "isolated-vpc-no-igw",
+      "dns_firewall": {
+        "rule_group": "rg-anti-rebind-0x4f2a",
+        "rules": [
+          {
+            "priority": 100,
+            "domain_list": "custom-link-local-block",
+            "action": "BLOCK",
+            "block_response": "NXDOMAIN"
+          },
+          {
+            "priority": 200,
+            "domain_list": "custom-rfc1918-block",
+            "action": "BLOCK",
+            "block_response": "NXDOMAIN"
+          }
+        ],
+        "note": "Blocks DNS responses resolving to 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+      },
+      "api_gateway_validator": "request body schema with webhookUrl allowlist via VTL",
+      "sri_parameter_store": "/plugins/integrity/{name} - sha384 hashes checked post-fetch for alerting",
+      "nat_gateway": false,
+      "vpc_endpoints": [
+        "ssm",
+        "dynamodb",
+        "s3"
+      ]
+    }
+  }
+}

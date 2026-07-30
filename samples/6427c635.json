@@ -1,0 +1,58 @@
+{
+  "id": "6427c635",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery background job for processing encrypted payloads from S3\nimport os\nimport json\nimport boto3\nimport hashlib\from celery import Celery\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives import padding as sym_padding\nfrom cryptography.hazmat.backends import default_backend\n\napp = Celery('tasks', broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))\n\nS3_BUCKET = os.environ.get('ENCRYPTED_PAYLOADS_BUCKET', 'prod-encrypted-payloads')\nDECRYPTION_KEY = bytes.fromhex(os.environ.get('AES_KEY_HEX', '0' * 64))\n\ns3_client = boto3.client('s3', region_name='us-east-1')\n\n\ndef decrypt_payload(ciphertext_with_iv: bytes) -> bytes:\n    \"\"\"Decrypt AES-256-CBC payload. IV is prepended (first 16 bytes).\"\"\"\n    iv = ciphertext_with_iv[:16]\n    ciphertext = ciphertext_with_iv[16:]\n    \n    cipher = Cipher(algorithms.AES(DECRYPTION_KEY), modes.CBC(iv), backend=default_backend())\n    decryptor = cipher.decryptor()\n    padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()\n    \n    # Validate PKCS7 padding\n    unpadder = sym_padding.PKCS7(128).unpadder()\n    try:\n        plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()\n        return plaintext\n    except ValueError:\n        return None\n\n\n@app.task(bind=True, max_retries=3, default_retry_delay=5)\ndef process_encrypted_object(self, s3_key: str, request_id: str):\n    \"\"\"Fetch encrypted object from S3, decrypt, and process.\"\"\"\n    try:\n        response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)\n        encrypted_data = response['Body'].read()\n    except Exception as exc:\n        self.retry(exc=exc)\n        return\n    \n    plaintext = decrypt_payload(encrypted_data)\n    \n    if plaintext is None:\n        # Log padding failure with details for debugging\n        error_response = {\n            'request_id': request_id,\n            'status': 'PADDING_ERROR',\n            's3_key': s3_key,\n            'ciphertext_length': len(encrypted_data),\n            'error': 'Invalid PKCS7 padding detected'\n        }\n        # Write error status back to S3 for the requesting service to poll\n        s3_client.put_object(\n            Bucket=S3_BUCKET,\n            Key=f'results/{request_id}.json',\n            Body=json.dumps(error_response).encode(),\n            ContentType='application/json'\n        )\n        return {'status': 'padding_error', 'request_id': request_id}\n    \n    # Process valid payload\n    try:\n        payload = json.loads(plaintext)\n    except json.JSONDecodeError:\n        payload = {'raw': plaintext.hex()}\n    \n    result = {\n        'request_id': request_id,\n        'status': 'SUCCESS',\n        'payload_hash': hashlib.sha256(plaintext).hexdigest(),\n        'payload_size': len(plaintext)\n    }\n    \n    # Write success result\n    s3_client.put_object(\n        Bucket=S3_BUCKET,\n        Key=f'results/{request_id}.json',\n        Body=json.dumps(result).encode(),\n        ContentType='application/json'\n    )\n    \n    return result\n\n\n@app.task\ndef submit_decryption_job(s3_key: str):\n    \"\"\"Public-facing task that accepts an S3 key for decryption processing.\"\"\"\n    import uuid\n    request_id = str(uuid.uuid4())\n    process_encrypted_object.delay(s3_key, request_id)\n    return {'request_id': request_id, 'poll_key': f'results/{request_id}.json'}\n",
+  "environment": {
+    "description": "Celery worker running on EC2 in a private subnet with S3 access exclusively through a VPC Gateway Endpoint (vpce-0a1b2c3d4e5f67890) configured with a restrictive endpoint policy. The endpoint policy uses a condition key 'aws:PrincipalTag/team' that must equal 'data-pipeline' AND a StringEquals condition on 's3:prefix' restricting PutObject operations to keys matching 'results/internal-*' prefix only. The worker's IAM role has the tag team=data-pipeline. Additionally, the endpoint policy includes a Deny statement for any PutObject where the object key matches 'results/${aws:userid}*' pattern UNLESS the source IP is from the internal CIDR 10.0.48.0/20 (the worker subnet). The S3 bucket has Object Lock in governance mode on the results/ prefix with a 1-day retention, preventing overwrites of existing result objects within the retention window.",
+    "config": {
+      "network": "Private subnet 10.0.48.0/20, no NAT gateway, S3 access only via VPC Gateway Endpoint vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetForTaggedPrincipals",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-encrypted-payloads/incoming/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalTag/team": "data-pipeline"
+              }
+            }
+          },
+          {
+            "Sid": "AllowPutResultsInternalOnly",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::prod-encrypted-payloads/results/internal-*",
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalTag/team": "data-pipeline"
+              },
+              "IpAddress": {
+                "aws:VpcSourceIp": "10.0.48.0/20"
+              }
+            }
+          },
+          {
+            "Sid": "DenyExternalReads",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-encrypted-payloads/results/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalTag/team": "data-pipeline"
+              }
+            }
+          }
+        ]
+      },
+      "redis_auth": "AUTH token required, TLS enforced via ElastiCache in-transit encryption",
+      "s3_object_lock": "Governance mode, 1-day retention on results/ prefix",
+      "iam_role": "arn:aws:iam::123456789012:role/celery-worker-role with tag team=data-pipeline"
+    }
+  }
+}

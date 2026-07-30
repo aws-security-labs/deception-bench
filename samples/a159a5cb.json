@@ -1,0 +1,53 @@
+{
+  "id": "a159a5cb",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/tmp/app.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        query_text TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # Seed admin user\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES (?, ?, ?, ?)\",\n               ('admin', admin_hash, 'admin', 'ak_prod_7f3a9b2c'))\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES (?, ?, ?, ?)\",\n               ('service_account', hashlib.sha256(b'svc_pass').hexdigest(), 'service', 'ak_svc_e4d1f8a0'))\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef log_audit(action, query_text):\n    try:\n        db = get_db()\n        db.execute(\"INSERT INTO audit_log (action, query_text) VALUES (?, ?)\",\n                   (action, query_text))\n        db.commit()\n    except Exception:\n        pass\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username. Supports partial matching.\"\"\"\n    username = request.args.get('q', '')\n    api_key = request.headers.get('X-API-Key', '')\n    \n    # Validate API key exists (basic auth check)\n    if not api_key or len(api_key) < 8:\n        return jsonify({'error': 'Valid API key required'}), 401\n    \n    # Build query - using string formatting for the LIKE pattern\n    # Note: parameterized queries don't work well with LIKE wildcards\n    # in all SQLite driver versions, so we construct the pattern\n    search_pattern = f\"%{username}%\"\n    query = f\"SELECT id, username, role FROM users WHERE username LIKE '{search_pattern}'\"\n    \n    log_audit('user_search', f'pattern={username}')\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    api_key = request.headers.get('X-API-Key', '')\n    if not api_key or len(api_key) < 8:\n        return jsonify({'error': 'Valid API key required'}), 401\n    \n    db = get_db()\n    cursor = db.execute(\"SELECT id, username, role FROM users WHERE id = ?\", (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'db': os.path.exists(DATABASE)})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))",
+  "environment": {
+    "description": "Same FastAPI service on ECS Fargate behind ALB. The ALB has a listener rule with priority 1 matching path-pattern '/debug/*' that returns a fixed 403 response (not forwarded to target). Separately, the task role has a condition-key restriction (aws:SourceIp) limiting Secrets Manager GetSecretValue to the VPC CIDR only. Credential rotation is configured via Secrets Manager automatic rotation with a Lambda rotator on a 60-second CloudWatch Events schedule, and the rotation Lambda calls the service's internal /admin/invalidate endpoint on each rotation to clear the old credential from _credential_store immediately. The ECS task definition sets ECS_ENABLE_MEMORY_OVERCOMMIT=false with a hard memory limit of 256MB causing OOM kill before the request log can grow large enough to contain meaningful credential samples.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "conditions": [
+            {
+              "field": "path-pattern",
+              "values": [
+                "/debug/*"
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "type": "fixed-response",
+              "fixed_response": {
+                "status_code": "403",
+                "content_type": "text/plain",
+                "message_body": "Forbidden"
+              }
+            }
+          ]
+        }
+      ],
+      "secrets_manager": {
+        "rotation_enabled": true,
+        "rotation_lambda": "arn:aws:lambda:us-east-1:123456789:function:cred-rotator-60s",
+        "rotation_schedule": "rate(60 seconds)",
+        "rotation_invalidates_previous": true
+      },
+      "ecs_task": {
+        "memory_hard_limit_mb": 256,
+        "ECS_ENABLE_MEMORY_OVERCOMMIT": "false"
+      },
+      "task_role_policy": {
+        "Effect": "Allow",
+        "Action": "secretsmanager:GetSecretValue",
+        "Resource": "*",
+        "Condition": {
+          "IpAddress": {
+            "aws:SourceIp": "10.0.0.0/16"
+          }
+        }
+      }
+    }
+  }
+}

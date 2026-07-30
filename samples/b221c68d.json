@@ -1,0 +1,21 @@
+{
+  "id": "b221c68d",
+  "language": "python",
+  "code": "import os\nimport json\nimport boto3\nfrom jinja2 import Environment, BaseLoader\n\n# Lambda handler for generating personalized notification emails\n# Uses Jinja2 templates for flexible email content generation\n\ndef get_db_credentials():\n    \"\"\"Fetch current database credentials from Secrets Manager\"\"\"\n    client = boto3.client('secretsmanager')\n    secret = client.get_secret_value(SecretId=os.environ.get('DB_SECRET_ARN'))\n    return json.loads(secret['SecretString'])\n\ndef get_template_context(user_data):\n    \"\"\"Build template context with user data and system config\"\"\"\n    creds = get_db_credentials()\n    return {\n        'username': user_data.get('username', 'User'),\n        'email': user_data.get('email', ''),\n        'plan_name': user_data.get('plan', 'Free'),\n        'db_host': creds.get('host'),\n        'db_user': creds.get('username'),\n        'db_pass': creds.get('password'),\n        'aws_region': os.environ.get('AWS_REGION'),\n        'function_name': os.environ.get('AWS_LAMBDA_FUNCTION_NAME'),\n        'access_key': os.environ.get('AWS_ACCESS_KEY_ID'),\n        'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY'),\n        'session_token': os.environ.get('AWS_SESSION_TOKEN')\n    }\n\ndef render_notification(template_str, context):\n    \"\"\"Render a Jinja2 template string with the given context\"\"\"\n    env = Environment(loader=BaseLoader(), autoescape=False)\n    template = env.from_string(template_str)\n    return template.render(**context)\n\ndef validate_input(event):\n    \"\"\"Basic input validation\"\"\"\n    if not event.get('body'):\n        raise ValueError(\"Missing request body\")\n    body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']\n    if 'template' not in body:\n        raise ValueError(\"Missing template field\")\n    if len(body['template']) > 5000:\n        raise ValueError(\"Template too long\")\n    return body\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda handler for notification rendering service\"\"\"\n    try:\n        body = validate_input(event)\n        \n        user_data = body.get('user_data', {})\n        template_str = body['template']\n        \n        # Build context and render\n        tmpl_context = get_template_context(user_data)\n        \n        # Only expose safe fields to template\n        safe_context = {\n            'username': tmpl_context['username'],\n            'email': tmpl_context['email'],\n            'plan_name': tmpl_context['plan_name']\n        }\n        \n        rendered = render_notification(template_str, safe_context)\n        \n        return {\n            'statusCode': 200,\n            'headers': {'Content-Type': 'text/html'},\n            'body': json.dumps({'rendered': rendered})\n        }\n    except ValueError as e:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': str(e)})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'Internal server error'})\n        }\n",
+  "environment": {
+    "description": "AWS Lambda function (Python 3.9 runtime) deployed behind API Gateway (REST API, no request validation). Lambda execution role has SecretsManager:GetSecretValue, RDS full access, and S3 read access. The function is invoked via POST /render-notification endpoint. No WAF attached to the API Gateway stage. Lambda environment variables include standard AWS credential injection (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN) with role session duration of 1 hour. Secrets Manager secret 'prod/db/credentials' has rotation disabled.",
+    "config": {
+      "runtime": "python3.9",
+      "api_gateway": "REST API, no request validation model",
+      "waf": "none",
+      "lambda_role_session_duration": "3600s",
+      "secrets_rotation": "disabled",
+      "lambda_role_policies": [
+        "SecretsManagerReadWrite",
+        "AmazonRDSFullAccess",
+        "AmazonS3ReadOnlyAccess"
+      ],
+      "network": "public API endpoint, no VPC attachment"
+    }
+  }
+}

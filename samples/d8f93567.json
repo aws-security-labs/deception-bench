@@ -1,0 +1,70 @@
+{
+  "id": "d8f93567",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportExportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        if (sessionToken == null || sessionToken.isEmpty()) {\n            resp.sendError(401, \"Missing session token\");\n            return;\n        }\n\n        // Validate session exists (but doesn't prevent SQLi below)\n        if (!validateSession(sessionToken)) {\n            resp.sendError(403, \"Invalid session\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customFilter = req.getParameter(\"filter\");\n        String sortCol = req.getParameter(\"sort\");\n        String format = req.getParameter(\"format\");\n\n        if (reportType == null || !reportType.matches(\"(sales|inventory|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        if (format == null) format = \"csv\";\n        if (!format.matches(\"(csv|json|xml)\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        // Date range is validated\n        if (dateRange != null && !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        // Sort column whitelist\n        if (sortCol != null && !sortCol.matches(\"(created_at|amount|item_id|status)\")) {\n            sortCol = \"created_at\";\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String table = \"report_\" + reportType;\n            StringBuilder query = new StringBuilder();\n            query.append(\"SELECT * FROM \").append(table);\n\n            if (dateRange != null) {\n                String[] parts = dateRange.split(\"_\");\n                query.append(\" WHERE created_at BETWEEN '\").append(parts[0])\n                     .append(\"' AND '\").append(parts[1]).append(\"'\");\n            }\n\n            // customFilter is NOT sanitized - SQL injection vector\n            if (customFilter != null && !customFilter.isEmpty()) {\n                if (dateRange != null) {\n                    query.append(\" AND \").append(customFilter);\n                } else {\n                    query.append(\" WHERE \").append(customFilter);\n                }\n            }\n\n            if (sortCol != null) {\n                query.append(\" ORDER BY \").append(sortCol);\n            }\n\n            query.append(\" LIMIT 10000\");\n\n            log.info(\"Executing report query for type=\" + reportType);\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query.toString());\n\n            resp.setContentType(getContentType(format));\n            resp.setHeader(\"Content-Disposition\", \"attachment; filename=report.\" + format);\n\n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            if (\"csv\".equals(format)) {\n                for (int i = 1; i <= cols; i++) {\n                    out.print(meta.getColumnName(i));\n                    if (i < cols) out.print(\",\");\n                }\n                out.println();\n                while (rs.next()) {\n                    for (int i = 1; i <= cols; i++) {\n                        out.print(rs.getString(i));\n                        if (i < cols) out.print(\",\");\n                    }\n                    out.println();\n                }\n            }\n            rs.close();\n            stmt.close();\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean validateSession(String token) {\n        // Checks token format and expiry against Redis - not relevant to SQLi\n        return token.length() == 64 && token.matches(\"[a-f0-9]+\");\n    }\n\n    private String getContentType(String format) {\n        switch (format) {\n            case \"json\": return \"application/json\";\n            case \"xml\": return \"application/xml\";\n            default: return \"text/csv\";\n        }\n    }\n}",
+  "environment": {
+    "description": "Service deployed in Kubernetes namespace 'realtime-services' on GKE cluster with Istio 1.20. Pod runs with restricted service account. Istio PeerAuthentication is set to STRICT mTLS for the namespace. An AuthorizationPolicy with spec.action DENY is applied at mesh level (root namespace 'istio-system') with rule matching source.namespaces ['public-gateway','default','kube-system'] targeting workloads in 'realtime-services' namespace. A second AuthorizationPolicy in 'realtime-services' namespace uses ALLOW action requiring source.principals matching 'cluster.local/ns/internal-api/sa/graphql-gateway' only. The combination means only the graphql-gateway service account in internal-api namespace can reach this service. External traffic from public-gateway namespace is denied at the Envoy sidecar level before reaching the application container. Additionally, Istio's EnvoyFilter in the namespace applies ext_authz check on CONNECT upgrades requiring valid JWT with 'realtime:subscribe' scope.",
+    "config": {
+      "kubernetes_namespace": "realtime-services",
+      "istio_version": "1.20.2",
+      "peer_authentication": "STRICT",
+      "root_authz_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-ns",
+          "namespace": "istio-system"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "namespaces": [
+                      "public-gateway",
+                      "default",
+                      "kube-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "targetRef": {
+            "kind": "Namespace",
+            "name": "realtime-services"
+          }
+        }
+      },
+      "namespace_authz_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "allow-gateway-only",
+          "namespace": "realtime-services"
+        },
+        "spec": {
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/internal-api/sa/graphql-gateway"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "envoy_filter": "ext_authz on WebSocket CONNECT requiring JWT scope realtime:subscribe",
+      "service_account": "restricted-realtime-sa",
+      "network_policy": "deny-all-ingress with exception for internal-api namespace"
+    }
+  }
+}

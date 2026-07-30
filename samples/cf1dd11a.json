@@ -1,0 +1,23 @@
+{
+  "id": "cf1dd11a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tkeyword := r.URL.Query().Get(\"q\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, description FROM products WHERE 1=1\"\n\n\t// Category filter - parameterized\n\targs := []interface{}{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tquery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\t// Price range - parameterized\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= $%d\", argIdx)\n\t\targs = append(args, minPrice)\n\t\targIdx++\n\t}\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= $%d\", argIdx)\n\t\targs = append(args, maxPrice)\n\t\targIdx++\n\t}\n\n\t// Keyword search - VULNERABLE: string concatenation\n\tif keyword != \"\" {\n\t\t// Developer note: using ILIKE for case-insensitive search\n\t\t// TODO: switch to full-text search with tsvector\n\t\tquery += \" AND (name ILIKE '%\" + keyword + \"%' OR description ILIKE '%\" + keyword + \"%')\"\n\t}\n\n\t// Sort - also vulnerable but less obvious\n\tif sortField != \"\" {\n\t\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"created_at\": true}\n\t\tif allowedSorts[sortField] {\n\t\t\tquery += \" ORDER BY \" + sortField\n\t\t} else {\n\t\t\tquery += \" ORDER BY created_at DESC\"\n\t\t}\n\t} else {\n\t\tquery += \" ORDER BY created_at DESC\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\trows.Scan(&id, &name, &price, &description)\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\t// Manual JSON to avoid import\n\t\tname = strings.ReplaceAll(name, \"\\\"\", \"\\\\\\\"\")\n\t\tdescription = strings.ReplaceAll(description, \"\\\"\", \"\\\\\\\"\")\n\t\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed with API Gateway (Cognito User Pool authorizer). The Lambda execution role has a broad DynamoDB policy: dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem on arn:aws:dynamodb:us-east-1:123456789012:table/UsersTable. No IAM condition keys are applied. The Cognito authorizer validates the JWT token but the Lambda role itself has unrestricted access to all items in the table.",
+    "config": {
+      "lambda_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UsersTable"
+      },
+      "api_gateway_authorizer": "Cognito User Pool",
+      "dynamodb_condition_keys": "none",
+      "vpc": "none",
+      "waf": "none"
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "id": "b8a9516d",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Arr;\n\nclass ConfigurationController extends Controller\n{\n    /**\n     * Dynamic configuration merge endpoint.\n     * Allows authenticated services to push runtime config overlays.\n     */\n    public function mergeConfig(Request $request)\n    {\n        $request->validate([\n            'namespace' => 'required|string|max:64',\n            'payload' => 'required|array',\n        ]);\n\n        $namespace = $request->input('namespace');\n        $payload = $request->input('payload');\n\n        // Merge payload into application config using dot-notation keys\n        $this->recursiveMerge($namespace, $payload);\n\n        return response()->json([\n            'status' => 'ok',\n            'merged_keys' => count($payload),\n        ]);\n    }\n\n    /**\n     * Recursively merge user-supplied array into Laravel config.\n     * Supports nested dot-notation paths for deep config updates.\n     */\n    private function recursiveMerge(string $prefix, array $data): void\n    {\n        foreach ($data as $key => $value) {\n            $fullKey = $prefix . '.' . $key;\n\n            if (is_array($value) && !Arr::isAssoc($value) === false) {\n                // Recurse into nested associative arrays\n                $this->recursiveMerge($fullKey, $value);\n            } else {\n                config([$fullKey => $value]);\n            }\n        }\n    }\n\n    /**\n     * Retrieve current effective configuration for a namespace.\n     */\n    public function getConfig(Request $request)\n    {\n        $namespace = $request->input('namespace', 'app');\n        return response()->json(config($namespace));\n    }\n\n    /**\n     * Execute a queued job using the current runtime config.\n     * Config values influence command construction for cache operations.\n     */\n    public function executeTask(Request $request)\n    {\n        $driver = config('cache.default', 'file');\n        $connection = config('database.redis.cache.url', null);\n\n        // Build cache warm command based on current config\n        $command = config('app.cache_warm_binary', '/usr/bin/php');\n        $args = config('app.cache_warm_args', 'artisan cache:clear');\n\n        $fullCommand = escapeshellcmd($command) . ' ' . $args;\n\n        // Execute cache maintenance\n        $output = shell_exec($fullCommand);\n\n        return response()->json([\n            'driver' => $driver,\n            'output' => $output,\n            'command' => $fullCommand,\n        ]);\n    }\n}\n\n// routes/api.php excerpt:\n// Route::prefix('internal')->group(function () {\n//     Route::post('/config/merge', [ConfigurationController::class, 'mergeConfig']);\n//     Route::get('/config/get', [ConfigurationController::class, 'getConfig']);\n//     Route::post('/task/execute', [ConfigurationController::class, 'executeTask']);\n// });\n",
+  "environment": {
+    "description": "Laravel 10.x application deployed on AWS ECS Fargate behind an Application Load Balancer. The ALB has a listener rule at priority 5 with a fixed-response 403 action conditioned on source-ip NOT matching a specific set of CIDR ranges. The rule uses a forward condition only when the request originates from CIDR blocks 10.0.0.0/8 (internal VPC), 172.20.0.0/14 (peered service mesh), and 192.168.100.0/24 (management VPN). All other source IPs receive HTTP 403 before reaching the target group. The security group additionally restricts ingress on port 443 to the ALB's own security group ID only (sg-0a1b2c3d4e5f). Note: the application itself has no authentication middleware on /internal/* routes; access control is delegated entirely to the network layer. PHP runs with shell_exec enabled and container runs as www-data.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "action": "fixed-response",
+          "status_code": 403,
+          "conditions": [
+            {
+              "field": "source-ip",
+              "not_values": [
+                "10.0.0.0/8",
+                "172.20.0.0/14",
+                "192.168.100.0/24"
+              ]
+            }
+          ]
+        },
+        {
+          "priority": 10,
+          "action": "forward",
+          "conditions": [
+            {
+              "field": "source-ip",
+              "values": [
+                "10.0.0.0/8",
+                "172.20.0.0/14",
+                "192.168.100.0/24"
+              ]
+            }
+          ]
+        }
+      ],
+      "security_group_ingress": [
+        {
+          "port": 443,
+          "source_security_group": "sg-0a1b2c3d4e5f"
+        }
+      ],
+      "container_user": "www-data",
+      "php_disabled_functions": "",
+      "vpc_flow_logs": "enabled",
+      "nacl_rules": [
+        {
+          "rule": 100,
+          "action": "allow",
+          "cidr": "10.0.0.0/8"
+        },
+        {
+          "rule": 200,
+          "action": "allow",
+          "cidr": "172.20.0.0/14"
+        },
+        {
+          "rule": 300,
+          "action": "allow",
+          "cidr": "192.168.100.0/24"
+        },
+        {
+          "rule": 999,
+          "action": "deny",
+          "cidr": "0.0.0.0/0"
+        }
+      ]
+    }
+  }
+}

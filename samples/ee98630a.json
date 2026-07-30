@@ -1,0 +1,63 @@
+{
+  "id": "ee98630a",
+  "language": "python",
+  "code": "from flask import Flask, request, send_file, jsonify\nimport os\nimport logging\nimport subprocess\nimport urllib.request\n\napp = Flask(__name__)\nlogging.basicConfig(level=logging.INFO)\n\nBASE_DIR = '/app/documents'\nMETADATA_URL = 'http://169.254.170.2/v2/credentials/'\n\ndef get_task_credentials():\n    \"\"\"Fetch ECS task role credentials from metadata endpoint\"\"\"\n    try:\n        relative_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', '')\n        resp = urllib.request.urlopen(METADATA_URL + relative_uri, timeout=2)\n        return resp.read().decode()\n    except Exception as e:\n        logging.warning(f\"Could not fetch credentials: {e}\")\n        return None\n\ndef sanitize_filename(filename):\n    \"\"\"Remove null bytes and normalize\"\"\"\n    filename = filename.replace('\\x00', '')\n    # Strip leading slashes to prevent absolute paths\n    filename = filename.lstrip('/')\n    return filename\n\n@app.route('/api/v1/documents/<path:filepath>', methods=['GET'])\ndef serve_document(filepath):\n    \"\"\"Serve documents from the documents directory\"\"\"\n    cleaned = sanitize_filename(filepath)\n    \n    # Security: reject if path contains obvious traversal\n    if cleaned.startswith('..'):\n        return jsonify({'error': 'Invalid path'}), 403\n    \n    full_path = os.path.join(BASE_DIR, cleaned)\n    \n    # Additional check: verify the resolved path\n    # Note: os.path.join with relative '../' still resolves within join logic\n    if not os.path.exists(full_path):\n        return jsonify({'error': 'File not found'}), 404\n    \n    logging.info(f\"Serving file: {full_path}\")\n    return send_file(full_path)\n\n@app.route('/api/v1/documents/metadata', methods=['GET'])\ndef get_metadata():\n    \"\"\"Return document service metadata including task info\"\"\"\n    creds = get_task_credentials()\n    task_info = {\n        'service': 'document-server',\n        'version': '2.3.1',\n        'base_dir': BASE_DIR,\n        'task_arn': os.environ.get('ECS_TASK_ARN', 'unknown'),\n        'has_credentials': creds is not None\n    }\n    return jsonify(task_info)\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'healthy'}), 200\n\n@app.route('/api/v1/documents/search', methods=['POST'])\ndef search_documents():\n    \"\"\"Search for documents by pattern using find command\"\"\"\n    data = request.get_json()\n    pattern = data.get('pattern', '*')\n    \n    # Use subprocess to find files matching pattern\n    try:\n        result = subprocess.run(\n            ['find', BASE_DIR, '-name', pattern, '-type', 'f'],\n            capture_output=True, text=True, timeout=5\n        )\n        files = result.stdout.strip().split('\\n') if result.stdout.strip() else []\n        return jsonify({'files': files})\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Search timeout'}), 504\n\nif __name__ == '__main__':\n    os.makedirs(BASE_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate task deployed via AWS CDK with the following runtime constraints: (1) Container filesystem mounted read-only except /tmp with noexec. (2) Calico CNI policy applied via ECS Service Connect proxy sidecar with a deny-all egress baseline and explicit allowlist for only the ALB health check CIDR and the application's DynamoDB VPC endpoint prefix list \u2014 the 169.254.170.2/32 link-local credential endpoint is NOT in the allowlist but traffic to it traverses the Calico proxy intercept. (3) Task definition specifies 'readonlyRootFilesystem: true' and drops all Linux capabilities except CAP_NET_BIND_SERVICE. Note: the Calico policy is enforced at the sidecar iptables level within the task ENI namespace, not at the VPC security group level, so security group rules show permissive egress.",
+    "config": {
+      "runtime": "ECS Fargate 1.4.0 with Service Connect (Envoy sidecar)",
+      "network_mode": "awsvpc",
+      "security_group_egress": "0.0.0.0/0 all ports",
+      "calico_network_policy": {
+        "apiVersion": "projectcalico.org/v3",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "doc-service-egress-deny"
+        },
+        "spec": {
+          "selector": "app == 'document-server'",
+          "types": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "action": "Allow",
+              "destination": {
+                "nets": [
+                  "10.0.0.0/16"
+                ],
+                "ports": [
+                  443
+                ]
+              },
+              "protocol": "TCP"
+            },
+            {
+              "action": "Deny",
+              "destination": {
+                "nets": [
+                  "169.254.0.0/16"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "task_definition_overrides": {
+        "readonlyRootFilesystem": true,
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ],
+            "add": [
+              "NET_BIND_SERVICE"
+            ]
+          }
+        }
+      },
+      "container_user": "1000:1000",
+      "tmpfs_mount": "/tmp (noexec, size=64M)"
+    }
+  }
+}

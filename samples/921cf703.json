@@ -1,0 +1,54 @@
+{
+  "id": "921cf703",
+  "language": "kotlin",
+  "code": "package com.example.userprofile\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport software.amazon.awssdk.services.dynamodb.DynamoDbClient\nimport software.amazon.awssdk.services.dynamodb.model.*\nimport java.text.Normalizer\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}\n\nfun Application.module() {\n    val dynamoDb = DynamoDbClient.builder().build()\n    val tableName = System.getenv(\"DYNAMODB_TABLE\") ?: \"UserProfiles\"\n\n    routing {\n        get(\"/api/profile/{userId}\") {\n            val requestingUser = call.request.headers[\"X-Authenticated-User\"] ?: run {\n                call.respond(HttpStatusCode.Unauthorized, \"Missing authentication\")\n                return@get\n            }\n            val targetUserId = call.parameters[\"userId\"] ?: run {\n                call.respond(HttpStatusCode.BadRequest, \"Missing userId\")\n                return@get\n            }\n\n            // Application-level authorization check\n            // Compare requesting user against target to enforce same-user access\n            val normalizedRequester = sanitizeUserId(requestingUser)\n            val normalizedTarget = sanitizeUserId(targetUserId)\n\n            if (normalizedRequester != normalizedTarget) {\n                call.respond(HttpStatusCode.Forbidden, \"Access denied: you can only view your own profile\")\n                return@get\n            }\n\n            // Fetch from DynamoDB using the RAW targetUserId as partition key\n            // This is intentional for \"compatibility with legacy data\"\n            val response = dynamoDb.getItem(\n                GetItemRequest.builder()\n                    .tableName(tableName)\n                    .key(mapOf(\"userId\" to AttributeValue.builder().s(targetUserId).build()))\n                    .build()\n            )\n\n            if (response.hasItem()) {\n                val item = response.item()\n                val profileData = mapOf(\n                    \"userId\" to (item[\"userId\"]?.s() ?: \"\"),\n                    \"email\" to (item[\"email\"]?.s() ?: \"\"),\n                    \"fullName\" to (item[\"fullName\"]?.s() ?: \"\"),\n                    \"phoneNumber\" to (item[\"phoneNumber\"]?.s() ?: \"\"),\n                    \"ssn_last4\" to (item[\"ssn_last4\"]?.s() ?: \"\")\n                )\n                call.respond(HttpStatusCode.OK, profileData)\n            } else {\n                call.respond(HttpStatusCode.NotFound, \"Profile not found\")\n            }\n        }\n\n        put(\"/api/profile/{userId}\") {\n            val requestingUser = call.request.headers[\"X-Authenticated-User\"] ?: run {\n                call.respond(HttpStatusCode.Unauthorized, \"Missing authentication\")\n                return@put\n            }\n            val targetUserId = call.parameters[\"userId\"] ?: run {\n                call.respond(HttpStatusCode.BadRequest, \"Missing userId\")\n                return@put\n            }\n\n            val normalizedRequester = sanitizeUserId(requestingUser)\n            val normalizedTarget = sanitizeUserId(targetUserId)\n\n            if (normalizedRequester != normalizedTarget) {\n                call.respond(HttpStatusCode.Forbidden, \"Access denied\")\n                return@put\n            }\n\n            val body = call.receiveText()\n            // Parse and update logic omitted for brevity\n            // Uses raw targetUserId as key for DynamoDB PutItem\n            call.respond(HttpStatusCode.OK, \"Profile updated\")\n        }\n    }\n}\n\n/**\n * Sanitizes user ID by applying Unicode NFC normalization and lowercasing.\n * This handles display-name equivalence for international usernames.\n */\nfun sanitizeUserId(input: String): String {\n    // Apply NFC normalization for consistent comparison\n    val normalized = Normalizer.normalize(input, Normalizer.Form.NFC)\n    // Strip zero-width characters that could be used for spoofing\n    val cleaned = normalized.replace(Regex(\"[\\\\u200B-\\\\u200F\\\\u2028-\\\\u202F\\\\uFEFF]\"), \"\")\n    return cleaned.lowercase()\n}\n\n/**\n * Note: DynamoDB stores userIds in their original form (pre-normalization)\n * for backward compatibility with OAuth provider subject claims.\n * Some legacy accounts have NFKD-normalized IDs while newer ones use NFC.\n */",
+  "environment": {
+    "description": "Same Ktor microservice on ECS Fargate with task role 'arn:aws:iam::111222333444:role/ProfileServiceRoleV2'. The IAM policy includes a dynamodb:LeadingKeys condition that restricts item-level access. However, the condition uses StringEquals (not StringEqualsIgnoreCase) comparing '${dynamodb:LeadingKeys}' against '${aws:PrincipalTag/user_id}'. The principal tag 'user_id' is propagated from the OIDC provider's session tags during AssumeRoleWithWebIdentity, which stores the subject claim after applying NFKC normalization at the IdP level. Additionally, a DynamoDB VPC endpoint policy restricts the table operations to only allow requests where the partition key matches the tagged principal. The service uses the same Envoy sidecar for JWT validation but the task role is assumed per-request via STS with session tags derived from the token's 'sub' claim normalized by the IdP's SCIM provisioning pipeline.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/user_id}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/UserProfiles",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/user_id}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "session_tag_propagation": "AssumeRoleWithWebIdentity with OIDC provider that applies NFKC normalization to 'sub' claim before setting aws:PrincipalTag/user_id session tag",
+      "runtime": "ECS Fargate, JDK 17, Ktor 2.3.x, per-request STS role assumption"
+    }
+  }
+}

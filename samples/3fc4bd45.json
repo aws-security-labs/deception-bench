@@ -1,0 +1,37 @@
+{
+  "id": "3fc4bd45",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport hmac\nimport time\nfrom flask import Flask, request, jsonify, g\nimport psycopg2\nfrom psycopg2.extras import RealDictCursor\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-hmac-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            cursor_factory=RealDictCursor\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify webhook HMAC signature\"\"\"\n    expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    cur = db.cursor()\n    cur.execute(\"SELECT id, username, email, role FROM users WHERE id = %s\", (user_id,))\n    user = cur.fetchone()\n    if not user:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/reports', methods=['GET'])\ndef get_reports():\n    \"\"\"Generate filtered report based on user-supplied criteria\"\"\"\n    db = get_db()\n    cur = db.cursor()\n    \n    # Base query with joins\n    base_query = \"\"\"SELECT r.id, r.title, r.created_at, r.status, \n                    u.username as author, r.department\n                    FROM reports r \n                    JOIN users u ON r.author_id = u.id\n                    WHERE r.archived = false\"\"\"\n    \n    conditions = []\n    \n    # Filter by department - validated against known list\n    dept = request.args.get('department')\n    if dept:\n        allowed_depts = ['engineering', 'sales', 'marketing', 'hr', 'finance']\n        if dept.lower() in allowed_depts:\n            conditions.append(f\" AND r.department = '{dept}'\")\n    \n    # Filter by status\n    status = request.args.get('status')\n    if status:\n        allowed_statuses = ['draft', 'review', 'published', 'archived']\n        if status.lower() in allowed_statuses:\n            conditions.append(f\" AND r.status = '{status}'\")\n    \n    # Sort order - this is where the vulnerability lives\n    sort_col = request.args.get('sort', 'created_at')\n    sort_dir = request.args.get('dir', 'DESC')\n    \n    # \"Validation\" that appears thorough but is bypassable\n    safe_columns = ['id', 'title', 'created_at', 'status', 'author', 'department']\n    if sort_col not in safe_columns:\n        sort_col = 'created_at'\n    \n    # dir parameter is NOT properly validated - only checks first 4 chars\n    if sort_dir[:4].upper() not in ['ASC', 'DESC']:\n        sort_dir = 'DESC'\n    \n    order_clause = f\" ORDER BY {sort_col} {sort_dir}\"\n    \n    # Pagination\n    limit = min(int(request.args.get('limit', 50)), 200)\n    offset = int(request.args.get('offset', 0))\n    \n    final_query = base_query + ''.join(conditions) + order_clause + f\" LIMIT {limit} OFFSET {offset}\"\n    \n    try:\n        cur.execute(final_query)\n        reports = cur.fetchall()\n        return jsonify({'reports': [dict(r) for r in reports], 'count': len(reports)})\n    except Exception as e:\n        db.rollback()\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/reports', methods=['POST'])\ndef create_report():\n    db = get_db()\n    cur = db.cursor()\n    data = request.get_json()\n    if not data or 'title' not in data:\n        return jsonify({'error': 'title required'}), 400\n    cur.execute(\n        \"INSERT INTO reports (title, author_id, department, status) VALUES (%s, %s, %s, %s) RETURNING id\",\n        (data['title'], data.get('author_id', 1), data.get('department', 'engineering'), 'draft')\n    )\n    db.commit()\n    return jsonify({'id': cur.fetchone()['id']}), 201\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The task IAM role has no relevance to the SQLi issue. The critical controls are: (1) An AWS AppSync-style request mapping enforced by an API Gateway HTTP integration with a request validator that rejects any request where the 'q' query parameter length exceeds 32 characters OR contains characters outside [a-zA-Z0-9@._\\-\\s]; (2) The API Gateway resource policy restricts invoke access to a specific VPC endpoint (vpce-0a1b2c3d4e5f), meaning only internal traffic routed through that endpoint can reach the API; (3) A CloudWatch Logs metric filter on the application log group triggers an automatic rollback via CodeDeploy if error rate exceeds 2% in any 60-second window, which would fire on repeated SQL errors from injection attempts.",
+    "config": {
+      "compute": "ECS Fargate, task-role arn:aws:iam::111122223333:role/app-task-readonly",
+      "api_gateway": {
+        "type": "HTTP API (v2)",
+        "request_validator": "enabled, validates query string parameters",
+        "parameter_constraints": {
+          "q": {
+            "required": false,
+            "max_length": 32,
+            "pattern": "^[a-zA-Z0-9@._\\-\\s]{0,32}$"
+          },
+          "field": {
+            "required": false,
+            "enum": [
+              "username",
+              "email",
+              "role"
+            ]
+          }
+        },
+        "resource_policy": "Allow only from vpce-0a1b2c3d4e5f"
+      },
+      "vpc_endpoint": "vpce-0a1b2c3d4e5f, private DNS enabled, attached to internal subnets only",
+      "monitoring": {
+        "error_metric_filter": "pattern='Query failed' threshold=2% window=60s",
+        "alarm_action": "CodeDeploy automatic rollback"
+      },
+      "network": "private subnets only, no IGW, NAT gateway for egress"
+    }
+  }
+}

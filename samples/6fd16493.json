@@ -1,0 +1,26 @@
+{
+  "id": "6fd16493",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nAPI_SECRET = os.environ.get('API_SECRET', 'default-hmac-key')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\ndef verify_request_signature(payload, signature):\n    \"\"\"Verify HMAC-SHA256 signature of request body\"\"\"\n    expected = hmac.new(API_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria.\n    Supports filtering by department, role, and name pattern.\n    Results are paginated with limit/offset.\n    \"\"\"\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    name_pattern = request.args.get('name', '')\n    limit = request.args.get('limit', '20')\n    offset = request.args.get('offset', '0')\n    \n    # Validate pagination params\n    try:\n        limit = min(int(limit), 100)\n        offset = max(int(offset), 0)\n    except ValueError:\n        return jsonify({'error': 'Invalid pagination parameters'}), 400\n    \n    # Build query with filters\n    conditions = []\n    if department:\n        conditions.append(f\"department = '{department}'\")\n    if role:\n        conditions.append(f\"role = '{role}'\")\n    if name_pattern:\n        conditions.append(f\"display_name ILIKE '%{name_pattern}%'\")\n    \n    where_clause = ''\n    if conditions:\n        where_clause = 'WHERE ' + ' AND '.join(conditions)\n    \n    query = f\"SELECT id, display_name, email, department, role FROM users {where_clause} ORDER BY display_name LIMIT {limit} OFFSET {offset}\"\n    \n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        users = []\n        for row in rows:\n            users.append({\n                'id': row[0],\n                'display_name': row[1],\n                'email': row[2],\n                'department': row[3],\n                'role': row[4]\n            })\n        cur.close()\n        conn.close()\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Internal server error'}), 500\n\n@app.route('/api/v1/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID\"\"\"\n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(\"SELECT id, display_name, email, department, role FROM users WHERE id = %s\", (user_id,))\n        row = cur.fetchone()\n        cur.close()\n        conn.close()\n        if row:\n            return jsonify({'id': row[0], 'display_name': row[1], 'email': row[2], 'department': row[3], 'role': row[4]})\n        return jsonify({'error': 'Not found'}), 404\n    except Exception as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Internal server error'}), 500\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Container running as non-root user (uid 1000) with default Docker configuration. The container filesystem is read-write. /tmp is a standard directory on the container's overlay filesystem with world-writable permissions. Multiple processes can run concurrently in the container via the entrypoint script which spawns worker instances. No seccomp profile beyond Docker default. No AppArmor confinement beyond docker-default.",
+    "config": {
+      "runtime": "docker",
+      "image": "python:3.11-slim",
+      "user": "1000:1000",
+      "read_only": false,
+      "tmpfs": [],
+      "security_opt": [
+        "no-new-privileges"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "CHOWN"
+      ],
+      "entrypoint": "/usr/local/bin/worker-pool.sh",
+      "concurrency": "multi-process"
+    }
+  }
+}

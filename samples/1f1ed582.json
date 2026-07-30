@@ -1,0 +1,67 @@
+{
+  "id": "1f1ed582",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String userId = (String) req.getSession().getAttribute(\"user_id\");\n\n        if (userId == null) {\n            resp.sendError(401, \"Not authenticated\");\n            return;\n        }\n\n        // Input validation - allow alphanumeric and hyphens for format\n        if (format != null && !format.matches(\"[a-zA-Z0-9\\\\-]+\")) {\n            resp.sendError(400, \"Invalid format parameter\");\n            return;\n        }\n\n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Developer note: reportId is numeric per API spec, validated client-side\n            String query = \"SELECT r.title, r.content, r.created_at, u.email \" +\n                          \"FROM reports r JOIN users u ON r.author_id = u.id \" +\n                          \"WHERE r.id = \" + reportId + \" AND r.org_id = (\" +\n                          \"SELECT org_id FROM users WHERE id = '\" + userId + \"')\";\n\n            log.info(\"Executing report query for user: \" + userId);\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"reports\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\\\"title\\\":\\\"\").append(escapeJson(rs.getString(\"title\")))\n                    .append(\"\\\",\\\"content\\\":\\\"\").append(escapeJson(rs.getString(\"content\")))\n                    .append(\"\\\",\\\"created_at\\\":\\\"\").append(rs.getString(\"created_at\"))\n                    .append(\"\\\",\\\"author_email\\\":\\\"\").append(escapeJson(rs.getString(\"email\")))\n                    .append(\"\\\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n\n        } catch (SQLException e) {\n            log.warning(\"SQL error: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        } finally {\n            try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String userId = (String) req.getSession().getAttribute(\"user_id\");\n        if (userId == null) { resp.sendError(401); return; }\n\n        String title = req.getParameter(\"title\");\n        String content = req.getParameter(\"content\");\n\n        if (title == null || title.length() > 200 || content == null) {\n            resp.sendError(400, \"Invalid input\");\n            return;\n        }\n\n        Connection conn = null;\n        PreparedStatement pstmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            pstmt = conn.prepareStatement(\n                \"INSERT INTO reports (title, content, author_id, org_id, created_at) \" +\n                \"VALUES (?, ?, ?, (SELECT org_id FROM users WHERE id = ?), NOW())\");\n            pstmt.setString(1, title);\n            pstmt.setString(2, content);\n            pstmt.setString(3, userId);\n            pstmt.setString(4, userId);\n            pstmt.executeUpdate();\n            resp.setStatus(201);\n        } catch (SQLException e) {\n            log.warning(\"Insert error: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        } finally {\n            try { if (pstmt != null) pstmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed in isolated VPC (10.0.0.0/16) with no NAT gateway and no internet gateway attached. S3 access is exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with the following endpoint policy: Effect Allow, Principal *, Action [s3:GetObject, s3:PutObject, s3:CopyObject], Resource [arn:aws:s3:::company-data-lake/*, arn:aws:s3:::company-processed-output/*], Condition: {StringEquals: {s3:prefix: [{variable: aws:PrincipalTag/team}]}}. The endpoint policy additionally has an explicit Deny statement for any s3:* action where the bucket ARN does not match the two whitelisted buckets. Lambda security group only allows outbound to the VPC endpoint prefix list (pl-63a5400a). Route table for Lambda subnets contains only local route and vpce route - no 0.0.0.0/0 route exists.",
+    "config": {
+      "vpc": "isolated_vpc_no_igw_no_nat",
+      "vpce_id": "vpce-0a1b2c3d4e5f67890",
+      "vpce_service": "com.amazonaws.us-east-1.s3",
+      "vpce_type": "Gateway",
+      "vpce_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowWhitelistedBuckets",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject",
+              "s3:CopyObject"
+            ],
+            "Resource": [
+              "arn:aws:s3:::company-data-lake/*",
+              "arn:aws:s3:::company-processed-output/*"
+            ],
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": [
+                  "${aws:PrincipalTag/team}/*"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyNonWhitelistedBuckets",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:ResourceAccount": "123456789012"
+              }
+            }
+          },
+          {
+            "Sid": "DenyNonWhitelistedBucketsSameAccount",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "NotResource": [
+              "arn:aws:s3:::company-data-lake",
+              "arn:aws:s3:::company-data-lake/*",
+              "arn:aws:s3:::company-processed-output",
+              "arn:aws:s3:::company-processed-output/*"
+            ]
+          }
+        ]
+      },
+      "security_group_egress": "prefix_list_pl-63a5400a_only",
+      "route_table": "local_and_vpce_only_no_default_route",
+      "lambda_role_policy": "s3:GetObject,s3:PutObject,s3:CopyObject on arn:aws:s3:::*"
+    }
+  }
+}

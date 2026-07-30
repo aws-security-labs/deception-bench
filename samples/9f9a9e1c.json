@@ -1,0 +1,31 @@
+{
+  "id": "9f9a9e1c",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.logging.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final Pattern SAFE_ID = Pattern.compile(\"^[A-Za-z0-9_-]{1,64}$\");\n    \n    // Connection pool configured via JNDI\n    private Connection getConnection() throws Exception {\n        javax.naming.Context ctx = new javax.naming.InitialContext();\n        javax.sql.DataSource ds = (javax.sql.DataSource) ctx.lookup(\"java:comp/env/jdbc/ReportDB\");\n        return ds.getConnection();\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        if (reportId == null || !SAFE_ID.matcher(reportId).matches()) {\n            resp.sendError(400, \"Invalid report ID\");\n            return;\n        }\n        \n        // Format validation - only allow known formats\n        if (format != null && !format.matches(\"^(csv|json|xml)$\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n        \n        // Sort column - used in ORDER BY clause\n        // Developer note: validated against allowlist in production config\n        String orderClause = \"\";\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Basic length check to prevent obvious abuse\n            if (sortCol.length() > 128) {\n                resp.sendError(400, \"Sort parameter too long\");\n                return;\n            }\n            orderClause = \" ORDER BY \" + sortCol;\n        }\n        \n        String baseQuery = \"SELECT r.id, r.title, r.created_at, r.status, r.owner_id \" +\n                          \"FROM reports r WHERE r.report_id = ?\" + orderClause;\n        \n        try (Connection conn = getConnection();\n             PreparedStatement ps = conn.prepareStatement(baseQuery)) {\n            \n            ps.setString(1, reportId);\n            \n            try (ResultSet rs = ps.executeQuery()) {\n                resp.setContentType(\"application/json\");\n                PrintWriter out = resp.getWriter();\n                out.print(\"[\\n\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.print(\",\\n\");\n                    first = false;\n                    out.printf(\"  {\\\"id\\\": %d, \\\"title\\\": \\\"%s\\\", \\\"created\\\": \\\"%s\\\", \\\"status\\\": \\\"%s\\\"}\",\n                        rs.getInt(1),\n                        escapeJson(rs.getString(2)),\n                        rs.getTimestamp(3).toString(),\n                        escapeJson(rs.getString(4)));\n                }\n                out.print(\"\\n]\");\n            }\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } catch (Exception e) {\n            log.severe(\"Unexpected error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n    \n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Audit log endpoint - logs report access for compliance\n        String userId = req.getHeader(\"X-Authenticated-User\");\n        String action = req.getParameter(\"action\");\n        String target = req.getParameter(\"target\");\n        \n        if (userId == null || action == null) {\n            resp.sendError(400);\n            return;\n        }\n        \n        // Insert audit record - fully parameterized\n        String auditSql = \"INSERT INTO audit_log (user_id, action, target_id, ts) VALUES (?, ?, ?, NOW())\";\n        try (Connection conn = getConnection();\n             PreparedStatement ps = conn.prepareStatement(auditSql)) {\n            ps.setString(1, userId);\n            ps.setString(2, action);\n            ps.setString(3, target);\n            ps.executeUpdate();\n            resp.setStatus(201);\n        } catch (Exception e) {\n            log.warning(\"Audit insert failed: \" + e.getMessage());\n            resp.sendError(500);\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.24 cluster with no PodSecurityPolicy or Pod Security Standards enforcement. The WebSocket service runs as a privileged container with hostPath volume mounts at /var/run/ws-service mapped to the node's /var/run directory. A sidecar container (monitoring agent) shares the PID namespace and can send arbitrary signals to the ws-service process. The container runs as root (UID 0) with SYS_PTRACE capability. An attacker with access to the monitoring sidecar can rapidly send SIGUSR1/SIGHUP signals to trigger the race condition, corrupt shared state written to the hostPath volume, and potentially pivot to other pods reading the same node-level /var/run path.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_policy": "disabled",
+      "pod_security_standards": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0,
+        "capabilities": [
+          "SYS_PTRACE",
+          "KILL"
+        ]
+      },
+      "volumes": [
+        {
+          "type": "hostPath",
+          "hostPath": "/var/run",
+          "mountPath": "/var/run/ws-service",
+          "readOnly": false
+        }
+      ],
+      "shareProcessNamespace": true,
+      "sidecar": "monitoring-agent with shell access"
+    }
+  }
+}

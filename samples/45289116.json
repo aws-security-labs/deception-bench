@@ -1,0 +1,19 @@
+{
+  "id": "45289116",
+  "language": "javascript",
+  "code": "const grpc = require('@grpc/grpc-js');\nconst protoLoader = require('@grpc/proto-loader');\n\nconst PROTO_PATH = './service.proto';\nconst packageDefinition = protoLoader.loadSync(PROTO_PATH, {\n  keepCase: true,\n  longs: String,\n  enums: String,\n  defaults: true,\n  oneofs: true\n});\n\nconst serviceProto = grpc.loadPackageDefinition(packageDefinition).internal;\n\n// Lambda handler that proxies requests to internal gRPC service\nexports.handler = async (event) => {\n  const endpoint = process.env.GRPC_ENDPOINT || 'internal-service.local:50051';\n  \n  const client = new serviceProto.DataService(\n    endpoint,\n    grpc.credentials.createInsecure()\n  );\n\n  // Extract caller metadata from event headers\n  const callerRole = event.headers?.['x-caller-role'] || 'anonymous';\n  const callerTenant = event.headers?.['x-tenant-id'] || 'default';\n  const traceId = event.headers?.['x-amzn-trace-id'] || '';\n  \n  // Build gRPC metadata from incoming request headers\n  const metadata = new grpc.Metadata();\n  metadata.set('x-caller-role', callerRole);\n  metadata.set('x-tenant-id', callerTenant);\n  metadata.set('x-trace-id', traceId);\n  \n  // VULNERABILITY: User-controlled headers are passed directly as gRPC metadata\n  // An attacker can inject arbitrary metadata keys that the downstream service\n  // trusts for authorization decisions\n  if (event.headers) {\n    const propagateHeaders = Object.keys(event.headers).filter(\n      h => h.startsWith('x-internal-') || h.startsWith('x-auth-')\n    );\n    for (const header of propagateHeaders) {\n      metadata.set(header, event.headers[header]);\n    }\n  }\n\n  // The downstream gRPC service checks 'x-internal-admin' metadata\n  // to grant admin access - attacker can set this via HTTP header\n  const request = {\n    query: event.body?.query || '',\n    limit: parseInt(event.body?.limit) || 100\n  };\n\n  return new Promise((resolve, reject) => {\n    client.fetchData(request, metadata, (error, response) => {\n      if (error) {\n        resolve({\n          statusCode: 500,\n          body: JSON.stringify({ error: error.message })\n        });\n      } else {\n        resolve({\n          statusCode: 200,\n          body: JSON.stringify(response)\n        });\n      }\n    });\n  });\n};\n\n// Health check endpoint\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'ok', version: '2.4.1' })\n  };\n};\n\n// Internal metrics - not exposed via API Gateway\nexports.metrics = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({\n      connections: grpc.getClientChannel?.()?.getConnectivityState?.() || 'unknown',\n      uptime: process.uptime()\n    })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function deployed behind API Gateway (HTTP API, no authorization). Lambda is in a VPC with a NAT gateway providing outbound internet access. The gRPC endpoint (internal-service.local:50051) is resolvable via Route53 private hosted zone and the downstream gRPC service is accessible on port 50051 from the Lambda's security group. API Gateway endpoint is publicly accessible with no request validation or header filtering configured. The downstream gRPC DataService trusts 'x-internal-admin: true' metadata for privilege escalation.",
+    "config": {
+      "api_gateway_type": "HTTP_API",
+      "authorization": "NONE",
+      "lambda_vpc": true,
+      "nat_gateway": true,
+      "security_group_egress": "0.0.0.0/0:all",
+      "grpc_service_network": "private_subnet",
+      "route53_private_zone": "internal-service.local",
+      "api_gateway_endpoint": "public",
+      "request_validation": "none"
+    }
+  }
+}

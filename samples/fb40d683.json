@@ -1,0 +1,57 @@
+{
+  "id": "fb40d683",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// searchProducts handles product search with optional category filter\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"missing search query\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize query - remove obvious dangerous characters\n\tquery = strings.ReplaceAll(query, \";\", \"\")\n\tquery = strings.ReplaceAll(query, \"--\", \"\")\n\n\tbaseSQL := fmt.Sprintf(\"SELECT id, name, price, description FROM products WHERE name ILIKE '%%%s%%'\", query)\n\n\tif category != \"\" {\n\t\t// Category is validated against known list\n\t\tvalidCategories := map[string]bool{\"electronics\": true, \"books\": true, \"clothing\": true, \"home\": true}\n\t\tif validCategories[strings.ToLower(category)] {\n\t\t\tbaseSQL += fmt.Sprintf(\" AND category = '%s'\", category)\n\t\t}\n\t}\n\n\t// Sort parameter - only allow specific columns\n\tswitch sortBy {\n\tcase \"price_asc\":\n\t\tbaseSQL += \" ORDER BY price ASC\"\n\tcase \"price_desc\":\n\t\tbaseSQL += \" ORDER BY price DESC\"\n\tcase \"name\":\n\t\tbaseSQL += \" ORDER BY name ASC\"\n\tdefault:\n\t\tbaseSQL += \" ORDER BY relevance DESC\"\n\t}\n\n\tbaseSQL += \" LIMIT 50\"\n\n\trows, err := db.Query(baseSQL)\n\tif err != nil {\n\t\thttp.Error(w, \"search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tjson := fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)\n\t\tw.Write([]byte(json))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"Listening on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Same service on ECS Fargate with task role arn:aws:iam::111222333444:role/OrderServiceRoleScoped. The IAM policy uses dynamodb:LeadingKeys condition with ForAllValues:StringEquals set to ${aws:PrincipalTag/TenantId}, and additionally the policy includes a Deny statement with StringNotLike on dynamodb:FilterExpression condition key restricting filter expressions to patterns matching only 'attribute_exists(item_id) AND status = *' or 'attribute_exists(item_id) AND created_after = *'. The DynamoDB VPC endpoint has a resource policy that further enforces dynamodb:LeadingKeys. The ECS task has a PrincipalTag 'TenantId' propagated from the OIDC identity provider federation. Note: the Deny with dynamodb:FilterExpression is evaluated BEFORE any Allow per IAM policy evaluation logic.",
+    "config": {
+      "iam_policy": [
+        {
+          "Sid": "AllowScopedQuery",
+          "Effect": "Allow",
+          "Action": [
+            "dynamodb:Query"
+          ],
+          "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/multi_tenant_orders",
+          "Condition": {
+            "ForAllValues:StringEquals": {
+              "dynamodb:LeadingKeys": [
+                "${aws:PrincipalTag/TenantId}"
+              ]
+            }
+          }
+        },
+        {
+          "Sid": "DenyArbitraryFilters",
+          "Effect": "Deny",
+          "Action": [
+            "dynamodb:Query"
+          ],
+          "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/multi_tenant_orders",
+          "Condition": {
+            "StringNotLike": {
+              "dynamodb:FilterExpression": [
+                "attribute_exists(item_id) AND status = *",
+                "attribute_exists(item_id) AND created_after = *"
+              ]
+            }
+          }
+        }
+      ],
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "dynamodb:Query",
+        "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/multi_tenant_orders",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/TenantId}"
+            ]
+          }
+        }
+      },
+      "principal_tag_source": "OIDC federation with immutable TenantId claim"
+    }
+  }
+}

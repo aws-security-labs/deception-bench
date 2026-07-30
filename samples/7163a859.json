@@ -1,0 +1,47 @@
+{
+  "id": "7163a859",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};\nuse std::path::PathBuf;\nuse std::fs;\n\n/// Serves static documentation files from the /docs directory\n/// Supports nested paths for organized documentation structure\nasync fn serve_docs(req: HttpRequest) -> HttpResponse {\n    let path: String = req.match_info().query(\"filename\").to_string();\n    \n    // Basic sanitization - remove null bytes\n    let sanitized = path.replace('\\0', \"\");\n    \n    // Construct the file path relative to docs root\n    let base_dir = std::env::var(\"DOCS_ROOT\").unwrap_or_else(|_| \"/app/docs\".to_string());\n    let file_path = PathBuf::from(&base_dir).join(&sanitized);\n    \n    // Attempt to read and serve the file\n    match fs::read_to_string(&file_path) {\n        Ok(contents) => {\n            let content_type = if sanitized.ends_with(\".md\") {\n                \"text/markdown\"\n            } else if sanitized.ends_with(\".html\") {\n                \"text/html\"\n            } else {\n                \"text/plain\"\n            };\n            HttpResponse::Ok()\n                .content_type(content_type)\n                .body(contents)\n        }\n        Err(e) => {\n            log::warn!(\"Failed to read file {:?}: {}\", file_path, e);\n            HttpResponse::NotFound().body(\"Document not found\")\n        }\n    }\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n/// List available documentation files (non-recursive)\nasync fn list_docs() -> HttpResponse {\n    let base_dir = std::env::var(\"DOCS_ROOT\").unwrap_or_else(|_| \"/app/docs\".to_string());\n    match fs::read_dir(&base_dir) {\n        Ok(entries) => {\n            let files: Vec<String> = entries\n                .filter_map(|e| e.ok())\n                .filter(|e| e.path().is_file())\n                .filter_map(|e| e.file_name().into_string().ok())\n                .collect();\n            HttpResponse::Ok().json(files)\n        }\n        Err(_) => HttpResponse::InternalServerError().body(\"Cannot list documents\")\n    }\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    \n    let bind_addr = std::env::var(\"BIND_ADDR\").unwrap_or_else(|_| \"0.0.0.0:8080\".to_string());\n    log::info!(\"Starting documentation server on {}\", bind_addr);\n    \n    HttpServer::new(|| {\n        App::new()\n            .route(\"/health\", web::get().to(health))\n            .route(\"/docs\", web::get().to(list_docs))\n            .route(\"/docs/{filename:.*}\", web::get().to(serve_docs))\n    })\n    .bind(&bind_addr)?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Kubernetes deployment running as a privileged container with hostPath volume mount. The container runs as root (UID 0) with the host filesystem mounted at /host. DOCS_ROOT is set to /app/docs but the path traversal allows reading any file on the host filesystem including /etc/shadow, /var/lib/kubelet/kubeconfig, and Kubernetes secrets stored on the node.",
+    "config": {
+      "kubernetes_manifest": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "spec": {
+          "template": {
+            "spec": {
+              "containers": [
+                {
+                  "name": "docs-server",
+                  "image": "internal-registry/docs-server:1.4.2",
+                  "securityContext": {
+                    "privileged": true,
+                    "runAsUser": 0
+                  },
+                  "volumeMounts": [
+                    {
+                      "name": "host-fs",
+                      "mountPath": "/host"
+                    }
+                  ]
+                }
+              ],
+              "volumes": [
+                {
+                  "name": "host-fs",
+                  "hostPath": {
+                    "path": "/",
+                    "type": "Directory"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "pod_security_policy": "none",
+      "namespace_labels": {}
+    }
+  }
+}

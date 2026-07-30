@@ -1,0 +1,48 @@
+{
+  "id": "cae138ff",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\ntype SearchResult struct {\n\tID       int\n\tTitle    string\n\tBody     string\n\tAuthor   string\n\tCategory string\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\ttmpl = template.Must(template.New(\"results\").Parse(`\n\t\t<html><body>\n\t\t<h1>Search Results for: {{.Query}}</h1>\n\t\t{{range .Results}}\n\t\t<div class=\"result\">\n\t\t\t<h3>{{.Title}}</h3>\n\t\t\t<p>{{.Body}}</p>\n\t\t\t<span>By: {{.Author}} | Category: {{.Category}}</span>\n\t\t</div>\n\t\t{{end}}\n\t\t</body></html>\n\t`))\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build search query with category filter\n\tbaseQuery := fmt.Sprintf(\"SELECT id, title, body, author, category FROM articles WHERE title ILIKE '%%%s%%'\", query)\n\n\tif category != \"\" {\n\t\t// Validate category against known list\n\t\tvalidCats := []string{\"tech\", \"science\", \"health\", \"business\"}\n\t\tcatValid := false\n\t\tfor _, vc := range validCats {\n\t\t\tif strings.EqualFold(category, vc) {\n\t\t\t\tcatValid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif catValid {\n\t\t\tbaseQuery += fmt.Sprintf(\" AND category = '%s'\", category)\n\t\t}\n\t}\n\n\t// Sort handling - only allow specific columns\n\tallowedSorts := map[string]bool{\"title\": true, \"author\": true, \"id\": true}\n\tif sortBy != \"\" && allowedSorts[sortBy] {\n\t\tbaseQuery += \" ORDER BY \" + sortBy\n\t} else {\n\t\tbaseQuery += \" ORDER BY id DESC\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Title, &sr.Body, &sr.Author, &sr.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tdata := struct {\n\t\tQuery   string\n\t\tResults []SearchResult\n\t}{Query: query, Results: results}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tstatus := map[string]string{\"status\": \"ok\"}\n\tif err != nil {\n\t\tstatus[\"status\"] = \"degraded\"\n\t\tstatus[\"db\"] = \"unreachable\"\n\t}\n\tjson.NewEncoder(w).Encode(status)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "ECS Fargate service (platform version 1.4.0) in isolated subnet with pgBouncer sidecar in transaction pooling mode with prepared statement support. Task networking configured with awsvpcConfiguration where the ENI has a security group (sg-0a1b2c3d4e5f) with egress rules limited to port 5432 toward the RDS security group and port 443 toward the VPC endpoint prefix list (pl-63a5400a for com.amazonaws.us-east-1.s3 and interface endpoints for ECR/logs). The task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/PB-NoIMDS) that includes an explicit deny on sts:* with condition aws:VpcSourceIp not matching 10.0.0.0/8. Additionally, the Fargate platform has ECS_AWSVPC_BLOCK_IMDS=true set in the agent configuration which injects iptables rules dropping traffic to 169.254.169.254 and 169.254.170.2/credentials path is scoped via task credential endpoint rotation with 60s TTL. The VPC has no NAT gateway and no internet gateway attached; DNS resolution goes through Route53 Resolver inbound endpoint with response policy zone blocking *.internal and *.metadata queries.",
+    "config": {
+      "ecs_platform_version": "1.4.0",
+      "ECS_AWSVPC_BLOCK_IMDS": "true",
+      "network_mode": "awsvpc",
+      "subnet_type": "isolated",
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "security_group_egress_rules": [
+        {
+          "protocol": "tcp",
+          "port": 5432,
+          "destination": "sg-rds-0f9e8d7c"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "pl-63a5400a"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "vpce-ecr-endpoint"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "vpce-logs-endpoint"
+        }
+      ],
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/PB-NoIMDS",
+      "route53_resolver_rpz": "blocking *.metadata.internal zones",
+      "pgbouncer_mode": "transaction",
+      "pgbouncer_prepared_statements": true,
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.ecr.dkr",
+        "com.amazonaws.us-east-1.ecr.api",
+        "com.amazonaws.us-east-1.logs",
+        "com.amazonaws.us-east-1.s3"
+      ]
+    }
+  }
+}

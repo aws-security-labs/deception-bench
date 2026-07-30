@@ -1,0 +1,64 @@
+{
+  "id": "28caccfa",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nconst uploadDir = \"/data/uploads\"\n\nfunc generateFilename() string {\n\tbytes := make([]byte, 16)\n\trand.Read(bytes)\n\treturn hex.EncodeToString(bytes)\n}\n\nfunc sanitizeFilename(name string) string {\n\t// Remove path traversal attempts\n\tname = filepath.Base(name)\n\t// Remove null bytes\n\tname = strings.ReplaceAll(name, \"\\x00\", \"\")\n\treturn name\n}\n\nfunc uploadHandler(c *gin.Context) {\n\tfile, header, err := c.Request.FormFile(\"file\")\n\tif err != nil {\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"No file provided\"})\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\t// Size limit: 50MB\n\tif header.Size > 50*1024*1024 {\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"File too large\"})\n\t\treturn\n\t}\n\n\toriginalName := sanitizeFilename(header.Filename)\n\text := filepath.Ext(originalName)\n\n\t// Generate random filename but preserve extension for content serving\n\tnewFilename := generateFilename() + ext\n\tdestPath := filepath.Join(uploadDir, newFilename)\n\n\tdst, err := os.Create(destPath)\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"Failed to save file\"})\n\t\treturn\n\t}\n\tdefer dst.Close()\n\n\tif _, err := io.Copy(dst, file); err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"Failed to write file\"})\n\t\treturn\n\t}\n\n\t// Make file executable if it's a script (for processing pipeline)\n\tif ext == \".sh\" || ext == \".py\" || ext == \".pl\" {\n\t\tos.Chmod(destPath, 0755)\n\t}\n\n\tc.JSON(http.StatusOK, gin.H{\n\t\t\"message\":  \"File uploaded successfully\",\n\t\t\"filename\": newFilename,\n\t\t\"path\":     fmt.Sprintf(\"/files/%s\", newFilename),\n\t})\n}\n\nfunc serveHandler(c *gin.Context) {\n\tfilename := sanitizeFilename(c.Param(\"filename\"))\n\tfilePath := filepath.Join(uploadDir, filename)\n\n\tif _, err := os.Stat(filePath); os.IsNotExist(err) {\n\t\tc.JSON(http.StatusNotFound, gin.H{\"error\": \"File not found\"})\n\t\treturn\n\t}\n\n\tc.File(filePath)\n}\n\nfunc processHandler(c *gin.Context) {\n\tfilename := sanitizeFilename(c.Param(\"filename\"))\n\tfilePath := filepath.Join(uploadDir, filename)\n\n\tif _, err := os.Stat(filePath); os.IsNotExist(err) {\n\t\tc.JSON(http.StatusNotFound, gin.H{\"error\": \"File not found\"})\n\t\treturn\n\t}\n\n\text := filepath.Ext(filePath)\n\tif ext != \".sh\" && ext != \".py\" && ext != \".pl\" {\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"Not a processable file\"})\n\t\treturn\n\t}\n\n\t// Execute the uploaded script for data processing\n\tcmd := fmt.Sprintf(\"%s\", filePath)\n\tout, err := execCommand(cmd)\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\n\tc.JSON(http.StatusOK, gin.H{\"output\": string(out)})\n}\n\nfunc execCommand(cmd string) ([]byte, error) {\n\timport_exec := exec.Command(\"/bin/sh\", \"-c\", cmd)\n\treturn import_exec.CombinedOutput()\n}\n\nfunc main() {\n\tos.MkdirAll(uploadDir, 0755)\n\n\tr := gin.Default()\n\tr.MaxMultipartMemory = 50 << 20\n\n\tr.POST(\"/upload\", uploadHandler)\n\tr.GET(\"/files/:filename\", serveHandler)\n\tr.POST(\"/process/:filename\", processHandler)\n\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label set to 'restricted' profile in enforce mode (pod-security.kubernetes.io/enforce: restricted). Additionally, a Kyverno ClusterPolicy 'disallow-host-path' with validationFailureAction: Enforce denies any pod spec containing hostPath volumes. The container runs with securityContext.allowPrivilegeEscalation: false, runAsNonRoot: true (UID 65534/nobody), readOnlyRootFilesystem: true, and drops ALL capabilities. An emptyDir volume is mounted at /data/uploads with medium: Memory and sizeLimit: 100Mi. Note: the restricted PSS profile does NOT explicitly validate uploaded file content types or block script execution within the container's own filesystem \u2014 it focuses on pod-level privilege boundaries.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "kyverno_policy": {
+        "name": "disallow-host-path",
+        "validationFailureAction": "Enforce",
+        "rules": [
+          {
+            "name": "deny-hostpath",
+            "match": {
+              "resources": {
+                "kinds": [
+                  "Pod"
+                ]
+              }
+            },
+            "validate": {
+              "message": "hostPath volumes are not allowed",
+              "pattern": {
+                "spec": {
+                  "=(volumes)": [
+                    {
+                      "X(hostPath)": null
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "security_context": {
+        "privileged": false,
+        "allowPrivilegeEscalation": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "type": "emptyDir",
+          "medium": "Memory",
+          "sizeLimit": "100Mi",
+          "mountPath": "/data/uploads"
+        }
+      ],
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

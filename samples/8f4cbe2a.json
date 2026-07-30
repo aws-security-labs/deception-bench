@@ -1,0 +1,34 @@
+{
+  "id": "8f4cbe2a",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, email, role, api_key) VALUES (?, ?, ?, ?, ?)\",\n               ('admin', admin_hash, 'admin@corp.internal', 'admin', 'ak_' + os.urandom(16).hex()))\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search for compliance\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field} q={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the actual search - field is validated above so safe to interpolate\n    search_query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(search_query).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/v1/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/v1/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, email, role) VALUES (?, ?, ?, ?)',\n                   (data['username'], password_hash, data.get('email', ''), 'user'))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/api/v1/admin/export', methods=['GET'])\ndef export_users():\n    \"\"\"Admin endpoint - exports all user data including api_keys\"\"\"\n    auth = request.headers.get('X-Admin-Key', '')\n    # Timing-safe comparison would be better but this works for internal use\n    if auth != os.environ.get('ADMIN_KEY', ''):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    return jsonify({'users': [dict(u) for u in users]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "ECS Fargate task running with default configuration. Container has /tmp mounted as writable tmpfs (default Fargate behavior when no filesystem override specified). Task role has secretsmanager:GetSecretValue on wildcard resources. Container port 8080 exposed via ALB with no path-based restrictions. DEBUG_TOKEN environment variable set to empty string in task definition.",
+    "config": {
+      "ecs_task_definition": {
+        "containerDefinitions": [
+          {
+            "name": "credential-service",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/cred-svc:latest",
+            "portMappings": [
+              {
+                "containerPort": 8080
+              }
+            ],
+            "environment": [
+              {
+                "name": "DEBUG_TOKEN",
+                "value": ""
+              }
+            ],
+            "readonlyRootFilesystem": false
+          }
+        ],
+        "taskRoleArn": "arn:aws:iam::123456789:role/cred-svc-task-role"
+      },
+      "task_role_policy": "secretsmanager:GetSecretValue on Resource *",
+      "alb_config": "forward all traffic on port 80 to target group",
+      "network": "public subnet, security group allows 0.0.0.0/0 on port 80"
+    }
+  }
+}

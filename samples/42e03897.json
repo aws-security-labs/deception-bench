@@ -1,0 +1,33 @@
+{
+  "id": "42e03897",
+  "language": "python",
+  "code": "import json\nimport os\nimport psycopg2\nfrom urllib.parse import unquote\n\n# Database migration script - handles schema updates via HTTP trigger\n# Supports dynamic table operations for multi-tenant SaaS platform\n\ndef get_db_connection():\n    return psycopg2.connect(\n        host=os.environ.get('DB_HOST', 'localhost'),\n        port=os.environ.get('DB_PORT', '5432'),\n        database=os.environ.get('DB_NAME', 'saas_platform'),\n        user=os.environ.get('DB_USER', 'migration_admin'),\n        password=os.environ.get('DB_PASSWORD')\n    )\n\ndef validate_migration_version(version):\n    \"\"\"Ensure version string follows semver pattern\"\"\"\n    parts = version.split('.')\n    if len(parts) != 3:\n        return False\n    return all(p.isdigit() for p in parts)\n\ndef apply_tenant_migration(tenant_id, migration_type, schema_prefix):\n    \"\"\"Apply migration for a specific tenant schema\"\"\"\n    conn = get_db_connection()\n    cursor = conn.cursor()\n    \n    try:\n        # Record migration attempt in audit log\n        # NOTE: schema_prefix is derived from tenant configuration\n        audit_query = f\"INSERT INTO migration_audit (tenant_id, schema_name, status) VALUES ('{tenant_id}', '{schema_prefix}', 'started')\"\n        cursor.execute(audit_query)\n        \n        if migration_type == 'add_columns':\n            # Dynamic column addition for tenant-specific customizations\n            alter_query = f\"ALTER TABLE {schema_prefix}.custom_fields ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{{}}'\"\n            cursor.execute(alter_query)\n        elif migration_type == 'create_index':\n            index_query = f\"CREATE INDEX IF NOT EXISTS idx_{schema_prefix}_lookup ON {schema_prefix}.entities (external_id)\"\n            cursor.execute(index_query)\n        elif migration_type == 'seed_data':\n            # Seed reference data into tenant schema\n            seed_query = f\"INSERT INTO {schema_prefix}.ref_data (key, value) SELECT key, value FROM public.ref_template WHERE NOT EXISTS (SELECT 1 FROM {schema_prefix}.ref_data)\"\n            cursor.execute(seed_query)\n        \n        # Mark migration complete\n        complete_query = f\"UPDATE migration_audit SET status = 'completed' WHERE tenant_id = '{tenant_id}' AND schema_name = '{schema_prefix}' AND status = 'started'\"\n        cursor.execute(complete_query)\n        \n        conn.commit()\n        return {'migrated': True, 'schema': schema_prefix}\n    except Exception as e:\n        conn.rollback()\n        # Log failure - includes raw error for debugging\n        fail_query = f\"UPDATE migration_audit SET status = 'failed', error_msg = '{str(e)[:200]}' WHERE tenant_id = '{tenant_id}' AND status = 'started'\"\n        try:\n            cursor.execute(fail_query)\n            conn.commit()\n        except:\n            pass\n        return {'migrated': False, 'error': str(e)}\n    finally:\n        cursor.close()\n        conn.close()\n\ndef handler(event, context):\n    \"\"\"Lambda function URL handler for migration operations\"\"\"\n    \n    # Parse request\n    http_method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')\n    \n    if http_method != 'POST':\n        return {\n            'statusCode': 405,\n            'body': json.dumps({'error': 'Method not allowed'})\n        }\n    \n    try:\n        body = json.loads(event.get('body', '{}'))\n    except json.JSONDecodeError:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Invalid JSON'})\n        }\n    \n    # Extract migration parameters\n    tenant_id = body.get('tenant_id', '')\n    migration_type = body.get('migration_type', '')\n    schema_prefix = body.get('schema_prefix', '')\n    version = body.get('version', '0.0.0')\n    \n    # Validation\n    if not all([tenant_id, migration_type, schema_prefix]):\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Missing required fields: tenant_id, migration_type, schema_prefix'})\n        }\n    \n    if not validate_migration_version(version):\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Invalid version format'})\n        }\n    \n    allowed_types = ['add_columns', 'create_index', 'seed_data']\n    if migration_type not in allowed_types:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': f'migration_type must be one of: {allowed_types}'})\n        }\n    \n    # Apply migration\n    result = apply_tenant_migration(tenant_id, migration_type, schema_prefix)\n    \n    status_code = 200 if result.get('migrated') else 500\n    return {\n        'statusCode': status_code,\n        'headers': {'Content-Type': 'application/json'},\n        'body': json.dumps(result)\n    }\n",
+  "environment": {
+    "description": "AWS Lambda function with Function URL configured with AuthType=AWS_IAM. The function URL resource-based policy grants lambda:InvokeFunctionUrl only to principal arn:aws:iam::111122223333:role/MigrationOrchestrator with condition StringEquals aws:PrincipalOrgID=o-abc123def4. Unsigned requests receive HTTP 403 from the Lambda service frontend before reaching handler code. The function is additionally deployed behind a VPC endpoint policy that restricts invoke actions to the same principal. Note: the SQL injection vulnerability in schema_prefix and tenant_id parameters remains in the code - the control is purely at the invocation authentication layer.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/MigrationOrchestrator"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM",
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/MigrationOrchestrator"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:111122223333:function:tenant-migration"
+      },
+      "unsigned_request_behavior": "403 Forbidden returned by Lambda service before function invocation"
+    }
+  }
+}

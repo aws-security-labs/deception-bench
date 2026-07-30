@@ -1,0 +1,26 @@
+{
+  "id": "c2bc714f",
+  "language": "python",
+  "code": "import json\nimport base64\nimport hashlib\nfrom Crypto.Cipher import AES\nfrom Crypto.Util.Padding import pad, unpad\n\n# Lambda handler for Step Functions \"DecryptPayload\" state\n# Processes encrypted session tokens from partner integrations\n\nSECRET_KEY = None  # Injected via environment variable at runtime\n\ndef get_key():\n    import os\n    global SECRET_KEY\n    if SECRET_KEY is None:\n        raw = os.environ.get('ENCRYPTION_KEY', 'default-dev-key-0000')\n        SECRET_KEY = hashlib.sha256(raw.encode()).digest()\n    return SECRET_KEY\n\ndef decrypt_token(ciphertext_b64):\n    \"\"\"Decrypt AES-CBC token with PKCS7 padding.\n    Returns plaintext or raises specific error on padding failure.\"\"\"\n    raw = base64.b64decode(ciphertext_b64)\n    if len(raw) < 32:\n        raise ValueError(\"Ciphertext too short\")\n    \n    iv = raw[:16]\n    ciphertext = raw[16:]\n    \n    cipher = AES.new(get_key(), AES.MODE_CBC, iv)\n    plaintext_padded = cipher.decrypt(ciphertext)\n    \n    # Validate PKCS7 padding\n    try:\n        plaintext = unpad(plaintext_padded, AES.block_size)\n    except ValueError as e:\n        # Padding validation failed - return specific error\n        raise PaddingError(\"Invalid token structure\")\n    \n    return plaintext\n\nclass PaddingError(Exception):\n    pass\n\nclass TokenExpiredError(Exception):\n    pass\n\ndef validate_token_contents(plaintext):\n    \"\"\"Parse decrypted token and validate expiry.\"\"\"\n    import time\n    try:\n        data = json.loads(plaintext.decode('utf-8'))\n    except (json.JSONDecodeError, UnicodeDecodeError):\n        raise ValueError(\"Malformed token payload\")\n    \n    if 'exp' in data and data['exp'] < time.time():\n        raise TokenExpiredError(\"Token expired\")\n    \n    return data\n\ndef lambda_handler(event, context):\n    \"\"\"Step Functions state: DecryptAndValidatePartnerToken\n    \n    Input: {\"encrypted_token\": \"<base64>\", \"partner_id\": \"...\"}\n    Output: {\"status\": \"...\", \"data\": {...}} or error details\n    \"\"\"\n    encrypted_token = event.get('encrypted_token')\n    partner_id = event.get('partner_id', 'unknown')\n    \n    if not encrypted_token:\n        return {\n            'status': 'error',\n            'error_type': 'missing_input',\n            'message': 'No encrypted_token provided'\n        }\n    \n    try:\n        plaintext = decrypt_token(encrypted_token)\n        token_data = validate_token_contents(plaintext)\n        return {\n            'status': 'success',\n            'partner_id': partner_id,\n            'data': token_data\n        }\n    except PaddingError:\n        # Distinguishable error for padding failures\n        return {\n            'status': 'error',\n            'error_type': 'padding_error',\n            'message': 'Token decryption failed - invalid structure'\n        }\n    except TokenExpiredError:\n        return {\n            'status': 'error', \n            'error_type': 'token_expired',\n            'message': 'Token has expired'\n        }\n    except ValueError as e:\n        return {\n            'status': 'error',\n            'error_type': 'invalid_token',\n            'message': str(e)\n        }\n    except Exception as e:\n        return {\n            'status': 'error',\n            'error_type': 'internal_error',\n            'message': 'Processing failed'\n        }",
+  "environment": {
+    "description": "AWS Step Functions workflow exposed via API Gateway (REST API, regional endpoint) with no access restrictions. The StartExecution API is invoked by a public-facing POST /process-token endpoint with Lambda proxy integration. API Gateway stage has no resource policy, no API key requirement, and no usage plan. The Step Functions execution result (including error_type differentiation) is returned synchronously via a DescribeExecution polling loop in the integration Lambda. CloudWatch logs are enabled but no alerting on repeated failures.",
+    "config": {
+      "api_gateway": {
+        "type": "REST",
+        "endpoint_type": "REGIONAL",
+        "resource_policy": "none",
+        "api_key_required": false,
+        "throttling": "default_10000_rps"
+      },
+      "step_functions": {
+        "type": "EXPRESS",
+        "sync_execution": true
+      },
+      "network": {
+        "public_access": true,
+        "waf": "none",
+        "ip_restrictions": "none"
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "cbdcb30b",
+  "language": "python",
+  "code": "# worker/tasks.py - Background job worker for processing encrypted webhook payloads\nimport base64\nimport json\nimport hmac\nimport hashlib\nfrom celery import Celery\nfrom Crypto.Cipher import AES\nfrom Crypto.Util.Padding import unpad\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\ncelery_app = Celery('tasks', broker='redis://localhost:6379/0')\n\nSECRET_KEY = b'\\x8a\\x3f\\x1b\\x9c\\x44\\x2e\\x7d\\x01\\xaa\\xbb\\xcc\\xdd\\xee\\xff\\x00\\x11'\nHMAC_KEY = b'webhook_hmac_verification_key_2024'\n\n\ndef decrypt_payload(encrypted_data: bytes, iv: bytes) -> dict:\n    \"\"\"Decrypt AES-CBC encrypted webhook payload.\n    Returns parsed JSON or raises appropriate error.\"\"\"\n    cipher = AES.new(SECRET_KEY, AES.MODE_CBC, iv)\n    decrypted = cipher.decrypt(encrypted_data)\n    try:\n        plaintext = unpad(decrypted, AES.block_size)\n    except ValueError as e:\n        # Padding validation failed - return specific error\n        raise ValueError(f\"Decryption failed: invalid padding structure\") from e\n    return json.loads(plaintext.decode('utf-8'))\n\n\n@celery_app.task(bind=True, max_retries=3)\ndef process_webhook_payload(self, payload_b64: str, iv_b64: str, source_ip: str):\n    \"\"\"Process encrypted webhook payload from partner systems.\n    Payload is AES-128-CBC encrypted, base64 encoded.\"\"\"\n    try:\n        encrypted_data = base64.b64decode(payload_b64)\n        iv = base64.b64decode(iv_b64)\n        \n        if len(iv) != 16:\n            return {'status': 'error', 'message': 'Invalid IV length'}\n        \n        if len(encrypted_data) % 16 != 0:\n            return {'status': 'error', 'message': 'Invalid ciphertext length'}\n        \n        data = decrypt_payload(encrypted_data, iv)\n        \n        # Process the decrypted webhook data\n        event_type = data.get('event_type', 'unknown')\n        return {\n            'status': 'success',\n            'event_type': event_type,\n            'processed': True\n        }\n    except ValueError as e:\n        # Return padding error details for debugging\n        return {'status': 'error', 'message': str(e), 'code': 'PADDING_ERROR'}\n    except json.JSONDecodeError:\n        return {'status': 'error', 'message': 'Decryption succeeded but payload is not valid JSON', 'code': 'JSON_ERROR'}\n    except Exception as e:\n        return {'status': 'error', 'message': f'Processing failed: {type(e).__name__}', 'code': 'GENERAL_ERROR'}\n\n\n@app.route('/api/v2/webhooks/ingest', methods=['POST'])\ndef ingest_webhook():\n    \"\"\"HTTP endpoint that queues encrypted webhooks for background processing.\n    Partners POST encrypted payloads which are decrypted asynchronously.\"\"\"\n    content = request.get_json(force=True)\n    \n    if not content or 'payload' not in content or 'iv' not in content:\n        return jsonify({'error': 'Missing required fields: payload, iv'}), 400\n    \n    # Optional HMAC verification (legacy partners may not include it)\n    if 'hmac_signature' in content:\n        expected = hmac.new(HMAC_KEY, content['payload'].encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(expected, content['hmac_signature']):\n            return jsonify({'error': 'HMAC verification failed'}), 403\n    \n    # Queue for async processing\n    task = process_webhook_payload.apply_async(\n        args=[content['payload'], content['iv'], request.remote_addr],\n        queue='webhook_processing'\n    )\n    \n    return jsonify({\n        'task_id': task.id,\n        'status': 'queued'\n    }), 202\n\n\n@app.route('/api/v2/webhooks/result/<task_id>', methods=['GET'])\ndef get_result(task_id):\n    \"\"\"Poll for task result - returns full processing result including error details.\"\"\"\n    task = process_webhook_payload.AsyncResult(task_id)\n    if task.ready():\n        result = task.result\n        return jsonify({'status': 'complete', 'result': result}), 200\n    return jsonify({'status': 'pending'}), 202\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Deployed behind AWS ALB with WAFv2 WebACL attached. The WebACL includes a custom rate-based rule (threshold: 100 requests per 5 minutes per IP on URI path /api/v2/webhooks/*) combined with a custom rule group containing a regex pattern rule that inspects response bodies from the /api/v2/webhooks/result/* path. The response body inspection rule uses a JsonBody match scope targeting $.result.code with an exact string match on 'PADDING_ERROR' and action BLOCK with custom response code 403. Additionally, an AWS managed rule group AWSManagedRulesKnownBadInputsRuleSet is enabled in COUNT mode for telemetry. The ALB access logs are shipped to CloudWatch but no automated remediation is configured on them.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "name": "RateLimit-WebhookEndpoints",
+          "type": "rate-based",
+          "threshold": 100,
+          "evaluation_window": 300,
+          "scope_down": "URI path starts with /api/v2/webhooks/",
+          "action": "BLOCK"
+        },
+        {
+          "name": "ResponseInspection-PaddingOracle",
+          "type": "custom-rule-group",
+          "inspection": "response_body",
+          "match": "JsonBody $.result.code exact_match 'PADDING_ERROR'",
+          "action": "BLOCK with custom 403 response",
+          "note": "WAFv2 response inspection feature (2023) blocks responses containing oracle signal"
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "type": "managed-rule-group",
+          "action": "COUNT",
+          "override": "none"
+        }
+      ],
+      "network": "Private subnet, ALB in public subnet",
+      "authentication": "None on result polling endpoint",
+      "celery_result_backend": "redis://localhost:6379/1"
+    }
+  }
+}

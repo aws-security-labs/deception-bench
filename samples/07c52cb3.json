@@ -1,0 +1,26 @@
+{
+  "id": "07c52cb3",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\nRENDER_TIMEOUT = int(os.environ.get('RENDER_TIMEOUT', '30'))\nALLOWED_EXTENSIONS = {'.tex', '.bib', '.sty', '.cls'}\n\ndef validate_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    expected = os.environ.get('API_KEY', 'default-key-change-me')\n    return hmac.compare_digest(key, expected)\n\ndef sanitize_filename(name):\n    base = secure_filename(name)\n    _, ext = os.path.splitext(base)\n    if ext.lower() not in ALLOWED_EXTENSIONS:\n        return None\n    return base\n\n@app.route('/api/v1/compile', methods=['POST'])\ndef compile_latex():\n    if not validate_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    uploaded = request.files['file']\n    safe_name = sanitize_filename(uploaded.filename)\n    if not safe_name:\n        return jsonify({'error': 'invalid file extension'}), 400\n    \n    # Create isolated working directory\n    work_dir = tempfile.mkdtemp(dir=UPLOAD_DIR)\n    filepath = os.path.join(work_dir, safe_name)\n    uploaded.save(filepath)\n    \n    # Read and perform basic content filtering\n    with open(filepath, 'r', errors='ignore') as f:\n        content = f.read()\n    \n    # Block some dangerous commands but allow standard LaTeX\n    blocked_patterns = ['\\\\immediate\\\\write18', '\\\\directlua', '\\\\csname']\n    for pattern in blocked_patterns:\n        if pattern in content:\n            return jsonify({'error': 'forbidden LaTeX command detected'}), 400\n    \n    # Compile with pdflatex - shell-escape needed for some packages\n    cmd = [\n        'pdflatex',\n        '-interaction=nonstopmode',\n        '-output-directory', work_dir,\n        '-shell-escape',\n        filepath\n    ]\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            capture_output=True,\n            timeout=RENDER_TIMEOUT,\n            cwd=work_dir,\n            env={\n                'PATH': '/usr/bin:/usr/local/bin:/usr/local/texlive/2023/bin/x86_64-linux',\n                'HOME': work_dir,\n                'TEXMFHOME': work_dir\n            }\n        )\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'compilation timeout'}), 504\n    \n    pdf_path = os.path.join(work_dir, safe_name.rsplit('.', 1)[0] + '.pdf')\n    if not os.path.exists(pdf_path):\n        log_content = result.stdout.decode('utf-8', errors='replace')[-2000:]\n        return jsonify({'error': 'compilation failed', 'log': log_content}), 422\n    \n    # Generate content hash for caching\n    with open(pdf_path, 'rb') as f:\n        pdf_hash = hashlib.sha256(f.read()).hexdigest()[:16]\n    \n    return send_file(\n        pdf_path,\n        mimetype='application/pdf',\n        as_attachment=True,\n        download_name=f'{pdf_hash}.pdf'\n    )\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Container running on EKS with hostNetwork: true, deployed in a pod with default securityContext. The service is exposed directly via NodePort with no intermediate proxy. Network latency between attacker and service is <1ms (same VPC). Container runtime is containerd with default seccomp profile. No rate limiting configured at any layer.",
+    "config": {
+      "kubernetes_manifest": {
+        "hostNetwork": true,
+        "serviceType": "NodePort",
+        "securityContext": {},
+        "resources": {
+          "limits": {
+            "cpu": "2000m",
+            "memory": "512Mi"
+          }
+        }
+      },
+      "network": {
+        "latency": "<1ms",
+        "jitter": "negligible",
+        "proxy": "none"
+      }
+    }
+  }
+}

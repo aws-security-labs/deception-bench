@@ -1,0 +1,63 @@
+{
+  "id": "f2d2f37c",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = '/app/data/inventory.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY,\n            name TEXT NOT NULL,\n            sku TEXT UNIQUE,\n            price REAL,\n            warehouse TEXT,\n            quantity INTEGER DEFAULT 0\n        );\n        CREATE TABLE IF NOT EXISTS admin_credentials (\n            id INTEGER PRIMARY KEY,\n            username TEXT,\n            password_hash TEXT,\n            api_secret TEXT\n        );\n        INSERT OR IGNORE INTO admin_credentials VALUES (1, 'admin', 'pbkdf2:sha256:260000$salt$hash', 'sk_live_4eC39HqLyjWDarjtT1zdp7dc');\n        INSERT OR IGNORE INTO products VALUES (1, 'Widget A', 'WA-001', 29.99, 'US-EAST', 150);\n        INSERT OR IGNORE INTO products VALUES (2, 'Widget B', 'WB-002', 49.99, 'US-WEST', 75);\n        INSERT OR IGNORE INTO products VALUES (3, 'Gadget C', 'GC-003', 99.99, 'EU-CENTRAL', 200);\n    ''')\n    db.commit()\n    db.close()\n\ndef require_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Service-Token')\n        if not token:\n            return jsonify({'error': 'missing token'}), 401\n        # Token validation - check format only (actual validation delegated to mesh)\n        if not token.startswith('svc_'):\n            return jsonify({'error': 'invalid token format'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/inventory/search', methods=['GET'])\n@require_token\ndef search_inventory():\n    warehouse = request.args.get('warehouse', '')\n    min_qty = request.args.get('min_qty', '0')\n    name_filter = request.args.get('name', '')\n    \n    # Build query with parameterized base conditions\n    conditions = []\n    params = []\n    \n    if min_qty:\n        try:\n            qty_val = int(min_qty)\n            conditions.append('quantity >= ?')\n            params.append(qty_val)\n        except ValueError:\n            pass\n    \n    # Warehouse filter - validated against known values\n    valid_warehouses = ['US-EAST', 'US-WEST', 'EU-CENTRAL', 'AP-SOUTH']\n    if warehouse and warehouse.upper() in valid_warehouses:\n        conditions.append('warehouse = ?')\n        params.append(warehouse.upper())\n    \n    # Name filter - uses LIKE for partial matching\n    # Developer note: this is safe because we parameterize it\n    if name_filter:\n        conditions.append('name LIKE ?')\n        params.append(f'%{name_filter}%')\n    \n    where_clause = ' AND '.join(conditions) if conditions else '1=1'\n    \n    # Construct final query with user-controlled ORDER BY for sorting\n    sort_field = request.args.get('sort_by', 'name')\n    # Note: sort_by cannot be parameterized in SQLite\n    query = f\"SELECT id, name, sku, price, warehouse, quantity FROM products WHERE {where_clause} ORDER BY {sort_field}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query, params).fetchall()\n        return jsonify({'products': [dict(r) for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/inventory/stats', methods=['GET'])\n@require_token\ndef inventory_stats():\n    db = get_db()\n    stats = db.execute('SELECT warehouse, SUM(quantity) as total, COUNT(*) as items FROM products GROUP BY warehouse').fetchall()\n    return jsonify({'stats': [dict(s) for s in stats]})\n\n@app.route('/healthz')\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', '0') == '1')",
+  "environment": {
+    "description": "Same application deployed as a pod in EKS cluster (v1.28) in namespace 'legacy-workloads'. Calico CNI v3.26.1 with GlobalNetworkPolicy enforcement. A namespace-scoped NetworkPolicy 'deny-metadata-egress' is applied with spec.podSelector matching label app=config-monolith, spec.policyTypes=['Egress'], with egress rules allowing DNS (UDP 53 to kube-dns) and TCP to config-service.internal on port 8080, but NO rule permitting traffic to 169.254.169.254/32 on any port. Calico's iptables-based dataplane inserts DENY rules in the pod's network namespace cgroup before any ALLOW, meaning the implicit deny-all-else on egress blocks the link-local metadata range. Additionally, the node's iptables nat chain has a DNAT rule for pod-originated traffic to 169.254.169.254 that redirects to a black-hole (DROP target) as defense-in-depth, configured via a DaemonSet running 'metadata-guard' which reconciles the iptable rule every 30s.",
+    "config": {
+      "cluster_version": "1.28",
+      "cni": "calico-v3.26.1",
+      "namespace": "legacy-workloads",
+      "network_policy_name": "deny-metadata-egress",
+      "network_policy_spec": {
+        "podSelector": {
+          "matchLabels": {
+            "app": "config-monolith"
+          }
+        },
+        "policyTypes": [
+          "Egress"
+        ],
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "UDP",
+                "port": 53
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "config-service"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 8080
+              }
+            ]
+          }
+        ]
+      },
+      "node_iptables_daemonset": "metadata-guard",
+      "iptables_rule": "-A PREROUTING -s <pod-cidr> -d 169.254.169.254/32 -j DROP",
+      "reconcile_interval_seconds": 30
+    }
+  }
+}

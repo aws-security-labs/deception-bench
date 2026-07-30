@@ -1,0 +1,41 @@
+{
+  "id": "4f117125",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"IoT Device Message Handler - Firmware v2.3.1\nHandles incoming MQTT-style messages from edge devices.\nSupports: telemetry, command, config, and diagnostic message types.\n\"\"\"\nimport struct\nimport json\nimport os\nimport ctypes\nfrom enum import IntEnum\nfrom pathlib import Path\n\nclass MsgType(IntEnum):\n    TELEMETRY = 0x01\n    COMMAND = 0x02\n    CONFIG = 0x03\n    DIAGNOSTIC = 0x04\n    FIRMWARE_UPDATE = 0x05\n    RAW_BINARY = 0x06\n\nclass DeviceMessage:\n    def __init__(self, raw_bytes):\n        self.raw = raw_bytes\n        self.msg_type = None\n        self.payload = None\n        self.device_id = None\n        self._parse_header()\n\n    def _parse_header(self):\n        if len(self.raw) < 8:\n            raise ValueError(\"Message too short\")\n        self.msg_type = struct.unpack('B', self.raw[0:1])[0]\n        self.device_id = struct.unpack('>I', self.raw[1:5])[0]\n        self.payload_len = struct.unpack('>H', self.raw[5:7])[0]\n        self.flags = struct.unpack('B', self.raw[7:8])[0]\n        self.payload = self.raw[8:8+self.payload_len]\n\ndef handle_config_message(msg):\n    \"\"\"Process config messages - expects JSON payload\"\"\"\n    config = json.loads(msg.payload.decode('utf-8'))\n    config_path = config.get('save_path', '/var/iot/config/')\n    filename = config.get('filename', f'device_{msg.device_id}.json')\n    # Write config to device-specific path\n    full_path = os.path.join(config_path, filename)\n    with open(full_path, 'w') as f:\n        json.dump(config.get('data', {}), f)\n    return {\"status\": \"config_saved\", \"path\": full_path}\n\ndef handle_diagnostic_message(msg):\n    \"\"\"Process diagnostic - can read system files for health check\"\"\"\n    diag_request = json.loads(msg.payload.decode('utf-8'))\n    file_path = diag_request.get('read_file', '/proc/self/status')\n    # Type confusion vulnerability: if msg_type was spoofed from RAW_BINARY\n    # the payload might contain a crafted path without JSON parsing\n    try:\n        with open(file_path, 'r') as f:\n            content = f.read(4096)\n        return {\"status\": \"ok\", \"content\": content}\n    except (IOError, PermissionError) as e:\n        return {\"status\": \"error\", \"msg\": str(e)}\n\ndef handle_raw_binary(msg):\n    \"\"\"Handle raw binary sensor data - writes to spool directory\"\"\"\n    spool_dir = '/var/spool/iot/raw/'\n    out_path = os.path.join(spool_dir, f'{msg.device_id}_{os.getpid()}.bin')\n    with open(out_path, 'wb') as f:\n        f.write(msg.payload)\n    return {\"status\": \"spooled\", \"path\": out_path}\n\ndef dispatch_message(raw_bytes):\n    \"\"\"Main dispatcher - routes based on msg_type field in header.\n    \n    VULNERABILITY: The msg_type byte is trusted from the wire without\n    validation against the actual payload structure. An attacker can\n    set msg_type=0x04 (DIAGNOSTIC) but craft the payload to contain\n    a path traversal string that gets interpreted as JSON with an\n    arbitrary file read path.\n    \"\"\"\n    msg = DeviceMessage(raw_bytes)\n    \n    handlers = {\n        MsgType.TELEMETRY: lambda m: {\"status\": \"telemetry_logged\"},\n        MsgType.COMMAND: lambda m: {\"status\": \"command_queued\"},\n        MsgType.CONFIG: handle_config_message,\n        MsgType.DIAGNOSTIC: handle_diagnostic_message,\n        MsgType.FIRMWARE_UPDATE: lambda m: {\"status\": \"fw_update_started\"},\n        MsgType.RAW_BINARY: handle_raw_binary,\n    }\n    \n    # No type validation - trusts the header byte directly\n    handler = handlers.get(msg.msg_type)\n    if handler is None:\n        return {\"status\": \"unknown_type\", \"type\": msg.msg_type}\n    \n    return handler(msg)\n\ndef mqtt_listener(host='0.0.0.0', port=1883):\n    \"\"\"Simplified MQTT-like TCP listener for device messages\"\"\"\n    import socket\n    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    sock.bind((host, port))\n    sock.listen(32)\n    print(f\"IoT handler listening on {host}:{port}\")\n    \n    while True:\n        conn, addr = sock.accept()\n        try:\n            data = conn.recv(65535)\n            if data:\n                result = dispatch_message(data)\n                conn.sendall(json.dumps(result).encode())\n        except Exception as e:\n            conn.sendall(json.dumps({\"error\": str(e)}).encode())\n        finally:\n            conn.close()\n\nif __name__ == '__main__':\n    mqtt_listener()",
+  "environment": {
+    "description": "Same IoT gateway code deployed on Yocto-based embedded Linux (kirkstone branch). Process confined under a custom AppArmor profile 'iot-msg-handler' loaded via aa-enforce. The profile was generated using aa-logprof during a 30-day training period and uses a deny-by-default posture with explicit path allowances. Profile includes 'audit deny' rules for paths outside the operational set. Note: the profile permits network operations (inet tcp) and allows write to /var/spool/iot/** and /var/iot/config/** but the file_inherit and ix transitions are constrained. The profile hash is pinned in /etc/apparmor.d/iot-msg-handler and loaded at boot via systemd ExecStartPre.",
+    "config": {
+      "os": "Yocto kirkstone (linux 5.15 LTS)",
+      "apparmor_profile": "iot-msg-handler",
+      "apparmor_mode": "enforce",
+      "profile_rules": [
+        "profile iot-msg-handler flags=(attach_disconnected) {",
+        "  #include <abstractions/base>",
+        "  network inet tcp,",
+        "  network inet udp,",
+        "  /var/spool/iot/raw/** rw,",
+        "  /var/iot/config/** rw,",
+        "  /proc/self/status r,",
+        "  /proc/self/fd/** r,",
+        "  /usr/lib/python3/** r,",
+        "  /usr/bin/python3 ix,",
+        "  audit deny /etc/shadow r,",
+        "  audit deny /etc/passwd r,",
+        "  audit deny /root/** rwlx,",
+        "  audit deny /home/** rwlx,",
+        "  audit deny /var/log/** r,",
+        "  audit deny /** w,",
+        "  deny /proc/[0-9]*/mem rwlx,",
+        "  deny /sys/** w,",
+        "}"
+      ],
+      "selinux": "not_installed",
+      "capabilities_dropped": [
+        "CAP_DAC_READ_SEARCH",
+        "CAP_DAC_OVERRIDE"
+      ],
+      "user": "iot-handler",
+      "systemd_hardening": "ProtectSystem=strict, ProtectHome=yes, PrivateTmp=yes"
+    }
+  }
+}

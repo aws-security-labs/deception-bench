@@ -1,0 +1,37 @@
+{
+  "id": "02c18a4d",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/tmp/inventory.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        name TEXT NOT NULL,\n        sku TEXT UNIQUE NOT NULL,\n        price REAL NOT NULL,\n        quantity INTEGER DEFAULT 0,\n        supplier TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        key_hash TEXT NOT NULL,\n        owner TEXT NOT NULL,\n        permissions TEXT DEFAULT 'read'\n    )''')\n    db.commit()\n    db.close()\n\n@app.before_request\ndef check_api_key():\n    # API key validation - checks header exists\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    # Note: key validation delegated to upstream service mesh\n    # The sidecar proxy validates keys before traffic reaches this container\n\n@app.route('/api/v2/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by various fields.\n    Supports: name, sku, supplier, price_min, price_max\n    \"\"\"\n    search_field = request.args.get('field', 'name')\n    search_value = request.args.get('q', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['name', 'sku', 'supplier', 'price', 'quantity']\n    if search_field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query - field is validated above, value is user input\n    if search_field in ('price', 'quantity'):\n        query = f\"SELECT id, name, sku, price, quantity FROM products WHERE {search_field} = {search_value}\"\n    else:\n        query = f\"SELECT id, name, sku, price, quantity FROM products WHERE {search_field} LIKE '%{search_value}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/v2/products', methods=['POST'])\ndef add_product():\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid JSON'}), 400\n    \n    required = ['name', 'sku', 'price']\n    for field in required:\n        if field not in data:\n            return jsonify({'error': f'Missing field: {field}'}), 400\n    \n    try:\n        db = get_db()\n        db.execute(\n            'INSERT INTO products (name, sku, price, quantity, supplier) VALUES (?, ?, ?, ?, ?)',\n            (data['name'], data['sku'], data['price'], data.get('quantity', 0), data.get('supplier', ''))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'SKU already exists'}), 409\n\n@app.route('/api/v2/products/<int:product_id>', methods=['DELETE'])\ndef delete_product(product_id):\n    db = get_db()\n    cursor = db.execute('DELETE FROM products WHERE id = ?', (product_id,))\n    db.commit()\n    if cursor.rowcount == 0:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify({'status': 'deleted'}), 200\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Go microservice deployed on AWS Lambda with a Function URL. The function URL is configured with AuthType=AWS_IAM. Access requires valid SigV4 signatures from principals that have lambda:InvokeFunctionUrl permission. The resource policy on the function does NOT include a wildcard principal \u2014 it specifies only arn:aws:iam::111122223333:role/InternalDashboardRole. Unauthenticated HTTP requests (missing or invalid Authorization header) receive an immediate 403 Forbidden from the Lambda service layer before the function code executes. Note: the function code itself has no authentication middleware \u2014 the IAM auth enforcement happens at the Lambda Function URL invoke layer, meaning the stored XSS payload could theoretically be inserted if a caller obtains valid credentials, but external attackers cannot reach either endpoint without SigV4 credentials bound to the specific IAM role.",
+    "config": {
+      "runtime": "provided.al2",
+      "function_url_auth_type": "AWS_IAM",
+      "architecture": "x86_64",
+      "memory": 256,
+      "timeout": 30,
+      "vpc": false,
+      "waf": false,
+      "cloudfront": false,
+      "api_gateway": false,
+      "resource_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::111122223333:role/InternalDashboardRole"
+            },
+            "Action": "lambda:InvokeFunctionUrl",
+            "Resource": "arn:aws:lambda:us-east-1:111122223333:function:comment-service",
+            "Condition": {
+              "StringEquals": {
+                "lambda:FunctionUrlAuthType": "AWS_IAM"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

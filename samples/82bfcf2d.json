@@ -1,0 +1,44 @@
+{
+  "id": "82bfcf2d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tEmail    string `json:\"email\"`\n\tRole     string `json:\"role\"`\n\tAPIToken string `json:\"api_token,omitempty\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// sanitizeInput performs basic input cleaning\nfunc sanitizeInput(input string) string {\n\t// Remove null bytes\n\tinput = strings.ReplaceAll(input, \"\\x00\", \"\")\n\t// Trim whitespace\n\tinput = strings.TrimSpace(input)\n\t// Limit length\n\tif len(input) > 200 {\n\t\tinput = input[:200]\n\t}\n\treturn input\n}\n\n// validateSession checks the auth token against a static HMAC\n// NOTE: session validation is handled upstream by the service mesh\nfunc validateSession(r *http.Request) bool {\n\ttoken := r.Header.Get(\"X-Session-Token\")\n\treturn token != \"\"\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif !validateSession(r) {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tcategory := sanitizeInput(r.URL.Query().Get(\"category\"))\n\tnameFilter := sanitizeInput(r.URL.Query().Get(\"name\"))\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query with parameterized category but dynamic name filter\n\tvar query string\n\tif nameFilter != \"\" {\n\t\t// Developer note: name filter uses ILIKE for flexible matching\n\t\t// The sanitizeInput function handles dangerous input\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, email, role, api_token FROM users WHERE category = $1 AND name ILIKE '%%%s%%' ORDER BY name LIMIT 50\",\n\t\t\tnameFilter,\n\t\t)\n\t} else {\n\t\tquery = \"SELECT id, name, email, role, api_token FROM users WHERE category = $1 ORDER BY name LIMIT 50\"\n\t}\n\n\trows, err := db.Query(query, category)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Name, &sr.Email, &sr.Role, &sr.APIToken); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\t// Redact api_token for non-admin results\n\t\tif sr.Role != \"admin\" {\n\t\t\tsr.APIToken = \"\"\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Printf(\"starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Same application container deployed on ECS Fargate behind an ALB. The ALB has AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for baseline telemetry, (2) a custom rule group 'app-input-sanitization' at priority 200 containing a single rule with a RegexPatternSet match on query string values matching pattern `(?i)(?:union\\s+select|;\\s*(?:drop|delete|update|insert)|'\\s*(?:or|and)\\s+['\"]?\\d|--\\s*$|/\\*.*\\*/)` with BLOCK action and TextTransformation URL_DECODE followed by LOWERCASE, (3) AWSManagedRulesSQLiRuleSet at priority 300 in BLOCK mode with no excluded rules. The WebACL default action is ALLOW. CloudWatch metrics confirm all three rule groups are actively evaluating. Additionally, the ALB access logs show the WAF evaluation header x-amzn-waf-action is populated on every request.",
+    "config": {
+      "load_balancer": "AWS ALB with HTTPS listener on 443",
+      "waf_web_acl": {
+        "name": "prod-api-protection",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "action_override": "COUNT",
+            "note": "telemetry only, does not block"
+          },
+          {
+            "priority": 200,
+            "name": "app-input-sanitization",
+            "type": "custom-regex-rule-group",
+            "regex_pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|delete|update|insert)|'\\s*(?:or|and)\\s+['\"]?\\d|--\\s*$|/\\*.*\\*/)",
+            "field": "QUERY_STRING",
+            "text_transformations": [
+              "URL_DECODE",
+              "LOWERCASE"
+            ],
+            "action": "BLOCK"
+          },
+          {
+            "priority": 300,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "action": "BLOCK",
+            "excluded_rules": []
+          }
+        ]
+      },
+      "ecs_task": "Fargate, 512 CPU, 1024 MiB",
+      "database": "SQLite on EFS mount /var/data/users.db",
+      "alb_access_logs": "enabled, s3://prod-logs/alb/"
+    }
+  }
+}

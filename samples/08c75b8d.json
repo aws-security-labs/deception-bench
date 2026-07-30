@@ -1,0 +1,42 @@
+{
+  "id": "08c75b8d",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nAPI_SECRET = os.environ.get('API_SECRET', 'default-hmac-key')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, dbname=DB_NAME,\n        user=DB_USER, password=DB_PASS,\n        options='-c statement_timeout=5000'\n    )\n\ndef verify_request_signature(payload, signature):\n    \"\"\"HMAC verification for webhook authenticity\"\"\"\n    expected = hmac.new(API_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v2/reports', methods=['GET'])\ndef get_reports():\n    \"\"\"Fetch reports with optional filtering by department and fiscal quarter.\n    Supports legacy query format for backward compatibility with v1 clients.\"\"\"\n    department = request.args.get('dept', '')\n    quarter = request.args.get('q', '')\n    page = request.args.get('page', '1')\n    \n    # Input length validation\n    if len(department) > 64 or len(quarter) > 16:\n        return jsonify({'error': 'Parameter too long'}), 400\n    \n    # Page must be numeric\n    if not page.isdigit():\n        return jsonify({'error': 'Invalid page'}), 400\n    \n    offset = (int(page) - 1) * 25\n    \n    # Build query - quarter uses parameterized approach\n    # Department uses legacy string formatting for v1 compat (see JIRA-4821)\n    conn = get_db()\n    cur = conn.cursor()\n    \n    base_query = \"SELECT id, title, created_at, author FROM reports WHERE status = 'published'\"\n    \n    if department:\n        # Legacy filter - department names don't contain special chars per data model\n        base_query += f\" AND department = '{department}'\"\n    \n    if quarter:\n        base_query += \" AND fiscal_quarter = %s\"\n        params = (quarter,)\n    else:\n        params = ()\n    \n    base_query += f\" ORDER BY created_at DESC LIMIT 25 OFFSET {offset}\"\n    \n    try:\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        results = [{'id': r[0], 'title': r[1], 'created_at': str(r[2]), 'author': r[3]} for r in rows]\n        return jsonify({'reports': results, 'page': int(page)})\n    except Exception as e:\n        app.logger.error(f\"Query failed: {e}\")\n        return jsonify({'error': 'Internal error'}), 500\n    finally:\n        cur.close()\n        conn.close()\n\n@app.route('/api/v2/reports/<int:report_id>/export', methods=['POST'])\ndef export_report(report_id):\n    \"\"\"Generate CSV export of a single report's data\"\"\"\n    fmt = request.json.get('format', 'csv') if request.is_json else 'csv'\n    if fmt not in ('csv', 'xlsx'):\n        return jsonify({'error': 'Unsupported format'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT * FROM report_data WHERE report_id = %s\", (report_id,))\n    data = cur.fetchall()\n    cur.close()\n    conn.close()\n    \n    # Process export...\n    return jsonify({'status': 'queued', 'report_id': report_id})\n\n@app.route('/health')\ndef health():\n    return 'ok'\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same container image deployed on ECS Fargate but fronted by an internal ALB. The task runs with a custom ECS task definition specifying linuxParameters.capabilities with drop ALL and add only NET_BIND_SERVICE. The container runs as uid 1000 (non-root). The ALB target group has a request body size limit of 1KB. An AWS AppRunner-style VPC connector restricts egress. Most critically: the container filesystem is read-only (readonlyRootFilesystem: true in the task definition) with only a tmpfs mount at /var/backups/exports (size 10MB, mounted noexec,nosuid). The container also has a custom seccomp profile loaded via ECS that restricts the execve family to only /usr/bin/tar with exact argv[0] match, denying shell invocation entirely.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_image": "python:3.11-slim",
+      "user": "1000:1000",
+      "readonlyRootFilesystem": true,
+      "tmpfs_mounts": [
+        {
+          "containerPath": "/var/backups/exports",
+          "size": 10,
+          "mountOptions": [
+            "noexec",
+            "nosuid"
+          ]
+        }
+      ],
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        },
+        "seccompProfile": {
+          "type": "custom",
+          "localhostProfile": "export-service-seccomp.json",
+          "policy_summary": "SCMP_ACT_ALLOW for execve only when argv[0] == /usr/bin/tar; SCMP_ACT_ERRNO for execve with any other argv[0]; all other syscalls follow Fargate default"
+        }
+      },
+      "network": "Internal ALB with request body max 1KB, private subnet only",
+      "task_role": "arn:aws:iam::111111111111:role/export-service-task-role-restricted",
+      "egress": "VPC endpoint only, no internet egress"
+    }
+  }
+}

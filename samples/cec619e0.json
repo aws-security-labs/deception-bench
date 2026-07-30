@@ -1,0 +1,91 @@
+{
+  "id": "cec619e0",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 10,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'missing tenant token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tid;\n    req.userRole = payload.role;\n  } catch (e) {\n    return res.status(401).json({ error: 'invalid token' });\n  }\n  next();\n}\n\napp.use(extractTenant);\n\n// Document search endpoint - supports flexible filtering\napp.get('/api/v1/documents', async (req, res) => {\n  const { category, author, sort_by, direction } = req.query;\n  \n  let query = `SELECT id, title, category, author, created_at FROM documents WHERE tenant_id = '${req.tenantId}'`;\n  \n  if (category) {\n    query += ` AND category = '${category}'`;\n  }\n  if (author) {\n    query += ` AND author = '${author}'`;\n  }\n  \n  // Sort support\n  const allowedSorts = ['created_at', 'title', 'category'];\n  if (sort_by && allowedSorts.includes(sort_by)) {\n    query += ` ORDER BY ${sort_by} ${direction === 'desc' ? 'DESC' : 'ASC'}`;\n  }\n  \n  query += ' LIMIT 100';\n  \n  try {\n    const result = await pool.query(query);\n    res.json({ documents: result.rows });\n  } catch (e) {\n    console.error('Query error:', e.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Document detail with version history\napp.get('/api/v1/documents/:id/versions', async (req, res) => {\n  const docId = req.params.id;\n  // Intentionally not parameterized for \"performance\" with prepared statement caching\n  const query = `SELECT v.version_num, v.modified_by, v.modified_at, v.change_summary \n    FROM document_versions v \n    JOIN documents d ON d.id = v.document_id \n    WHERE d.tenant_id = '${req.tenantId}' AND v.document_id = '${docId}'\n    ORDER BY v.version_num DESC`;\n  \n  try {\n    const result = await pool.query(query);\n    res.json({ versions: result.rows });\n  } catch (e) {\n    console.error('Version query error:', e.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v1/documents/export', async (req, res) => {\n  const { doc_ids, format } = req.body;\n  if (!Array.isArray(doc_ids) || doc_ids.length === 0) {\n    return res.status(400).json({ error: 'doc_ids required' });\n  }\n  \n  const idList = doc_ids.map(id => `'${id}'`).join(',');\n  const query = `SELECT id, title, content, metadata FROM documents WHERE tenant_id = '${req.tenantId}' AND id IN (${idList})`;\n  \n  try {\n    const result = await pool.query(query);\n    // Format conversion would happen here\n    res.json({ exported: result.rows.length, data: result.rows });\n  } catch (e) {\n    console.error('Export error:', e.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('Document service running on :3000'));",
+  "environment": {
+    "description": "Same Actix-web service deployed in namespace 'prod-api' with Istio sidecar. Istio PeerAuthentication is set to STRICT mTLS for the mesh. An AuthorizationPolicy named 'deny-external-audit' is applied at mesh level (root namespace istio-system) with a DENY action matching requests where source.namespace is NOT in ['prod-api', 'monitoring'] AND the operation paths include '/api/v1/audit'. A second workload-scoped AuthorizationPolicy 'allow-ingress-only' on the prod-api namespace uses an ALLOW action requiring source.principal to match 'cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account' for paths ['/api/v1/login', '/api/v1/search']. The /api/v1/audit endpoint is only reachable from pods in 'monitoring' namespace with service account 'sa-audit-collector'. External requests through the IngressGateway can only reach /login and /search. The Fluentd log parser uses a strict regex pattern that drops log lines not matching the expected structured format (field=value pairs without newlines), effectively neutralizing injected log entries that attempt CRLF or multi-line injection into the SIEM.",
+    "config": {
+      "kubernetes_namespace": "prod-api",
+      "istio_mtls_mode": "STRICT",
+      "istio_peer_authentication": "STRICT mesh-wide",
+      "authorization_policy_1": {
+        "name": "deny-external-audit",
+        "namespace": "istio-system",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "prod-api",
+                    "monitoring"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/v1/audit"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_2": {
+        "name": "allow-ingress-only",
+        "namespace": "prod-api",
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/v1/login",
+                    "/api/v1/search"
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/monitoring/sa/sa-audit-collector"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/v1/audit"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "fluentd_parser": "regex pattern: /^(?<level>\\w+)\\s+(?<fields>[a-zA-Z_]+=\\S+(?:\\s+[a-zA-Z_]+=\\S+)*)$/",
+      "network_policy": "default-deny ingress with explicit allow from istio-system"
+    }
+  }
+}

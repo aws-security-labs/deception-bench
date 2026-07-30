@@ -1,0 +1,62 @@
+{
+  "id": "8a12f5b1",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, Error};\nuse actix_multipart::Multipart;\nuse futures_util::StreamExt;\nuse std::path::PathBuf;\nuse std::io::Write;\nuse zip::ZipArchive;\nuse std::fs;\nuse tempfile::NamedTempFile;\n\nconst UPLOAD_DIR: &str = \"/var/app/uploads\";\nconst EXTRACT_DIR: &str = \"/var/app/extracted\";\n\n/// Handles ZIP file uploads and extracts contents to the extraction directory.\n/// Supports nested directories within the archive.\nasync fn upload_and_extract(mut payload: Multipart) -> Result<HttpResponse, Error> {\n    while let Some(item) = payload.next().await {\n        let mut field = item.map_err(|e| {\n            actix_web::error::ErrorBadRequest(format!(\"Multipart error: {}\", e))\n        })?;\n\n        // Write uploaded content to a temporary file\n        let mut temp_file = NamedTempFile::new().map_err(|e| {\n            actix_web::error::ErrorInternalServerError(format!(\"Temp file error: {}\", e))\n        })?;\n\n        while let Some(chunk) = field.next().await {\n            let data = chunk.map_err(|e| {\n                actix_web::error::ErrorBadRequest(format!(\"Read error: {}\", e))\n            })?;\n            temp_file.write_all(&data).map_err(|e| {\n                actix_web::error::ErrorInternalServerError(format!(\"Write error: {}\", e))\n            })?;\n        }\n\n        // Open as ZIP archive\n        let file = fs::File::open(temp_file.path()).map_err(|e| {\n            actix_web::error::ErrorInternalServerError(format!(\"File open error: {}\", e))\n        })?;\n\n        let mut archive = ZipArchive::new(file).map_err(|e| {\n            actix_web::error::ErrorBadRequest(format!(\"Invalid ZIP: {}\", e))\n        })?;\n\n        // Extract each entry\n        for i in 0..archive.len() {\n            let mut entry = archive.by_index(i).map_err(|e| {\n                actix_web::error::ErrorInternalServerError(format!(\"ZIP entry error: {}\", e))\n            })?;\n\n            let entry_name = entry.name().to_string();\n            \n            // Skip directories themselves, they'll be created with files\n            if entry_name.ends_with('/') {\n                continue;\n            }\n\n            // Construct output path by joining extract dir with entry name\n            // Note: we sanitize by checking the entry doesn't start with '/'\n            let sanitized_name = if entry_name.starts_with('/') {\n                &entry_name[1..]\n            } else {\n                &entry_name\n            };\n\n            let output_path = PathBuf::from(EXTRACT_DIR).join(sanitized_name);\n\n            // Create parent directories if needed\n            if let Some(parent) = output_path.parent() {\n                fs::create_dir_all(parent).map_err(|e| {\n                    actix_web::error::ErrorInternalServerError(format!(\"Dir create error: {}\", e))\n                })?;\n            }\n\n            // Write file contents\n            let mut outfile = fs::File::create(&output_path).map_err(|e| {\n                actix_web::error::ErrorInternalServerError(format!(\"File create error: {}\", e))\n            })?;\n\n            std::io::copy(&mut entry, &mut outfile).map_err(|e| {\n                actix_web::error::ErrorInternalServerError(format!(\"Copy error: {}\", e))\n            })?;\n        }\n    }\n\n    Ok(HttpResponse::Ok().json(serde_json::json!({\n        \"status\": \"success\",\n        \"message\": \"Archive extracted successfully\"\n    })))\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    // Ensure directories exist\n    fs::create_dir_all(UPLOAD_DIR)?;\n    fs::create_dir_all(EXTRACT_DIR)?;\n\n    println!(\"Starting server on 0.0.0.0:8080\");\n\n    HttpServer::new(|| {\n        App::new()\n            .route(\"/health\", web::get().to(health))\n            .route(\"/api/v1/upload\", web::post().to(upload_and_extract))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same Actix-web service deployed on ECS Fargate behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes a custom rule group with a RegexPatternSet rule that inspects the Body of POST requests to /api/v1/upload. The rule uses a byte-match condition on the raw multipart body scanning for sequences containing '../' (hex 2e2e2f) and '..\\' (hex 2e2e5c) patterns within the first 8KB of the body payload. Additionally, the WebACL has a size constraint rule limiting request body to 10MB. The WAF is configured with OverrideAction: none and the custom rule has Action: BLOCK with a 403 response. The WAF logs to CloudWatch Logs with full request body sampling enabled for blocked requests. Note: the WAF body inspection uses the 'BODY' field type with OversizeHandling set to 'MATCH' meaning oversized bodies are also blocked.",
+    "config": {
+      "runtime": "ECS Fargate (rust:1.75-slim, non-root user 1000)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/zip-upload-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "BlockPathTraversalInBody",
+          "priority": 1,
+          "statement": {
+            "RegexPatternSetReferenceStatement": {
+              "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/path-traversal-patterns/def456",
+              "FieldToMatch": {
+                "Body": {
+                  "OversizeHandling": "MATCH"
+                }
+              },
+              "TextTransformations": [
+                {
+                  "Priority": 0,
+                  "Type": "URL_DECODE"
+                },
+                {
+                  "Priority": 1,
+                  "Type": "NONE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK",
+          "regex_patterns": [
+            "\\.\\.[\\/\\\\]",
+            "%2e%2e[%2f%5c/\\\\]"
+          ]
+        },
+        {
+          "name": "BodySizeConstraint",
+          "priority": 2,
+          "statement": {
+            "SizeConstraintStatement": {
+              "FieldToMatch": {
+                "Body": {
+                  "OversizeHandling": "MATCH"
+                }
+              },
+              "ComparisonOperator": "GT",
+              "Size": 10485760
+            }
+          },
+          "action": "BLOCK"
+        }
+      ],
+      "waf_association": "ALB ARN associated with WebACL",
+      "filesystem": "Ephemeral Fargate storage, /var/app is container-local",
+      "container_user": "UID 1000 (non-root)"
+    }
+  }
+}

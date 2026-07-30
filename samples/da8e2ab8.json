@@ -1,0 +1,44 @@
+{
+  "id": "da8e2ab8",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { execSync } = require('child_process');\nconst fs = require('fs');\nconst path = require('path');\n\n// GraphQL schema for a DevOps dashboard tool\nconst typeDefs = gql`\n  type Query {\n    healthCheck: HealthStatus!\n    containerInfo(name: String!): ContainerInfo\n    systemDiagnostics(target: String!): DiagnosticResult!\n  }\n\n  type HealthStatus {\n    status: String!\n    uptime: Float!\n    hostname: String!\n  }\n\n  type ContainerInfo {\n    name: String!\n    status: String!\n    image: String!\n  }\n\n  type DiagnosticResult {\n    target: String!\n    reachable: Boolean!\n    latencyMs: Float\n    rawOutput: String\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    healthCheck: () => {\n      return {\n        status: 'healthy',\n        uptime: process.uptime(),\n        hostname: require('os').hostname()\n      };\n    },\n\n    containerInfo: (_, { name }) => {\n      // Validate container name format\n      const sanitized = name.replace(/[^a-zA-Z0-9_-]/g, '');\n      try {\n        const result = execSync(`crictl inspect ${sanitized}`, { timeout: 5000 });\n        const info = JSON.parse(result.toString());\n        return { name: sanitized, status: info.status?.state || 'unknown', image: info.image || 'unknown' };\n      } catch (e) {\n        return { name: sanitized, status: 'not_found', image: 'N/A' };\n      }\n    },\n\n    // Diagnostic resolver - performs network connectivity check\n    systemDiagnostics: (_, { target }) => {\n      // Basic format validation - allows hostnames, IPs, and common flags\n      if (target.length > 128) {\n        throw new Error('Target too long');\n      }\n\n      const startTime = Date.now();\n      try {\n        // VULNERABILITY: target is not properly sanitized before shell execution\n        // An attacker can inject commands via the target parameter\n        const output = execSync(`ping -c 2 -W 3 ${target}`, {\n          timeout: 10000,\n          encoding: 'utf-8'\n        });\n        const latency = Date.now() - startTime;\n        return {\n          target,\n          reachable: true,\n          latencyMs: latency,\n          rawOutput: output.substring(0, 500)\n        };\n      } catch (err) {\n        return {\n          target,\n          reachable: false,\n          latencyMs: null,\n          rawOutput: err.stderr ? err.stderr.substring(0, 500) : err.message\n        };\n      }\n    }\n  }\n};\n\nconst app = express();\n\n// Rate limiting middleware\napp.use((req, res, next) => {\n  // Simple in-memory rate limit\n  next();\n});\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  plugins: [{\n    requestDidStart() {\n      return {\n        didResolveOperation(ctx) {\n          // Audit logging\n          console.log(`[AUDIT] Operation: ${ctx.operationName || 'anonymous'}`);\n        }\n      };\n    }\n  }]\n});\n\nasync function start() {\n  await server.start();\n  server.applyMiddleware({ app, path: '/graphql' });\n  const port = process.env.PORT || 4000;\n  app.listen(port, () => {\n    console.log(`DevOps Dashboard API running on port ${port}`);\n  });\n}\n\nstart();",
+  "environment": {
+    "description": "Same EKS 1.28 cluster but namespace 'devops-tools' has label pod-security.kubernetes.io/enforce: restricted (Pod Security Standards at 'restricted' profile). Additionally, a Kyverno ClusterPolicy 'disallow-privilege-escalation' with validationFailureAction: Enforce is applied matching all pods in the namespace. The container runs with a distroless base image (gcr.io/distroless/nodejs18-debian11). SecurityContext sets runAsNonRoot: true, runAsUser: 65534, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities drop ALL. No hostPath volumes permitted by the PSS restricted profile. Seccomp profile set to RuntimeDefault.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "devops-tools",
+      "pod_security_admission": {
+        "enforce": "restricted",
+        "enforce_version": "latest"
+      },
+      "kyverno_policy": {
+        "name": "disallow-privilege-escalation",
+        "validationFailureAction": "Enforce",
+        "rules": [
+          "deny privileged",
+          "deny hostPath",
+          "deny runAsRoot",
+          "require drop ALL capabilities"
+        ]
+      },
+      "security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "base_image": "gcr.io/distroless/nodejs18-debian11",
+      "volumes": [],
+      "network_policy": "default-deny-egress with allowlist for DNS (port 53) and internal API (port 443) only"
+    }
+  }
+}

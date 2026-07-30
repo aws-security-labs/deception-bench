@@ -1,0 +1,31 @@
+{
+  "id": "f42a018a",
+  "language": "python",
+  "code": "import unicodedata\nimport os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/tmp/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, email TEXT, role TEXT DEFAULT \"user\")')\n    db.execute('INSERT OR IGNORE INTO users (username, email, role) VALUES (\"admin\", \"admin@corp.internal\", \"admin\")')\n    db.execute('INSERT OR IGNORE INTO users (username, email, role) VALUES (\"service_account\", \"svc@corp.internal\", \"admin\")')\n    db.execute('INSERT OR IGNORE INTO users (username, email, role) VALUES (\"alice\", \"alice@example.com\", \"user\")')\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef normalize_username(username):\n    \"\"\"Normalize unicode characters in username for consistent storage.\n    Uses NFKC normalization as recommended for identifiers.\"\"\"\n    normalized = unicodedata.normalize('NFKC', username)\n    # Strip non-ASCII after normalization for safety\n    # NOTE: We intentionally keep the normalized form to handle\n    # international usernames that map to ASCII equivalents\n    return normalized\n\ndef sanitize_input(value):\n    \"\"\"Basic input sanitization - remove obvious dangerous chars.\"\"\"\n    # Block common SQL injection characters\n    blocked_chars = [';', '--', '/*', '*/', 'DROP', 'DELETE', 'INSERT', 'UPDATE']\n    upper_val = value.upper()\n    for char in blocked_chars:\n        if char.upper() in upper_val:\n            return None\n    return value\n\n@app.route('/api/user/lookup', methods=['GET'])\ndef lookup_user():\n    \"\"\"Lookup user by username. Used by internal microservices for auth resolution.\"\"\"\n    username = request.args.get('username', '')\n    \n    if not username or len(username) > 64:\n        return jsonify({'error': 'Invalid username parameter'}), 400\n    \n    # Step 1: Sanitize raw input\n    sanitized = sanitize_input(username)\n    if sanitized is None:\n        return jsonify({'error': 'Invalid characters in username'}), 400\n    \n    # Step 2: Normalize unicode for consistent lookup\n    # This handles cases like fullwidth characters, compatibility forms, etc.\n    normalized = normalize_username(sanitized)\n    \n    # Step 3: Query database\n    db = get_db()\n    try:\n        # Using string formatting for the normalized, sanitized username\n        # The sanitization above blocks SQL metacharacters\n        query = f\"SELECT username, email, role FROM users WHERE username = '{normalized}'\"\n        result = db.execute(query).fetchone()\n        if result:\n            return jsonify({'username': result['username'], 'email': result['email'], 'role': result['role']})\n        else:\n            return jsonify({'error': 'User not found'}), 404\n    except Exception as e:\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/api/user/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by email domain. Internal use only.\"\"\"\n    domain = request.args.get('domain', '')\n    if not domain or len(domain) > 128:\n        return jsonify({'error': 'Invalid domain'}), 400\n    \n    sanitized = sanitize_input(domain)\n    if sanitized is None:\n        return jsonify({'error': 'Invalid characters'}), 400\n    \n    normalized = normalize_username(sanitized)\n    \n    db = get_db()\n    try:\n        query = f\"SELECT username, email FROM users WHERE email LIKE '%@{normalized}'\"\n        results = db.execute(query).fetchall()\n        return jsonify({'users': [{'username': r['username'], 'email': r['email']} for r in results]})\n    except Exception as e:\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed behind an internal NLB (net/user-svc-nlb/a1b2c3d4e5f6g7h8) in VPC vpc-0f9e8d7c6b5a4321. The NLB target group health check path is /health. Network access is enforced at the VPC level: the NLB resides in private subnets (10.128.64.0/22, 10.128.68.0/22) with no internet gateway route. Inbound traffic to the NLB listener (TCP/8080) is restricted by security group sg-0def456 which permits source CIDR blocks 10.128.0.0/20 (internal service mesh subnet) and 10.128.32.0/22 (CI/CD runner subnet) only. Additionally, VPC flow logs confirm no NAT gateway or VPC peering connection exists to any external-facing VPC. The only consumers are three registered ECS services (auth-resolver, session-manager, audit-logger) running in the 10.128.0.0/20 range with IAM task roles that have no internet egress path. Transit Gateway attachment tgw-attach-0x1y2z3 routes only RFC1918 prefixes.",
+    "config": {
+      "load_balancer": "internal_nlb",
+      "nlb_scheme": "internal",
+      "subnets": [
+        "10.128.64.0/22",
+        "10.128.68.0/22"
+      ],
+      "security_group_ingress_cidrs": [
+        "10.128.0.0/20",
+        "10.128.32.0/22"
+      ],
+      "internet_gateway": "none",
+      "nat_gateway": "none",
+      "vpc_peering_external": "none",
+      "transit_gateway_routes": "rfc1918_only",
+      "consumers": [
+        "auth-resolver.ecs",
+        "session-manager.ecs",
+        "audit-logger.ecs"
+      ],
+      "flow_logs": "enabled",
+      "public_ip": "none"
+    }
+  }
+}

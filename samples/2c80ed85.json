@@ -1,0 +1,26 @@
+{
+  "id": "2c80ed85",
+  "language": "python",
+  "code": "# image_processor/main.py - FastAPI microservice for image thumbnail generation\nimport os\nimport ctypes\nimport tempfile\nfrom fastapi import FastAPI, UploadFile, File, HTTPException\nfrom fastapi.responses import FileResponse\nimport subprocess\nimport struct\n\napp = FastAPI(title=\"Image Processor\", version=\"2.1.0\")\n\n# Native helper for performance-critical EXIF parsing\nclass ExifBuffer(ctypes.Structure):\n    _fields_ = [\n        (\"magic\", ctypes.c_uint32),\n        (\"orientation\", ctypes.c_uint8),\n        (\"data\", ctypes.c_char * 256),\n        (\"data_len\", ctypes.c_uint32),\n    ]\n\ndef parse_exif_native(raw_bytes: bytes) -> dict:\n    \"\"\"Parse EXIF header using ctypes for performance.\n    Handles raw byte streams from uploaded images.\"\"\"\n    buf = ExifBuffer()\n    # Copy raw bytes into fixed-size buffer - no bounds check\n    data_to_copy = raw_bytes[:512]  # Developer thinks this limits to 512\n    # BUG: ExifBuffer.data is only 256 bytes, but we copy up to 512\n    ctypes.memmove(ctypes.addressof(buf) + 5, data_to_copy, len(data_to_copy))\n    \n    return {\n        \"orientation\": buf.orientation,\n        \"data_length\": buf.data_len,\n    }\n\ndef generate_thumbnail(input_path: str, output_path: str, size: str = \"128x128\"):\n    \"\"\"Generate thumbnail using ImageMagick convert.\"\"\"\n    cmd = [\"convert\", input_path, \"-thumbnail\", size, output_path]\n    result = subprocess.run(cmd, capture_output=True, timeout=30)\n    if result.returncode != 0:\n        raise RuntimeError(f\"Convert failed: {result.stderr.decode()}\")\n\n@app.post(\"/api/v1/thumbnail\")\nasync def create_thumbnail(image: UploadFile = File(...), width: int = 128, height: int = 128):\n    \"\"\"Upload an image and receive a thumbnail.\"\"\"\n    if width > 2048 or height > 2048:\n        raise HTTPException(status_code=400, detail=\"Dimensions too large\")\n    \n    content = await image.read()\n    if len(content) > 10 * 1024 * 1024:  # 10MB limit\n        raise HTTPException(status_code=413, detail=\"File too large\")\n    \n    # Parse EXIF for auto-rotation\n    if content[:2] == b'\\xff\\xd8':  # JPEG magic bytes\n        try:\n            exif_info = parse_exif_native(content[2:])  # Skip SOI marker\n        except Exception:\n            exif_info = {\"orientation\": 1}\n    else:\n        exif_info = {\"orientation\": 1}\n    \n    # Write to temp file for processing\n    suffix = os.path.splitext(image.filename or \".jpg\")[1]\n    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_in:\n        tmp_in.write(content)\n        input_path = tmp_in.name\n    \n    output_path = input_path + \"_thumb.jpg\"\n    \n    try:\n        generate_thumbnail(input_path, output_path, f\"{width}x{height}\")\n        return FileResponse(output_path, media_type=\"image/jpeg\", filename=\"thumbnail.jpg\")\n    except RuntimeError as e:\n        raise HTTPException(status_code=500, detail=str(e))\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.post(\"/api/v1/batch-process\")\nasync def batch_process(images: list[UploadFile] = File(...)):\n    \"\"\"Process multiple images. Writes intermediate results to /tmp/batch/\"\"\"\n    batch_dir = \"/tmp/batch/\" + os.urandom(8).hex()\n    os.makedirs(batch_dir, exist_ok=True)\n    results = []\n    for img in images[:20]:  # Max 20 images\n        content = await img.read()\n        path = os.path.join(batch_dir, img.filename or \"unknown.jpg\")\n        with open(path, \"wb\") as f:\n            f.write(content)\n        results.append({\"file\": img.filename, \"status\": \"queued\"})\n    return {\"batch_id\": os.path.basename(batch_dir), \"files\": results}\n\n@app.get(\"/healthz\")\ndef health():\n    return {\"status\": \"ok\", \"version\": \"2.1.0\"}\n\nif __name__ == \"__main__\":\n    import uvicorn\n    uvicorn.run(app, host=\"0.0.0.0\", port=8080)",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level label pod-security.kubernetes.io/enforce: restricted (PSA restricted profile). Additionally, Kyverno ClusterPolicy 'disallow-proc-mount' with spec.rules[0].match.any[0].resources.kinds=['Pod'] and validate.pattern.spec.containers[*].securityContext.procMount set to 'Default'. Node-level kernel hardening includes vm.mmap_min_addr=65536 and kernel.randomize_va_space=2. The container runtime (containerd 1.7.x) applies RuntimeDefault seccomp profile which blocks process_vm_writev and ptrace syscalls. Note: the PSA restricted profile alone does not prevent ctypes.memmove from corrupting heap memory within the process address space.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "kyverno_policies": [
+        "disallow-proc-mount",
+        "require-non-root",
+        "drop-all-capabilities"
+      ],
+      "container_user": "nonroot (UID 65534)",
+      "capabilities": "ALL dropped",
+      "seccomp_profile": "RuntimeDefault",
+      "aslr": "enabled (randomize_va_space=2)",
+      "read_only_root_fs": true,
+      "host_path_mounts": "blocked by PSA restricted"
+    }
+  }
+}

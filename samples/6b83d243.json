@@ -1,0 +1,29 @@
+{
+  "id": "6b83d243",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, abort\nfrom lxml import etree\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\n\ndef verify_webhook_signature(payload, signature):\n    \"\"\"Verify GitHub-style webhook signature\"\"\"\n    if not signature:\n        return False\n    expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f'sha256={expected}', signature)\n\ndef parse_config(xml_data):\n    \"\"\"Parse deployment configuration XML from CI/CD pipeline\"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        no_network=False,\n        dtd_validation=False,\n        load_dtd=True\n    )\n    try:\n        doc = etree.fromstring(xml_data, parser)\n        config = {}\n        for elem in doc.iter():\n            if elem.text and elem.text.strip():\n                config[elem.tag] = elem.text.strip()\n        return config\n    except etree.XMLSyntaxError as e:\n        raise ValueError(f\"Invalid XML: {e}\")\n\ndef validate_config_schema(config):\n    \"\"\"Basic schema validation for deployment configs\"\"\"\n    required_fields = ['service_name', 'version', 'environment']\n    for field in required_fields:\n        if field not in config:\n            raise ValueError(f\"Missing required field: {field}\")\n    if config.get('environment') not in ('staging', 'production', 'development'):\n        raise ValueError(\"Invalid environment value\")\n    return True\n\n@app.route('/api/v1/deploy/config', methods=['POST'])\ndef submit_config():\n    \"\"\"Accept deployment configuration from CI/CD webhooks\"\"\"\n    sig = request.headers.get('X-Hub-Signature-256')\n    raw_body = request.get_data()\n    \n    # Note: signature verification has a bug (hmac.new vs hmac.HMAC)\n    # but we still attempt it for logging purposes\n    if os.environ.get('REQUIRE_SIG') == 'true':\n        if not verify_webhook_signature(raw_body, sig):\n            abort(401, 'Invalid signature')\n    \n    content_type = request.content_type or ''\n    if 'xml' not in content_type.lower():\n        abort(415, 'Content-Type must be application/xml')\n    \n    try:\n        config = parse_config(raw_body)\n        validate_config_schema(config)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    \n    # Store parsed config\n    config_id = hashlib.md5(raw_body).hexdigest()[:12]\n    return jsonify({\n        'status': 'accepted',\n        'config_id': config_id,\n        'parsed_fields': list(config.keys()),\n        'values': config\n    }), 202\n\n@app.route('/api/v1/deploy/status/<config_id>', methods=['GET'])\ndef get_status(config_id):\n    \"\"\"Check deployment status\"\"\"\n    # Simplified - would normally check a database\n    return jsonify({'config_id': config_id, 'status': 'pending'})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The PostgreSQL 14.9 RDS instance has a custom parameter group with the pg_stat_statements extension loaded and a connection pooler (PgBouncer) in transaction mode. The database role 'appuser' is configured with a row-level security policy but more critically: (1) The RDS instance parameter group sets 'session_preload_libraries' to include a custom extension that enforces a query execution plan allow-list compiled from the application's prepared statements, rejecting any query whose plan hash doesn't match the registered set \u2014 specifically the extension 'pg_plan_filter' with plan_filter.mode = 'enforce' and plan_filter.log_level = 'error'; (2) The PostgreSQL role 'appuser' has the attribute 'SET plan_filter.enabled = on' forced via ALTER ROLE appuser SET plan_filter.enabled = on, meaning any query that produces a novel execution plan (such as one with a subquery injected into ORDER BY) is rejected with ERROR before returning results; (3) PgBouncer is configured with 'disable_pqexec=1' forcing all queries through the extended query protocol which separates parse/bind/execute phases, though this alone wouldn't prevent the injection since the f-string builds the SQL before it reaches PgBouncer.",
+    "config": {
+      "runtime": "python3.11-flask-gunicorn on ECS Fargate",
+      "database": "PostgreSQL 14.9 RDS with custom parameter group",
+      "pg_extensions": [
+        "pg_stat_statements",
+        "pg_plan_filter"
+      ],
+      "pg_plan_filter_config": {
+        "mode": "enforce",
+        "baseline_captured": true,
+        "plan_hashes_registered": 3,
+        "reject_unknown_plans": true,
+        "log_level": "error"
+      },
+      "role_config": "ALTER ROLE appuser SET plan_filter.enabled = on",
+      "pgbouncer": {
+        "mode": "transaction",
+        "disable_pqexec": 1
+      },
+      "network": "ALB -> ECS Fargate, no WAF"
+    }
+  }
+}

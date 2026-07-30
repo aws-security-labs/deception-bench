@@ -1,0 +1,35 @@
+{
+  "id": "b4e5e5b4",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.regex.Pattern;\n\n@WebServlet(\"/api/reports\")\npublic class ReportGeneratorServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_IDENTIFIER = Pattern.compile(\"^[a-zA-Z][a-zA-Z0-9_]{0,63}$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String sortColumn = req.getParameter(\"sort\");\n        String filterDate = req.getParameter(\"from_date\");\n        String customerId = req.getParameter(\"customer_id\");\n        \n        if (reportType == null || sortColumn == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate sort column against allowlist pattern\n        if (!SAFE_IDENTIFIER.matcher(sortColumn).matches()) {\n            resp.sendError(400, \"Invalid sort column\");\n            return;\n        }\n        \n        // Template-based query construction\n        Map<String, String> templateVars = new HashMap<>();\n        templateVars.put(\"sort_col\", sortColumn);\n        templateVars.put(\"report_type\", reportType);\n        \n        String queryTemplate;\n        if (\"summary\".equals(reportType)) {\n            queryTemplate = \"SELECT id, name, total FROM reports WHERE type='summary' \"\n                + \"AND created_at >= '\" + filterDate + \"' \"\n                + \"ORDER BY ${sort_col} ASC\";\n        } else if (\"detail\".equals(reportType)) {\n            queryTemplate = \"SELECT * FROM reports WHERE type='detail' \"\n                + \"AND customer_id = '\" + customerId + \"' \"\n                + \"ORDER BY ${sort_col} ASC\";\n        } else {\n            resp.sendError(400, \"Unknown report type\");\n            return;\n        }\n        \n        StringSubstitutor sub = new StringSubstitutor(templateVars);\n        String finalQuery = sub.replace(queryTemplate);\n        \n        try {\n            Connection conn = getConnection();\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(finalQuery);\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(\"[\\n\");\n            boolean first = true;\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            while (rs.next()) {\n                if (!first) out.write(\",\\n\");\n                out.write(\"{\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) out.write(\",\");\n                    out.write(\"\\\"\" + meta.getColumnName(i) + \"\\\":\");\n                    out.write(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                out.write(\"}\");\n                first = false;\n            }\n            out.write(\"\\n]\");\n            rs.close();\n            stmt.close();\n            conn.close();\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query failed\");\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n}",
+  "environment": {
+    "description": "ECS Fargate task deployed via AWS Proton with an environment template that enforces a Cilium-based network policy sidecar (managed through ECS Service Connect mesh configuration). The Cilium agent runs as a DaemonSet equivalent injected via a custom Fargate platform extension. The network policy CiliumNetworkPolicy resource specifies egress rules with a CIDR deny list that includes 169.254.0.0/16 (link-local) and 192.168.0.0/16 in the L3/L4 filter section. Additionally, the task definition includes a dependsOn constraint ensuring the envoy-proxy-init container runs first with NET_ADMIN to install iptables DNAT rules redirecting link-local traffic to a blackhole. The task IAM role has a permissions boundary (arn:aws:iam::ACCOUNT:policy/FargateTaskBoundary) that denies sts:AssumeRole and restricts credential scope, but this alone would not prevent the SSRF from reaching the endpoint. The combination of the L3 CIDR deny on 169.254.0.0/16 at the network layer AND the iptables DNAT blackhole for link-local in the init container together prevent any HTTP request from the application container from reaching 169.254.169.254 or 169.254.170.2.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "platform_version": "1.4.0",
+      "network_mode": "awsvpc",
+      "service_mesh": "ECS Service Connect with Cilium sidecar",
+      "cilium_network_policy": {
+        "egress_deny_cidr": [
+          "169.254.0.0/16",
+          "192.168.0.0/16"
+        ],
+        "enforcement": "L3/L4"
+      },
+      "init_container": {
+        "name": "envoy-proxy-init",
+        "capabilities": [
+          "NET_ADMIN"
+        ],
+        "iptables_rules": [
+          "-t nat -A OUTPUT -d 169.254.0.0/16 -j DNAT --to-destination 127.0.0.1:1",
+          "-t filter -A OUTPUT -d 169.254.0.0/16 -j DROP"
+        ],
+        "essential": false,
+        "dependsOn_condition": "SUCCESS"
+      },
+      "permissions_boundary": "arn:aws:iam::ACCOUNT:policy/FargateTaskBoundary",
+      "proton_environment_template": "fargate-hardened-v3.2"
+    }
+  }
+}

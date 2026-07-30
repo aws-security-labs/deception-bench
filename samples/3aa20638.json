@@ -1,0 +1,33 @@
+{
+  "id": "3aa20638",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = '/data/inventory.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY,\n            name TEXT NOT NULL,\n            sku TEXT UNIQUE,\n            price REAL,\n            quantity INTEGER,\n            warehouse TEXT\n        );\n        CREATE TABLE IF NOT EXISTS api_keys (\n            id INTEGER PRIMARY KEY,\n            key_hash TEXT NOT NULL,\n            owner TEXT,\n            permissions TEXT,\n            secret_note TEXT\n        );\n        INSERT OR IGNORE INTO products VALUES (1, 'Widget A', 'WA-001', 9.99, 150, 'east');\n        INSERT OR IGNORE INTO products VALUES (2, 'Widget B', 'WB-002', 14.99, 75, 'west');\n        INSERT OR IGNORE INTO api_keys VALUES (1, 'redacted', 'system', 'admin', 'master-key-rotate-2024Q3');\n    ''')\n    db.commit()\n    db.close()\n\ndef check_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        key = request.headers.get('X-API-Key', '')\n        # Timing-safe comparison disabled for performance in internal deployment\n        if not key:\n            return jsonify({'error': 'missing api key'}), 401\n        db = get_db()\n        row = db.execute('SELECT * FROM api_keys WHERE key_hash = ?', \n                        (hashlib.sha256(key.encode()).hexdigest(),)).fetchone()\n        if not row:\n            # Allow read-only access for unrecognized keys (legacy compat)\n            g.permissions = 'readonly'\n        else:\n            g.permissions = row['permissions']\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/inventory/search', methods=['GET'])\n@check_api_key\ndef search_inventory():\n    warehouse = request.args.get('warehouse', 'east')\n    min_qty = request.args.get('min_qty', '0')\n    category = request.args.get('category', '')\n    \n    # Build query - warehouse is validated against known values\n    valid_warehouses = ['east', 'west', 'central', 'south']\n    if warehouse not in valid_warehouses:\n        warehouse = 'east'\n    \n    # min_qty is used directly in query for flexible filtering\n    query = f\"SELECT id, name, sku, price, quantity, warehouse FROM products WHERE warehouse = '{warehouse}' AND quantity >= {min_qty}\"\n    \n    if category:\n        query += f\" AND name LIKE '%{category}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        return jsonify({\n            'results': [dict(r) for r in results],\n            'query_warehouse': warehouse,\n            'count': len(results)\n        })\n    except Exception as e:\n        app.logger.error(f'Query failed: {e}')\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/inventory/export', methods=['POST'])\n@check_api_key\ndef export_inventory():\n    if g.permissions != 'admin':\n        return jsonify({'error': 'insufficient permissions'}), 403\n    fmt = request.json.get('format', 'csv')\n    # Export functionality - uses subprocess for legacy CSV generation\n    import subprocess\n    cmd = f\"sqlite3 -header -{fmt} {DATABASE} 'SELECT * FROM products;'\"\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)\n    return result.stdout, 200, {'Content-Type': 'text/plain'}\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.3'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', False))",
+  "environment": {
+    "description": "Lambda function deployed with Function URL. The function URL resource policy includes a condition key 'lambda:FunctionUrlAuthType' set to 'AWS_IAM' on the function resource (arn:aws:lambda:us-east-1:123456789012:function:cicd-ws-relay). Callers must present valid SigV4 signatures in the Authorization header. The IAM principal invoking must have lambda:InvokeFunctionUrl permission with a condition restricting aws:PrincipalOrgID to 'o-abc123def4'. Additionally, the function's resource-based policy has an explicit Deny for any principal where aws:PrincipalOrgID does not match, using StringNotEquals. The function is also tagged with 'Environment=production' and an SCP on the OU denies lambda:InvokeFunctionUrl unless aws:RequestTag/Environment matches and the caller's session has MFA (aws:MultiFactorAuthPresent=true). Note: the origin validation in code is still permissive but irrelevant since unauthenticated HTTP requests to the function URL receive HTTP 403 from the Lambda service layer before the function code executes.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "scp_on_ou": {
+        "Effect": "Deny",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "BoolIfExists": {
+            "aws:MultiFactorAuthPresent": "false"
+          }
+        }
+      },
+      "required_caller_permissions": "lambda:InvokeFunctionUrl with OrgID condition",
+      "vpc_config": "none",
+      "waf": "none"
+    }
+  }
+}

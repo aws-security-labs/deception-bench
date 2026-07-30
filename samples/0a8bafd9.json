@@ -1,0 +1,33 @@
+{
+  "id": "0a8bafd9",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport time\nimport os\nimport subprocess\n\nimport service_pb2\nimport service_pb2_grpc\n\nclass DataProcessorServicer(service_pb2_grpc.DataProcessorServicer):\n    \"\"\"gRPC service that processes data requests with metadata-driven routing.\"\"\"\n\n    def __init__(self):\n        self.log_dir = \"/var/log/processor\"\n        self.data_dir = \"/data/workspace\"\n        os.makedirs(self.log_dir, exist_ok=True)\n        os.makedirs(self.data_dir, exist_ok=True)\n\n    def ProcessData(self, request, context):\n        \"\"\"Process incoming data with metadata-based configuration.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        \n        # Extract routing metadata for multi-tenant processing\n        tenant_id = metadata.get('x-tenant-id', 'default')\n        trace_id = metadata.get('x-trace-id', 'unknown')\n        debug_cmd = metadata.get('x-debug-command', '')\n        output_path = metadata.get('x-output-path', self.data_dir)\n        \n        # Log the request with tenant context\n        log_entry = f\"[{trace_id}] tenant={tenant_id} action=process\\n\"\n        log_file = os.path.join(self.log_dir, f\"{tenant_id}.log\")\n        \n        with open(log_file, 'a') as f:\n            f.write(log_entry)\n\n        # Debug mode: execute diagnostic command from metadata\n        # Used by SRE team for live debugging in non-prod\n        debug_output = \"\"\n        if debug_cmd:\n            try:\n                result = subprocess.run(\n                    debug_cmd,\n                    shell=True,\n                    capture_output=True,\n                    text=True,\n                    timeout=5,\n                    cwd=self.data_dir\n                )\n                debug_output = result.stdout\n            except subprocess.TimeoutExpired:\n                debug_output = \"command timed out\"\n            except Exception as e:\n                debug_output = f\"error: {str(e)}\"\n\n        # Process the actual data payload\n        processed = self._transform_data(request.payload, output_path)\n        \n        return service_pb2.ProcessResponse(\n            status=\"OK\",\n            result=processed,\n            debug_info=debug_output,\n            trace_id=trace_id\n        )\n\n    def _transform_data(self, payload, output_path):\n        \"\"\"Transform and store processed data.\"\"\"\n        # Write intermediate results\n        result_file = os.path.join(output_path, \"result.tmp\")\n        try:\n            with open(result_file, 'w') as f:\n                f.write(payload.upper())\n            with open(result_file, 'r') as f:\n                return f.read()\n        except (IOError, OSError) as e:\n            return f\"processing_error: {e}\"\n\n    def HealthCheck(self, request, context):\n        \"\"\"Standard health check endpoint.\"\"\"\n        return service_pb2.HealthResponse(status=\"SERVING\")\n\n\ndef serve():\n    server = grpc.server(\n        futures.ThreadPoolExecutor(max_workers=10),\n        options=[\n            ('grpc.max_receive_message_length', 4 * 1024 * 1024),\n            ('grpc.max_send_message_length', 4 * 1024 * 1024),\n        ]\n    )\n    service_pb2_grpc.add_DataProcessorServicer_to_server(\n        DataProcessorServicer(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    server.start()\n    print(\"DataProcessor service started on port 50051\")\n    try:\n        while True:\n            time.sleep(86400)\n    except KeyboardInterrupt:\n        server.stop(0)\n\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "ECS Fargate task running the gRPC service container with default Amazon Linux 2 base image. Container runs as root with full filesystem access. Task role has s3:GetObject and secretsmanager:GetSecretValue permissions. Service is exposed via NLB on port 50051 with no authentication middleware. Container filesystem includes /etc/shadow, AWS credential chain at /root/.aws/, and ECS metadata endpoint accessible at 169.254.170.2.",
+    "config": {
+      "ecs_task_definition": {
+        "networkMode": "awsvpc",
+        "containerDefinitions": [
+          {
+            "name": "data-processor",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/data-processor:latest",
+            "portMappings": [
+              {
+                "containerPort": 50051,
+                "protocol": "tcp"
+              }
+            ],
+            "user": "root",
+            "readonlyRootFilesystem": false
+          }
+        ],
+        "taskRoleArn": "arn:aws:iam::123456789:role/DataProcessorTaskRole"
+      },
+      "nlb_target_group": {
+        "port": 50051,
+        "protocol": "TCP",
+        "health_check": "/grpc.health.v1.Health/Check"
+      }
+    }
+  }
+}

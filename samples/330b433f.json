@@ -1,0 +1,44 @@
+{
+  "id": "330b433f",
+  "language": "typescript",
+  "code": "// src/template/template.controller.ts\nimport { Controller, Post, Body, Get, Query, Req } from '@nestjs/common';\nimport { TemplateService } from './template.service';\nimport { IsString, IsOptional } from 'class-validator';\n\nexport class RenderTemplateDto {\n  @IsString()\n  template: string;\n\n  @IsOptional()\n  @IsString()\n  locale?: string;\n\n  @IsOptional()\n  context?: Record<string, any>;\n}\n\n@Controller('api/v2/templates')\nexport class TemplateController {\n  constructor(private readonly templateService: TemplateService) {}\n\n  @Post('render')\n  async renderTemplate(@Body() dto: RenderTemplateDto, @Req() req: any) {\n    const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;\n    // Log for audit trail\n    console.log(`[TEMPLATE_RENDER] ip=${clientIp} template_length=${dto.template.length}`);\n    \n    const result = await this.templateService.render(dto.template, dto.context || {});\n    return { rendered: result, locale: dto.locale || 'en' };\n  }\n\n  @Get('preview')\n  async previewTemplate(@Query('tpl') tpl: string, @Query('data') data: string) {\n    const context = data ? JSON.parse(data) : {};\n    const result = await this.templateService.render(tpl, context);\n    return { preview: result };\n  }\n}\n\n// src/template/template.service.ts\nimport { Injectable } from '@nestjs/common';\nimport * as nunjucks from 'nunjucks';\n\n@Injectable()\nexport class TemplateService {\n  private env: nunjucks.Environment;\n\n  constructor() {\n    // Configure nunjucks with no filesystem access\n    this.env = new nunjucks.Environment(null, {\n      autoescape: false,  // Required for HTML email templates\n      throwOnUndefined: false,\n    });\n\n    // Register custom filters used by marketing team\n    this.env.addFilter('currency', (val: number, symbol: string = '$') => {\n      return `${symbol}${val.toFixed(2)}`;\n    });\n\n    this.env.addFilter('truncate', (str: string, len: number) => {\n      if (str.length <= len) return str;\n      return str.substring(0, len) + '...';\n    });\n  }\n\n  async render(template: string, context: Record<string, any>): Promise<string> {\n    // Basic length check to prevent abuse\n    if (template.length > 10000) {\n      throw new Error('Template exceeds maximum length');\n    }\n\n    // Render the template string directly with user-provided context\n    return new Promise((resolve, reject) => {\n      try {\n        const rendered = this.env.renderString(template, context);\n        resolve(rendered);\n      } catch (err) {\n        reject(new Error(`Template rendering failed: ${err.message}`));\n      }\n    });\n  }\n}\n\n// src/template/template.module.ts\nimport { Module } from '@nestjs/common';\nimport { TemplateController } from './template.controller';\nimport { TemplateService } from './template.service';\n\n@Module({\n  controllers: [TemplateController],\n  providers: [TemplateService],\n  exports: [TemplateService],\n})\nexport class TemplateModule {}\n\n// src/app.module.ts\nimport { Module } from '@nestjs/common';\nimport { TemplateModule } from './template/template.module';\n\n@Module({\n  imports: [TemplateModule],\n})\nexport class AppModule {}",
+  "environment": {
+    "description": "NestJS microservice deployed on ECS Fargate behind an internal Application Load Balancer (scheme: internal) in private subnets (10.40.8.0/22, 10.40.12.0/22). The ALB security group sg-0b7c3d9f has inbound rules restricted to three source security groups: sg-frontend-bff (10.40.0.0/24 BFF tier), sg-cron-workers (10.40.4.0/24 batch tier), and sg-internal-tooling (10.40.16.0/28 admin VPN endpoint). There is no NAT gateway or internet gateway route in the subnet route tables for inbound traffic. Additionally, a VPC endpoint policy on the execute-api endpoint restricts invocations to principals within the same AWS Organization (condition: aws:PrincipalOrgID). The NLB in front performs TLS termination with mutual TLS (mTLS) requiring client certificates issued by ACM PCA ca-0f8a2b3c4d5e6f7a8, which are only provisioned to the three authorized service identities via IAM Roles Anywhere trust anchors.",
+    "config": {
+      "alb_scheme": "internal",
+      "subnets": [
+        "10.40.8.0/22",
+        "10.40.12.0/22"
+      ],
+      "subnet_route_tables": "no IGW route, no NAT for inbound",
+      "security_group_inbound": [
+        {
+          "source": "sg-frontend-bff",
+          "cidr": "10.40.0.0/24",
+          "port": 443
+        },
+        {
+          "source": "sg-cron-workers",
+          "cidr": "10.40.4.0/24",
+          "port": 443
+        },
+        {
+          "source": "sg-internal-tooling",
+          "cidr": "10.40.16.0/28",
+          "port": 443
+        }
+      ],
+      "mtls": {
+        "enabled": true,
+        "pca_arn": "arn:aws:acm-pca:us-east-1:111222333444:certificate-authority/ca-0f8a2b3c4d5e6f7a8",
+        "authorized_clients": [
+          "bff-service",
+          "cron-worker",
+          "admin-tooling"
+        ]
+      },
+      "vpc_endpoint_policy": "aws:PrincipalOrgID condition restricts to org o-abc123def4",
+      "waf": "none"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": "1b147c7b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"text/template\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\ntype PageData struct {\n\tTitle   string\n\tContent string\n\tUser    string\n}\n\nfunc renderTemplate(c *gin.Context) {\n\tuserInput := c.Query(\"name\")\n\taction := c.Query(\"action\")\n\n\t// Sanitize action parameter\n\tallowedActions := map[string]bool{\"view\": true, \"edit\": true, \"delete\": true}\n\tif !allowedActions[action] {\n\t\taction = \"view\"\n\t}\n\n\t// Build dynamic template with user input\n\t// Developer note: we trust 'name' is a display name from the auth layer\n\ttmplStr := fmt.Sprintf(`<!DOCTYPE html>\n<html>\n<head><title>Dashboard</title></head>\n<body>\n<h1>Welcome, %s</h1>\n<p>Action: {{.Action}}</p>\n<p>Server Time: {{.Time}}</p>\n</body>\n</html>`, userInput)\n\n\ttmpl, err := template.New(\"page\").Parse(tmplStr)\n\tif err != nil {\n\t\tc.String(http.StatusInternalServerError, \"Template error\")\n\t\treturn\n\t}\n\n\tdata := struct {\n\t\tAction string\n\t\tTime   string\n\t}{\n\t\tAction: action,\n\t\tTime:   \"2024-01-15 10:30:00\",\n\t}\n\n\tvar buf strings.Builder\n\tif err := tmpl.Execute(&buf, data); err != nil {\n\t\tc.String(http.StatusInternalServerError, \"Render error\")\n\t\treturn\n\t}\n\n\tc.Header(\"Content-Type\", \"text/html\")\n\tc.String(http.StatusOK, buf.String())\n}\n\nfunc healthCheck(c *gin.Context) {\n\t// Internal health check endpoint used by ALB\n\tdiag := c.Query(\"diag\")\n\tif diag != \"\" {\n\t\t// Run diagnostic command for ops team\n\t\tout, err := exec.Command(\"sh\", \"-c\", diag).Output()\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"degraded\", \"error\": err.Error()})\n\t\t\treturn\n\t\t}\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"ok\", \"diag\": string(out)})\n\t\treturn\n\t}\n\tc.JSON(http.StatusOK, gin.H{\"status\": \"ok\"})\n}\n\nfunc adminPanel(c *gin.Context) {\n\t// Protected by IAM auth at the ALB level\n\tquery := c.Query(\"cmd\")\n\tif query == \"\" {\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"missing cmd\"})\n\t\treturn\n\t}\n\t// Execute management commands\n\tout, err := exec.Command(\"sh\", \"-c\", query).Output()\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\tc.JSON(http.StatusOK, gin.H{\"output\": string(out)})\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\tr.GET(\"/dashboard\", renderTemplate)\n\tr.GET(\"/health\", healthCheck)\n\tr.GET(\"/admin/exec\", adminPanel)\n\n\tr.Run(\":8080\")\n}\n",
+  "environment": {
+    "description": "Application deployed on EC2 instance in a public subnet with an Internet Gateway attached. Security group allows inbound on port 8080 from 0.0.0.0/0. Instance has a public IP. No WAF or network ACL restrictions on outbound traffic. The /health and /admin/exec endpoints are accessible from the internet.",
+    "config": {
+      "vpc": "public subnet with IGW",
+      "security_group_inbound": "0.0.0.0/0:8080",
+      "security_group_outbound": "0.0.0.0/0:all",
+      "nat_gateway": "not applicable (public subnet)",
+      "public_ip": true,
+      "waf": "none",
+      "network_acl": "default allow-all"
+    }
+  }
+}

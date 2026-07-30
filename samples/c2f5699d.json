@@ -1,0 +1,30 @@
+{
+  "id": "c2f5699d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"unsafe\"\n)\n\n// #cgo CFLAGS: -O0\n// #include <stdlib.h>\n// #include <string.h>\n// typedef struct {\n//     char* workspace_path;\n//     char* artifact_path;\n//     int   privileged;\n// } PipelineConfig;\n// PipelineConfig* parse_config(const char* raw) {\n//     if (raw == NULL) return NULL;\n//     PipelineConfig* cfg = (PipelineConfig*)malloc(sizeof(PipelineConfig));\n//     cfg->workspace_path = NULL;\n//     cfg->artifact_path = NULL;\n//     cfg->privileged = 0;\n//     // Simplified parser - looks for key=value pairs\n//     const char* p = raw;\n//     while (*p) {\n//         if (strncmp(p, \"workspace=\", 10) == 0) {\n//             p += 10;\n//             const char* end = strchr(p, '\\n');\n//             if (end) { cfg->workspace_path = strndup(p, end-p); p = end+1; }\n//             else { cfg->workspace_path = strdup(p); break; }\n//         } else if (strncmp(p, \"artifacts=\", 10) == 0) {\n//             p += 10;\n//             const char* end = strchr(p, '\\n');\n//             if (end) { cfg->artifact_path = strndup(p, end-p); p = end+1; }\n//             else { cfg->artifact_path = strdup(p); break; }\n//         } else if (strncmp(p, \"privileged=\", 11) == 0) {\n//             p += 11;\n//             cfg->privileged = (*p == '1' || *p == 't') ? 1 : 0;\n//             const char* end = strchr(p, '\\n');\n//             if (end) p = end+1; else break;\n//         } else {\n//             const char* end = strchr(p, '\\n');\n//             if (end) p = end+1; else break;\n//         }\n//     }\n//     return cfg;\n// }\nimport \"C\"\n\ntype PipelinePlugin struct {\n\tName    string\n\tVersion string\n}\n\nfunc (p *PipelinePlugin) ExecuteStep(configRaw string) error {\n\tcConfig := C.CString(configRaw)\n\tdefer C.free(unsafe.Pointer(cConfig))\n\n\tparsed := C.parse_config(cConfig)\n\tif parsed == nil {\n\t\treturn fmt.Errorf(\"failed to parse pipeline config\")\n\t}\n\tdefer C.free(unsafe.Pointer(parsed))\n\n\t// BUG: No null check on workspace_path before use\n\t// If config omits workspace= line, workspace_path is NULL\n\tworkspace := C.GoString(parsed.workspace_path)\n\n\t// When privileged=1 and workspace is attacker-controlled,\n\t// mount host filesystem paths\n\tif parsed.privileged == 1 {\n\t\thostPath := fmt.Sprintf(\"/host%s\", workspace)\n\t\tif _, err := os.Stat(hostPath); err == nil {\n\t\t\tcmd := exec.Command(\"cp\", \"-r\", hostPath+\"/\", \"/tmp/exfil/\")\n\t\t\tcmd.Run()\n\t\t}\n\t}\n\n\t// Artifact path also has null deref potential\n\tvar artifactDir string\n\tif parsed.artifact_path != nil {\n\t\tartifactDir = C.GoString(parsed.artifact_path)\n\t} else {\n\t\tartifactDir = workspace + \"/artifacts\"\n\t}\n\n\tif strings.Contains(artifactDir, \"..\") {\n\t\treturn fmt.Errorf(\"path traversal detected\")\n\t}\n\n\tos.MkdirAll(artifactDir, 0755)\n\tfmt.Printf(\"[%s v%s] Pipeline step complete. Artifacts: %s\\n\",\n\t\tp.Name, p.Version, artifactDir)\n\treturn nil\n}\n\nfunc main() {\n\tplugin := &PipelinePlugin{Name: \"artifact-collector\", Version: \"2.4.1\"}\n\n\tconfigInput := os.Getenv(\"PIPELINE_CONFIG\")\n\tif configInput == \"\" {\n\t\tconfigInput = \"workspace=/build\\nartifacts=/build/out\\nprivileged=0\"\n\t}\n\n\tif err := plugin.ExecuteStep(configInput); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Pipeline error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Same Kubernetes 1.24 cluster but namespace 'ci-pipelines' has label pod-security.kubernetes.io/enforce: baseline applied at namespace level. Additionally, a Kyverno ClusterPolicy 'restrict-volume-types' with validationFailureAction: Enforce denies any pod spec containing hostPath volume type OR securityContext.privileged=true in that namespace. The Kyverno policy uses a preconditions block matching on namespace label 'pipeline-tier: standard' which is present. Note: the Pod Security Standards 'baseline' profile permits hostProcess=false but the null pointer dereference itself still crashes the process - the gate only prevents the privileged container escape path that makes the crash exploitable for host access.",
+    "config": {
+      "kubernetes_version": "1.24.12",
+      "namespace": "ci-pipelines",
+      "pod_security_admission_enforce": "baseline",
+      "kyverno_version": "1.9.2",
+      "kyverno_policy_name": "restrict-volume-types",
+      "kyverno_validation_action": "Enforce",
+      "kyverno_rules": [
+        "deny spec.volumes[*].hostPath",
+        "deny spec.containers[*].securityContext.privileged=true",
+        "deny spec.initContainers[*].securityContext.privileged=true"
+      ],
+      "kyverno_preconditions": {
+        "match_namespace_label": "pipeline-tier=standard"
+      },
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pipeline-tier": "standard"
+      },
+      "container_runtime": "containerd-1.6.19",
+      "seccomp_default": "RuntimeDefault"
+    }
+  }
+}

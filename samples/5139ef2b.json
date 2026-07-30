@@ -1,0 +1,42 @@
+{
+  "id": "5139ef2b",
+  "language": "python",
+  "code": "import jwt\nimport json\nimport boto3\nfrom flask import Flask, request, jsonify\nfrom functools import wraps\nimport os\n\napp = Flask(__name__)\n\n# Public key for RS256 verification\nPUBLIC_KEY = os.environ.get('JWT_PUBLIC_KEY', '')\nDYNAMO_TABLE = os.environ.get('DYNAMO_TABLE', 'user_records')\n\ndef get_dynamodb():\n    return boto3.resource('dynamodb').Table(DYNAMO_TABLE)\n\ndef verify_token(token):\n    \"\"\"Verify JWT token and extract claims.\n    Supports RS256 and HS256 for backward compatibility with internal services.\"\"\"\n    try:\n        # Decode header to determine algorithm\n        header = jwt.get_unverified_header(token)\n        algorithm = header.get('alg', 'RS256')\n        \n        # Allow both RS256 and HS256 for flexibility\n        if algorithm == 'HS256':\n            # For internal service-to-service tokens\n            secret = os.environ.get('HMAC_SECRET', PUBLIC_KEY)\n            payload = jwt.decode(token, secret, algorithms=['HS256'])\n        elif algorithm == 'RS256':\n            payload = jwt.decode(token, PUBLIC_KEY, algorithms=['RS256'])\n        else:\n            return None\n        \n        return payload\n    except jwt.InvalidTokenError as e:\n        app.logger.warning(f\"Token validation failed: {e}\")\n        return None\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        auth_header = request.headers.get('Authorization', '')\n        if not auth_header.startswith('Bearer '):\n            return jsonify({'error': 'Missing token'}), 401\n        \n        token = auth_header[7:]\n        claims = verify_token(token)\n        if not claims:\n            return jsonify({'error': 'Invalid token'}), 401\n        \n        request.user_claims = claims\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/records/<user_id>', methods=['GET'])\n@require_auth\ndef get_user_records(user_id):\n    \"\"\"Fetch records for a given user from DynamoDB.\n    Access control: users can only access their own records.\"\"\"\n    claims = request.user_claims\n    requesting_user = claims.get('sub', '')\n    role = claims.get('role', 'user')\n    \n    # Admin bypass for support operations\n    if role != 'admin' and requesting_user != user_id:\n        return jsonify({'error': 'Forbidden'}), 403\n    \n    table = get_dynamodb()\n    try:\n        response = table.query(\n            KeyConditionExpression=boto3.dynamodb.conditions.Key('userId').eq(user_id)\n        )\n        return jsonify({'records': response.get('Items', [])})\n    except Exception as e:\n        app.logger.error(f\"DynamoDB query failed: {e}\")\n        return jsonify({'error': 'Internal error'}), 500\n\n@app.route('/api/records/<user_id>', methods=['PUT'])\n@require_auth\ndef update_user_record(user_id):\n    \"\"\"Update a record for a user.\"\"\"\n    claims = request.user_claims\n    requesting_user = claims.get('sub', '')\n    role = claims.get('role', 'user')\n    \n    if role != 'admin' and requesting_user != user_id:\n        return jsonify({'error': 'Forbidden'}), 403\n    \n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'No data provided'}), 400\n    \n    table = get_dynamodb()\n    try:\n        table.put_item(Item={\n            'userId': user_id,\n            'data': data.get('data', ''),\n            'updatedBy': requesting_user\n        })\n        return jsonify({'status': 'updated'})\n    except Exception as e:\n        app.logger.error(f\"DynamoDB put failed: {e}\")\n        return jsonify({'error': 'Internal error'}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service in us-west-2 VPC. Task execution role arn:aws:iam::987654321098:role/svc-records-task-role with inline policy. DynamoDB table 'user_records' has a leading key condition policy attached to the task role using dynamodb:LeadingKeys condition. The IAM policy on the task role includes a Condition block with ForAllValues:StringEquals on dynamodb:LeadingKeys set to ${aws:PrincipalTag/sub}, and the task role has a session tag propagation from the OIDC provider that sets aws:PrincipalTag/sub to the authenticated user's subject claim at token exchange time via IAM Roles Anywhere with a trust policy condition. Additionally, the DynamoDB table has a resource policy with an explicit Deny for any principal whose dynamodb:LeadingKeys does not match the partition key being accessed. Container runs with read-only root filesystem and drops all capabilities except NET_BIND_SERVICE.",
+    "config": {
+      "task_role_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:Query",
+              "dynamodb:GetItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-west-2:987654321098:table/user_records",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": "${aws:PrincipalTag/sub}"
+              }
+            }
+          },
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:PutItem",
+            "Resource": "arn:aws:dynamodb:us-west-2:987654321098:table/user_records",
+            "Condition": {
+              "StringNotEquals": {
+                "dynamodb:LeadingKeys": "${aws:PrincipalTag/sub}"
+              }
+            }
+          }
+        ]
+      },
+      "session_tag_source": "IAM Roles Anywhere trust policy with X.509 certificate subject mapping to aws:PrincipalTag/sub from mTLS client cert CN",
+      "table_resource_policy": "Explicit Deny if dynamodb:LeadingKeys != caller partition key",
+      "container_security": "readOnlyRootFilesystem: true, drop ALL, add NET_BIND_SERVICE",
+      "network": "Internal ALB, private subnet, no internet egress"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "id": "d2b5fce8",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst ldap = require('ldapjs');\n\nconst app = express();\napp.use(express.json());\napp.use(express.urlencoded({ extended: true }));\n\n// LDAP connection configuration\nconst LDAP_URL = process.env.LDAP_URL || 'ldap://internal-directory.corp.local:389';\nconst LDAP_BASE_DN = process.env.LDAP_BASE_DN || 'dc=corp,dc=local';\nconst LDAP_BIND_DN = process.env.LDAP_BIND_DN || 'cn=svc-app,ou=services,dc=corp,dc=local';\nconst LDAP_BIND_PW = process.env.LDAP_BIND_PW || '';\n\nfunction createLdapClient() {\n  const client = ldap.createClient({ url: LDAP_URL });\n  return new Promise((resolve, reject) => {\n    client.bind(LDAP_BIND_DN, LDAP_BIND_PW, (err) => {\n      if (err) reject(err);\n      else resolve(client);\n    });\n  });\n}\n\n// Middleware to extract caller identity from headers\nfunction extractCallerContext(req, res, next) {\n  // When behind Lambda function URL, AWS injects requestContext\n  req.callerArn = req.headers['x-amzn-request-context'] \n    ? JSON.parse(Buffer.from(req.headers['x-amzn-request-context'], 'base64').toString()).identity?.caller\n    : null;\n  next();\n}\n\napp.use(extractCallerContext);\n\n// User lookup endpoint - used by internal tooling\napp.get('/api/users/search', async (req, res) => {\n  const { username, department } = req.query;\n  \n  if (!username && !department) {\n    return res.status(400).json({ error: 'Provide username or department' });\n  }\n\n  let filter;\n  if (username && department) {\n    // Build compound filter\n    filter = `(&(uid=${username})(department=${department}))`;\n  } else if (username) {\n    filter = `(uid=${username})`;\n  } else {\n    filter = `(department=${department})`;\n  }\n\n  try {\n    const client = await createLdapClient();\n    const opts = {\n      filter: filter,\n      scope: 'sub',\n      attributes: ['uid', 'cn', 'mail', 'department', 'title', 'memberOf']\n    };\n\n    const results = [];\n    await new Promise((resolve, reject) => {\n      client.search(LDAP_BASE_DN, opts, (err, searchRes) => {\n        if (err) return reject(err);\n        searchRes.on('searchEntry', (entry) => {\n          results.push(entry.pojo);\n        });\n        searchRes.on('error', (err) => reject(err));\n        searchRes.on('end', () => resolve());\n      });\n    });\n\n    client.unbind();\n    res.json({ count: results.length, users: results });\n  } catch (err) {\n    console.error('LDAP search failed:', err.message);\n    res.status(500).json({ error: 'Directory search failed' });\n  }\n});\n\n// Group membership check\napp.post('/api/groups/check', async (req, res) => {\n  const { user, group } = req.body;\n  \n  if (!user || !group) {\n    return res.status(400).json({ error: 'user and group required' });\n  }\n\n  // Direct string interpolation into LDAP filter\n  const filter = `(&(uid=${user})(memberOf=cn=${group},ou=groups,${LDAP_BASE_DN}))`;\n\n  try {\n    const client = await createLdapClient();\n    const opts = { filter, scope: 'sub', attributes: ['uid', 'cn'] };\n    \n    let found = false;\n    await new Promise((resolve, reject) => {\n      client.search(LDAP_BASE_DN, opts, (err, searchRes) => {\n        if (err) return reject(err);\n        searchRes.on('searchEntry', () => { found = true; });\n        searchRes.on('error', (err) => reject(err));\n        searchRes.on('end', () => resolve());\n      });\n    });\n\n    client.unbind();\n    res.json({ isMember: found });\n  } catch (err) {\n    console.error('Group check failed:', err.message);\n    res.status(500).json({ error: 'Group membership check failed' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => console.log(`Directory service listening on ${PORT}`));\n\nmodule.exports = app;",
+  "environment": {
+    "description": "Same Node.js Express application deployed as an AWS Lambda function with a Function URL. The function URL is configured with AuthType=AWS_IAM. The Lambda resource-based policy grants lambda:InvokeFunctionUrl only to principal 'arn:aws:iam::111122223333:role/InternalToolingRole' with condition 'FunctionUrlAuthType: AWS_IAM'. No additional principals are granted invoke permission. The function's execution role has a permissions boundary (arn:aws:iam::111122223333:policy/LambdaPermBoundary) that does not include lambda:InvokeFunctionUrl for any external principal. CloudTrail data events are enabled for Lambda invocations. The function runs in the same VPC with LDAP connectivity. Note: the x-amzn-request-context header parsing in the code is informational only and does not enforce access control at the application layer.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/InternalToolingRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "permissions_boundary": "arn:aws:iam::111122223333:policy/LambdaPermBoundary",
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-0a1b2c3d4e5f"
+        ],
+        "security_group_ids": [
+          "sg-ldap-client-allow"
+        ]
+      },
+      "cloudtrail_data_events": true,
+      "environment_variables": {
+        "LDAP_URL": "ldap://internal-directory.corp.local:389",
+        "LDAP_BASE_DN": "dc=corp,dc=local"
+      }
+    }
+  }
+}

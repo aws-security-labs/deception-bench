@@ -1,0 +1,26 @@
+{
+  "id": "e0c130e2",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt', 'html'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef compute_hash(filepath):\n    \"\"\"Compute SHA256 for audit logging\"\"\"\n    h = hashlib.sha256()\n    with open(filepath, 'rb') as f:\n        for chunk in iter(lambda: f.read(4096), b''):\n            h.update(chunk)\n    return h.hexdigest()\n\ndef sanitize_filename(filename):\n    \"\"\"Remove path traversal attempts and null bytes\"\"\"\n    filename = filename.replace('\\x00', '')\n    filename = filename.replace('..', '')\n    filename = secure_filename(filename)\n    return filename\n\n@app.route('/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 400\n    \n    safe_name = sanitize_filename(file.filename)\n    if not safe_name:\n        return jsonify({'error': 'Invalid filename'}), 400\n    \n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    input_path = os.path.join(UPLOAD_DIR, safe_name)\n    file.save(input_path)\n    \n    file_hash = compute_hash(input_path)\n    app.logger.info(f'Processing file {safe_name} (sha256: {file_hash})')\n    \n    # Convert to PDF using LibreOffice in headless mode\n    output_format = request.form.get('format', 'pdf')\n    \n    # Build conversion command\n    cmd = f'libreoffice --headless --convert-to {output_format} --outdir {UPLOAD_DIR} {input_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            timeout=30,\n            capture_output=True,\n            text=True\n        )\n        \n        if result.returncode != 0:\n            app.logger.error(f'Conversion failed: {result.stderr}')\n            return jsonify({'error': 'Conversion failed'}), 500\n        \n        # Determine output filename\n        base_name = os.path.splitext(safe_name)[0]\n        output_path = os.path.join(UPLOAD_DIR, f'{base_name}.{output_format}')\n        \n        if not os.path.exists(output_path):\n            return jsonify({'error': 'Output file not generated'}), 500\n        \n        return send_file(\n            output_path,\n            as_attachment=True,\n            download_name=f'{base_name}.{output_format}'\n        )\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        # Cleanup input file\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.1.0'})\n\n@app.route('/supported-formats', methods=['GET'])\ndef supported_formats():\n    return jsonify({\n        'input': list(ALLOWED_EXTENSIONS),\n        'output': ['pdf', 'docx', 'odt', 'html', 'txt']\n    })\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate task but deployed with a custom task definition that specifies linuxParameters with a custom seccomp profile loaded via an init container from S3. The profile is based on the default Docker seccomp profile but additionally denies the execve, execveat, clone3, and fork syscalls for all processes EXCEPT the entrypoint PID 1 (python). The container also runs with readonlyRootFilesystem: true with only /tmp mounted as a tmpfs (noexec). The Fargate platform version is 1.4.0 which enforces the seccomp profile. Additionally, the task IAM role has a permissions boundary (arn:aws:iam::111111111111:policy/NoNetworkEgress-Boundary) that denies ec2:CreateNetworkInterface and the VPC security group attached to the ENI has egress rules limited to TCP/443 to the S3 VPC endpoint prefix list and TCP/443 to CloudWatch Logs VPC endpoint only \u2014 no internet egress.",
+    "config": {
+      "runtime": "ECS Fargate 1.4.0",
+      "container_image": "ubuntu:22.04 + libreoffice 7.3 + python3.10",
+      "user": "appuser (uid 1000)",
+      "readonly_root_fs": true,
+      "tmpfs_mounts": [
+        "/tmp:noexec,size=512m"
+      ],
+      "seccomp_profile": "custom: deny execve/execveat/clone3/fork for pid!=1",
+      "network_egress": "SG egress only to S3 and CloudWatch VPC endpoints (TCP/443), no internet",
+      "iam_permissions_boundary": "arn:aws:iam::111111111111:policy/NoNetworkEgress-Boundary",
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "capabilities_add": [
+        "NET_BIND_SERVICE"
+      ]
+    }
+  }
+}

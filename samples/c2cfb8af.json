@@ -1,0 +1,30 @@
+{
+  "id": "c2cfb8af",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport subprocess\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\n# Webhook secret for signature verification\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify webhook signature - HMAC-SHA256\"\"\"\n    if not WEBHOOK_SECRET:\n        return True  # Skip verification if no secret configured\n    expected = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f\"sha256={expected}\", signature)\n\n@app.route('/api/v1/deploy', methods=['POST'])\ndef trigger_deploy():\n    \"\"\"Trigger deployment pipeline for a given service\"\"\"\n    sig = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.data, sig):\n        return jsonify({'error': 'invalid signature'}), 403\n\n    data = request.get_json(force=True)\n    service_name = data.get('service', '')\n    branch = data.get('ref', 'main')\n    deploy_env = data.get('environment', 'staging')\n\n    # Validate environment\n    if deploy_env not in ('staging', 'production', 'dev'):\n        return jsonify({'error': 'invalid environment'}), 400\n\n    # Build the deployment command\n    deploy_script = f\"/opt/deploy/run.sh --service {service_name} --branch {branch} --env {deploy_env}\"\n    \n    try:\n        result = subprocess.run(\n            deploy_script,\n            shell=True,\n            capture_output=True,\n            timeout=300,\n            text=True,\n            cwd='/opt/deploy'\n        )\n        return jsonify({\n            'status': 'completed' if result.returncode == 0 else 'failed',\n            'stdout': result.stdout[-2000:],\n            'stderr': result.stderr[-500:]\n        }), 200 if result.returncode == 0 else 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'deployment timed out'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/v1/status', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'healthy', 'version': '2.4.1'}), 200\n\n@app.route('/api/v1/rollback', methods=['POST'])\ndef rollback():\n    \"\"\"Rollback to previous deployment\"\"\"\n    data = request.get_json(force=True)\n    service_name = data.get('service', '')\n    revision = data.get('revision', '')\n    \n    if not revision.isalnum():\n        return jsonify({'error': 'invalid revision format'}), 400\n    \n    cmd = f\"/opt/deploy/rollback.sh --service {service_name} --revision {revision}\"\n    try:\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=120, text=True)\n        return jsonify({'status': 'rolled_back' if result.returncode == 0 else 'failed'})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate task with task role arn:iam::111122223333:role/StreamProcessorRole-Prod. IAM policy uses dynamodb:LeadingKeys condition to restrict GetItem/UpdateItem to items where PK begins with the caller's tagged tenant prefix (aws:PrincipalTag/tenant_prefix). The task role has a tag tenant_prefix=TENANT#svc-internal. Additionally, the DynamoDB table has a resource policy with a Deny statement for any principal whose aws:PrincipalTag/tenant_prefix does not match the leading key pattern in dynamodb:LeadingKeys. Kafka topic ACL restricts WRITE to producer service account only (principal=User:etl-producer-svc). Container runs with a custom seccomp profile that blocks execve, execveat, and fork syscalls (allowlist mode with 87 permitted syscalls excluding exec-family).",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/transform-jobs",
+        "Condition": {
+          "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant_prefix}*"
+          }
+        }
+      },
+      "task_role_tags": {
+        "tenant_prefix": "TENANT#svc-internal"
+      },
+      "dynamodb_resource_policy": "Deny if aws:PrincipalTag/tenant_prefix != leading key prefix",
+      "kafka_acl": "ALLOW principal=User:etl-producer-svc operation=WRITE topic=transform-events; DENY principal=* operation=WRITE topic=transform-events",
+      "seccomp_profile": "custom-allowlist-no-exec.json (87 syscalls, excludes execve/execveat/fork/vfork/clone for new processes)",
+      "container_user": "nonroot (uid 65534)"
+    }
+  }
+}

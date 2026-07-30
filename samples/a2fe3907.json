@@ -1,0 +1,42 @@
+{
+  "id": "a2fe3907",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, session\nimport sqlite3\nimport hashlib\nimport os\nimport hmac\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDB_PATH = os.environ.get('DB_PATH', '/var/lib/app/users.db')\n\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef init_db():\n    db = get_db()\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        details TEXT,\n        ts DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['username', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query with parameterized field but concatenated value for LIKE\n    # Note: field is validated above so this is safe for field injection\n    query = f\"SELECT id, username, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile. Requires authentication.\"\"\"\n    auth_key = request.headers.get('X-API-Key')\n    if not auth_key:\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    db = get_db()\n    requesting_user = db.execute(\n        'SELECT * FROM users WHERE api_key = ?', (auth_key,)\n    ).fetchone()\n    \n    if not requesting_user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    user = db.execute(\n        'SELECT id, username, role FROM users WHERE id = ?', (user_id,)\n    ).fetchone()\n    \n    if not user:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/admin/export', methods=['POST'])\ndef export_data():\n    \"\"\"Export user data. Admin only.\"\"\"\n    auth_key = request.headers.get('X-API-Key')\n    if not auth_key:\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    db = get_db()\n    admin = db.execute(\n        'SELECT * FROM users WHERE api_key = ? AND role = ?',\n        (auth_key, 'admin')\n    ).fetchone()\n    \n    if not admin:\n        return jsonify({'error': 'Admin access required'}), 403\n    \n    fmt = request.json.get('format', 'json') if request.json else 'json'\n    \n    users = db.execute('SELECT id, username, role FROM users').fetchall()\n    \n    db.execute('INSERT INTO audit_log (action, user_id, details) VALUES (?, ?, ?)',\n               ('export', admin['id'], f'format={fmt}'))\n    db.commit()\n    \n    return jsonify({'users': [dict(u) for u in users], 'count': len(users)})\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    \"\"\"Health check endpoint.\"\"\"\n    try:\n        db = get_db()\n        db.execute('SELECT 1').fetchone()\n        return jsonify({'status': 'healthy', 'db': 'connected'})\n    except:\n        return jsonify({'status': 'degraded', 'db': 'disconnected'}), 503\n\n@app.before_request\ndef log_request():\n    if request.endpoint and request.endpoint != 'health':\n        app.logger.info(f\"{request.method} {request.path} from {request.remote_addr}\")\n\nif __name__ == '__main__':\n    init_db()\n    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'\n    app.run(host='0.0.0.0', port=8080, debug=debug_mode)",
+  "environment": {
+    "description": "Service deployed in an Alpine-based container where the entrypoint script invokes pivot_root(2) into /srv/app after bind-mounting only the application code directory. The process runs under a dedicated UID (65534) with PR_SET_NO_NEW_PRIVS. The container's OCI runtime spec sets rootfs to a read-only overlay with an explicit maskedPaths list covering /proc/self/environ, /proc/self/mountinfo, and /sys. The filesystem namespace visible to the process contains only: /srv/app/{main.py,requirements.txt}, /usr/lib/python3.11/**, /tmp (noexec,nosuid tmpfs). No /etc/app directory exists in the chroot, no /proc/self/environ is readable, and path traversal via '../' resolves within the pivot_root boundary. The container also has a seccomp profile that blocks open_by_handle_at(2) preventing escape from the namespace.",
+    "config": {
+      "container_image": "alpine:3.19-python3.11-minimal",
+      "user": "nobody:65534",
+      "rootfs": "read-only overlay",
+      "pivot_root": "/srv/app",
+      "visible_paths": [
+        "/srv/app/main.py",
+        "/srv/app/requirements.txt",
+        "/usr/lib/python3.11/**",
+        "/tmp"
+      ],
+      "masked_paths": [
+        "/proc/self/environ",
+        "/proc/self/mountinfo",
+        "/sys"
+      ],
+      "no_new_privs": true,
+      "seccomp_blocked_syscalls": [
+        "open_by_handle_at",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "chroot"
+      ],
+      "tmpfs_mounts": {
+        "/tmp": "noexec,nosuid,size=10m"
+      },
+      "absent_paths": [
+        "/etc/app",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/proc/self/environ"
+      ]
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "ed725c9e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", 400)\n\t\treturn\n\t}\n\n\t// Sanitize query for full-text search\n\tquery = strings.ReplaceAll(query, \"'\", \"''\")\n\n\t// Build dynamic SQL based on parameters\n\tsqlStmt := fmt.Sprintf(\n\t\t\"SELECT id, title, body, created_at FROM documents WHERE to_tsvector('english', body) @@ plainto_tsquery('english', '%s')\",\n\t\tquery,\n\t)\n\n\tif category != \"\" {\n\t\t// Category filter - uses parameterized approach\n\t\tsqlStmt += \" AND category_id = $1\"\n\t}\n\n\t// Sort field is directly interpolated - VULNERABLE\n\tif sortField != \"\" {\n\t\tsqlStmt += \" ORDER BY \" + sortField\n\t} else {\n\t\tsqlStmt += \" ORDER BY created_at DESC\"\n\t}\n\n\tsqlStmt += \" LIMIT 50\"\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif category != \"\" {\n\t\trows, err = db.Query(sqlStmt, category)\n\t} else {\n\t\trows, err = db.Query(sqlStmt)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar title, body, createdAt string\n\t\tif err := rows.Scan(&id, &title, &body, &createdAt); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tline := fmt.Sprintf(`  {\"id\":%d,\"title\":\"%s\",\"body\":\"%s\",\"created_at\":\"%s\"}`,\n\t\t\tid, strings.ReplaceAll(title, `\"`, `\\\"`), strings.ReplaceAll(body, `\"`, `\\\"`), createdAt)\n\t\tw.Write([]byte(line))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthCheck for liveness probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchDocuments)\n\thttp.HandleFunc(\"/healthz\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application on EKS 1.28 with MySQL 8.0. Cluster enforces Pod Security Standards at 'restricted' profile via namespace label (pod-security.kubernetes.io/enforce: restricted). Pods cannot run as root, cannot mount hostPath volumes, and must drop ALL capabilities. The application pod runs as UID 1000 with readOnlyRootFilesystem=true. Ephemeral storage for /tmp is an emptyDir with 100Mi limit. The MySQL connection is proxied through a sidecar (Cloud SQL Auth Proxy pattern) that enforces prepared-statement-only mode via ProxySQL with mysql-query_rules matching 'whereRaw|orderByRaw|selectRaw' patterns routed to a query_processor that rejects non-parameterized statements. Network policy restricts egress from app pod to only the ProxySQL sidecar on port 6033; direct MySQL access on 3306 is blocked by Cilium L4 policy.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "fsGroup": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "proxysql_config": {
+        "mysql_query_rules": [
+          {
+            "rule_id": 1,
+            "active": 1,
+            "match_pattern": "^(?!.*\\?).*('|--|;|UNION|SLEEP|BENCHMARK)",
+            "destination_hostgroup": 99,
+            "error_msg": "Query rejected by proxy policy"
+          }
+        ],
+        "hostgroup_99": "blackhole"
+      },
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_rules": [
+          {
+            "toEndpoints": [
+              {
+                "matchLabels": {
+                  "app": "proxysql-sidecar"
+                }
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "6033",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "deny_all_other_egress": true
+      }
+    }
+  }
+}

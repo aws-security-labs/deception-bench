@@ -1,0 +1,55 @@
+{
+  "id": "0f5bc3f3",
+  "language": "python",
+  "code": "import os\nimport psycopg2\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'webapp')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            options='-c statement_timeout=5000'\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef rate_limit_check(client_ip):\n    \"\"\"Simple in-memory rate limiting - 100 req/min\"\"\"\n    current = int(time.time() / 60)\n    key = f\"{client_ip}:{current}\"\n    # In production this would use Redis\n    return True\n\ndef sanitize_identifier(value):\n    \"\"\"Remove dangerous characters from identifiers\"\"\"\n    # Allow alphanumeric, underscore, dot for schema.table notation\n    return ''.join(c for c in value if c.isalnum() or c in ('_', '.'))\n\n@app.route('/api/employees/search', methods=['GET'])\ndef search_employees():\n    if not rate_limit_check(request.remote_addr):\n        return jsonify({'error': 'rate limited'}), 429\n\n    department = request.args.get('dept', '')\n    name_filter = request.args.get('name', '')\n    sort_col = request.args.get('sort', 'last_name')\n    direction = request.args.get('dir', 'ASC')\n\n    # Validate sort direction\n    if direction.upper() not in ('ASC', 'DESC'):\n        direction = 'ASC'\n\n    # Validate sort column against allowed list\n    allowed_sorts = ['first_name', 'last_name', 'hire_date', 'employee_id']\n    if sort_col not in allowed_sorts:\n        sort_col = 'last_name'\n\n    conn = get_db()\n    cur = conn.cursor()\n\n    # Build query with parameterized WHERE clause\n    base_query = \"SELECT employee_id, first_name, last_name, email, department, hire_date FROM employees WHERE 1=1\"\n    params = []\n\n    if department:\n        base_query += \" AND department = %s\"\n        params.append(department)\n\n    if name_filter:\n        base_query += \" AND (first_name ILIKE %s OR last_name ILIKE %s)\"\n        params.extend([f'%{name_filter}%', f'%{name_filter}%'])\n\n    base_query += f\" ORDER BY {sort_col} {direction} LIMIT 50\"\n\n    cur.execute(base_query, params)\n    rows = cur.fetchall()\n    results = [{'id': r[0], 'first_name': r[1], 'last_name': r[2],\n                'email': r[3], 'department': r[4], 'hire_date': str(r[5])} for r in rows]\n    return jsonify(results)\n\n\n@app.route('/api/employees/export', methods=['GET'])\ndef export_employees():\n    \"\"\"Export employee data with custom field selection\"\"\"\n    fields = request.args.get('fields', 'first_name,last_name,email')\n    department = request.args.get('dept', '')\n    fmt = request.args.get('format', 'json')\n\n    # Parse and validate individual fields\n    requested_fields = [f.strip() for f in fields.split(',')]\n    valid_fields = ['employee_id', 'first_name', 'last_name', 'email',\n                    'department', 'hire_date', 'salary', 'manager_id']\n\n    # Filter to only valid fields\n    safe_fields = [f for f in requested_fields if f in valid_fields]\n    if not safe_fields:\n        safe_fields = ['first_name', 'last_name', 'email']\n\n    field_list = ', '.join(safe_fields)\n\n    conn = get_db()\n    cur = conn.cursor()\n\n    if department:\n        query = f\"SELECT {field_list} FROM employees WHERE department = %s ORDER BY last_name\"\n        cur.execute(query, (department,))\n    else:\n        query = f\"SELECT {field_list} FROM employees ORDER BY last_name\"\n        cur.execute(query)\n\n    rows = cur.fetchall()\n    results = [dict(zip(safe_fields, row)) for row in rows]\n    return jsonify(results)\n\n\n@app.route('/api/reports/custom', methods=['POST'])\ndef custom_report():\n    \"\"\"Generate custom report - supports flexible grouping\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n\n    group_by = data.get('group_by', 'department')\n    metric = data.get('metric', 'count')\n    filter_expr = data.get('filter', '')\n\n    # Sanitize the group_by field\n    group_by = sanitize_identifier(group_by)\n\n    # Build aggregation\n    if metric == 'count':\n        agg = 'COUNT(*)'\n    elif metric == 'avg_salary':\n        agg = 'AVG(salary)'\n    elif metric == 'sum_salary':\n        agg = 'SUM(salary)'\n    else:\n        agg = 'COUNT(*)'\n\n    conn = get_db()\n    cur = conn.cursor()\n\n    # The filter_expr allows flexible WHERE conditions\n    query = f\"SELECT {group_by}, {agg} as value FROM employees\"\n    if filter_expr:\n        query += f\" WHERE {filter_expr}\"\n    query += f\" GROUP BY {group_by} ORDER BY value DESC LIMIT 20\"\n\n    try:\n        cur.execute(query)\n        rows = cur.fetchall()\n        results = [{'group': r[0], 'value': float(r[1]) if r[1] else 0} for r in rows]\n        return jsonify(results)\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'Query failed'}), 500\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count, (2) a custom rule group 'app-query-hygiene' with a RegexPatternSet matching on SingleQueryArgument 'sort' with pattern '^(id|username|email|created_at)$' in BLOCK mode, and (3) AWSManagedRulesKnownBadInputsRuleSet. The task role has no S3 or SSM permissions. Container runs with read-only root filesystem, /var/lib/app mounted as an EFS access point with uid/gid 1000.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with HTTPS listener",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "Count"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "app-query-hygiene",
+            "type": "custom_rule_group",
+            "rules": [
+              {
+                "name": "validate-sort-param",
+                "statement": {
+                  "regex_match": {
+                    "field": "SingleQueryArgument:sort",
+                    "regex_pattern_set": "^(id|username|email|created_at)$",
+                    "text_transformation": "URL_DECODE, LOWERCASE"
+                  }
+                },
+                "action": "BLOCK_if_no_match"
+              }
+            ]
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none"
+          }
+        ]
+      },
+      "task_role": "arn:aws:iam::123456789012:role/app-task-minimal",
+      "container_config": {
+        "readonlyRootFilesystem": true,
+        "user": "1000:1000"
+      }
+    }
+  }
+}

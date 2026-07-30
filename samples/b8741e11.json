@@ -1,0 +1,24 @@
+{
+  "id": "b8741e11",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport shlex\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/lib/reports/uploads'\nOUTPUT_DIR = '/var/lib/reports/output'\n\ndef ensure_dirs():\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    os.makedirs(OUTPUT_DIR, exist_ok=True)\n\n@app.route('/api/v1/report/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a PDF report from uploaded template and user-supplied parameters.\"\"\"\n    ensure_dirs()\n    \n    template_name = request.form.get('template', 'default')\n    title = request.form.get('title', 'Report')\n    author = request.form.get('author', 'System')\n    date_range = request.form.get('date_range', 'last_30_days')\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    if output_format not in ('pdf', 'html', 'csv'):\n        return jsonify({'error': 'Invalid format'}), 400\n    \n    # Sanitize template name to prevent directory traversal\n    safe_template = secure_filename(template_name)\n    template_path = os.path.join('/var/lib/reports/templates', safe_template + '.tex')\n    \n    if not os.path.exists(template_path):\n        return jsonify({'error': 'Template not found'}), 404\n    \n    # Build the report generation command\n    output_file = os.path.join(OUTPUT_DIR, f'report_{os.getpid()}.{output_format}')\n    \n    # Construct sed command to substitute placeholders in template\n    # Then pipe to the appropriate converter\n    sed_expr = f's/%%TITLE%%/{title}/g; s/%%AUTHOR%%/{author}/g; s/%%DATERANGE%%/{date_range}/g'\n    \n    if output_format == 'pdf':\n        cmd = f\"sed '{sed_expr}' {shlex.quote(template_path)} | pdflatex -output-directory={shlex.quote(OUTPUT_DIR)} -jobname=report_{os.getpid()}\"\n    elif output_format == 'html':\n        cmd = f\"sed '{sed_expr}' {shlex.quote(template_path)} | pandoc -f latex -t html -o {shlex.quote(output_file)}\"\n    else:\n        cmd = f\"sed '{sed_expr}' {shlex.quote(template_path)} | pandoc -f latex -t csv -o {shlex.quote(output_file)}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=OUTPUT_DIR\n        )\n        \n        if result.returncode != 0:\n            app.logger.error(f\"Report generation failed: {result.stderr.decode()}\")\n            return jsonify({'error': 'Generation failed', 'details': result.stderr.decode()[:200]}), 500\n        \n        if os.path.exists(output_file):\n            return send_file(output_file, as_attachment=True)\n        else:\n            return jsonify({'error': 'Output file not created'}), 500\n            \n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Report generation timed out'}), 504\n    except Exception as e:\n        app.logger.error(f\"Unexpected error: {str(e)}\")\n        return jsonify({'error': 'Internal error'}), 500\n\n\n@app.route('/api/v1/report/list', methods=['GET'])\ndef list_reports():\n    \"\"\"List previously generated reports.\"\"\"\n    ensure_dirs()\n    files = os.listdir(OUTPUT_DIR)\n    return jsonify({'reports': files})\n\n\n@app.route('/api/v1/report/download/<filename>', methods=['GET'])\ndef download_report(filename):\n    \"\"\"Download a previously generated report.\"\"\"\n    safe_name = secure_filename(filename)\n    filepath = os.path.join(OUTPUT_DIR, safe_name)\n    if os.path.exists(filepath):\n        return send_file(filepath, as_attachment=True)\n    return jsonify({'error': 'Not found'}), 404\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on an EC2 instance running Amazon Linux 2, behind a basic Network Load Balancer (NLB, Layer 4 only). The Flask app runs as the 'reportgen' user with standard Linux permissions. No application-layer proxy or filtering is applied. The NLB passes TCP traffic directly to port 8080. Security group allows inbound 443/80 from 0.0.0.0/0. No SELinux or AppArmor profiles are enforced (permissive mode). The container/host has sed, pdflatex, pandoc installed.",
+    "config": {
+      "load_balancer": "AWS NLB (Layer 4, TCP passthrough)",
+      "os": "Amazon Linux 2",
+      "selinux": "permissive",
+      "apparmor": "disabled",
+      "seccomp": "unconfined",
+      "user": "reportgen (uid 1001)",
+      "installed_tools": [
+        "sed",
+        "pdflatex",
+        "pandoc",
+        "bash",
+        "curl",
+        "nc"
+      ]
+    }
+  }
+}

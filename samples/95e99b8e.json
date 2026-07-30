@@ -1,0 +1,57 @@
+{
+  "id": "95e99b8e",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware to parse session from cookie\nfunction getSession(req) {\n  const token = req.cookies?.session_token;\n  if (!token) return null;\n  // Decode base64 session payload (trusted, set by our auth layer)\n  try {\n    return JSON.parse(Buffer.from(token, 'base64').toString());\n  } catch { return null; }\n}\n\n// Rate limiting state (in-memory, per-instance)\nconst requestCounts = new Map();\nfunction rateLimit(ip) {\n  const now = Date.now();\n  const entry = requestCounts.get(ip) || { count: 0, reset: now + 60000 };\n  if (now > entry.reset) { entry.count = 0; entry.reset = now + 60000; }\n  entry.count++;\n  requestCounts.set(ip, entry);\n  return entry.count > 100;\n}\n\n// Input length validation middleware\napp.use((req, res, next) => {\n  for (const [key, value] of Object.entries(req.query)) {\n    if (typeof value === 'string' && value.length > 512) {\n      return res.status(400).json({ error: 'Parameter too long' });\n    }\n  }\n  next();\n});\n\n// Audit log helper - uses parameterized query (safe)\nasync function auditLog(action, userId, detail) {\n  await pool.query(\n    'INSERT INTO audit_log(action, user_id, detail, ts) VALUES($1, $2, $3, NOW())',\n    [action, userId, detail]\n  );\n}\n\n// Search endpoint for internal reporting\napp.get('/api/reports/search', async (req, res) => {\n  const session = getSession(req);\n  if (!session) return res.status(401).json({ error: 'Unauthorized' });\n  \n  if (rateLimit(req.ip)) return res.status(429).json({ error: 'Rate limited' });\n\n  const { department, fiscal_year, metric } = req.query;\n  \n  // Validate fiscal_year is numeric\n  if (fiscal_year && !/^\\d{4}$/.test(fiscal_year)) {\n    return res.status(400).json({ error: 'Invalid fiscal year' });\n  }\n  \n  // Validate metric against allowlist\n  const allowedMetrics = ['revenue', 'headcount', 'expenses', 'margin'];\n  const selectedMetric = allowedMetrics.includes(metric) ? metric : 'revenue';\n  \n  // Build query - department filter is vulnerable\n  let query = `SELECT department, ${selectedMetric}, fiscal_year, report_id \n               FROM financial_reports \n               WHERE fiscal_year = ${fiscal_year || 2024}`;\n  \n  if (department) {\n    // Developer note: department comes from dropdown, should be safe\n    query += ` AND department = '${department}'`;\n  }\n  \n  query += ` ORDER BY ${selectedMetric} DESC LIMIT 50`;\n  \n  try {\n    const result = await pool.query(query);\n    await auditLog('report_search', session.user_id, `dept=${department}`);\n    res.json({ reports: result.rows });\n  } catch (err) {\n    // Return generic error (don't leak DB errors)\n    console.error('Query failed:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(8080, () => console.log('Listening on 8080'));",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK action, (3) a custom rule with a RegexPatternSet matching on query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*and\\s+')` with BLOCK action, and (4) AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK). The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs (com.amazonaws.region.logs), enforced by the task's security group which has NO outbound rules except to the VPC endpoint prefix list on port 443.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override": {
+              "SizeRestrictions_QUERYSTRING": "COUNT"
+            },
+            "action": "use_rule_action"
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "action": "use_rule_action"
+          },
+          {
+            "priority": 3,
+            "name": "custom-sqli-regex",
+            "match": "regex_on_query_string_values",
+            "pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*and\\s+')",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 4,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "action": "use_rule_action"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "ecs_task_security_group": {
+        "inbound": [
+          {
+            "from": "ALB-SG",
+            "port": 8080
+          }
+        ],
+        "outbound": [
+          {
+            "to": "com.amazonaws.us-east-1.logs VPC endpoint prefix list",
+            "port": 443
+          }
+        ]
+      },
+      "runtime": "Python 3.11, Flask 2.3, gunicorn on ECS Fargate",
+      "database": "SQLite local file (ephemeral task storage)"
+    }
+  }
+}

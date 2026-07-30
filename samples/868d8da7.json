@@ -1,0 +1,66 @@
+{
+  "id": "868d8da7",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed values\n        if (reportType == null || !reportType.matches(\"(quarterly|annual|monthly)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Validate date range format\n        if (dateRange == null || !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        // Build query - department and sortCol are used directly for flexibility\n        // Note: reportType and dates are validated above\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT r.id, r.title, r.created_at, r.amount, d.name as dept_name \");\n        query.append(\"FROM reports r JOIN departments d ON r.dept_id = d.id \");\n        query.append(\"WHERE r.report_type = '\" + reportType + \"' \");\n        query.append(\"AND r.created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"' \");\n\n        if (department != null && !department.isEmpty()) {\n            // Filter by department name for convenience\n            query.append(\"AND d.name = '\" + department + \"' \");\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            query.append(\"ORDER BY \" + sortCol + \" \");\n        } else {\n            query.append(\"ORDER BY r.created_at DESC \");\n        }\n\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query.toString())) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.printf(\"  {\\\"id\\\": %d, \\\"title\\\": \\\"%s\\\", \\\"date\\\": \\\"%s\\\", \\\"amount\\\": %.2f, \\\"dept\\\": \\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"title\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"created_at\"),\n                    rs.getDouble(\"amount\"),\n                    rs.getString(\"dept_name\").replace(\"\\\"\", \"\\\\\\\"\"));\n                first = false;\n            }\n            out.print(\"\\n]\");\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST creates a new report entry\n        String title = req.getParameter(\"title\");\n        String deptId = req.getParameter(\"dept_id\");\n        String amount = req.getParameter(\"amount\");\n        String type = req.getParameter(\"type\");\n\n        if (title == null || deptId == null || amount == null || type == null) {\n            resp.sendError(400, \"Missing required fields\");\n            return;\n        }\n\n        String insertSql = \"INSERT INTO reports (title, dept_id, amount, report_type, created_at) \" +\n                           \"VALUES ('\" + title + \"', \" + deptId + \", \" + amount + \", '\" + type + \"', NOW())\";\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            int rows = stmt.executeUpdate(insertSql);\n            resp.setStatus(201);\n            resp.getWriter().print(\"{\\\"created\\\": \" + rows + \"}\");\n        } catch (SQLException e) {\n            log.severe(\"Insert failed: \" + e.getMessage());\n            resp.sendError(500, \"Failed to create report\");\n        }\n    }\n}",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) deployed in VPC (subnet-0a3f8c, subnet-0b7d2e) with a Gateway VPC Endpoint for S3 (vpce-0x8a3b9f2c1d4e5678) attached to route tables rtb-0fa82c and rtb-0eb91d. The VPC endpoint has a custom policy document that uses a Condition block with StringEquals on 's3:prefix' and a StringLike on 'aws:ResourceAccount' matching only the owning account ID (112233445566). Additionally, the endpoint policy restricts s3:CopyObject and s3:PutObject actions to only buckets matching 'arn:aws:s3:::company-*-prod' and 'arn:aws:s3:::company-*-prod/*'. The VPC has no NAT gateway and no internet gateway attached, so all S3 API calls MUST traverse the VPC endpoint. Security group sg-0f4a8b2c on the Lambda ENIs allows only outbound to prefix list pl-63a5400a (S3). No other egress path exists.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "vpc": true,
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "vpc_endpoint_id": "vpce-0x8a3b9f2c1d4e5678",
+      "vpc_endpoint_type": "Gateway",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowStagingRead",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:HeadObject",
+              "s3:DeleteObject"
+            ],
+            "Resource": [
+              "arn:aws:s3:::company-staging-prod/*"
+            ]
+          },
+          {
+            "Sid": "AllowCopyToApprovedBuckets",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:CopyObject",
+              "s3:PutObject"
+            ],
+            "Resource": [
+              "arn:aws:s3:::company-*-prod/*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceAccount": "112233445566"
+              }
+            }
+          },
+          {
+            "Sid": "AllowListApproved",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:ListBucket",
+            "Resource": [
+              "arn:aws:s3:::company-*-prod"
+            ]
+          }
+        ]
+      },
+      "route_tables": [
+        "rtb-0fa82c",
+        "rtb-0eb91d"
+      ],
+      "security_group_egress": "pl-63a5400a (S3 prefix list) only",
+      "no_other_egress": true
+    }
+  }
+}

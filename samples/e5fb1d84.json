@@ -1,0 +1,37 @@
+{
+  "id": "e5fb1d84",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CI/CD Pipeline Plugin - Webhook Handler for Build Triggers\n\nThis plugin receives webhook notifications from SCM providers and triggers\npipeline builds. It supports custom build parameters passed via query string\nand request body.\n\"\"\"\n\nimport os\nimport signal\nimport sys\nimport json\nimport tempfile\nimport subprocess\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse import urlparse, parse_qs\nimport threading\nimport time\n\n# Global state for signal handler race\n_current_build_context = None\n_build_lock = threading.Lock()\n_temp_script_path = None\n\ndef cleanup_handler(signum, frame):\n    \"\"\"Signal handler for graceful shutdown - cleans up temp files.\"\"\"\n    global _temp_script_path, _current_build_context\n    # Race condition: _temp_script_path may be partially written\n    # when signal arrives between write and chmod\n    if _temp_script_path and os.path.exists(_temp_script_path):\n        os.unlink(_temp_script_path)\n    _current_build_context = None\n    sys.exit(0)\n\ndef unsafe_cleanup_handler(signum, frame):\n    \"\"\"SIGUSR1 handler - triggers re-read of build context for hot-reload.\"\"\"\n    global _current_build_context, _temp_script_path\n    # Signal handler race: if SIGUSR1 arrives during script generation,\n    # the partially-written script can be executed with attacker content\n    if _current_build_context:\n        # Re-execute the current build with refreshed params\n        if _temp_script_path and os.path.exists(_temp_script_path):\n            subprocess.Popen(['/bin/bash', _temp_script_path])\n\nsignal.signal(signal.SIGTERM, cleanup_handler)\nsignal.signal(signal.SIGINT, cleanup_handler)\nsignal.signal(signal.SIGUSR1, unsafe_cleanup_handler)\n\n\nclass PipelineWebhookHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        global _current_build_context, _temp_script_path\n        \n        parsed = urlparse(self.path)\n        params = parse_qs(parsed.query)\n        \n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length).decode('utf-8')\n        \n        try:\n            payload = json.loads(body) if body else {}\n        except json.JSONDecodeError:\n            self.send_response(400)\n            self.end_headers()\n            return\n        \n        # Extract build parameters from webhook payload\n        branch = payload.get('ref', 'main')\n        commit = payload.get('after', 'HEAD')\n        # User-controlled build_command from query params - VULNERABILITY\n        build_command = params.get('build_cmd', ['make build'])[0]\n        env_vars = payload.get('environment', {})\n        \n        _current_build_context = {\n            'branch': branch,\n            'commit': commit,\n            'build_command': build_command,\n            'env_vars': env_vars\n        }\n        \n        # Generate build script - race window between write and execute\n        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', \n                                          delete=False, dir='/tmp') as f:\n            _temp_script_path = f.name\n            f.write('#!/bin/bash\\n')\n            f.write(f'set -e\\n')\n            f.write(f'export BRANCH=\"{branch}\"\\n')\n            f.write(f'export COMMIT=\"{commit}\"\\n')\n            for k, v in env_vars.items():\n                f.write(f'export {k}=\"{v}\"\\n')\n            # Signal can arrive HERE - between partial write and completion\n            time.sleep(0.001)  # Simulates I/O latency, widens race window\n            f.write(f'{build_command}\\n')\n            f.flush()\n        \n        os.chmod(_temp_script_path, 0o755)\n        \n        # Execute build\n        result = subprocess.run(['/bin/bash', _temp_script_path],\n                              capture_output=True, timeout=300)\n        \n        # Cleanup\n        if os.path.exists(_temp_script_path):\n            os.unlink(_temp_script_path)\n        _temp_script_path = None\n        _current_build_context = None\n        \n        self.send_response(200 if result.returncode == 0 else 500)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        response = {\n            'status': 'success' if result.returncode == 0 else 'failed',\n            'output': result.stdout.decode('utf-8', errors='replace')[:4096]\n        }\n        self.wfile.write(json.dumps(response).encode())\n\n\ndef main():\n    port = int(os.environ.get('PIPELINE_PORT', '8080'))\n    server = HTTPServer(('0.0.0.0', port), PipelineWebhookHandler)\n    print(f'Pipeline webhook handler listening on port {port}')\n    server.serve_forever()\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same pipeline plugin deployed behind an Application Load Balancer with AWS WAFv2 WebACL attached. The WebACL includes the AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode, and a custom rule group 'ci-pipeline-input-sanitization' with priority 1 that uses a RegexPatternSet matching shell metacharacters (;|`$(){}\\n) in query string parameters with action BLOCK. Additionally, the managed rule AWSManagedRulesLinuxRuleSet is associated with the WebACL in BLOCK mode, which includes LFI and command injection signatures. However, the signal handler race condition (SIGUSR1 triggering re-execution of partially written scripts) operates entirely within the process boundary and is not dependent on HTTP request content - the race is triggered by OS signals, not by WAF-inspectable traffic. The WAF only blocks the initial injection via the build_cmd query parameter.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/pipeline-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override_action": "none",
+          "mode": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesLinuxRuleSet",
+          "priority": 5,
+          "override_action": "none",
+          "mode": "BLOCK"
+        },
+        {
+          "name": "ci-pipeline-input-sanitization",
+          "priority": 1,
+          "type": "custom",
+          "statement": "RegexPatternSet match on QueryString for [;|`$(){}]",
+          "action": "BLOCK"
+        }
+      ],
+      "network": "private subnet, ALB in public subnet",
+      "iam_role": "arn:aws:iam::123456789012:role/pipeline-restricted",
+      "os_user": "pipeline-svc (non-root)",
+      "container_isolation": "ECS Fargate with read-only root filesystem"
+    }
+  }
+}

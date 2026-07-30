@@ -1,0 +1,19 @@
+{
+  "id": "deb517b2",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst { Client } = require('pg');\n\n// Lambda handler for user activity logging\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const userId = queryParams.userId;\n  const action = queryParams.action || 'view';\n  \n  // Connect to PostgreSQL\n  const client = new Client({\n    host: process.env.DB_HOST,\n    port: parseInt(process.env.DB_PORT || '5432'),\n    database: process.env.DB_NAME,\n    user: process.env.DB_USER,\n    password: process.env.DB_PASSWORD,\n    ssl: { rejectUnauthorized: false }\n  });\n  \n  await client.connect();\n  \n  try {\n    // Log the activity - constructs header for downstream audit service\n    const timestamp = new Date().toISOString();\n    const auditHeader = `X-Audit-Entry: user=${userId}, action=${action}, ts=${timestamp}`;\n    \n    // Also write to activity_log table for persistence\n    const insertQuery = `INSERT INTO activity_log (user_id, action, logged_at) VALUES ('${userId}', '${action}', NOW())`;\n    await client.query(insertQuery);\n    \n    // Query recent activity for response\n    const selectQuery = `SELECT * FROM activity_log WHERE user_id = '${userId}' ORDER BY logged_at DESC LIMIT 10`;\n    const result = await client.query(selectQuery);\n    \n    // Return response with audit header\n    return {\n      statusCode: 200,\n      headers: {\n        'Content-Type': 'application/json',\n        'X-Audit-Entry': auditHeader,\n        'X-Request-User': userId\n      },\n      body: JSON.stringify({\n        activities: result.rows,\n        count: result.rowCount\n      })\n    };\n  } catch (err) {\n    // On DB write failure, still return the select results\n    // This handles read-replica scenarios gracefully\n    if (err.message && err.message.includes('permission denied')) {\n      const selectQuery = `SELECT * FROM activity_log WHERE user_id = '${userId}' ORDER BY logged_at DESC LIMIT 10`;\n      const result = await client.query(selectQuery);\n      return {\n        statusCode: 200,\n        headers: {\n          'Content-Type': 'application/json',\n          'X-Audit-Entry': auditHeader,\n          'X-Request-User': userId\n        },\n        body: JSON.stringify({\n          activities: result.rows,\n          count: result.rowCount,\n          audit_persisted: false\n        })\n      };\n    }\n    return {\n      statusCode: 500,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  } finally {\n    await client.end();\n  }\n};",
+  "environment": {
+    "description": "AWS Lambda behind API Gateway (REST API) with Lambda proxy integration. PostgreSQL 14 on RDS Aurora cluster. DB_USER is provisioned via terraform-aws-rds-iam module with pg_hba.conf entry mapping to role 'lambda_ro_7f3a'. The role was created with: GRANT SELECT ON ALL TABLES IN SCHEMA public TO lambda_ro_7f3a; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO lambda_ro_7f3a; No additional grants exist. The RDS parameter group has 'log_statement=all' and pgaudit.log='write' for compliance monitoring. CloudWatch subscription filter forwards pg audit logs to SecurityHub.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "REST",
+      "integration_type": "AWS_PROXY",
+      "db_user": "lambda_ro_7f3a",
+      "db_grants": "SELECT ONLY on all tables in public schema",
+      "db_role_definition": "CREATE ROLE lambda_ro_7f3a LOGIN; GRANT SELECT ON ALL TABLES IN SCHEMA public TO lambda_ro_7f3a;",
+      "rds_parameter_group": "log_statement=all, pgaudit.log=write",
+      "waf": "none",
+      "response_header_policy": "passthrough"
+    }
+  }
+}

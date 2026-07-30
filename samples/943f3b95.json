@@ -1,0 +1,47 @@
+{
+  "id": "943f3b95",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\nALLOWED_FORMATS = ['png', 'jpg', 'gif', 'webp', 'pdf']\nMAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify HMAC signature for API authentication\"\"\"\n    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert documents between formats using LibreOffice headless mode\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('format', 'pdf')\n    \n    if output_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'unsupported format: {output_format}'}), 400\n    \n    if uploaded.content_length and uploaded.content_length > MAX_FILE_SIZE:\n        return jsonify({'error': 'file too large'}), 413\n    \n    with tempfile.TemporaryDirectory() as tmpdir:\n        input_path = os.path.join(tmpdir, uploaded.filename)\n        uploaded.save(input_path)\n        \n        # Convert using LibreOffice\n        cmd = f'libreoffice --headless --convert-to {output_format} --outdir {tmpdir} \"{input_path}\"'\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'conversion failed', 'detail': result.stderr.decode()[:200]}), 500\n        \n        base_name = os.path.splitext(uploaded.filename)[0]\n        output_path = os.path.join(tmpdir, f'{base_name}.{output_format}')\n        \n        if not os.path.exists(output_path):\n            return jsonify({'error': 'output file not generated'}), 500\n        \n        return send_file(output_path, as_attachment=True)\n\n@app.route('/api/v1/thumbnail', methods=['POST'])\ndef generate_thumbnail():\n    \"\"\"Generate thumbnail from uploaded image using ImageMagick\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    uploaded = request.files['file']\n    width = request.form.get('width', '200')\n    height = request.form.get('height', '200')\n    \n    # Validate dimensions are numeric\n    if not width.isdigit() or not height.isdigit():\n        return jsonify({'error': 'dimensions must be numeric'}), 400\n    \n    with tempfile.TemporaryDirectory() as tmpdir:\n        input_path = os.path.join(tmpdir, uploaded.filename)\n        uploaded.save(input_path)\n        output_path = os.path.join(tmpdir, 'thumb.png')\n        \n        cmd = f'convert \"{input_path}\" -resize {width}x{height} \"{output_path}\"'\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=15)\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'thumbnail generation failed'}), 500\n        \n        return send_file(output_path, as_attachment=True)\n\n@app.route('/api/v1/metadata', methods=['POST'])\ndef extract_metadata():\n    \"\"\"Extract metadata from uploaded file using exiftool\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    uploaded = request.files['file']\n    \n    with tempfile.TemporaryDirectory() as tmpdir:\n        input_path = os.path.join(tmpdir, uploaded.filename)\n        uploaded.save(input_path)\n        \n        cmd = ['exiftool', '-json', input_path]\n        result = subprocess.run(cmd, capture_output=True, timeout=10)\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'metadata extraction failed'}), 500\n        \n        import json\n        metadata = json.loads(result.stdout)\n        return jsonify({'metadata': metadata[0] if metadata else {}})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. AWS WAF v2 WebACL is associated with the ALB. The WebACL contains two rule groups evaluated in priority order: (1) Priority 100: AWS Managed Rule Group 'AWSManagedRulesCommonRuleSet' with SizeRestrictions_QUERYSTRING action override set to COUNT (permissive), and CrossSiteScripting_QUERYSTRING set to COUNT. (2) Priority 200: AWS Managed Rule Group 'AWSManagedRulesSQLiRuleSet' with NO action overrides \u2014 all rules in BLOCK mode including SQLi_QUERYSTRING, SQLi_BODY, SQLi_COOKIE, and SQLi_URIPATH. The WebACL default action is ALLOW. CloudWatch metrics confirm the SQLi rule group is actively evaluating and blocking requests. Additionally, the WAF is configured with a custom response body (403 JSON: {\"error\":\"request_denied\"}) for blocked requests.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "load_balancer": "ALB with AWS WAF v2 WebACL association",
+      "waf_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "CommonRuleSet",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "vendor": "AWS",
+            "action_overrides": [
+              {
+                "rule": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              },
+              {
+                "rule": "CrossSiteScripting_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 200,
+            "name": "SQLiProtection",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "vendor": "AWS",
+            "action_overrides": [],
+            "note": "All rules active in default BLOCK mode"
+          }
+        ],
+        "custom_response_bodies": {
+          "blocked": "{\"error\":\"request_denied\"}"
+        }
+      },
+      "security_groups": "ALB: inbound 443/0.0.0.0/0; Fargate: inbound 8080 from ALB SG",
+      "runtime": "ECS Fargate, python:3.11-slim",
+      "database": "SQLite local file (ephemeral task storage)"
+    }
+  }
+}

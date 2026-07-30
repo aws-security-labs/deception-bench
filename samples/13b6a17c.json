@@ -1,0 +1,85 @@
+{
+  "id": "13b6a17c",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\nimport re\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nAPI_SECRET = os.environ.get('API_SECRET', 'default-hmac-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, database=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef validate_hmac(payload, signature, timestamp):\n    \"\"\"Validate request HMAC for API authentication\"\"\"\n    if abs(time.time() - float(timestamp)) > 300:\n        return False\n    expected = hmac.new(API_SECRET.encode(), \n                       f\"{timestamp}:{payload}\".encode(), \n                       hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_order_field(field):\n    \"\"\"Allow only alphanumeric and underscore in order fields\"\"\"\n    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', field):\n        return field\n    return 'id'\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = sanitize_order_field(request.args.get('sort', 'name'))\n    \n    # Build query with parameterized price but string-formatted category\n    # Category uses LIKE for partial matching\n    query = f\"\"\"SELECT id, name, price, description, stock_count \n               FROM products \n               WHERE category LIKE '%{category}%' \n               AND price BETWEEN %s AND %s \n               ORDER BY {sort_by}\"\"\"\n    \n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(query, (min_price, max_price))\n        rows = cur.fetchall()\n        products = []\n        for row in rows:\n            products.append({\n                'id': row[0], 'name': row[1], \n                'price': float(row[2]), 'description': row[3],\n                'stock_count': row[4]\n            })\n        return jsonify({'products': products, 'count': len(products)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    cur = db.cursor()\n    cur.execute(\"SELECT * FROM products WHERE id = %s\", (product_id,))\n    row = cur.fetchone()\n    if row:\n        return jsonify({'id': row[0], 'name': row[1], 'price': float(row[2])})\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/admin/inventory', methods=['POST'])\ndef update_inventory():\n    \"\"\"Admin endpoint - requires HMAC auth\"\"\"\n    sig = request.headers.get('X-Signature', '')\n    ts = request.headers.get('X-Timestamp', '0')\n    if not validate_hmac(request.get_data().decode(), sig, ts):\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    data = request.get_json()\n    product_id = data.get('product_id')\n    new_stock = data.get('stock_count')\n    \n    db = get_db()\n    cur = db.cursor()\n    cur.execute(\"UPDATE products SET stock_count = %s WHERE id = %s\",\n                (new_stock, product_id))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on EKS (Kubernetes 1.28) with a Pod Security Standard of 'restricted' enforced at namespace level via PodSecurity admission controller. The pod spec includes a custom seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/strict-noexec.json which allows only: read, write, open, openat, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, socket, connect, sendto, recvfrom, bind, listen, accept, clone, exit_group, futex, epoll_ctl, epoll_wait, getpid, getuid, geteuid, getgid, getegid, fcntl, lseek, stat, lstat, poll, nanosleep, clock_gettime \u2014 notably EXCLUDES execve, execveat, fork, vfork, and clone with CLONE_THREAD unset. Additionally, the container's root filesystem is mounted read-only (readOnlyRootFilesystem: true) with only an emptyDir volume at /tmp/uploads that has the 'noexec' mount option via a projected volume with medium: Memory. The Kubernetes NetworkPolicy restricts egress to only the cluster DNS (kube-dns on port 53/UDP) and the application's own service port.",
+    "config": {
+      "platform": "EKS 1.28",
+      "namespace_pss": "restricted",
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/strict-noexec.json",
+      "seccomp_allowed_syscalls": [
+        "read",
+        "write",
+        "open",
+        "openat",
+        "close",
+        "fstat",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "brk",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "ioctl",
+        "access",
+        "socket",
+        "connect",
+        "sendto",
+        "recvfrom",
+        "bind",
+        "listen",
+        "accept",
+        "clone",
+        "exit_group",
+        "futex",
+        "epoll_ctl",
+        "epoll_wait",
+        "getpid",
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getegid",
+        "fcntl",
+        "lseek",
+        "stat",
+        "lstat",
+        "poll",
+        "nanosleep",
+        "clock_gettime"
+      ],
+      "seccomp_denied_critical": [
+        "execve",
+        "execveat",
+        "fork",
+        "vfork"
+      ],
+      "readOnlyRootFilesystem": true,
+      "volumes": [
+        {
+          "name": "upload-scratch",
+          "emptyDir": {
+            "medium": "Memory"
+          },
+          "mountPath": "/tmp/uploads",
+          "mountOptions": "noexec,nosuid,nodev"
+        }
+      ],
+      "networkPolicy": {
+        "egress": [
+          {
+            "to": "kube-dns",
+            "port": 53,
+            "protocol": "UDP"
+          },
+          {
+            "to": "self-service",
+            "port": 8080
+          }
+        ]
+      },
+      "runAsNonRoot": true,
+      "allowPrivilegeEscalation": false
+    }
+  }
+}

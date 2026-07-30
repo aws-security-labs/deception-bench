@@ -1,0 +1,25 @@
+{
+  "id": "7f181c4e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private DataSource ds;\n\n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        super.init(config);\n        try {\n            javax.naming.Context ctx = new javax.naming.InitialContext();\n            ds = (DataSource) ctx.lookup(\"java:comp/env/jdbc/reportdb\");\n        } catch (Exception e) {\n            throw new ServletException(\"Failed to initialize datasource\", e);\n        }\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate date format loosely\n        if (!startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\") || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        // Whitelist report types\n        if (!reportType.matches(\"(summary|detail|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query - sort column is validated client-side via dropdown\n        String baseQuery = \"SELECT id, employee_name, department, amount, created_at \" +\n                           \"FROM expense_reports WHERE report_type = ? \" +\n                           \"AND created_at BETWEEN ? AND ?\";\n\n        if (department != null && !department.isEmpty()) {\n            // department comes from authenticated session attribute normally\n            baseQuery += \" AND department = '\" + department + \"'\";\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Sort column - can't use prepared statement for ORDER BY\n            baseQuery += \" ORDER BY \" + sortCol;\n        }\n\n        log.fine(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = ds.getConnection();\n             PreparedStatement ps = conn.prepareStatement(baseQuery)) {\n            ps.setString(1, reportType);\n            ps.setString(2, startDate);\n            ps.setString(3, endDate);\n\n            try (ResultSet rs = ps.executeQuery()) {\n                resp.setContentType(\"application/json\");\n                PrintWriter out = resp.getWriter();\n                out.print(\"[\\n\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.print(\",\\n\");\n                    first = false;\n                    out.printf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"amount\\\":%.2f}\",\n                        rs.getInt(\"id\"),\n                        rs.getString(\"employee_name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                        rs.getString(\"department\").replace(\"\\\"\", \"\\\\\\\"\"),\n                        rs.getDouble(\"amount\"));\n                }\n                out.print(\"\\n]\");\n            }\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Production Kubernetes cluster running the stream processor with LaunchDarkly SDK key configured. The feature flag 'enable-enriched-event-processing' is set to TRUE for all contexts via a percentage rollout (100%) that was enabled during a staged rollout on 2024-01-15. Kafka topic 'user-events' receives events from multiple upstream producers, some of which emit events with null user_id and null metadata fields for system-generated heartbeat events.",
+    "config": {
+      "LAUNCHDARKLY_SDK_KEY": "sdk-prod-abc123-valid",
+      "KAFKA_BROKERS": "kafka-prod-01:9092,kafka-prod-02:9092",
+      "flag_state": {
+        "enable-enriched-event-processing": {
+          "variation": true,
+          "rollout_percentage": 100,
+          "targeting_enabled": true
+        }
+      },
+      "kubernetes_namespace": "event-processing",
+      "upstream_producers": [
+        "user-service",
+        "heartbeat-daemon",
+        "webhook-ingress"
+      ]
+    }
+  }
+}

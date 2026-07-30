@@ -1,0 +1,31 @@
+{
+  "id": "083c15b2",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search action\n    try:\n        db = get_db()\n        log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field}, value={value}')\"\n        db.execute(log_query)\n        db.commit()\n    except Exception as e:\n        app.logger.warning(f\"Audit log failed: {e}\")\n    \n    # Perform the actual search using parameterized query\n    search_query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE ?\"\n    try:\n        results = db.execute(search_query, (f'%{value}%',)).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, api_key) VALUES (?, ?, ?)',\n            (data['username'], data['email'], os.urandom(16).hex())\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind the same ALB configuration, but the task runs with a custom seccomp profile (applied via ECS task definition seccompProfile field with 'localhost' type referencing /etc/ecs/seccomp/restricted.json). The seccomp profile is based on the default Docker profile but additionally denies the 'flock' syscall. The Fargate task uses an EFS mount for /var/lib/app/ with an EFS access point configured with POSIX permissions uid=1000, gid=1000, permissions=0755 on the root directory. The EFS file system has a resource policy that enforces aws:SecureTransport and denies elasticfilesystem:ClientWrite unless the IAM condition 'elasticfilesystem:AccessPointArn' matches the specific access point ARN. The access point enforces path /app-data with owner uid 1000. The task IAM role has a permissions boundary (arn:aws:iam::ACCOUNT:policy/DataProtectionBoundary) that includes a Deny on 'elasticfilesystem:ClientWrite' with a StringNotEquals condition on 'elasticfilesystem:AccessedViaMountTarget' for the specific mount target in the private subnet. Additionally, the ALB has an AWS WAF WebACL attached with rule group 'AWSManagedRulesCommonRuleSet' in COUNT mode and a custom rule that inspects query string parameters using a regex pattern matching on the 'value' parameter: if the decoded query string value for 'value' contains patterns matching SQL comment sequences (--), semicolons followed by SQL keywords, or unbalanced single quotes exceeding 3 occurrences, the request is blocked with a 403 response. The custom WAF rule has priority 1 (evaluated first).",
+    "config": {
+      "compute": "ECS Fargate 1.4.0, platform version LATEST",
+      "container": "Custom seccomp profile denying flock syscall, read-only root filesystem except /tmp and /var/lib/app",
+      "storage": "EFS with access point, resource policy enforcing SecureTransport and conditional write access",
+      "iam": "Task role with permissions boundary DataProtectionBoundary, denies EFS write except via specific mount target",
+      "waf": {
+        "web_acl": "app-protection-acl",
+        "rules": [
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 2,
+            "action": "COUNT"
+          },
+          {
+            "name": "custom-query-string-inspection",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": "RegexPatternSet match on query string 'value' parameter: patterns ['-{2,}', ';\\s*(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|ALTER)', \"'{3,}\"]"
+          }
+        ]
+      },
+      "network": "Private subnet, NAT gateway for egress, SG allows only ALB inbound on 8080"
+    }
+  }
+}

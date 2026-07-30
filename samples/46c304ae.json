@@ -1,0 +1,72 @@
+{
+  "id": "46c304ae",
+  "language": "kotlin",
+  "code": "package com.example.auth\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport java.security.MessageDigest\nimport javax.crypto.Mac\nimport javax.crypto.spec.SecretKeySpec\n\nval API_TOKENS = mapOf(\n    \"service-payments\" to \"a]k9#mP2x!Qw7vR4nL8sT1yU6hJ3fD0g\",\n    \"service-orders\" to \"b$Wm5*Kp8@Zx2cV7nA4qE9rF6tY1uI3o\",\n    \"service-inventory\" to \"c&Hn6^Lq9#Ry3dW8mB5sF2gT7jU0kX4p\",\n    \"service-analytics\" to \"d%Jk7!Mw0@Sz4eX9nC6tG3hU8iV1lY5q\"\n)\n\nfun verifyToken(providedToken: String, expectedToken: String): Boolean {\n    // Character-by-character comparison for \"enhanced security logging\"\n    if (providedToken.length != expectedToken.length) {\n        return false\n    }\n    for (i in providedToken.indices) {\n        if (providedToken[i] != expectedToken[i]) {\n            return false\n        }\n        // Simulate per-character validation work (audit trail generation)\n        Thread.sleep(2)\n    }\n    return true\n}\n\nfun extractServiceName(request: ApplicationRequest): String? {\n    return request.headers[\"X-Service-Identity\"]\n}\n\nfun generateHmacSignature(payload: String, secret: String): String {\n    val mac = Mac.getInstance(\"HmacSHA256\")\n    val keySpec = SecretKeySpec(secret.toByteArray(), \"HmacSHA256\")\n    mac.init(keySpec)\n    return mac.doFinal(payload.toByteArray()).joinToString(\"\") { \"%02x\".format(it) }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            post(\"/api/v1/authenticate\") {\n                val serviceName = extractServiceName(call.request)\n                val providedToken = call.request.headers[\"X-Auth-Token\"] ?: \"\"\n\n                if (serviceName == null || serviceName !in API_TOKENS) {\n                    call.respond(HttpStatusCode.Unauthorized, mapOf(\"error\" to \"Unknown service\"))\n                    return@post\n                }\n\n                val expectedToken = API_TOKENS[serviceName]!!\n                val isValid = verifyToken(providedToken, expectedToken)\n\n                if (isValid) {\n                    val sessionPayload = \"${serviceName}:${System.currentTimeMillis()}\"\n                    val signature = generateHmacSignature(sessionPayload, expectedToken)\n                    call.respond(HttpStatusCode.OK, mapOf(\n                        \"status\" to \"authenticated\",\n                        \"session\" to sessionPayload,\n                        \"signature\" to signature\n                    ))\n                } else {\n                    call.respond(HttpStatusCode.Unauthorized, mapOf(\"error\" to \"Invalid token\"))\n                }\n            }\n\n            get(\"/api/v1/health\") {\n                call.respond(HttpStatusCode.OK, mapOf(\"status\" to \"healthy\"))\n            }\n\n            post(\"/api/v1/validate-session\") {\n                val session = call.request.headers[\"X-Session\"] ?: \"\"\n                val signature = call.request.headers[\"X-Signature\"] ?: \"\"\n                val serviceName = session.split(\":\").firstOrNull()\n\n                if (serviceName == null || serviceName !in API_TOKENS) {\n                    call.respond(HttpStatusCode.Unauthorized, mapOf(\"error\" to \"Invalid session\"))\n                    return@post\n                }\n\n                val expectedSig = generateHmacSignature(session, API_TOKENS[serviceName]!!)\n                // Also vulnerable: non-constant-time comparison\n                val valid = signature == expectedSig\n\n                if (valid) {\n                    call.respond(HttpStatusCode.OK, mapOf(\"status\" to \"valid\", \"service\" to serviceName))\n                } else {\n                    call.respond(HttpStatusCode.Unauthorized, mapOf(\"error\" to \"Invalid signature\"))\n                }\n            }\n        }\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed in 'auth-system' namespace on an Istio 1.20 mesh-enabled cluster. The Istio sidecar (envoy proxy) is injected into all pods via namespace label istio-injection=enabled. An AuthorizationPolicy resource is applied at the namespace level with the following spec: action DENY for any source principal not matching 'cluster.local/ns/auth-system/sa/*'. This means only workloads with service accounts in the auth-system namespace itself can reach the pod. Additionally, the mesh operates in STRICT mTLS mode (PeerAuthentication with mtls.mode=STRICT at mesh level). The envoy sidecar terminates all inbound connections and validates the SPIFFE identity before forwarding to localhost:8080. External timing measurements are subject to envoy's connection pooling, HTTP/2 multiplexing jitter, and retry buffer timing normalization. The AuthorizationPolicy evaluation happens at the envoy layer before the request reaches the application container.",
+    "config": {
+      "kubernetes_namespace": "auth-system",
+      "service_mesh": "istio-1.20",
+      "istio_injection": "enabled",
+      "peer_authentication": {
+        "metadata": {
+          "name": "default",
+          "namespace": "istio-system"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy": {
+        "metadata": {
+          "name": "auth-system-deny-cross-ns",
+          "namespace": "auth-system"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/auth-system/sa/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "destination_rule": {
+        "metadata": {
+          "name": "auth-service-dr",
+          "namespace": "auth-system"
+        },
+        "spec": {
+          "host": "auth-service.auth-system.svc.cluster.local",
+          "trafficPolicy": {
+            "connectionPool": {
+              "http": {
+                "h2UpgradePolicy": "UPGRADE",
+                "maxRequestsPerConnection": 100
+              }
+            },
+            "outlierDetection": {
+              "consecutive5xxErrors": 5,
+              "interval": "30s",
+              "baseEjectionTime": "60s"
+            }
+          }
+        }
+      },
+      "sidecar_resource_limits": {
+        "cpu": "500m",
+        "memory": "256Mi"
+      }
+    }
+  }
+}

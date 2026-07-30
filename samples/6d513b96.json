@@ -1,0 +1,39 @@
+{
+  "id": "6d513b96",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst http = require('http');\nconst WebSocket = require('ws');\nconst path = require('path');\n\nconst app = express();\nconst server = http.createServer(app);\nconst wss = new WebSocket.Server({ server, path: '/ws/chat' });\n\n// Session store (simplified)\nconst sessions = new Map();\n\n// Middleware to parse cookies\napp.use((req, res, next) => {\n  const cookies = {};\n  (req.headers.cookie || '').split(';').forEach(c => {\n    const [k, v] = c.trim().split('=');\n    if (k) cookies[k] = v;\n  });\n  req.cookies = cookies;\n  next();\n});\n\n// User dashboard with WebSocket connection\napp.get('/dashboard', (req, res) => {\n  const sessionId = req.cookies.session_id;\n  if (!sessionId || !sessions.has(sessionId)) {\n    return res.redirect('/login');\n  }\n  const user = sessions.get(sessionId);\n  // Render dashboard with user-controlled \"theme\" parameter\n  const theme = req.query.theme || 'default';\n  \n  res.send(`<!DOCTYPE html>\n<html>\n<head><title>Dashboard - ${user.name}</title></head>\n<body class=\"theme-${theme}\">\n  <h1>Welcome, ${user.name}</h1>\n  <div id=\"messages\"></div>\n  <script>\n    const ws = new WebSocket('wss://' + location.host + '/ws/chat');\n    ws.onmessage = function(evt) {\n      const msg = JSON.parse(evt.data);\n      document.getElementById('messages').innerHTML += \n        '<div class=\"msg\">' + msg.content + '</div>';\n    };\n    ws.onopen = function() {\n      ws.send(JSON.stringify({type: 'auth', token: '${sessionId}'}));\n    };\n  </script>\n  <img src=\"/static/logo.png\" onerror=\"this.src='/static/fallback.png'\">\n</body>\n</html>`);\n});\n\n// WebSocket authentication and message handling\nwss.on('connection', (ws, req) => {\n  let authenticated = false;\n  let currentUser = null;\n\n  ws.on('message', (data) => {\n    try {\n      const msg = JSON.parse(data);\n      \n      if (msg.type === 'auth') {\n        // Authenticate via session token sent over WebSocket\n        if (sessions.has(msg.token)) {\n          authenticated = true;\n          currentUser = sessions.get(msg.token);\n          ws.send(JSON.stringify({ type: 'auth_ok', user: currentUser.name }));\n        } else {\n          ws.send(JSON.stringify({ type: 'auth_fail' }));\n          ws.close();\n        }\n        return;\n      }\n\n      if (!authenticated) {\n        ws.close();\n        return;\n      }\n\n      if (msg.type === 'chat') {\n        // Broadcast message to all authenticated clients\n        // NOTE: No origin validation on WebSocket upgrade\n        const payload = JSON.stringify({\n          type: 'message',\n          content: msg.content,\n          from: currentUser.name,\n          timestamp: Date.now()\n        });\n        wss.clients.forEach(client => {\n          if (client.readyState === WebSocket.OPEN) {\n            client.send(payload);\n          }\n        });\n      }\n\n      if (msg.type === 'admin_action' && currentUser.role === 'admin') {\n        // Execute admin commands\n        const result = executeAdminCommand(msg.command, msg.params);\n        ws.send(JSON.stringify({ type: 'admin_result', result }));\n      }\n    } catch (e) {\n      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));\n    }\n  });\n});\n\nfunction executeAdminCommand(command, params) {\n  const commands = {\n    'list_users': () => Array.from(sessions.values()).map(u => u.name),\n    'kick_user': (p) => { sessions.delete(p.sessionId); return 'kicked'; },\n    'broadcast': (p) => { return `Broadcast: ${p.message}`; }\n  };\n  if (commands[command]) return commands[command](params);\n  return 'unknown command';\n}\n\n// Login endpoint\napp.post('/login', express.urlencoded({ extended: false }), (req, res) => {\n  const { username, password } = req.body;\n  // Simplified auth\n  if (username && password === 'valid') {\n    const sid = require('crypto').randomBytes(16).toString('hex');\n    sessions.set(sid, { name: username, role: username === 'admin' ? 'admin' : 'user' });\n    res.cookie('session_id', sid, { httpOnly: true, sameSite: 'Strict' });\n    res.redirect('/dashboard');\n  } else {\n    res.status(401).send('Invalid credentials');\n  }\n});\n\nserver.listen(process.env.PORT || 3000, () => {\n  console.log(`Server running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "ECS Fargate service running behind an Application Load Balancer with a CloudFront distribution in front. The CloudFront distribution has a Response Headers Policy (ID: managed-policy-67f7725c-6f97-4210-82d7-5512b31e9d03) attached which injects Content-Security-Policy headers. The policy specifies: script-src 'self'; connect-src 'self' wss://*.internal.corp.net; frame-ancestors 'none'. The CloudFront distribution is the ONLY ingress path (ALB security group restricts inbound to CloudFront managed prefix list com.amazonaws.global.cloudfront.origin-facing). Additionally, the ECS task IAM role has a permissions boundary that prevents ssm:SendCommand and the task uses a read-only root filesystem. The Fargate platform version is 1.4.0 with runtime platform Linux/ARM64.",
+    "config": {
+      "ecs_launch_type": "FARGATE",
+      "platform_version": "1.4.0",
+      "runtime_platform": "LINUX_ARM64",
+      "network_mode": "awsvpc",
+      "alb_config": {
+        "listener_rules": [
+          {
+            "path": "/*",
+            "action": "forward"
+          }
+        ],
+        "security_group_inbound": "com.amazonaws.global.cloudfront.origin-facing prefix list only"
+      },
+      "cloudfront": {
+        "enabled": true,
+        "response_headers_policy": "managed-policy-67f7725c-6f97-4210-82d7-5512b31e9d03",
+        "csp_header": "script-src 'self'; connect-src 'self' wss://*.internal.corp.net; frame-ancestors 'none'",
+        "origin_protocol": "HTTPS",
+        "websocket_protocol": "WSS"
+      },
+      "task_definition": {
+        "container_port": 3000,
+        "readonly_root_filesystem": true,
+        "environment": {
+          "PORT": "3000",
+          "NODE_ENV": "production"
+        },
+        "iam_permissions_boundary": "arn:aws:iam::123456789012:policy/RestrictedTaskBoundary"
+      }
+    }
+  }
+}

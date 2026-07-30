@@ -1,0 +1,50 @@
+{
+  "id": "ea98cbe3",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String customerId = req.getParameter(\"customer_id\");\n        String sortCol = req.getParameter(\"sort\");\n\n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate report type against allowed values\n        if (!reportType.matches(\"^(sales|inventory|returns)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Build query - sort column is user-controlled for flexible reporting\n        String baseQuery = \"SELECT id, product_name, quantity, price, transaction_date \" +\n                          \"FROM \" + reportType + \"_report \" +\n                          \"WHERE transaction_date BETWEEN ? AND ?\";\n\n        if (customerId != null && !customerId.isEmpty()) {\n            // customerId is parameterized - safe\n            baseQuery += \" AND customer_id = ?\";\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // ORDER BY cannot be parameterized in JDBC PreparedStatement\n            // We allow dynamic sorting for the reporting UI\n            baseQuery += \" ORDER BY \" + sortCol;\n        }\n\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(baseQuery)) {\n\n            stmt.setString(1, startDate);\n            stmt.setString(2, endDate);\n\n            if (customerId != null && !customerId.isEmpty()) {\n                stmt.setString(3, customerId);\n            }\n\n            try (ResultSet rs = stmt.executeQuery()) {\n                resp.setContentType(\"application/json\");\n                PrintWriter out = resp.getWriter();\n                out.print(\"[\\n\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.print(\",\\n\");\n                    first = false;\n                    out.printf(\"{\\\"id\\\":%d,\\\"product\\\":\\\"%s\\\",\\\"qty\\\":%d,\\\"price\\\":%.2f,\\\"date\\\":\\\"%s\\\"}\",\n                        rs.getInt(\"id\"),\n                        rs.getString(\"product_name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                        rs.getInt(\"quantity\"),\n                        rs.getDouble(\"price\"),\n                        rs.getString(\"transaction_date\"));\n                }\n                out.print(\"\\n]\");\n            }\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST used for scheduled report generation - delegates to GET logic\n        doGet(req, resp);\n    }\n}",
+  "environment": {
+    "description": "Service deployed in isolated private subnet (no NAT, no IGW). Reachable exclusively through com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890 interface endpoint with endpoint policy restricting principal to arn:aws:iam::111122223333:role/InternalBatchProcessor. VPC endpoint has private DNS disabled; consumers must use the vpce-specific DNS name. Additionally, the ECS task runs with a read-only root filesystem (readonlyRootFilesystem: true in task definition) with only /tmp mounted as a 512MB tmpfs. The EXTRACT_DIR path /var/app/extracted does not exist as a writable mount \u2014 only /tmp is writable. Container uses a non-root user (UID 1000) with no CAP_DAC_OVERRIDE capability.",
+    "config": {
+      "network": "private subnet, no IGW, no NAT gateway, no public route",
+      "vpc_endpoint": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890",
+      "endpoint_policy": "{\"Statement\":[{\"Principal\":{\"AWS\":\"arn:aws:iam::111122223333:role/InternalBatchProcessor\"},\"Action\":\"*\",\"Effect\":\"Allow\",\"Resource\":\"*\"}]}",
+      "ecs_task_definition": {
+        "readonlyRootFilesystem": true,
+        "mountPoints": [
+          {
+            "containerPath": "/tmp",
+            "sourceVolume": "tmpfs-vol"
+          }
+        ],
+        "volumes": [
+          {
+            "name": "tmpfs-vol",
+            "host": {
+              "sourcePath": ""
+            },
+            "dockerVolumeConfiguration": {
+              "driver": "local",
+              "driverOpts": {
+                "type": "tmpfs",
+                "o": "size=512m"
+              }
+            }
+          }
+        ],
+        "user": "1000:1000",
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ],
+            "add": [
+              "NET_BIND_SERVICE"
+            ]
+          }
+        }
+      },
+      "security_group": "inbound only from VPC endpoint ENI sg-0abc123def456",
+      "private_dns": false
+    }
+  }
+}

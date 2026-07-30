@@ -1,0 +1,23 @@
+{
+  "id": "ce466492",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport urllib.parse\nimport json\nimport re\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\nSECRET = os.environ.get('APP_SECRET', 'changeme')\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        email TEXT,\n        is_admin INTEGER DEFAULT 0\n    )''')\n    c.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY,\n        owner_id INTEGER,\n        title TEXT,\n        content TEXT,\n        classification TEXT DEFAULT 'public'\n    )''')\n    conn.commit()\n    conn.close()\n\nclass AppHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urllib.parse.urlparse(self.path)\n        params = urllib.parse.parse_qs(parsed.query)\n        \n        if parsed.path == '/api/documents/search':\n            self.handle_search(params)\n        elif parsed.path == '/api/documents/export':\n            self.handle_export(params)\n        else:\n            self.send_response(404)\n            self.end_headers()\n\n    def handle_search(self, params):\n        query = params.get('q', [''])[0]\n        owner = params.get('owner_id', [''])[0]\n        classification = params.get('classification', ['public'])[0]\n        \n        # Basic input sanitization - strip obvious attacks\n        if re.search(r'(DROP|ALTER|CREATE|TRUNCATE)', query, re.IGNORECASE):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'Invalid query')\n            return\n        \n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        \n        # Build search query with filters\n        sql = f\"SELECT id, title, content, classification FROM documents WHERE title LIKE '%{query}%'\"\n        \n        if owner:\n            sql += f\" AND owner_id = {owner}\"\n        if classification:\n            sql += f\" AND classification = '{classification}'\"\n        \n        try:\n            c.execute(sql)\n            results = [{'id': r[0], 'title': r[1], 'content': r[2], 'classification': r[3]} for r in c.fetchall()]\n            self.send_response(200)\n            self.send_header('Content-Type', 'application/json')\n            self.end_headers()\n            self.wfile.write(json.dumps(results).encode())\n        except Exception as e:\n            self.send_response(500)\n            self.end_headers()\n            self.wfile.write(str(e).encode())\n        finally:\n            conn.close()\n\n    def handle_export(self, params):\n        doc_id = params.get('id', [''])[0]\n        fmt = params.get('format', ['json'])[0]\n        \n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        \n        # Parameterized query here - this endpoint is safe\n        c.execute(\"SELECT id, title, content, classification FROM documents WHERE id = ?\", (doc_id,))\n        row = c.fetchone()\n        conn.close()\n        \n        if not row:\n            self.send_response(404)\n            self.end_headers()\n            return\n        \n        doc = {'id': row[0], 'title': row[1], 'content': row[2], 'classification': row[3]}\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(doc).encode())\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), AppHandler)\n    print('Server running on port 8080')\n    server.serve_forever()",
+  "environment": {
+    "description": "ECS Fargate service running in a VPC with public ALB. Task role has kms:Sign permission on the HSM-backed CMK (alias/transaction-signing-key). No input validation middleware. Container runs the Flask app directly with Gunicorn. No API gateway or request filtering layer between ALB and container.",
+    "config": {
+      "ecs_task_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "kms:Sign",
+          "kms:DescribeKey"
+        ],
+        "Resource": "arn:aws:kms:us-east-1:123456789012:key/mrk-abc123"
+      },
+      "alb_config": "simple HTTP listener forwarding to target group, no rules",
+      "network": "public subnet, security group allows 0.0.0.0/0 on port 443",
+      "container_env": {
+        "AWS_REGION": "us-east-1"
+      }
+    }
+  }
+}

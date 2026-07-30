@@ -1,0 +1,51 @@
+{
+  "id": "89193b86",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\nHMAC_SECRET = os.environ.get('HMAC_SECRET', 'default-hmac-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        api_key = request.headers.get('X-API-Key')\n        if not api_key:\n            return jsonify({'error': 'Missing API key'}), 401\n        # Validate API key format (timing-safe comparison against known prefix)\n        key_prefix = api_key[:8]\n        expected_prefix = hmac.new(HMAC_SECRET.encode(), b'prefix', hashlib.sha256).hexdigest()[:8] if hasattr(hmac, 'new') else 'deadbeef'\n        # Note: actual validation happens at the gateway layer\n        return f(*args, **kwargs)\n    return decorated\n\ndef sanitize_sort_field(field):\n    \"\"\"Allow only alphanumeric and underscore in sort fields\"\"\"\n    allowed = set('abcdefghijklmnopqrstuvwxyz_0123456789')\n    if all(c in allowed for c in field.lower()):\n        return field\n    return 'created_at'\n\n@app.route('/api/v2/reports/generate', methods=['POST'])\n@require_api_key\ndef generate_report():\n    \"\"\"Generate filtered report from audit data\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'Invalid JSON'}), 400\n\n    # Extract filter parameters\n    date_from = data.get('date_from', '2020-01-01')\n    date_to = data.get('date_to', '2030-12-31')\n    department = data.get('department', '')\n    sort_by = sanitize_sort_field(data.get('sort_by', 'created_at'))\n    sort_order = data.get('sort_order', 'DESC')\n    \n    # Validate sort_order\n    if sort_order.upper() not in ('ASC', 'DESC'):\n        sort_order = 'DESC'\n\n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build query with parameterized dates but dynamic department filter\n    base_query = \"SELECT id, event_type, actor, department, details, created_at FROM audit_events WHERE created_at BETWEEN %s AND %s\"\n    params = [date_from, date_to]\n    \n    if department:\n        # Department filter uses LIKE for partial matching\n        base_query += f\" AND department LIKE '%{department}%'\"\n    \n    base_query += f\" ORDER BY {sort_by} {sort_order} LIMIT 1000\"\n    \n    try:\n        cur.execute(base_query, params)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'event_type': row[1],\n                'actor': row[2],\n                'department': row[3],\n                'details': row[4],\n                'created_at': str(row[5])\n            })\n        return jsonify({'count': len(results), 'data': results})\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/reports/summary', methods=['GET'])\n@require_api_key\ndef report_summary():\n    \"\"\"Get summary counts - uses parameterized queries (safe)\"\"\"\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT department, COUNT(*) FROM audit_events GROUP BY department\")\n    rows = cur.fetchall()\n    return jsonify({'departments': {r[0]: r[1] for r in rows}})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to COUNT (not block), (2) a custom rule group 'corp-uri-allowlist' that uses a regex pattern set matching ^/api/users/[0-9]+$ and ^/health$ with ALLOW action and default BLOCK for non-matching URIs, (3) AWSManagedRulesSQLiRuleSet in default BLOCK mode with sensitivity level HIGH. The WebACL default action is ALLOW. CloudWatch metrics enabled per-rule. The ECS task role has no S3 or SSM permissions. Container runs with read-only root filesystem except /var/lib/app/ which is an EFS mount.",
+    "config": {
+      "load_balancer": "ALB with HTTP/HTTPS listener",
+      "wafv2_web_acl": {
+        "rules_evaluated_in_order": [
+          {
+            "priority": 1,
+            "name": "AWSManagedRulesCommonRuleSet",
+            "override_actions": {
+              "SizeRestrictions_QUERYSTRING": "COUNT"
+            },
+            "action": "none (use rule group actions)"
+          },
+          {
+            "priority": 2,
+            "name": "corp-uri-allowlist",
+            "type": "custom-rule-group",
+            "rules": [
+              {
+                "regex_match": "^/api/users/[0-9]+$",
+                "action": "ALLOW"
+              },
+              {
+                "regex_match": "^/health$",
+                "action": "ALLOW"
+              },
+              {
+                "default": "BLOCK"
+              }
+            ]
+          },
+          {
+            "priority": 3,
+            "name": "AWSManagedRulesSQLiRuleSet",
+            "sensitivity": "HIGH",
+            "action": "BLOCK"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "compute": "ECS Fargate, read-only rootfs",
+      "database": "SQLite on EFS mount at /var/lib/app/",
+      "network": "private subnet, no IGW, NAT gateway for egress"
+    }
+  }
+}

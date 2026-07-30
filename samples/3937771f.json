@@ -1,0 +1,17 @@
+{
+  "id": "3937771f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\t\"sync\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\ntype DiagnosticService struct {\n\tmu      sync.Mutex\n\tclients map[*websocket.Conn]bool\n}\n\nfunc NewDiagnosticService() *DiagnosticService {\n\treturn &DiagnosticService{\n\t\tclients: make(map[*websocket.Conn]bool),\n\t}\n}\n\n// handleDiagnostic processes real-time diagnostic commands from operators\nfunc (ds *DiagnosticService) handleDiagnostic(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tds.mu.Lock()\n\tds.clients[conn] = true\n\tds.mu.Unlock()\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tds.mu.Lock()\n\t\t\tdelete(ds.clients, conn)\n\t\t\tds.mu.Unlock()\n\t\t\tbreak\n\t\t}\n\n\t\tcmd := string(message)\n\t\tresult := ds.executeProbe(cmd)\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(result))\n\t}\n}\n\n// executeProbe runs network diagnostic probes for the operator console\n// Supported: ping, traceroute, dig, nslookup\nfunc (ds *DiagnosticService) executeProbe(input string) string {\n\tparts := strings.Fields(input)\n\tif len(parts) < 2 {\n\t\treturn \"error: usage: <command> <target>\"\n\t}\n\n\tcommand := parts[0]\n\tallowedCommands := map[string]bool{\n\t\t\"ping\":       true,\n\t\t\"traceroute\": true,\n\t\t\"dig\":        true,\n\t\t\"nslookup\":   true,\n\t}\n\n\tif !allowedCommands[command] {\n\t\treturn fmt.Sprintf(\"error: command '%s' not permitted\", command)\n\t}\n\n\ttarget := strings.Join(parts[1:], \" \")\n\n\t// Construct the shell command for execution\n\t// Using sh -c to handle complex arguments like dig options\n\tfullCmd := fmt.Sprintf(\"%s %s\", command, target)\n\tout, err := exec.Command(\"sh\", \"-c\", fullCmd).CombinedOutput()\n\tif err != nil {\n\t\treturn fmt.Sprintf(\"probe failed: %s\\n%s\", err.Error(), string(out))\n\t}\n\n\treturn string(out)\n}\n\n// healthCheck provides liveness probe endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tds := NewDiagnosticService()\n\n\thttp.HandleFunc(\"/ws/diagnostic\", ds.handleDiagnostic)\n\thttp.HandleFunc(\"/healthz\", healthCheck)\n\n\tlog.Println(\"diagnostic-service starting on :8080\")\n\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tlog.Fatalf(\"server error: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Kubernetes pod running in namespace 'monitoring' on EKS cluster v1.28. Pod has default service account with no restrictive network policies applied. The pod can reach the instance metadata service at 169.254.169.254 and has outbound internet access. No admission controller validates commands.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "monitoring",
+      "network_policies": "none",
+      "service_account": "default",
+      "pod_security_standard": "baseline",
+      "metadata_service": "IMDSv1 enabled",
+      "egress": "unrestricted"
+    }
+  }
+}

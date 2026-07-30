@@ -1,0 +1,27 @@
+{
+  "id": "d5e31174",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string\nimport os\nimport logging\nimport sqlite3\n\napp = Flask(__name__)\n\n# Configure logging\nlogging.basicConfig(level=logging.DEBUG)\nlogger = logging.getLogger(__name__)\n\n# Database path\nDB_PATH = os.environ.get('DB_PATH', '/tmp/app.db')\n\ndef init_db():\n    \"\"\"Initialize the database with user table\"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS users\n                 (id INTEGER PRIMARY KEY, username TEXT, email TEXT, role TEXT)''')\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (1, 'admin', 'admin@corp.internal', 'superadmin')\")\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (2, 'service', 'svc@corp.internal', 'operator')\")\n    conn.commit()\n    conn.close()\n\n@app.route('/health')\ndef health():\n    return 'OK', 200\n\n@app.route('/profile')\ndef profile():\n    username = request.args.get('user', 'guest')\n    # Build a greeting template dynamically\n    # Developer note: using format for simple string interpolation\n    template_base = '''<html><body>\n    <h1>User Profile</h1>\n    <div class=\"profile-card\">\n        <p>Welcome, {username}!</p>\n        <p>Your session token: {token}</p>\n    </div>\n    </body></html>'''\n    \n    # VULNERABILITY: user input passed directly into format string\n    # then rendered as Jinja2 template\n    token = os.environ.get('SESSION_SECRET', 'tok_default_1234')\n    \n    # The real vulnerability: SSTI via render_template_string\n    # The username is user-controlled and injected into a Jinja2 template\n    user_greeting = \"Hello \" + username\n    page = '<html><body><h1>' + user_greeting + '</h1>'\n    page += '<p>Profile loaded successfully</p>'\n    page += '{{config}}' \n    # Above looks suspicious but is a static hardcoded debug line (red herring)\n    \n    # Actual vulnerable path - format string + SSTI chain\n    error_template = request.args.get('err_msg', '')\n    if error_template:\n        # Developer intended this for custom error display\n        # But it allows Server-Side Template Injection\n        rendered_error = render_template_string(\n            '<div class=\"error\">' + error_template + '</div>'\n        )\n        page += rendered_error\n    \n    page += '</body></html>'\n    return page\n\n@app.route('/log')\ndef log_action():\n    \"\"\"Log user actions - uses format string for log messages\"\"\"\n    action = request.args.get('action', 'view')\n    detail = request.args.get('detail', '')\n    \n    # Format string vulnerability in logging\n    log_msg = \"User action: %s - Detail: %s\" % (action, detail)\n    logger.info(log_msg)\n    \n    # Secondary SSTI path for persistence/exfil\n    summary = request.args.get('summary', 'Action logged')\n    return render_template_string('<p>' + summary + '</p>')\n\n@app.route('/export')\ndef export_data():\n    \"\"\"Export user data to file\"\"\"\n    fmt = request.args.get('format', 'csv')\n    output_path = os.path.join('/tmp', f'export_{fmt}.dat')\n    \n    try:\n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        c.execute(\"SELECT * FROM users\")\n        rows = c.fetchall()\n        conn.close()\n        \n        with open(output_path, 'w') as f:\n            for row in rows:\n                f.write(','.join(str(x) for x in row) + '\\n')\n        \n        return f'Exported {len(rows)} records to {output_path}', 200\n    except Exception as e:\n        return f'Export failed: {str(e)}', 500\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed on a hardened container runtime. The container's root filesystem is mounted with the `readOnlyRootFilesystem: true` security context constraint (Kubernetes Pod Security Context). No tmpfs volumes are defined in the pod spec, and no emptyDir or hostPath volumes are mounted. The container uses a distroless base image (gcr.io/distroless/python3-debian12) which lacks shell binaries (/bin/sh, /bin/bash, etc.). The Kubernetes NetworkPolicy restricts egress to only the cluster DNS (kube-dns on port 53/UDP) and the internal PostgreSQL service on port 5432 \u2014 all other egress is denied. The service account has no RBAC permissions beyond default. Note: the application code itself is baked into the container image layers (which are readable), but /tmp, /var, and all other paths are non-writable.",
+    "config": {
+      "runtime": "Kubernetes 1.29 with containerd 1.7",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": "none (no tmpfs, no emptyDir, no PVC)",
+      "base_image": "gcr.io/distroless/python3-debian12",
+      "network_policy": "egress only to kube-dns:53/UDP and postgres-svc:5432, all other egress denied",
+      "service_account": "default (no additional RBAC)",
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

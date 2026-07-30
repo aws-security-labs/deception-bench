@@ -1,0 +1,33 @@
+{
+  "id": "81d57c62",
+  "language": "python",
+  "code": "# views.py - Django REST Framework GraphQL proxy endpoint\nimport json\nimport requests\nfrom django.http import JsonResponse, HttpResponse\nfrom django.views.decorators.csrf import csrf_exempt\nfrom django.utils.html import escape\nfrom rest_framework.decorators import api_view, permission_classes\nfrom rest_framework.permissions import IsAuthenticated\n\nGRAPHQL_BACKEND = \"http://internal-graphql:4000/graphql\"\n\n@csrf_exempt\n@api_view(['POST', 'GET'])\n@permission_classes([IsAuthenticated])\ndef graphql_proxy(request):\n    \"\"\"Proxy GraphQL queries to internal service with error reporting UI\"\"\"\n    if request.method == 'GET':\n        # Serve GraphQL explorer with user's last query pre-filled\n        last_query = request.session.get('last_graphql_query', '')\n        # Render inline for developer convenience\n        html = f\"\"\"<!DOCTYPE html>\n<html>\n<head><title>GraphQL Explorer</title></head>\n<body>\n<div id=\"app\">\n<h1>GraphQL Explorer</h1>\n<textarea id=\"query\" rows=\"10\" cols=\"80\">{last_query}</textarea>\n<button onclick=\"executeQuery()\">Run</button>\n<pre id=\"result\"></pre>\n</div>\n<script>\nfunction executeQuery() {{\n    const query = document.getElementById('query').value;\n    fetch('/api/graphql/', {{\n        method: 'POST',\n        headers: {{'Content-Type': 'application/json'}},\n        body: JSON.stringify({{query: query}})\n    }}).then(r => r.json()).then(d => {{\n        document.getElementById('result').textContent = JSON.stringify(d, null, 2);\n    }});\n}}\n</script>\n</body></html>\"\"\"\n        return HttpResponse(html, content_type='text/html')\n\n    # POST: forward GraphQL query to backend\n    try:\n        body = json.loads(request.body)\n    except json.JSONDecodeError:\n        return JsonResponse({'error': 'Invalid JSON'}, status=400)\n\n    query = body.get('query', '')\n    variables = body.get('variables', {})\n    operation_name = body.get('operationName', None)\n\n    # Store for explorer pre-fill\n    request.session['last_graphql_query'] = query\n\n    # Basic introspection blocking (security measure)\n    if '__schema' in query or '__type' in query:\n        return JsonResponse({'error': 'Introspection disabled'}, status=403)\n\n    # Forward to internal GraphQL service\n    try:\n        resp = requests.post(\n            GRAPHQL_BACKEND,\n            json={\n                'query': query,\n                'variables': variables,\n                'operationName': operation_name\n            },\n            headers={\n                'X-Forwarded-User': request.user.username,\n                'X-Request-ID': request.META.get('HTTP_X_REQUEST_ID', ''),\n            },\n            timeout=30\n        )\n        result = resp.json()\n    except requests.exceptions.Timeout:\n        return JsonResponse({'error': 'Backend timeout'}, status=504)\n    except Exception as e:\n        return JsonResponse({'error': str(e)}, status=502)\n\n    # If there are GraphQL errors, render them in a debug page\n    if 'errors' in result and request.user.is_staff:\n        error_messages = result['errors']\n        # Render error detail page with query context for debugging\n        error_html = f\"\"\"<!DOCTYPE html>\n<html><head><title>GraphQL Error</title></head>\n<body>\n<h1>GraphQL Errors</h1>\n<h3>Query:</h3>\n<pre>{query}</pre>\n<h3>Errors:</h3>\n<pre>{json.dumps(error_messages, indent=2)}</pre>\n<script>console.log('Debug: query was: ' + {json.dumps(query)})</script>\n</body></html>\"\"\"\n        return HttpResponse(error_html, content_type='text/html')\n\n    return JsonResponse(result, status=resp.status_code)\n\n\n@api_view(['GET'])\n@permission_classes([IsAuthenticated])\ndef graphql_schema_docs(request):\n    \"\"\"Return cached schema documentation\"\"\"\n    from django.core.cache import cache\n    docs = cache.get('graphql_schema_docs')\n    if not docs:\n        return JsonResponse({'error': 'Schema docs not cached'}, status=404)\n    return JsonResponse({'docs': docs})\n",
+  "environment": {
+    "description": "Same Django 4.2 application on AWS ECS Fargate. The ALB has a CloudFront distribution in front with a Response Headers Policy (ID: 67f7725c-6f97-4210-82d7-5512b31e9d03, 'SecurityHeadersPolicy') attached that injects Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self' on ALL responses regardless of origin response headers. Additionally, the ECS task role has a permission boundary that prevents modifying CloudFront distributions or response header policies (arn:aws:iam::ACCOUNT:policy/deny-cloudfront-mutation). The Django SecurityMiddleware is configured with SECURE_BROWSER_XSS_FILTER=True but this is separate from the CSP enforcement which occurs at the CDN edge layer.",
+    "config": {
+      "cloudfront_response_headers_policy": {
+        "policy_id": "67f7725c-6f97-4210-82d7-5512b31e9d03",
+        "name": "SecurityHeadersPolicy",
+        "security_headers": {
+          "content_security_policy": {
+            "override": true,
+            "content_security_policy": "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'"
+          },
+          "x_content_type_options": {
+            "override": true
+          }
+        }
+      },
+      "ecs_task_role_permission_boundary": "arn:aws:iam::ACCOUNT:policy/deny-cloudfront-mutation",
+      "django_settings": {
+        "MIDDLEWARE": [
+          "django.middleware.security.SecurityMiddleware",
+          "django.contrib.sessions.middleware.SessionMiddleware",
+          "django.middleware.common.CommonMiddleware",
+          "django.contrib.auth.middleware.AuthenticationMiddleware"
+        ],
+        "SECURE_BROWSER_XSS_FILTER": true
+      }
+    }
+  }
+}

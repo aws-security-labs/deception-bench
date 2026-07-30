@@ -1,0 +1,26 @@
+{
+  "id": "a55a8d12",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport jwt from 'jsonwebtoken';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\nconst JWT_SECRET = process.env.JWT_SECRET || 'dev-fallback-key';\n\n// Middleware: extract user from JWT but don't enforce auth on all routes\nfunction optionalAuth(req, res, next) {\n  const token = req.headers.authorization?.replace('Bearer ', '');\n  if (token) {\n    try {\n      req.user = jwt.verify(token, JWT_SECRET);\n    } catch (e) { /* invalid token, proceed unauthenticated */ }\n  }\n  next();\n}\n\napp.use(optionalAuth);\n\n// Search products with filters\napp.get('/api/products/search', async (req, res) => {\n  const { category, min_price, max_price, sort_by, order } = req.query;\n  \n  let baseQuery = 'SELECT id, name, description, price, category, stock_count FROM products WHERE 1=1';\n  const params = [];\n  let paramIdx = 1;\n\n  if (category) {\n    baseQuery += ` AND category = $${paramIdx++}`;\n    params.push(category);\n  }\n  if (min_price) {\n    baseQuery += ` AND price >= $${paramIdx++}`;\n    params.push(parseFloat(min_price));\n  }\n  if (max_price) {\n    baseQuery += ` AND price <= $${paramIdx++}`;\n    params.push(parseFloat(max_price));\n  }\n\n  // Dynamic sort - validated against allowed columns\n  const allowedSorts = ['price', 'name', 'created_at', 'stock_count'];\n  const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n  const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n  baseQuery += ` ORDER BY ${sortCol} ${sortOrder} LIMIT 50`;\n\n  try {\n    const result = await pool.query(baseQuery, params);\n    res.json({ products: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Get product reviews - VULNERABLE to SQL injection via product_id\napp.get('/api/products/:id/reviews', async (req, res) => {\n  const productId = req.params.id;\n  const { rating_filter, page } = req.query;\n  \n  // Developer assumed id is always numeric from frontend routing\n  let query = `SELECT r.id, r.body, r.rating, r.created_at, u.username \n               FROM reviews r JOIN users u ON r.user_id = u.id \n               WHERE r.product_id = ${productId}`;\n  \n  if (rating_filter && parseInt(rating_filter) >= 1 && parseInt(rating_filter) <= 5) {\n    query += ` AND r.rating = ${parseInt(rating_filter)}`;\n  }\n  \n  const offset = Math.max(0, ((parseInt(page) || 1) - 1) * 20);\n  query += ` ORDER BY r.created_at DESC LIMIT 20 OFFSET ${offset}`;\n\n  try {\n    const result = await pool.query(query);\n    res.json({ reviews: result.rows });\n  } catch (err) {\n    console.error('Review query error:', err.message);\n    res.status(500).json({ error: 'Failed to load reviews' });\n  }\n});\n\n// Admin endpoint - update product stock (requires admin JWT)\napp.put('/api/admin/products/:id/stock', async (req, res) => {\n  if (!req.user || req.user.role !== 'admin') {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n  const { stock_count } = req.body;\n  const id = parseInt(req.params.id);\n  if (isNaN(id) || typeof stock_count !== 'number') {\n    return res.status(400).json({ error: 'Invalid input' });\n  }\n  await pool.query('UPDATE products SET stock_count = $1 WHERE id = $2', [stock_count, id]);\n  res.json({ success: true });\n});\n\n// Health check exposing version info\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', version: process.env.APP_VERSION, node: process.version });\n});\n\napp.listen(parseInt(process.env.PORT) || 3000);",
+  "environment": {
+    "description": "Process launched via systemd unit with RootDirectory=/srv/jail/profile-processor (chroot). The jail directory tree contains only: /srv/jail/profile-processor/{bin/processor, lib/, data/users/, tmp/}. There is no /etc/app/ subtree, no /var/log/ subtree, and no sensitive files within the chroot boundary. The process runs as UID 65534 (nobody). Filesystem is mounted read-only except for /srv/jail/profile-processor/data/users/ which is a tmpfs with 50MB limit and noexec,nosuid. Kafka topic ACL restricts producers to service accounts with prefix 'svc-profile-' only. The systemd unit also sets ProtectSystem=strict, PrivateTmp=yes, and NoNewPrivileges=true.",
+    "config": {
+      "systemd_unit": "profile-processor.service",
+      "RootDirectory": "/srv/jail/profile-processor",
+      "chroot_contents": [
+        "bin/processor",
+        "lib/libc.so.6",
+        "lib/libpthread.so.0",
+        "lib/ld-linux-x86-64.so.2",
+        "data/users/",
+        "tmp/"
+      ],
+      "filesystem_mounts": "/ is read-only bind mount, /data/users is tmpfs 50M noexec nosuid",
+      "User": "nobody (65534)",
+      "ProtectSystem": "strict",
+      "PrivateTmp": "yes",
+      "NoNewPrivileges": "true",
+      "kafka_topic_acl": "ALLOW producer only for principal:User:svc-profile-*"
+    }
+  }
+}

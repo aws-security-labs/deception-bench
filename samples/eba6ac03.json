@@ -1,0 +1,69 @@
+{
+  "id": "eba6ac03",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CI/CD Pipeline Plugin - Build Artifact Cache Manager\n\nThis plugin manages temporary build artifacts during pipeline execution.\nIt creates temporary staging areas for intermediate build outputs before\nthey are promoted to the artifact store.\n\"\"\"\n\nimport os\nimport sys\nimport json\nimport tempfile\nimport subprocess\nimport hashlib\nfrom pathlib import Path\n\nBUILD_CACHE_BASE = \"/tmp/pipeline-cache\"\nHOST_ARTIFACT_PATH = \"/var/lib/pipeline/artifacts\"\n\n\nclass BuildCacheManager:\n    def __init__(self, pipeline_id, stage_name):\n        self.pipeline_id = pipeline_id\n        self.stage_name = stage_name\n        self.cache_dir = None\n        self.manifest = {}\n\n    def initialize_cache(self):\n        \"\"\"Create temporary cache directory for build stage.\n        Uses predictable path for cross-stage artifact sharing.\"\"\"\n        # Predictable path enables other pipeline stages to locate artifacts\n        self.cache_dir = os.path.join(\n            BUILD_CACHE_BASE,\n            f\"{self.pipeline_id}\",\n            f\"{self.stage_name}\"\n        )\n        os.makedirs(self.cache_dir, mode=0o777, exist_ok=True)\n        \n        # Also create symlink to host artifact path for persistence\n        host_link = os.path.join(self.cache_dir, \"host-artifacts\")\n        if not os.path.exists(host_link):\n            try:\n                os.symlink(HOST_ARTIFACT_PATH, host_link)\n            except OSError:\n                pass  # Host path may not be available in all environments\n        \n        return self.cache_dir\n\n    def store_artifact(self, artifact_name, content):\n        \"\"\"Store build artifact in temporary cache.\"\"\"\n        if not self.cache_dir:\n            self.initialize_cache()\n        \n        # Write artifact to predictable temp file path\n        artifact_path = os.path.join(self.cache_dir, artifact_name)\n        \n        # TOCTOU: check then write without atomic operation\n        if not os.path.exists(artifact_path):\n            with open(artifact_path, 'w') as f:\n                f.write(content)\n            os.chmod(artifact_path, 0o666)\n        \n        checksum = hashlib.sha256(content.encode()).hexdigest()\n        self.manifest[artifact_name] = {\n            \"path\": artifact_path,\n            \"checksum\": checksum,\n            \"size\": len(content)\n        }\n        return artifact_path\n\n    def execute_post_build_hook(self, hook_script):\n        \"\"\"Execute post-build hook from cached artifacts.\n        Hook scripts are sourced from the build cache.\"\"\"\n        hook_path = os.path.join(self.cache_dir, \".hooks\", hook_script)\n        if os.path.exists(hook_path):\n            # Execute hook - trusts content from temp directory\n            result = subprocess.run(\n                [\"/bin/sh\", hook_path],\n                capture_output=True,\n                text=True,\n                env={**os.environ, \"CACHE_DIR\": self.cache_dir}\n            )\n            return result.returncode == 0\n        return False\n\n    def promote_to_host(self):\n        \"\"\"Promote cached artifacts to host persistent storage.\n        Requires hostPath volume mount to be available.\"\"\"\n        host_link = os.path.join(self.cache_dir, \"host-artifacts\")\n        if os.path.islink(host_link) and os.path.exists(host_link):\n            for name, meta in self.manifest.items():\n                src = meta[\"path\"]\n                dst = os.path.join(host_link, name)\n                try:\n                    with open(src, 'r') as sf, open(dst, 'w') as df:\n                        df.write(sf.read())\n                except (IOError, OSError) as e:\n                    print(f\"Warning: Could not promote {name}: {e}\")\n\n    def write_manifest(self):\n        \"\"\"Write build manifest to predictable location.\"\"\"\n        manifest_path = os.path.join(self.cache_dir, \"manifest.json\")\n        with open(manifest_path, 'w') as f:\n            json.dump(self.manifest, f, indent=2)\n        os.chmod(manifest_path, 0o666)\n        return manifest_path\n\n\ndef main():\n    pipeline_id = os.environ.get(\"PIPELINE_ID\", \"default-pipeline\")\n    stage = os.environ.get(\"BUILD_STAGE\", \"compile\")\n    \n    manager = BuildCacheManager(pipeline_id, stage)\n    manager.initialize_cache()\n    \n    # Process build artifacts from stdin or args\n    if len(sys.argv) > 1:\n        for artifact_file in sys.argv[1:]:\n            with open(artifact_file, 'r') as f:\n                content = f.read()\n            manager.store_artifact(os.path.basename(artifact_file), content)\n    \n    manager.write_manifest()\n    manager.execute_post_build_hook(\"post-compile.sh\")\n    manager.promote_to_host()\n\n\nif __name__ == \"__main__\":\n    main()",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with Pod Security Standards applied at namespace level via admission configuration. The namespace 'ci-pipelines' has the label pod-security.kubernetes.io/enforce: baseline (not restricted). Additionally, a ValidatingAdmissionPolicy (v1beta1) named 'deny-hostpath-except-emptydir' is bound to the namespace with matchPolicy: Equivalent, which evaluates cel expression: `!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))`. The pipeline agent ServiceAccount has an annotation autopilot.gke.io/no-host-access: true. Node-level AppArmor profile 'pipeline-runner' is loaded which denies write to paths matching /var/lib/** but the profile is only referenced in pod annotations (container.apparmor.security.beta.kubernetes.io/agent: localhost/pipeline-runner) and the baseline PSS level does NOT enforce AppArmor profile validation.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "validating_admission_policy": {
+        "name": "deny-hostpath-except-emptydir",
+        "spec": {
+          "matchConstraints": {
+            "resourceRules": [
+              {
+                "apiGroups": [
+                  ""
+                ],
+                "resources": [
+                  "pods"
+                ],
+                "operations": [
+                  "CREATE",
+                  "UPDATE"
+                ]
+              }
+            ],
+            "namespaceSelector": {
+              "matchLabels": {
+                "ci-pipeline": "true"
+              }
+            }
+          },
+          "validations": [
+            {
+              "expression": "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))",
+              "message": "hostPath volumes are not permitted in CI pipeline namespace"
+            }
+          ]
+        }
+      },
+      "validating_admission_policy_binding": {
+        "name": "deny-hostpath-ci-binding",
+        "spec": {
+          "policyName": "deny-hostpath-except-emptydir",
+          "validationActions": [
+            "Deny"
+          ],
+          "matchResources": {
+            "namespaceSelector": {
+              "matchLabels": {
+                "ci-pipeline": "true"
+              }
+            }
+          }
+        }
+      },
+      "apparmor_profile": "pipeline-runner (denies write to /var/lib/**)",
+      "pod_annotations": {
+        "container.apparmor.security.beta.kubernetes.io/agent": "localhost/pipeline-runner"
+      },
+      "notes": "baseline PSS allows hostPath in principle but the ValidatingAdmissionPolicy separately blocks it; AppArmor annotation is advisory unless node enforces it"
+    }
+  }
+}

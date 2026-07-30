@@ -1,0 +1,39 @@
+{
+  "id": "b08d3410",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\n# Webhook secret for signature verification\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\n\n# Directory where deployment scripts live\nSCRIPTS_DIR = os.environ.get('SCRIPTS_DIR', '/opt/deploy/scripts')\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify webhook signature - HMAC-SHA256\"\"\"\n    if not WEBHOOK_SECRET:\n        return True  # Skip verification if no secret configured\n    expected = 'sha256=' + hmac.new(\n        WEBHOOK_SECRET.encode(), payload, hashlib.sha256\n    ).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/hooks/deploy', methods=['POST'])\ndef deploy_hook():\n    \"\"\"Handle deployment webhook from CI/CD pipeline.\n    Executes the specified deployment script with the given parameters.\"\"\"\n    \n    signature = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.data, signature):\n        abort(403, 'Invalid signature')\n    \n    data = request.get_json(force=True)\n    if not data:\n        abort(400, 'Missing JSON body')\n    \n    # Extract deployment parameters\n    script_name = data.get('script', '')\n    environment = data.get('environment', 'staging')\n    version = data.get('version', 'latest')\n    region = data.get('region', 'us-east-1')\n    \n    # Basic validation - only allow alphanumeric script names\n    if not script_name or not script_name.replace('-', '').replace('_', '').isalnum():\n        abort(400, 'Invalid script name')\n    \n    # Construct the command\n    script_path = os.path.join(SCRIPTS_DIR, script_name)\n    \n    # Check script exists\n    if not os.path.isfile(script_path):\n        abort(404, f'Script {script_name} not found')\n    \n    # Build command with user-supplied arguments\n    # The version and region are passed as arguments to the script\n    cmd = f\"{script_path} --env {environment} --version {version} --region {region}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=300,\n            cwd=SCRIPTS_DIR\n        )\n        \n        response = {\n            'status': 'success' if result.returncode == 0 else 'failed',\n            'exit_code': result.returncode,\n            'stdout': result.stdout[-2000:] if result.stdout else '',\n            'stderr': result.stderr[-500:] if result.stderr else ''\n        }\n        \n        return jsonify(response), 200 if result.returncode == 0 else 500\n        \n    except subprocess.TimeoutExpired:\n        return jsonify({'status': 'timeout'}), 504\n    except Exception as e:\n        return jsonify({'status': 'error', 'message': str(e)}), 500\n\n@app.route('/hooks/rollback', methods=['POST'])\ndef rollback_hook():\n    \"\"\"Emergency rollback endpoint\"\"\"\n    signature = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.data, signature):\n        abort(403, 'Invalid signature')\n    \n    data = request.get_json(force=True)\n    service = data.get('service', '')\n    \n    if not service or not service.replace('-', '').isalnum():\n        abort(400, 'Invalid service name')\n    \n    cmd = f\"/opt/deploy/rollback.sh {service}\"\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)\n    \n    return jsonify({\n        'status': 'rolled_back' if result.returncode == 0 else 'failed',\n        'output': result.stdout[-1000:]\n    })\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Staging deployment on ECS Fargate with identical container image. LaunchDarkly project 'platform-staging' has flag 'use-legacy-template-rendering' configured with targeting rule: context kind 'service' where key matches 'result-renderer' serves variation index 1 (boolean false). Flag default rule also serves false. The flag's 'off' variation is false. Kill switch is OFF (meaning targeting is active). The environment's SDK key connects to the staging LD project where this flag has never been toggled to true. Additionally, the LD relay proxy running as a sidecar caches flag state locally and the cached state file /var/ld-relay/flags/platform-staging.json confirms use-legacy-template-rendering=false for all contexts.",
+    "config": {
+      "runtime": "ECS Fargate, Python 3.11, Flask 2.3",
+      "launchdarkly_project": "platform-staging",
+      "launchdarkly_flag_state": {
+        "use-legacy-template-rendering": {
+          "default_variation": false,
+          "targeting_enabled": true,
+          "targeting_rules": [
+            {
+              "context_kind": "service",
+              "attribute": "key",
+              "op": "matches",
+              "values": [
+                "result-renderer"
+              ],
+              "variation": false
+            }
+          ],
+          "fallthrough_variation": false,
+          "off_variation": false
+        }
+      },
+      "ld_relay_proxy": {
+        "enabled": true,
+        "mode": "daemon",
+        "cached_flag_file": "/var/ld-relay/flags/platform-staging.json",
+        "cache_ttl": "indefinite until relay restart"
+      },
+      "network": "Internal ALB, staging VPC isolated",
+      "redis": "ElastiCache Redis 7.0, staging VPC, AUTH enabled"
+    }
+  }
+}

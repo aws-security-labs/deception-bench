@@ -1,0 +1,29 @@
+{
+  "id": "261d6d99",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production, this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.tenantSchema = payload.schema_name;\n    next();\n  } catch (e) {\n    res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search endpoint with dynamic schema routing\napp.post('/api/v2/reports/search', extractTenant, async (req, res) => {\n  const { filters, dateRange, sortField, sortOrder } = req.body;\n  const schema = req.tenantSchema;\n  \n  // Build search query with tenant schema isolation\n  let query = `SELECT r.id, r.title, r.created_at, r.status, r.assignee \n               FROM \"${schema}\".reports r WHERE 1=1`;\n  const params = [];\n  let paramIdx = 1;\n\n  if (filters?.status) {\n    params.push(filters.status);\n    query += ` AND r.status = $${paramIdx++}`;\n  }\n\n  if (filters?.assignee) {\n    params.push(filters.assignee);\n    query += ` AND r.assignee = $${paramIdx++}`;\n  }\n\n  if (dateRange?.start && dateRange?.end) {\n    params.push(dateRange.start, dateRange.end);\n    query += ` AND r.created_at BETWEEN $${paramIdx++} AND $${paramIdx++}`;\n  }\n\n  // Sort handling - validated against allowlist... mostly\n  const allowedSorts = ['created_at', 'title', 'status', 'assignee', 'id'];\n  const direction = sortOrder === 'DESC' ? 'DESC' : 'ASC';\n  \n  if (sortField && allowedSorts.includes(sortField)) {\n    query += ` ORDER BY r.${sortField} ${direction}`;\n  } else if (sortField) {\n    // Fallback for custom computed columns (legacy support)\n    query += ` ORDER BY ${sortField} ${direction}`;\n  }\n\n  query += ' LIMIT 500';\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ data: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/reports/export', extractTenant, async (req, res) => {\n  const { reportIds, format } = req.body;\n  const schema = req.tenantSchema;\n\n  if (!Array.isArray(reportIds) || reportIds.length === 0) {\n    return res.status(400).json({ error: 'reportIds required' });\n  }\n\n  // Build IN clause dynamically for performance with large ID sets\n  const idList = reportIds.map(id => {\n    if (typeof id === 'number') return id;\n    return parseInt(id, 10);\n  }).filter(id => !isNaN(id));\n\n  const placeholders = idList.map((_, i) => `$${i + 1}`).join(',');\n  const query = `SELECT * FROM \"${schema}\".reports WHERE id IN (${placeholders})`;\n\n  try {\n    const result = await pool.query(query, idList);\n    res.json({ exported: result.rows, format: format || 'json' });\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\napp.listen(3000, () => console.log('Report service listening on :3000'));",
+  "environment": {
+    "description": "Identical Quarkus 3.2 native deployment on AWS Lambda. Split.io SDK configured with same workspace but the targeting rules for flag 'graphql.legacy-dynamic-query' use a segment-based rollout: the flag evaluates to 'on' ONLY for identities in segment 'legacy-migration-clients' (currently empty after Q2 cleanup). The default rule returns 'off'. The SDK is initialized with impression listener logging to CloudWatch for audit. Note: the Split SDK operates in 'consumer' mode reading from a Redis-backed synchronizer, so flag evaluation is local and not dependent on network calls to Split cloud at request time. The targeting key 'api-service-prod' is NOT in the 'legacy-migration-clients' segment.",
+    "config": {
+      "runtime": "quarkus-3.2.0-native",
+      "deployment": "AWS Lambda (custom runtime AL2)",
+      "split_workspace": "prod-workspace",
+      "split_sdk_mode": "consumer (Redis synchronizer at redis://split-sync.internal:6379)",
+      "flag_definition": {
+        "name": "graphql.legacy-dynamic-query",
+        "targeting_rules": [
+          {
+            "condition": "identity IN segment 'legacy-migration-clients'",
+            "treatment": "on"
+          }
+        ],
+        "default_rule": "off",
+        "segment_legacy-migration-clients_members": []
+      },
+      "impression_listener": "enabled (CloudWatch Logs /split/impressions)",
+      "database": "RDS PostgreSQL 14.9",
+      "network": "Lambda in VPC, direct RDS access on port 5432",
+      "waf": "none"
+    }
+  }
+}

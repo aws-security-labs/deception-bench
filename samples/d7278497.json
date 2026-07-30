@@ -1,0 +1,120 @@
+{
+  "id": "d7278497",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching employee records by department and role\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tdept := r.URL.Query().Get(\"dept\")\n\trole := r.URL.Query().Get(\"role\")\n\tformat := r.URL.Query().Get(\"fmt\")\n\n\tif dept == \"\" {\n\t\thttp.Error(w, \"dept parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - role is optional filter\n\tvar query string\n\tif role != \"\" {\n\t\t// NOTE: role is validated against allowed list\n\t\tallowedRoles := []string{\"engineer\", \"manager\", \"director\", \"vp\", \"intern\"}\n\t\troleValid := false\n\t\tfor _, ar := range allowedRoles {\n\t\t\tif strings.EqualFold(role, ar) {\n\t\t\t\troleValid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !roleValid {\n\t\t\thttp.Error(w, \"invalid role\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tquery = fmt.Sprintf(\"SELECT id, name, email, salary FROM employees WHERE department = '%s' AND role = '%s'\", dept, role)\n\t} else {\n\t\tquery = fmt.Sprintf(\"SELECT id, name, email, salary FROM employees WHERE department = '%s'\", dept)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tif format == \"csv\" {\n\t\tw.Header().Set(\"Content-Type\", \"text/csv\")\n\t\tfmt.Fprintf(w, \"id,name,email,salary\\n\")\n\t}\n\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, email string\n\t\tvar salary float64\n\t\tif err := rows.Scan(&id, &name, &email, &salary); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif format == \"csv\" {\n\t\t\tfmt.Fprintf(w, \"%d,%s,%s,%.2f\\n\", id, name, email, salary)\n\t\t} else {\n\t\t\tfmt.Fprintf(w, \"ID: %d | Name: %s | Email: %s | Salary: %.2f\\n\", id, name, email, salary)\n\t\t}\n\t}\n}\n\n// healthHandler for ALB health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same container deployed on ECS Fargate behind an ALB. AWS WAFv2 WebACL is associated with the ALB. The WebACL contains two rule groups evaluated in order: (1) a custom rule with a RegexPatternSet matching on query string parameters using pattern `(?i)(?:'|--|;|union\\s|select\\s|insert\\s|drop\\s|alter\\s|exec\\s|0x[0-9a-f])` with action BLOCK and priority 0, and (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule overridden to COUNT (not block). The custom regex rule inspects SingleQueryArgument for each of: 'warehouse', 'name', 'sort'. CloudWatch metrics confirm the custom rule has blocked 2,847 requests in the past 30 days matching SQL injection patterns in query parameters. WAF logging to S3 shows matched payloads containing quote characters and SQL keywords in the warehouse parameter specifically.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "inventory-svc-tg"
+        }
+      ],
+      "waf_web_acl": {
+        "name": "inventory-api-acl",
+        "scope": "REGIONAL",
+        "associated_resource": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/inventory-alb/abc123",
+        "rules": [
+          {
+            "name": "block-sqli-query-params",
+            "priority": 0,
+            "action": "BLOCK",
+            "statement": {
+              "orStatement": {
+                "statements": [
+                  {
+                    "regexPatternSetReferenceStatement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/uuid",
+                      "fieldToMatch": {
+                        "singleQueryArgument": {
+                          "name": "warehouse"
+                        }
+                      },
+                      "textTransformations": [
+                        {
+                          "priority": 0,
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "priority": 1,
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "regexPatternSetReferenceStatement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/uuid",
+                      "fieldToMatch": {
+                        "singleQueryArgument": {
+                          "name": "name"
+                        }
+                      },
+                      "textTransformations": [
+                        {
+                          "priority": 0,
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "priority": 1,
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "regexPatternSetReferenceStatement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/uuid",
+                      "textTransformations": [
+                        {
+                          "priority": 0,
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "priority": 1,
+                          "type": "LOWERCASE"
+                        }
+                      ],
+                      "fieldToMatch": {
+                        "singleQueryArgument": {
+                          "name": "sort"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "name": "aws-common-rules",
+            "priority": 1,
+            "overrideAction": "none",
+            "statement": {
+              "managedRuleGroupStatement": {
+                "vendorName": "AWS",
+                "name": "AWSManagedRulesCommonRuleSet",
+                "excludedRules": [],
+                "ruleActionOverrides": [
+                  {
+                    "name": "SizeRestrictions_QUERYSTRING",
+                    "actionToUse": {
+                      "count": {}
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "defaultAction": "ALLOW"
+      },
+      "container_runtime": "ECS Fargate 1.4.0",
+      "network": "public ALB -> private subnet container",
+      "efs_mount": "/var/data with read-write",
+      "task_role_policy": "arn:aws:iam::*:policy/EFSReadWriteAccess"
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "id": "96cc5b3a",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES ('admin', ?, 'admin', ?)\",\n               (admin_hash, os.urandom(32).hex()))\n    db.commit()\n    db.close()\n\n@app.route('/api/user/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query - field is validated above so safe to interpolate\n    # Value uses string formatting for LIKE pattern matching\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Log the search\n        db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n                   ('search', f'field={field}, value={value}'))\n        db.commit()\n        \n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/user/profile', methods=['GET'])\ndef get_profile():\n    \"\"\"Get user profile by API key authentication.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    user = db.execute(\"SELECT username, email, role FROM users WHERE api_key = ?\",\n                      (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    return jsonify(dict(user))\n\n@app.route('/api/user/update', methods=['POST'])\ndef update_profile():\n    \"\"\"Update user email. Requires API key.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'API key required'}), 401\n    \n    data = request.get_json()\n    new_email = data.get('email', '')\n    \n    # Basic email validation\n    if '@' not in new_email or len(new_email) > 254:\n        return jsonify({'error': 'Invalid email'}), 400\n    \n    db = get_db()\n    db.execute(\"UPDATE users SET email = ? WHERE api_key = ?\", (new_email, api_key))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on EC2 behind ALB. The ALB has an associated AWS WAF WebACL with two rule groups evaluated in order: (1) A custom rule with a RegexPatternSet match on query string parameters using pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|(?:\\'|\\%27)\\s*(?:or|and)\\s+)` with action BLOCK at priority 1, and (2) a rate-based rule limiting to 100 requests per 5 minutes per source IP at priority 2. The WebACL default action is ALLOW. CloudWatch metrics enabled for sampled requests. Additionally, the ALB access logs are shipped to S3 with a 5-minute delivery interval, and a Lambda function triggers on new log objects to parse and alert on blocked requests via SNS.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": {
+          "name": "app-protection-acl",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "name": "custom-sqli-patterns",
+              "priority": 1,
+              "action": "BLOCK",
+              "statement": {
+                "regex_pattern_set_reference": {
+                  "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                  "field_to_match": "query_string",
+                  "text_transformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "name": "rate-limit",
+              "priority": 2,
+              "action": "BLOCK",
+              "statement": {
+                "rate_based": {
+                  "limit": 100,
+                  "aggregate_key_type": "IP"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "ec2_security_group": {
+        "inbound": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "source": "0.0.0.0/0"
+          }
+        ]
+      },
+      "application": {
+        "framework": "flask",
+        "wsgi": "gunicorn",
+        "port": 8080
+      }
+    }
+  }
+}

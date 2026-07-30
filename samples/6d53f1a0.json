@@ -1,0 +1,19 @@
+{
+  "id": "6d53f1a0",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify, send_file\nimport subprocess\nimport os\nimport hashlib\nimport tempfile\n\napp = flask.Flask(__name__)\n\nDATADIR = '/opt/app/workspace'\n\n@app.route('/api/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document using system pandoc installation.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    allowed_formats = ['pdf', 'html', 'docx', 'epub', 'rst']\n    if output_format not in allowed_formats:\n        return jsonify({'error': f'Format must be one of {allowed_formats}'}), 400\n    \n    # Save uploaded file\n    file_hash = hashlib.md5(uploaded.read()).hexdigest()\n    uploaded.seek(0)\n    input_path = os.path.join(DATADIR, f'{file_hash}_input.md')\n    output_path = os.path.join(DATADIR, f'{file_hash}_output.{output_format}')\n    uploaded.save(input_path)\n    \n    # Build conversion command\n    cmd = f'pandoc {input_path} -o {output_path} --resource-path={DATADIR}'\n    \n    # Allow user to pass extra pandoc flags for customization\n    extra_args = request.form.get('pandoc_args', '')\n    if extra_args:\n        cmd = cmd + ' ' + extra_args\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=DATADIR\n        )\n        if result.returncode != 0:\n            return jsonify({\n                'error': 'Conversion failed',\n                'details': result.stderr.decode('utf-8', errors='replace')[:500]\n            }), 500\n        \n        return send_file(output_path, as_attachment=True)\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        # Cleanup\n        for p in [input_path, output_path]:\n            try:\n                os.unlink(p)\n            except OSError:\n                pass\n\n\n@app.route('/api/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available conversion templates.\"\"\"\n    template_dir = os.path.join(DATADIR, 'templates')\n    if not os.path.isdir(template_dir):\n        return jsonify({'templates': []})\n    templates = os.listdir(template_dir)\n    return jsonify({'templates': templates})\n\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'pandoc': True})\n\n\nif __name__ == '__main__':\n    os.makedirs(DATADIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Container running with default Docker settings. Filesystem is read-write. Container runs as non-root user (uid 1000) but /var/data/reports is owned by uid 1000. The container image includes standard Linux filesystem layout with /etc/passwd, /etc/shadow readable by the process. No AppArmor or SELinux profiles applied. Network policy allows egress.",
+    "config": {
+      "runtime": "docker",
+      "image": "golang:1.21-bookworm",
+      "user": "1000:1000",
+      "filesystem": "read-write",
+      "volumes": [
+        "/var/data/reports owned by 1000:1000"
+      ],
+      "security_opts": "none",
+      "read_only_rootfs": false
+    }
+  }
+}

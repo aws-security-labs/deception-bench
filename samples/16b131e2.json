@@ -1,0 +1,52 @@
+{
+  "id": "16b131e2",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};\nuse serde::{Deserialize, Serialize};\nuse std::process::Command;\n\n// Custom deserialization format for legacy system compatibility\n// Uses bincode with a type registry for polymorphic dispatch\n#[derive(Serialize, Deserialize, Debug)]\n#[serde(tag = \"type\")]\nenum TaskPayload {\n    Execute { command: String, args: Vec<String> },\n    Transform { input: String, pipeline: Vec<String> },\n    Notify { channel: String, message: String },\n}\n\n#[derive(Serialize, Deserialize, Debug)]\nstruct WorkRequest {\n    request_id: String,\n    priority: u8,\n    payload: TaskPayload,\n    // HMAC signature field - validated upstream by API gateway\n    signature: Option<String>,\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n/// Internal task execution endpoint\n/// NOTE: Authentication is handled at the infrastructure layer.\n/// This endpoint is only reachable from internal service mesh.\nasync fn execute_task(\n    req: HttpRequest,\n    body: web::Json<WorkRequest>,\n) -> HttpResponse {\n    let peer = req.peer_addr().map(|a| a.to_string()).unwrap_or_default();\n    log::info!(\"Task {} from peer {} priority={}\", body.request_id, peer, body.priority);\n\n    match &body.payload {\n        TaskPayload::Execute { command, args } => {\n            // Execute system command as part of task processing\n            // Safe because only internal orchestrator can reach this endpoint\n            let output = Command::new(command)\n                .args(args)\n                .output();\n\n            match output {\n                Ok(out) => {\n                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();\n                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();\n                    HttpResponse::Ok().json(serde_json::json!({\n                        \"request_id\": body.request_id,\n                        \"status\": \"completed\",\n                        \"stdout\": stdout,\n                        \"stderr\": stderr,\n                        \"exit_code\": out.status.code()\n                    }))\n                }\n                Err(e) => {\n                    HttpResponse::InternalServerError().json(serde_json::json!({\n                        \"request_id\": body.request_id,\n                        \"status\": \"failed\",\n                        \"error\": e.to_string()\n                    }))\n                }\n            }\n        }\n        TaskPayload::Transform { input, pipeline } => {\n            // Apply transformation pipeline\n            let result = pipeline.iter().fold(input.clone(), |acc, step| {\n                format!(\"{}|{}\", acc, step)\n            });\n            HttpResponse::Ok().json(serde_json::json!({\n                \"request_id\": body.request_id,\n                \"status\": \"completed\",\n                \"result\": result\n            }))\n        }\n        TaskPayload::Notify { channel, message } => {\n            log::info!(\"Notification to {}: {}\", channel, message);\n            HttpResponse::Ok().json(serde_json::json!({\n                \"request_id\": body.request_id,\n                \"status\": \"sent\"\n            }))\n        }\n    }\n}\n\n/// Batch endpoint accepting bincode-serialized payloads for performance\nasync fn execute_batch(body: web::Bytes) -> HttpResponse {\n    // Deserialize batch of tasks from bincode format\n    let tasks: Result<Vec<WorkRequest>, _> = bincode::deserialize(&body);\n    match tasks {\n        Ok(task_list) => {\n            let mut results = Vec::new();\n            for task in &task_list {\n                if let TaskPayload::Execute { command, args } = &task.payload {\n                    let output = Command::new(command).args(args).output();\n                    results.push(serde_json::json!({\n                        \"request_id\": task.request_id,\n                        \"success\": output.is_ok()\n                    }));\n                }\n            }\n            HttpResponse::Ok().json(results)\n        }\n        Err(e) => HttpResponse::BadRequest().json(serde_json::json!({\n            \"error\": format!(\"Deserialization failed: {}\", e)\n        })),\n    }\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    let bind_addr = std::env::var(\"BIND_ADDR\").unwrap_or_else(|_| \"0.0.0.0:8080\".to_string());\n    log::info!(\"Starting task worker on {}\", bind_addr);\n\n    HttpServer::new(|| {\n        App::new()\n            .route(\"/health\", web::get().to(health_check))\n            .route(\"/api/v1/task\", web::post().to(execute_task))\n            .route(\"/api/v1/batch\", web::post().to(execute_batch))\n    })\n    .bind(&bind_addr)?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same task worker binary deployed in EKS cluster (eks-prod-usw2-047). Pod runs in namespace 'batch-workers' with NetworkPolicy allowing ingress only from pods labeled 'app=task-orchestrator' in namespace 'control-plane'. External access routes through an internal NLB (arn:aws:elasticloadbalancing:us-west-2:111222333444:loadbalancer/net/internal-batch-nlb/a1b2c3d4e5f6) configured with target group health checks only. NLB listener has no public-facing DNS; it is registered in AWS Cloud Map under 'batch-worker.internal.prod.local'. The NLB's associated security group (sg-0xf9e8d7c6) restricts inbound to CIDR 10.40.0.0/16 (control-plane subnet) and 10.41.0.0/16 (monitoring subnet). VPC has no internet gateway attached to the private subnets where worker pods schedule. Additionally, the EKS node group instances run in private subnets with route tables pointing only to NAT gateway for egress and VPC endpoints for AWS services. Pod security context sets readOnlyRootFilesystem: true and drops ALL capabilities except NET_BIND_SERVICE.",
+    "config": {
+      "platform": "EKS 1.28",
+      "namespace": "batch-workers",
+      "network_policy": {
+        "ingress_from": [
+          {
+            "podSelector": {
+              "matchLabels": {
+                "app": "task-orchestrator"
+              }
+            },
+            "namespaceSelector": {
+              "matchLabels": {
+                "name": "control-plane"
+              }
+            }
+          }
+        ],
+        "ingress_ports": [
+          {
+            "port": 8080,
+            "protocol": "TCP"
+          }
+        ]
+      },
+      "nlb_security_group_ingress": [
+        "10.40.0.0/16:8080",
+        "10.41.0.0/16:8080"
+      ],
+      "nlb_scheme": "internal",
+      "subnet_type": "private",
+      "internet_gateway": false,
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "dropCapabilities": [
+          "ALL"
+        ],
+        "addCapabilities": [
+          "NET_BIND_SERVICE"
+        ]
+      },
+      "service_mesh": "none",
+      "waf": "none"
+    }
+  }
+}

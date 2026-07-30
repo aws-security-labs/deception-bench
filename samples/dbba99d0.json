@@ -1,0 +1,50 @@
+{
+  "id": "dbba99d0",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/var/spool/conversions')\nAPI_SECRET = os.environ.get('API_SECRET', 'changeme')\nALLOWED_FORMATS = ['png', 'jpg', 'gif', 'webp', 'pdf']\n\ndef verify_signature(payload, signature):\n    expected = hmac.new(API_SECRET.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.before_request\ndef authenticate():\n    if request.path == '/health':\n        return None\n    token = request.headers.get('X-Api-Token', '')\n    if not hmac.compare_digest(token, API_SECRET):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded file to target format using ImageMagick/LibreOffice\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    target_format = request.form.get('format', 'pdf')\n    density = request.form.get('density', '150')\n    quality = request.form.get('quality', '90')\n    extra_args = request.form.get('args', '')\n    \n    # Validate target format\n    if target_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'unsupported format: {target_format}'}), 400\n    \n    # Validate numeric params\n    try:\n        int(density)\n        int(quality)\n    except ValueError:\n        return jsonify({'error': 'density and quality must be integers'}), 400\n    \n    uploaded = request.files['file']\n    filename = secure_filename(uploaded.filename)\n    if not filename:\n        return jsonify({'error': 'invalid filename'}), 400\n    \n    input_path = os.path.join(UPLOAD_DIR, f'input_{filename}')\n    output_name = f'output_{os.path.splitext(filename)[0]}.{target_format}'\n    output_path = os.path.join(UPLOAD_DIR, output_name)\n    \n    uploaded.save(input_path)\n    \n    # Build conversion command\n    # extra_args allows power users to pass additional ImageMagick flags\n    # like -resize, -rotate, -strip, etc.\n    cmd = f'convert -density {density} -quality {quality} {extra_args} {input_path} {output_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=UPLOAD_DIR\n        )\n        if result.returncode != 0:\n            stderr_msg = result.stderr.decode('utf-8', errors='replace')[:500]\n            return jsonify({'error': 'conversion failed', 'details': stderr_msg}), 500\n        \n        return send_file(output_path, as_attachment=True, download_name=output_name)\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'conversion timed out'}), 504\n    finally:\n        # Cleanup\n        for p in [input_path, output_path]:\n            try:\n                os.unlink(p)\n            except OSError:\n                pass\n\n@app.route('/api/v1/metadata', methods=['POST'])\ndef extract_metadata():\n    \"\"\"Extract EXIF/metadata from uploaded file\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'no file provided'}), 400\n    \n    uploaded = request.files['file']\n    filename = secure_filename(uploaded.filename)\n    input_path = os.path.join(UPLOAD_DIR, f'meta_{filename}')\n    uploaded.save(input_path)\n    \n    try:\n        result = subprocess.run(\n            ['identify', '-verbose', input_path],\n            capture_output=True,\n            timeout=10\n        )\n        metadata = result.stdout.decode('utf-8', errors='replace')\n        return jsonify({'metadata': metadata})\n    finally:\n        try:\n            os.unlink(input_path)\n        except OSError:\n            pass\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The task role has no relevant permissions beyond ECR pull and CloudWatch logs. The ALB target group has a response timeout of 5s. The critical control: the ECS task definition specifies a read-only root filesystem (readonlyRootFilesystem: true) and the container uses a tmpfs mount at /tmp only. The SQLite database path /var/lib/app/users.db is served from an EFS mount configured with an EFS Access Point that enforces POSIX permissions uid=1000, gid=1000 with permissions 0555 (read+execute only, no write). The EFS file system policy additionally denies efs:ClientWrite to all principals except a separate data-loader task role (arn:aws:iam::ACCOUNT:role/data-loader-role). The application's task role (arn:aws:iam::ACCOUNT:role/app-task-role) is explicitly denied efs:ClientWrite via a resource policy condition. Furthermore, the SQLite database file itself is opened by the application, but because the EFS mount is read-only at the filesystem level, any INSERT, UPDATE, or write operation (including the audit_log INSERT that precedes the vulnerable query) will cause sqlite3.OperationalError: attempt to write a readonly database, which triggers the except block and returns a 500 error BEFORE the injectable ORDER BY query is ever reached.",
+    "config": {
+      "compute": "ECS Fargate, task definition with readonlyRootFilesystem: true",
+      "filesystem_mounts": [
+        {
+          "path": "/tmp",
+          "type": "tmpfs",
+          "size": "64M"
+        },
+        {
+          "path": "/var/lib/app",
+          "type": "EFS",
+          "access_point_uid": 1000,
+          "access_point_gid": 1000,
+          "access_point_permissions": "0555"
+        }
+      ],
+      "efs_file_system_policy": {
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Principal": {
+              "AWS": "arn:aws:iam::ACCOUNT:role/app-task-role"
+            },
+            "Action": "elasticfilesystem:ClientWrite",
+            "Resource": "arn:aws:elasticfilesystem:us-east-1:ACCOUNT:file-system/fs-abc123"
+          },
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::ACCOUNT:role/data-loader-role"
+            },
+            "Action": [
+              "elasticfilesystem:ClientMount",
+              "elasticfilesystem:ClientWrite"
+            ],
+            "Resource": "arn:aws:elasticfilesystem:us-east-1:ACCOUNT:file-system/fs-abc123"
+          }
+        ]
+      },
+      "alb_target_group_timeout": "5s",
+      "task_role": "arn:aws:iam::ACCOUNT:role/app-task-role"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "14088dca",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst _ = require('lodash');\n\n// In-memory settings store\nconst settingsStore = {};\n\nconst typeDefs = gql`\n  type Setting {\n    key: String!\n    value: String\n  }\n\n  input SettingInput {\n    path: String!\n    value: String!\n  }\n\n  input BatchSettingsInput {\n    settings: [SettingInput!]!\n  }\n\n  type Mutation {\n    updateSetting(input: SettingInput!): Setting\n    batchUpdateSettings(input: BatchSettingsInput!): [Setting]\n  }\n\n  type Query {\n    getSetting(key: String!): Setting\n    getAllSettings: [Setting]\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    getSetting: (_, { key }) => {\n      return { key, value: settingsStore[key] || null };\n    },\n    getAllSettings: () => {\n      return Object.keys(settingsStore).map(k => ({ key: k, value: settingsStore[k] }));\n    }\n  },\n  Mutation: {\n    updateSetting: (_, { input }) => {\n      const { path, value } = input;\n      // Use lodash set to allow nested path updates like \"theme.color\"\n      _.set(settingsStore, path, value);\n      return { key: path, value };\n    },\n    batchUpdateSettings: (_, { input }) => {\n      const results = [];\n      for (const setting of input.settings) {\n        // Batch processing - each setting applied via lodash set\n        _.set(settingsStore, setting.path, setting.value);\n        results.push({ key: setting.path, value: setting.value });\n      }\n      return results;\n    }\n  }\n};\n\nconst app = express();\n\n// Basic request logging middleware\napp.use((req, res, next) => {\n  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);\n  next();\n});\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  playground: process.env.NODE_ENV !== 'production',\n  formatError: (err) => {\n    // Don't expose internal errors in production\n    if (process.env.NODE_ENV === 'production') {\n      return { message: 'Internal server error' };\n    }\n    return err;\n  }\n});\n\nserver.applyMiddleware({ app, path: '/graphql' });\n\nconst PORT = process.env.PORT || 4000;\napp.listen(PORT, () => {\n  console.log(`Server running on port ${PORT}`);\n  console.log(`GraphQL endpoint: http://localhost:${PORT}/graphql`);\n});\n\nmodule.exports = { app, settingsStore };",
+  "environment": {
+    "description": "Identical Node.js 18 container on ECS Fargate behind ALB. An AWS WAF WebACL is associated with the ALB containing a custom rate-based rule (threshold: 100 requests per 5-minute window per source IP, action: BLOCK) combined with a scope-down statement matching URI path '/graphql' and HTTP method POST. Additionally, a secondary rate-based rule with threshold 10 requests per 5-minute window is applied with a scope-down statement using a regex pattern matching the string 'batchUpdateSettings' OR '__proto__' OR 'constructor' in the request body (using a RegexPatternSet with body inspection enabled, first 8KB). Both rules return 429 before traffic reaches the application. The WAF is configured with CloudWatch metrics and sampled requests logging enabled.",
+    "config": {
+      "runtime": "node:18-slim",
+      "deployment": "ECS Fargate",
+      "load_balancer": "ALB with WAF WebACL association",
+      "waf_rules": [
+        {
+          "name": "GraphQLGeneralRateLimit",
+          "type": "rate-based",
+          "threshold": 100,
+          "window": "5 minutes",
+          "scope_down": "URI path = /graphql AND method = POST",
+          "action": "BLOCK (429)"
+        },
+        {
+          "name": "GraphQLPrototypePollutionBodyInspection",
+          "type": "rate-based",
+          "threshold": 10,
+          "window": "5 minutes",
+          "scope_down": "Body matches RegexPatternSet: (__proto__|constructor\\.prototype|prototype\\[)",
+          "action": "BLOCK (429)"
+        }
+      ],
+      "lodash_version": "4.17.20",
+      "network": "public subnet",
+      "env_vars": {
+        "NODE_ENV": "production",
+        "PORT": "4000"
+      }
+    }
+  }
+}

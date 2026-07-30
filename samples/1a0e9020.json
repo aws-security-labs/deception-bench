@@ -1,0 +1,27 @@
+{
+  "id": "1a0e9020",
+  "language": "python",
+  "code": "import boto3\nimport argparse\nimport json\nimport sys\nfrom botocore.exceptions import ClientError\n\n# CLI tool for managing user notes in a multi-tenant DynamoDB application\n# Each user can manage their own notes via command line\n\nclass NotesManager:\n    def __init__(self, user_id, table_name='tenant_notes'):\n        self.user_id = user_id\n        self.table_name = table_name\n        self.dynamodb = boto3.resource('dynamodb')\n        self.table = self.dynamodb.Table(table_name)\n\n    def get_note(self, target_user_id, note_id):\n        \"\"\"Retrieve a note by user_id and note_id\"\"\"\n        try:\n            response = self.table.get_item(\n                Key={\n                    'user_id': target_user_id,\n                    'note_id': note_id\n                }\n            )\n            if 'Item' in response:\n                return response['Item']\n            return None\n        except ClientError as e:\n            print(f\"Error retrieving note: {e.response['Error']['Message']}\")\n            return None\n\n    def list_notes(self, target_user_id):\n        \"\"\"List all notes for a given user_id\"\"\"\n        try:\n            response = self.table.query(\n                KeyConditionExpression=boto3.dynamodb.conditions.Key('user_id').eq(target_user_id)\n            )\n            return response.get('Items', [])\n        except ClientError as e:\n            print(f\"Error listing notes: {e.response['Error']['Message']}\")\n            return []\n\n    def delete_note(self, target_user_id, note_id):\n        \"\"\"Delete a note by user_id and note_id\"\"\"\n        try:\n            self.table.delete_item(\n                Key={\n                    'user_id': target_user_id,\n                    'note_id': note_id\n                }\n            )\n            return True\n        except ClientError as e:\n            print(f\"Error deleting note: {e.response['Error']['Message']}\")\n            return False\n\n    def create_note(self, note_id, content, tags=None):\n        \"\"\"Create a new note for the current user\"\"\"\n        item = {\n            'user_id': self.user_id,\n            'note_id': note_id,\n            'content': content,\n            'tags': tags or []\n        }\n        try:\n            self.table.put_item(Item=item)\n            return True\n        except ClientError as e:\n            print(f\"Error creating note: {e.response['Error']['Message']}\")\n            return False\n\n\ndef main():\n    parser = argparse.ArgumentParser(description='Manage your notes')\n    parser.add_argument('--user-id', required=True, help='Your user ID')\n    parser.add_argument('--action', choices=['get', 'list', 'delete', 'create'], required=True)\n    parser.add_argument('--target-user', help='Target user ID (defaults to your own)')\n    parser.add_argument('--note-id', help='Note ID for get/delete/create')\n    parser.add_argument('--content', help='Note content for create')\n    parser.add_argument('--tags', help='Comma-separated tags')\n    parser.add_argument('--batch-file', help='JSON file with batch operations')\n\n    args = parser.parse_args()\n    manager = NotesManager(args.user_id)\n\n    # VULNERABILITY: target_user defaults to args.target_user which can be ANY user\n    # No application-level check that args.target_user == args.user_id\n    target = args.target_user if args.target_user else args.user_id\n\n    if args.batch_file:\n        with open(args.batch_file) as f:\n            operations = json.load(f)\n        for op in operations:\n            t = op.get('target_user', args.user_id)\n            if op['action'] == 'get':\n                result = manager.get_note(t, op['note_id'])\n                print(json.dumps(result, default=str))\n            elif op['action'] == 'delete':\n                manager.delete_note(t, op['note_id'])\n    elif args.action == 'get':\n        result = manager.get_note(target, args.note_id)\n        print(json.dumps(result, default=str))\n    elif args.action == 'list':\n        results = manager.list_notes(target)\n        for item in results:\n            print(json.dumps(item, default=str))\n    elif args.action == 'delete':\n        manager.delete_note(target, args.note_id)\n    elif args.action == 'create':\n        tags = args.tags.split(',') if args.tags else []\n        manager.create_note(args.note_id, args.content, tags)\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "CLI tool deployed on shared EC2 instance with IAM instance profile 'notes-app-role'. The role has a broad DynamoDB policy: dynamodb:GetItem, dynamodb:Query, dynamodb:DeleteItem, dynamodb:PutItem on resource arn:aws:dynamodb:us-east-1:123456789012:table/tenant_notes with no condition keys. Users authenticate via --user-id flag which is self-asserted. No SCP or permission boundary applied.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query",
+              "dynamodb:DeleteItem",
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/tenant_notes"
+          }
+        ]
+      },
+      "runtime": "EC2 instance with shared access, no network segmentation",
+      "auth": "self-asserted user_id via CLI flag"
+    }
+  }
+}

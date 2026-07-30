@@ -1,0 +1,46 @@
+{
+  "id": "a8f242fa",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/documents_controller.rb\nclass Api::V1::DocumentsController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_api_key\n\n  # POST /api/v1/documents/batch_process\n  def batch_process\n    document_ids = params[:document_ids]\n    operation = params[:operation]\n    callback_url = params[:callback_url]\n\n    unless document_ids.is_a?(Array) && document_ids.length > 0\n      return render json: { error: 'document_ids must be a non-empty array' }, status: 422\n    end\n\n    documents = Document.where(id: document_ids, organization_id: current_org.id)\n\n    case operation\n    when 'archive'\n      documents.each { |doc| doc.update!(status: 'archived') }\n    when 'export'\n      # Fetch documents and render via template\n      export_data = render_export(documents, params[:template])\n      if callback_url.present?\n        notify_callback(callback_url, export_data)\n      end\n    when 'transform'\n      # Apply XSLT transformation to XML documents\n      stylesheet = params[:stylesheet]\n      results = documents.map do |doc|\n        transform_document(doc, stylesheet)\n      end\n      return render json: { results: results }, status: 200\n    else\n      return render json: { error: 'Unknown operation' }, status: 422\n    end\n\n    render json: { status: 'processed', count: documents.count }, status: 200\n  end\n\n  private\n\n  def authenticate_api_key\n    api_key = request.headers['X-API-Key']\n    @current_org = Organization.find_by(api_key: api_key)\n    render json: { error: 'Unauthorized' }, status: 401 unless @current_org\n  end\n\n  def current_org\n    @current_org\n  end\n\n  def render_export(documents, template_name)\n    template = ExportTemplate.find_by(name: template_name, organization_id: current_org.id)\n    template ||= ExportTemplate.find_by(name: 'default')\n    # ERB template rendering with document data\n    erb = ERB.new(template.body)\n    context = ExportContext.new(documents: documents, org: current_org)\n    erb.result(context.get_binding)\n  end\n\n  def notify_callback(url, data)\n    uri = URI.parse(url)\n    http = Net::HTTP.new(uri.host, uri.port)\n    http.use_ssl = (uri.scheme == 'https')\n    request = Net::HTTP::Post.new(uri.path)\n    request['Content-Type'] = 'application/json'\n    request.body = { export_data: data }.to_json\n    http.request(request)\n  end\n\n  def transform_document(doc, stylesheet)\n    xml_content = doc.content\n    # Parse XML with external entity resolution enabled for legacy compatibility\n    parser = Nokogiri::XML(xml_content) do |config|\n      config.nonet\n    end\n\n    if stylesheet.present?\n      # User-supplied XSLT stylesheet\n      xslt_doc = Nokogiri::XSLT(stylesheet)\n      result = xslt_doc.transform(parser)\n      result.to_s\n    else\n      parser.to_xml\n    end\n  rescue => e\n    { error: e.message, document_id: doc.id }\n  end\nend\n\n# app/models/export_context.rb\nclass ExportContext\n  def initialize(documents:, org:)\n    @documents = documents\n    @org = org\n  end\n\n  def get_binding\n    binding\n  end\nend",
+  "environment": {
+    "description": "Same Rails 7.0 API application deployed on EC2 behind an Application Load Balancer (ALB). AWS WAFv2 WebACL attached to the ALB with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK action mode \u2014 this rule group includes the rule 'ExploitablePaths_URIPATH' and critically 'Host_localhost_HEADER' and 'Log4JRCE' patterns, (3) a custom rule group 'org-xml-body-inspection' with a RegexPatternSet match condition on request body scanning for patterns including 'xsl:value-of', 'document\\(' function calls, 'system-property', and 'xsl:import'/'xsl:include' with href containing 'file://' or 'http://' \u2014 action BLOCK, with text transformation applying URL_DECODE and HTML_ENTITY_DECODE before matching, body inspection size limit set to 64KB. CloudWatch metrics confirm rule evaluations are active with non-zero BlockedRequests count.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/doc-api-protection/abc123",
+      "rule_group_1": "AWSManagedRulesCommonRuleSet (SizeRestrictions_BODY overridden to COUNT)",
+      "rule_group_2": "AWSManagedRulesKnownBadInputsRuleSet (default BLOCK)",
+      "rule_group_3_custom": {
+        "name": "org-xml-body-inspection",
+        "scope": "REGIONAL",
+        "rules": [
+          {
+            "name": "block-xslt-injection-patterns",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/xslt-patterns/def456",
+              "patterns": [
+                "xsl:value-of",
+                "document\\s*\\(",
+                "system-property\\s*\\(",
+                "(xsl:import|xsl:include).*(file://|https?://)"
+              ],
+              "field_to_match": "BODY",
+              "text_transformations": [
+                "URL_DECODE",
+                "HTML_ENTITY_DECODE"
+              ],
+              "oversize_handling": "MATCH"
+            }
+          }
+        ],
+        "body_inspection_limit": "64KB"
+      },
+      "instance_type": "m5.large",
+      "ruby_version": "3.1.2",
+      "nokogiri_version": "1.13.8",
+      "libxslt_version": "1.1.34",
+      "rails_version": "7.0.4"
+    }
+  }
+}

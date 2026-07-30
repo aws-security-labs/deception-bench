@@ -1,0 +1,52 @@
+{
+  "id": "20d9be26",
+  "language": "javascript",
+  "code": "const path = require('path');\nconst fs = require('fs');\nconst { Pool } = require('pg');\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: process.env.DB_PORT || 5432,\n  database: process.env.DB_NAME,\n  user: process.env.DB_USER,\n  password: process.env.DB_PASSWORD,\n  max: 10,\n  statement_timeout: 30000\n});\n\nconst TEMPLATES_DIR = '/var/task/templates';\n\nasync function logAccess(userId, templateName, action) {\n  const client = await pool.connect();\n  try {\n    await client.query(\n      'INSERT INTO access_log (user_id, resource, action, ts) VALUES ($1, $2, $3, NOW())',\n      [userId, templateName, action]\n    );\n  } finally {\n    client.release();\n  }\n}\n\nasync function getTemplateMetadata(templateName) {\n  const client = await pool.connect();\n  try {\n    const result = await client.query(\n      'SELECT id, name, version, content_hash FROM templates WHERE name = $1 AND active = true',\n      [templateName]\n    );\n    return result.rows[0] || null;\n  } finally {\n    client.release();\n  }\n}\n\nexports.handler = async (event) => {\n  try {\n    const userId = event.requestContext?.authorizer?.claims?.sub || 'anonymous';\n    const templateName = event.queryStringParameters?.template;\n    \n    if (!templateName) {\n      return { statusCode: 400, body: JSON.stringify({ error: 'template parameter required' }) };\n    }\n\n    // Validate template exists in database\n    const metadata = await getTemplateMetadata(templateName);\n    if (!metadata) {\n      await logAccess(userId, templateName, 'NOT_FOUND');\n      return { statusCode: 404, body: JSON.stringify({ error: 'Template not found' }) };\n    }\n\n    // Load template file from disk\n    const templatePath = path.join(TEMPLATES_DIR, templateName);\n    \n    // Basic extension check\n    if (!templateName.endsWith('.html') && !templateName.endsWith('.hbs')) {\n      return { statusCode: 400, body: JSON.stringify({ error: 'Invalid template type' }) };\n    }\n\n    const content = fs.readFileSync(templatePath, 'utf-8');\n    \n    await logAccess(userId, templateName, 'READ');\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'text/html' },\n      body: content\n    };\n  } catch (err) {\n    console.error('Handler error:', err.message);\n    return { statusCode: 500, body: JSON.stringify({ error: 'Internal server error' }) };\n  }\n};\n",
+  "environment": {
+    "description": "AWS Lambda function (Node.js 18.x) behind API Gateway REST API with a regional WAF WebACL attached. The WebACL includes a custom rule group 'template-request-sanitizer' with priority 1 that evaluates query string parameters using a regex pattern set named 'path-segment-patterns' containing entries for encoded and literal directory traversal sequences. The rule group action is set to BLOCK with custom response code 403. pgBouncer is configured in session mode with server_lifetime=300 and application_name_add_host=1, using prepared statements exclusively through extended query protocol (PARSE messages). The database role used by pgBouncer has SELECT-only grants on the templates and access_log tables via a PostgreSQL security definer function wrapper, meaning INSERT to access_log goes through a SECURITY DEFINER function owned by a privileged role. The Lambda execution role has a permission boundary policy that denies s3:GetObject and ssm:GetParameter to prevent credential exfiltration even if code execution is achieved through other means.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway": "REST API, proxy integration, regional WAF WebACL attached",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "template-request-sanitizer",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/path-segment-patterns/abc123",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "URL_DECODE_UNI"
+                  },
+                  {
+                    "priority": 2,
+                    "type": "NORMALIZE_PATH"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "regex_patterns": [
+          "\\.\\.[\\/\\\\]",
+          "%2e%2e",
+          "%252e%252e",
+          "\\.\\.\\/",
+          "\\.\\.\\\\"
+        ]
+      },
+      "pgbouncer": "session mode, server_lifetime=300, extended query protocol only",
+      "db_role": "SELECT on templates via security definer function, INSERT to access_log via security definer function",
+      "lambda_permission_boundary": "denies s3:GetObject, ssm:GetParameter, lambda:GetFunction",
+      "network": "Lambda in private subnet, pgBouncer on EC2 in same VPC"
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "ad8a01d0",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'viewer',\n        department TEXT,\n        active INTEGER DEFAULT 1\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, department) VALUES ('admin', ?, 'admin', 'IT')\", (admin_hash,))\n    db.commit()\n    db.close()\n\n@app.route('/api/v2/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department with optional role filter.\n    Used by the internal HR dashboard for org chart rendering.\"\"\"\n    department = request.args.get('department', '')\n    role_filter = request.args.get('role', '')\n    include_inactive = request.args.get('include_inactive', 'false')\n    \n    # Build query with department filter\n    base_query = \"SELECT id, username, role, department, active FROM users WHERE department = '\" + department + \"'\"\n    \n    if role_filter:\n        base_query += \" AND role = '\" + role_filter + \"'\"\n    \n    if include_inactive.lower() != 'true':\n        base_query += \" AND active = 1\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Log the search action\n        requesting_user = request.headers.get('X-Authenticated-User', 'anonymous')\n        db.execute(\"INSERT INTO audit_log (action, username) VALUES (?, ?)\",\n                   (f\"search_dept:{department}\", requesting_user))\n        db.commit()\n        \n        return jsonify({'users': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/v2/users/<int:user_id>/deactivate', methods=['POST'])\ndef deactivate_user(user_id):\n    \"\"\"Deactivate a user account. Requires manager role.\"\"\"\n    requesting_user = request.headers.get('X-Authenticated-User', 'anonymous')\n    db = get_db()\n    \n    # Check requester has appropriate role\n    requester = db.execute(\"SELECT role FROM users WHERE username = ?\", (requesting_user,)).fetchone()\n    if not requester or requester['role'] not in ('admin', 'manager'):\n        return jsonify({'error': 'Insufficient privileges'}), 403\n    \n    db.execute(\"UPDATE users SET active = 0 WHERE id = ?\", (user_id,))\n    db.execute(\"INSERT INTO audit_log (action, username) VALUES (?, ?)\",\n               (f\"deactivate_user:{user_id}\", requesting_user))\n    db.commit()\n    return jsonify({'status': 'deactivated', 'user_id': user_id})\n\n@app.route('/api/v2/users/export', methods=['GET'])\ndef export_users():\n    \"\"\"Export user list as JSON. Sensitive fields redacted for non-admin.\"\"\"\n    requesting_user = request.headers.get('X-Authenticated-User', 'anonymous')\n    db = get_db()\n    \n    requester = db.execute(\"SELECT role FROM users WHERE username = ?\", (requesting_user,)).fetchone()\n    \n    if requester and requester['role'] == 'admin':\n        cursor = db.execute(\"SELECT id, username, role, department, active, password_hash FROM users\")\n    else:\n        cursor = db.execute(\"SELECT id, username, department FROM users WHERE active = 1\")\n    \n    results = [dict(row) for row in cursor.fetchall()]\n    return jsonify({'export': results})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EKS pod in namespace 'api-services' behind AWS ALB with identical routing. Istio 1.19 sidecar injected with STRICT mTLS. The Envoy proxy's HttpConnectionManager has a custom Lua filter that enforces per-source-IP token bucket rate limiting at 3 requests per 10-second window on the gRPC-Web path prefix, returning 429 with connection: close header and draining the downstream connection on limit breach. Additionally, the Envoy route configuration sets max_grpc_timeout to 5s and the cluster has circuit_breakers with max_pending_requests=1. The ALB desync_mitigation_mode is set to 'strictest' which rejects ambiguous requests with both Transfer-Encoding and Content-Length headers. The Istio AuthorizationPolicy requires a valid JWT with 'admin' scope claim for any path matching '/grpc-web/UserService/CreateAdmin'.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "api-services",
+      "ingress": "aws-alb-ingress-controller v2.4.1",
+      "alb_config": {
+        "idle_timeout": 60,
+        "http_keepalive": true,
+        "desync_mitigation_mode": "strictest"
+      },
+      "service_mesh": "istio-1.19",
+      "istio_config": {
+        "mtls_mode": "STRICT",
+        "envoy_lua_rate_limit": {
+          "path_prefix": "/grpc-web/",
+          "tokens_per_window": 3,
+          "window_seconds": 10,
+          "on_limit": "429_with_connection_close_and_drain"
+        },
+        "envoy_route": {
+          "max_grpc_timeout": "5s"
+        },
+        "circuit_breakers": {
+          "max_pending_requests": 1
+        }
+      },
+      "authorization_policy": {
+        "action": "DENY",
+        "rules": [
+          {
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/grpc-web/UserService/CreateAdmin"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[scope]",
+                "notValues": [
+                  "admin"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "pod_security": "restricted",
+      "network_policy": "deny-all-except-istio-proxy"
+    }
+  }
+}

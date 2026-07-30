@@ -1,0 +1,21 @@
+{
+  "id": "02aa7598",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching products by various criteria\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category is required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize category - only allow alphanumeric and spaces\n\tfor _, c := range category {\n\t\tif !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ') {\n\t\t\thttp.Error(w, \"invalid category\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Build query with parameterized category but dynamic sort\n\tbaseQuery := \"SELECT id, name, price, description FROM products WHERE category = $1\"\n\n\tif minPrice != \"\" {\n\t\tbaseQuery += \" AND price >= \" + sanitizeNumeric(minPrice)\n\t}\n\tif maxPrice != \"\" {\n\t\tbaseQuery += \" AND price <= \" + sanitizeNumeric(maxPrice)\n\t}\n\n\t// Sort field - validated against allowlist... partially\n\tallowedSorts := []string{\"name\", \"price\", \"created_at\", \"rating\"}\n\tif sortField != \"\" {\n\t\tfound := false\n\t\tfor _, allowed := range allowedSorts {\n\t\t\tif strings.HasPrefix(sortField, allowed) {\n\t\t\t\tfound = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif found {\n\t\t\tbaseQuery += \" ORDER BY \" + sortField\n\t\t} else {\n\t\t\tbaseQuery += \" ORDER BY name\"\n\t\t}\n\t} else {\n\t\tbaseQuery += \" ORDER BY name\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, category)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tfirst = false\n\t\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc sanitizeNumeric(s string) string {\n\tvar result strings.Builder\n\tfor _, c := range s {\n\t\tif (c >= '0' && c <= '9') || c == '.' {\n\t\t\tresult.WriteRune(c)\n\t\t}\n\t}\n\tif result.Len() == 0 {\n\t\treturn \"0\"\n\t}\n\treturn result.String()\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on EC2 instance running PostgreSQL 14.2 with default configuration. The database role used by the application has SELECT privilege on all tables in the public schema including 'users', 'orders', 'payment_methods'. Network: application and database on same host, no intermediary. PostgreSQL pg_hba.conf allows local connections with md5 auth. No query-layer firewall or proxy between application and database.",
+    "config": {
+      "runtime": "EC2 t3.medium, Amazon Linux 2023",
+      "database": "PostgreSQL 14.2, self-managed, default postgresql.conf",
+      "db_role_privileges": "SELECT on ALL TABLES in public schema",
+      "network": "application connects to localhost:5432",
+      "pg_hba": "local all appuser md5",
+      "tables": [
+        "products",
+        "users",
+        "orders",
+        "payment_methods"
+      ]
+    }
+  }
+}

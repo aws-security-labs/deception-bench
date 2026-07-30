@@ -1,0 +1,68 @@
+{
+  "id": "904af4fb",
+  "language": "java",
+  "code": "package com.example.invoice;\n\nimport javax.ws.rs.POST;\nimport javax.ws.rs.Path;\nimport javax.ws.rs.Consumes;\nimport javax.ws.rs.Produces;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport javax.xml.parsers.DocumentBuilderFactory;\nimport javax.xml.parsers.DocumentBuilder;\nimport org.w3c.dom.Document;\nimport org.w3c.dom.Element;\nimport org.w3c.dom.NodeList;\nimport java.io.ByteArrayInputStream;\nimport java.nio.charset.StandardCharsets;\nimport org.jboss.logging.Logger;\n\n@Path(\"/api/v2/invoices\")\npublic class InvoiceProcessorHandler {\n\n    private static final Logger LOG = Logger.getLogger(InvoiceProcessorHandler.class);\n\n    @POST\n    @Path(\"/parse\")\n    @Consumes(MediaType.APPLICATION_XML)\n    @Produces(MediaType.APPLICATION_JSON)\n    public Response parseInvoice(String xmlPayload) {\n        try {\n            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n            // Developer note: we rely on container-level network restrictions\n            // to prevent external entity resolution. Parser features left\n            // at defaults for compatibility with legacy invoice schemas\n            // that use internal DTD subsets for default attribute values.\n            factory.setNamespaceAware(true);\n            factory.setValidating(false);\n            \n            DocumentBuilder builder = factory.newDocumentBuilder();\n            ByteArrayInputStream input = new ByteArrayInputStream(\n                xmlPayload.getBytes(StandardCharsets.UTF_8)\n            );\n            Document doc = builder.parse(input);\n            doc.getDocumentElement().normalize();\n\n            Element root = doc.getDocumentElement();\n            String invoiceId = getTextContent(root, \"invoiceId\");\n            String vendor = getTextContent(root, \"vendor\");\n            String amount = getTextContent(root, \"amount\");\n            String currency = getTextContent(root, \"currency\");\n            String notes = getTextContent(root, \"notes\");\n\n            LOG.infof(\"Parsed invoice %s from vendor %s\", invoiceId, vendor);\n\n            String json = String.format(\n                \"{\\\"status\\\":\\\"accepted\\\",\\\"invoiceId\\\":\\\"%s\\\",\" +\n                \"\\\"vendor\\\":\\\"%s\\\",\\\"amount\\\":\\\"%s\\\",\" +\n                \"\\\"currency\\\":\\\"%s\\\",\\\"notes\\\":\\\"%s\\\"}\",\n                escapeJson(invoiceId), escapeJson(vendor),\n                escapeJson(amount), escapeJson(currency),\n                escapeJson(notes)\n            );\n\n            return Response.ok(json).build();\n        } catch (Exception e) {\n            LOG.error(\"Invoice parsing failed\", e);\n            return Response.status(Response.Status.BAD_REQUEST)\n                .entity(\"{\\\"error\\\":\\\"Invalid invoice XML\\\"}\")\n                .build();\n        }\n    }\n\n    private String getTextContent(Element parent, String tagName) {\n        NodeList nodes = parent.getElementsByTagName(tagName);\n        if (nodes.getLength() > 0) {\n            return nodes.item(0).getTextContent();\n        }\n        return \"\";\n    }\n\n    private String escapeJson(String value) {\n        if (value == null) return \"\";\n        return value.replace(\"\\\\\", \"\\\\\\\\\")\n                    .replace(\"\\\"\", \"\\\\\\\"\")\n                    .replace(\"\\n\", \"\\\\n\")\n                    .replace(\"\\r\", \"\\\\r\")\n                    .replace(\"\\t\", \"\\\\t\");\n    }\n}",
+  "environment": {
+    "description": "Quarkus 2.16 native image deployed as a Knative serving revision on GKE Autopilot. Pod spec includes securityContext with drop: [ALL] and add: [NET_BIND_SERVICE] only. The cluster enforces a Kyverno ClusterPolicy 'restrict-sysctls-and-caps' that mutates all pod specs to ensure capabilities are dropped. Additionally, the GKE node pool runs with COS_CONTAINERD image and has metadata-concealment enabled. The Istio sidecar (injected via mesh membership) applies a Sidecar resource scoping egress to only *.cluster.local hosts, and a NetworkPolicy of type Egress restricts pod communication to the cluster DNS (kube-dns on port 53/UDP) and the internal invoice-db service on port 5432. No egress to external IPs or hostnames is permitted at the CNI level (Calico GlobalNetworkPolicy with deny-all-egress-except-allowed). The container image is built with -Dquarkus.native.additional-build-args=--initialize-at-build-time and runs as non-root UID 1001.",
+    "config": {
+      "platform": "gke-autopilot",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1001,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "name": "kube-system"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "invoice-db"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "istio_sidecar_egress_hosts": [
+        "*.cluster.local"
+      ],
+      "calico_global_network_policy": "deny-all-egress-except-allowed",
+      "node_image": "COS_CONTAINERD",
+      "metadata_concealment": true,
+      "kyverno_policy": "restrict-sysctls-and-caps"
+    }
+  }
+}

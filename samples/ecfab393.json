@@ -1,0 +1,27 @@
+{
+  "id": "ecfab393",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, middleware};\nuse serde::Deserialize;\nuse url::Url;\nuse std::collections::HashSet;\n\n#[derive(Deserialize)]\nstruct OAuthParams {\n    client_id: String,\n    redirect_uri: String,\n    response_type: String,\n    state: Option<String>,\n    scope: Option<String>,\n}\n\nstruct AppState {\n    registered_clients: HashSet<String>,\n    // Only the domain is validated, not the full URI path\n    allowed_redirect_domains: HashSet<String>,\n}\n\nfn validate_redirect_uri(uri: &str, allowed_domains: &HashSet<String>) -> bool {\n    // Parse the redirect_uri and check if the host matches allowed domains\n    match Url::parse(uri) {\n        Ok(parsed) => {\n            if let Some(host) = parsed.host_str() {\n                // Check if the host ends with any allowed domain\n                // This is intentionally vulnerable to subdomain tricks\n                for domain in allowed_domains {\n                    if host.ends_with(domain) {\n                        return true;\n                    }\n                }\n            }\n            false\n        }\n        Err(_) => false,\n    }\n}\n\nasync fn authorize(\n    query: web::Query<OAuthParams>,\n    data: web::Data<AppState>,\n) -> HttpResponse {\n    // Verify client_id is registered\n    if !data.registered_clients.contains(&query.client_id) {\n        return HttpResponse::BadRequest().json(serde_json::json!({\n            \"error\": \"invalid_client\",\n            \"error_description\": \"Unknown client_id\"\n        }));\n    }\n\n    // Validate redirect_uri against allowed domains\n    if !validate_redirect_uri(&query.redirect_uri, &data.allowed_redirect_domains) {\n        return HttpResponse::BadRequest().json(serde_json::json!({\n            \"error\": \"invalid_redirect_uri\",\n            \"error_description\": \"Redirect URI not allowed\"\n        }));\n    }\n\n    // Validate response_type\n    if query.response_type != \"code\" && query.response_type != \"token\" {\n        return HttpResponse::BadRequest().json(serde_json::json!({\n            \"error\": \"unsupported_response_type\"\n        }));\n    }\n\n    // Generate authorization code (simplified)\n    let auth_code = \"generated_auth_code_abc123\";\n    let state_param = query.state.as_deref().unwrap_or(\"\");\n\n    // Redirect to the client's redirect_uri with the auth code\n    let redirect_url = format!(\n        \"{}?code={}&state={}\",\n        query.redirect_uri, auth_code, state_param\n    );\n\n    HttpResponse::Found()\n        .append_header((\"Location\", redirect_url.as_str()))\n        .finish()\n}\n\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let mut registered_clients = HashSet::new();\n    registered_clients.insert(\"app-client-001\".to_string());\n    registered_clients.insert(\"app-client-002\".to_string());\n\n    let mut allowed_redirect_domains = HashSet::new();\n    allowed_redirect_domains.insert(\".myapp.com\".to_string());\n    allowed_redirect_domains.insert(\".trusted-partner.io\".to_string());\n\n    let app_state = web::Data::new(AppState {\n        registered_clients,\n        allowed_redirect_domains,\n    });\n\n    HttpServer::new(move || {\n        App::new()\n            .app_data(app_state.clone())\n            .route(\"/oauth/authorize\", web::get().to(authorize))\n            .route(\"/health\", web::get().to(health))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same Actix-web binary deployed behind an Envoy sidecar proxy (v1.28) with a custom Lua filter chain. The Envoy configuration includes a per-route rate limit descriptor keyed on {source_ip, request_path=/oauth/authorize} with a token bucket of 3 requests per 60-second window, enforced by an external ratelimit service (envoyproxy/ratelimit with Redis backend). When the bucket is exhausted, Envoy returns 429 before the request reaches the Actix-web process. Additionally, the Envoy route configuration for /oauth/authorize includes a header_mutation filter that strips and re-encodes the redirect_uri query parameter through a strict URL canonicalization step (using Envoy's path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT and custom Lua that rejects any redirect_uri where the parsed hostname contains characters outside [a-z0-9.-]), which prevents the subdomain confusion attack vector by rejecting hostnames like 'evil.myapp.com.attacker.io' before the application processes them.",
+    "config": {
+      "infrastructure": "Envoy 1.28 sidecar -> Actix-web on localhost:8080",
+      "rate_limit": {
+        "descriptor": "{source_ip, path=/oauth/authorize}",
+        "token_bucket": "3 req / 60s window",
+        "backend": "envoyproxy/ratelimit + Redis 7.2",
+        "action_on_exhaust": "return 429, request never forwarded"
+      },
+      "lua_filter": {
+        "phase": "request",
+        "logic": "extract redirect_uri param, parse as URL, reject if hostname matches /[^a-z0-9.\\-]/ or if hostname does not exactly match an entry in allowlist after canonicalization",
+        "allowlist": [
+          "app.myapp.com",
+          "dashboard.myapp.com",
+          "callback.trusted-partner.io"
+        ]
+      },
+      "envoy_path_handling": "path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT"
+    }
+  }
+}

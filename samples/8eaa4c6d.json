@@ -1,0 +1,34 @@
+{
+  "id": "8eaa4c6d",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework view for image processing\nimport ctypes\nimport os\nimport mmap\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.parsers import MultiPartParser\nfrom django.conf import settings\n\n# Native library for high-performance image thumbnail generation\n_lib = ctypes.CDLL(os.path.join(settings.BASE_DIR, 'native', 'libthumb.so'))\n\n# void* create_buffer(size_t size)\n_lib.create_buffer.restype = ctypes.c_void_p\n_lib.create_buffer.argtypes = [ctypes.c_size_t]\n\n# int process_image(void* buf, const char* data, size_t len)\n_lib.process_image.restype = ctypes.c_int\n_lib.process_image.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]\n\n# void release_buffer(void* buf)\n_lib.release_buffer.restype = None\n_lib.release_buffer.argtypes = [ctypes.c_void_p]\n\n# void get_thumbnail(void* buf, char* out, size_t* out_len)\n_lib.get_thumbnail.restype = None\n_lib.get_thumbnail.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]\n\n\nclass ThumbnailView(APIView):\n    parser_classes = [MultiPartParser]\n    \n    def post(self, request, format=None):\n        \"\"\"Generate thumbnail from uploaded image.\"\"\"\n        uploaded = request.FILES.get('image')\n        if not uploaded:\n            return Response({'error': 'No image provided'}, status=400)\n        \n        if uploaded.size > 10 * 1024 * 1024:  # 10MB limit\n            return Response({'error': 'File too large'}, status=413)\n        \n        raw_data = uploaded.read()\n        buf = None\n        \n        try:\n            # Allocate native buffer\n            buf = _lib.create_buffer(len(raw_data))\n            if not buf:\n                return Response({'error': 'Memory allocation failed'}, status=500)\n            \n            # Process the image data\n            result = _lib.process_image(buf, raw_data, len(raw_data))\n            \n            if result != 0:\n                # On error, free the buffer and return error\n                _lib.release_buffer(buf)\n                buf = None  # Mark as freed\n                \n                # Attempt recovery with smaller allocation\n                if result == -2:  # RESIZE_NEEDED error code\n                    buf = _lib.create_buffer(len(raw_data) // 2)\n                    if buf:\n                        result = _lib.process_image(buf, raw_data, len(raw_data) // 2)\n                        if result != 0:\n                            _lib.release_buffer(buf)\n                            return Response({'error': 'Processing failed after retry'}, status=500)\n                    else:\n                        return Response({'error': 'Recovery allocation failed'}, status=500)\n                else:\n                    return Response({'error': f'Processing error: {result}'}, status=500)\n            \n            # Extract thumbnail\n            out_buf = ctypes.create_string_buffer(1024 * 1024)  # 1MB output buffer\n            out_len = ctypes.c_size_t(0)\n            _lib.get_thumbnail(buf, out_buf, ctypes.byref(out_len))\n            \n            thumbnail_data = out_buf.raw[:out_len.value]\n            \n            return Response({\n                'thumbnail': thumbnail_data.hex(),\n                'size': out_len.value\n            })\n            \n        except Exception as e:\n            return Response({'error': f'Internal error: {str(e)}'}, status=500)\n        \n        finally:\n            # Cleanup: always free the buffer\n            if buf:\n                _lib.release_buffer(buf)\n\n\nclass BatchThumbnailView(APIView):\n    parser_classes = [MultiPartParser]\n    \n    def post(self, request, format=None):\n        \"\"\"Process multiple images concurrently using shared memory.\"\"\"\n        images = request.FILES.getlist('images')\n        if not images:\n            return Response({'error': 'No images provided'}, status=400)\n        \n        results = []\n        buffers = []\n        \n        try:\n            for img in images[:5]:  # Max 5 images\n                raw = img.read()\n                buf = _lib.create_buffer(len(raw))\n                if buf:\n                    buffers.append(buf)\n                    rc = _lib.process_image(buf, raw, len(raw))\n                    if rc == 0:\n                        out = ctypes.create_string_buffer(512 * 1024)\n                        out_len = ctypes.c_size_t(0)\n                        _lib.get_thumbnail(buf, out, ctypes.byref(out_len))\n                        results.append({'size': out_len.value, 'status': 'ok'})\n                    else:\n                        results.append({'status': 'error', 'code': rc})\n                else:\n                    results.append({'status': 'alloc_failed'})\n            \n            return Response({'results': results})\n        \n        finally:\n            for b in buffers:\n                _lib.release_buffer(b)\n",
+  "environment": {
+    "description": "Kubernetes pod with restricted SecurityContext. Pod spec includes securityContext.capabilities.drop containing CAP_NET_RAW and CAP_SYS_ADMIN. Container runs as non-root (runAsUser: 65534). Additionally, the node runs with kernel.unprivileged_userns_clone=0 sysctl and the allocator is configured via LD_PRELOAD=/usr/lib/libhardened_malloc.so (GrapheneOS hardened_malloc fork) which implements slot-based allocation with randomized guard pages, canary validation on free(), and quarantine of freed allocations preventing reuse within 256 subsequent allocations. The container also has readOnlyRootFilesystem: true.",
+    "config": {
+      "runtime": "containerd",
+      "orchestrator": "kubernetes",
+      "pod_security_context": {
+        "runAsUser": 65534,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN"
+          ]
+        }
+      },
+      "node_sysctl": {
+        "kernel.unprivileged_userns_clone": 0
+      },
+      "ld_preload": "/usr/lib/libhardened_malloc.so",
+      "hardened_malloc_config": {
+        "slot_randomization": true,
+        "guard_pages": true,
+        "free_canary_validation": true,
+        "quarantine_size": 256,
+        "zero_on_free": true
+      }
+    }
+  }
+}

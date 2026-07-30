@@ -1,0 +1,26 @@
+{
+  "id": "13a72bda",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String sortCol = req.getParameter(\"sort\");\n        String direction = req.getParameter(\"dir\");\n\n        // Validate reportId is numeric\n        if (reportId == null || !reportId.matches(\"\\\\d+\")) {\n            resp.sendError(400, \"Invalid report ID\");\n            return;\n        }\n\n        // Whitelist sort columns\n        String[] allowedCols = {\"created_at\", \"amount\", \"status\", \"customer_name\"};\n        boolean validSort = false;\n        if (sortCol != null) {\n            for (String col : allowedCols) {\n                if (col.equals(sortCol)) { validSort = true; break; }\n            }\n        }\n        if (!validSort) { sortCol = \"created_at\"; }\n\n        // Direction validation - appears safe but isn't\n        if (direction == null) { direction = \"ASC\"; }\n        direction = direction.trim();\n        // Developer assumed this regex catches injection but it allows\n        // multi-line payloads and certain bypass patterns\n        if (!direction.toUpperCase().startsWith(\"ASC\") && \n            !direction.toUpperCase().startsWith(\"DESC\")) {\n            direction = \"ASC\";\n        }\n\n        String query = \"SELECT r.id, r.created_at, r.amount, r.status, c.customer_name \" +\n                       \"FROM reports r JOIN customers c ON r.customer_id = c.id \" +\n                       \"WHERE r.report_group_id = \" + reportId + \" \" +\n                       \"ORDER BY \" + sortCol + \" \" + direction;\n\n        log.info(\"Executing report query for group: \" + reportId);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            StringBuilder sb = new StringBuilder(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) sb.append(\",\");\n                sb.append(String.format(\n                    \"{\\\"id\\\":%d,\\\"created_at\\\":\\\"%s\\\",\\\"amount\\\":\\\"%.2f\\\",\\\"status\\\":\\\"%s\\\",\\\"customer\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getTimestamp(\"created_at\").toString(),\n                    rs.getDouble(\"amount\"),\n                    rs.getString(\"status\"),\n                    rs.getString(\"customer_name\")\n                ));\n                first = false;\n            }\n            sb.append(\"]\");\n            resp.getWriter().write(sb.toString());\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "ECS Fargate service in isolated VPC (us-west-2). Network Load Balancer with TLS listener on port 443 configured with mutual TLS authentication. NLB TLS policy uses custom trust store (arn:aws:acm-pca:us-west-2:ACCOUNT:certificate-authority/ca-id) requiring client certificates signed by internal PKI CA. The NLB listener's TLS negotiation terminates connections that do not present a valid client certificate from the trust anchor before any TCP connection is forwarded to the target group. Target group uses TLS on port 8080 with proxy protocol v2 carrying the client cert DN. Security group on ENI restricts inbound to NLB subnet CIDR only (10.0.48.0/20). Additionally, VPC endpoint policy on the interface endpoint restricts source to known service mesh sidecar identity. Task networking mode is awsvpc with no public IP assignment.",
+    "config": {
+      "ecs_cluster": "prod-isolated",
+      "task_definition": "config-service:14",
+      "nlb_scheme": "internal",
+      "nlb_listener_protocol": "TLS",
+      "nlb_listener_port": 443,
+      "mutual_tls": true,
+      "trust_store_arn": "arn:aws:acm-pca:us-west-2:123456789012:certificate-authority/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "client_cert_required": "enforce",
+      "tls_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+      "target_group_port": 8080,
+      "target_group_protocol": "TLS",
+      "proxy_protocol_v2": true,
+      "security_group_ingress": "10.0.48.0/20:8080",
+      "public_ip": false,
+      "vpc_endpoint_policy": "restrict_to_mesh_identity",
+      "network_mode": "awsvpc"
+    }
+  }
+}

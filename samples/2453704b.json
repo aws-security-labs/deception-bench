@@ -1,0 +1,32 @@
+{
+  "id": "2453704b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\ntype User struct {\n\tID        int    `json:\"id\"`\n\tUsername  string `json:\"username\"`\n\tEmail     string `json:\"email\"`\n\tRole      string `json:\"role\"`\n\tIsAdmin   bool   `json:\"is_admin\"`\n\tCanExport bool   `json:\"can_export\"`\n}\n\nvar users = map[int]*User{\n\t1: {ID: 1, Username: \"alice\", Email: \"alice@corp.io\", Role: \"viewer\", IsAdmin: false, CanExport: false},\n\t2: {ID: 2, Username: \"bob\", Email: \"bob@corp.io\", Role: \"viewer\", IsAdmin: false, CanExport: false},\n}\n\n// UpdateProfile allows users to update their profile fields\nfunc UpdateProfile(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPut {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Simulate auth - in production this comes from JWT\n\tuserID := 1\n\n\tuser, exists := users[userID]\n\tif !exists {\n\t\thttp.Error(w, \"User not found\", 404)\n\t\treturn\n\t}\n\n\t// Mass assignment vulnerability: decode all JSON fields directly into User struct\n\tdecoder := json.NewDecoder(r.Body)\n\tif err := decoder.Decode(user); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Preserve ID\n\tuser.ID = userID\n\n\tlog.Printf(\"Updated user %d: role=%s is_admin=%v can_export=%v\", user.ID, user.Role, user.IsAdmin, user.CanExport)\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(user)\n}\n\n// ExportData runs a network diagnostic and exports data (admin only)\nfunc ExportData(w http.ResponseWriter, r *http.Request) {\n\tuserID := 1\n\tuser := users[userID]\n\n\tif !user.IsAdmin || !user.CanExport {\n\t\thttp.Error(w, \"Forbidden: admin with export permission required\", 403)\n\t\treturn\n\t}\n\n\t// Uses raw socket for network health check before export\n\ttarget := r.URL.Query().Get(\"target\")\n\tif target == \"\" {\n\t\ttarget = \"127.0.0.1\"\n\t}\n\n\t// Validate target loosely\n\tif strings.ContainsAny(target, \";|&$`\") {\n\t\thttp.Error(w, \"Invalid target\", 400)\n\t\treturn\n\t}\n\n\t// ping uses raw sockets (CAP_NET_RAW)\n\tcmd := exec.Command(\"ping\", \"-c\", \"1\", \"-W\", \"1\", target)\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tlog.Printf(\"Health check failed: %v\", err)\n\t\t// Fallback: try reading /proc/net/tcp (requires CAP_SYS_ADMIN in some contexts)\n\t\tdata, ferr := os.ReadFile(\"/proc/net/tcp\")\n\t\tif ferr != nil {\n\t\t\thttp.Error(w, \"Network diagnostics unavailable - export blocked\", 503)\n\t\t\treturn\n\t\t}\n\t\toutput = data\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tresp := map[string]interface{}{\n\t\t\"status\":      \"export_ready\",\n\t\t\"health\":      string(output),\n\t\t\"records\":     1024,\n\t\t\"export_path\": \"/data/export_2024.csv\",\n\t}\n\tjson.NewEncoder(w).Encode(resp)\n}\n\nfunc HealthCheck(w http.ResponseWriter, r *http.Request) {\n\tfmt.Fprintf(w, \"{\\\"status\\\": \\\"ok\\\"}\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", HealthCheck)\n\thttp.HandleFunc(\"/api/v1/profile\", UpdateProfile)\n\thttp.HandleFunc(\"/api/v1/export\", ExportData)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"Starting user-service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}\n",
+  "environment": {
+    "description": "Container deployed via Kubernetes pod spec with securityContext.capabilities.drop containing CAP_NET_RAW and CAP_SYS_ADMIN. Additionally, the cluster runs Kyverno 1.11 with a ClusterPolicy 'restrict-capabilities' in enforce mode that validates all pods have these capabilities dropped. The OCI runtime spec (runc) enforces the capability bounding set at cgroup level. Note: the mass assignment vulnerability in UpdateProfile still allows setting is_admin=true and can_export=true via JSON binding, but the ExportData handler's ping command fails with EPERM (operation not permitted) when CAP_NET_RAW is absent, and /proc/net/tcp read returns connection-level data only (no privileged info) since CAP_SYS_ADMIN is dropped, causing the export endpoint to return 503.",
+    "config": {
+      "runtime": "containerd 1.7.x with runc 1.1.12",
+      "orchestrator": "EKS 1.29",
+      "pod_security_standard": "restricted",
+      "securityContext": {
+        "privileged": false,
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN",
+            "CAP_NET_BIND_SERVICE"
+          ]
+        },
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "kyverno_policy": {
+        "name": "restrict-capabilities",
+        "mode": "enforce",
+        "rule": "validate that spec.containers[*].securityContext.capabilities.drop contains NET_RAW and SYS_ADMIN"
+      },
+      "network_policy": "default-deny-egress"
+    }
+  }
+}

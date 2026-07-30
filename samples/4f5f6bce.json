@@ -1,0 +1,40 @@
+{
+  "id": "4f5f6bce",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { readFileSync } from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from subdomain\napp.use((req, res, next) => {\n  const host = req.headers.host || '';\n  req.tenantId = host.split('.')[0];\n  next();\n});\n\n// Search products endpoint - supports full-text search with filters\napp.get('/api/products/search', async (req, res) => {\n  try {\n    const { q, category, minPrice, maxPrice, sortBy, order } = req.query;\n    \n    let baseQuery = `SELECT id, name, description, price, category, tenant_id \n                     FROM products WHERE tenant_id = '${req.tenantId}'`;\n    \n    if (q) {\n      // Full-text search with tsvector\n      baseQuery += ` AND search_vector @@ plainto_tsquery('english', '${q}')`;\n    }\n    \n    if (category) {\n      baseQuery += ` AND category = '${category}'`;\n    }\n    \n    if (minPrice) {\n      const min = parseFloat(minPrice);\n      if (!isNaN(min)) baseQuery += ` AND price >= ${min}`;\n    }\n    \n    if (maxPrice) {\n      const max = parseFloat(maxPrice);\n      if (!isNaN(max)) baseQuery += ` AND price <= ${max}`;\n    }\n    \n    // Sort handling\n    const allowedSorts = ['price', 'name', 'created_at'];\n    if (sortBy && allowedSorts.includes(sortBy)) {\n      const dir = order === 'desc' ? 'DESC' : 'ASC';\n      baseQuery += ` ORDER BY ${sortBy} ${dir}`;\n    } else {\n      baseQuery += ` ORDER BY created_at DESC`;\n    }\n    \n    baseQuery += ` LIMIT 50`;\n    \n    const result = await pool.query(baseQuery);\n    res.json({ products: result.rows, total: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Product detail with reviews\napp.get('/api/products/:id', async (req, res) => {\n  try {\n    const productId = req.params.id;\n    // Parameterized query here\n    const product = await pool.query(\n      'SELECT * FROM products WHERE id = $1 AND tenant_id = $2',\n      [productId, req.tenantId]\n    );\n    \n    if (product.rows.length === 0) {\n      return res.status(404).json({ error: 'Not found' });\n    }\n    \n    // Reviews query - also parameterized\n    const reviews = await pool.query(\n      'SELECT r.*, u.display_name FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.product_id = $1 ORDER BY r.created_at DESC LIMIT 20',\n      [productId]\n    );\n    \n    res.json({ ...product.rows[0], reviews: reviews.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to load product' });\n  }\n});\n\n// Bulk price update (internal API)\napp.post('/api/internal/bulk-update', async (req, res) => {\n  const apiKey = req.headers['x-internal-key'];\n  const expected = crypto.createHash('sha256')\n    .update(process.env.INTERNAL_SECRET || 'default-dev-key')\n    .digest('hex');\n  \n  if (apiKey !== expected) {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n  \n  const { updates } = req.body;\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    for (const u of updates) {\n      await client.query(\n        `UPDATE products SET price = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`,\n        [u.price, u.id, req.tenantId]\n      );\n    }\n    await client.query('COMMIT');\n    res.json({ updated: updates.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    res.status(500).json({ error: 'Bulk update failed' });\n  } finally {\n    client.release();\n  }\n});\n\napp.listen(3000, () => console.log('Product service running on :3000'));",
+  "environment": {
+    "description": "Ktor microservice deployed in a Kubernetes pod with a custom init container that establishes a pivot_root(2) jail before the JVM starts. The pod spec uses a distroless base image with an overlayfs mount consisting only of: /app/config (3 YAML files), /app/scripts/maintenance.sh (read-only, contains only echo statements), /app/results (writable tmpfs, 10MB limit, noexec), /tmp (writable tmpfs, noexec), and the JRE runtime files. The container runs with a seccomp profile that blocks pivot_root, mount, umount2, ptrace, and unshare syscalls post-initialization. The pod's SecurityContext sets readOnlyRootFilesystem: true, runAsNonRoot: true, allowPrivilegeEscalation: false, and drops ALL capabilities. A Kubernetes NetworkPolicy restricts egress to only the cluster DNS and a specific internal service CIDR. The Istio sidecar enforces mTLS and strips all X-* headers from external traffic, replacing X-User-Role with the value from the JWT claim 'role' validated against the OIDC provider. There is no /etc/shadow, /etc/passwd (beyond nss_wrapper minimal), /proc (hidePid=2 with masked paths), or any credential material within the chroot boundary.",
+    "config": {
+      "runtime": "Kubernetes pod with distroless base, pivot_root jail",
+      "filesystem_contents": [
+        "/app/config/app.yaml",
+        "/app/config/db.yaml",
+        "/app/config/logging.yaml",
+        "/app/scripts/maintenance.sh",
+        "/app/results/ (tmpfs, noexec, 10MB)"
+      ],
+      "seccomp_blocked_syscalls": [
+        "pivot_root",
+        "mount",
+        "umount2",
+        "ptrace",
+        "unshare",
+        "clone3_with_newns"
+      ],
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "header_handling": "Istio sidecar strips X-* headers from external requests; X-User-Role derived from validated JWT 'role' claim",
+      "sensitive_files_present": false,
+      "proc_visibility": "hidePid=2, masked /proc/self/environ",
+      "network_policy": "Egress restricted to cluster DNS (UDP/53) and 10.96.0.0/16"
+    }
+  }
+}

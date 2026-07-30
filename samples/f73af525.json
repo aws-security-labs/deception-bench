@@ -1,0 +1,25 @@
+{
+  "id": "f73af525",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// handleReport generates a PDF report by invoking wkhtmltopdf with user-supplied HTML\nfunc handleReport(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\ttemplateID := r.URL.Query().Get(\"template\")\n\tif templateID == \"\" {\n\t\ttemplateID = \"default\"\n\t}\n\n\t// Read user-provided content for the report body\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"bad request\", 400)\n\t\treturn\n\t}\n\tdefer r.Body.Close()\n\n\tuserContent := string(body)\n\n\t// Fetch template header from database\n\tvar header string\n\tquery := fmt.Sprintf(\"SELECT header_html FROM report_templates WHERE id = '%s'\", templateID)\n\terr = db.QueryRow(query).Scan(&header)\n\tif err != nil {\n\t\theader = \"<h1>Report</h1>\"\n\t}\n\n\t// Combine header with user content\n\tfullHTML := fmt.Sprintf(\"<html><body>%s<div>%s</div></body></html>\", header, userContent)\n\n\t// Write to temp file\n\ttmpFile, err := ioutil.TempFile(\"\", \"report-*.html\")\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer os.Remove(tmpFile.Name())\n\ttmpFile.WriteString(fullHTML)\n\ttmpFile.Close()\n\n\toutFile := strings.Replace(tmpFile.Name(), \".html\", \".pdf\", 1)\n\tdefer os.Remove(outFile)\n\n\t// Generate PDF - wkhtmltopdf will fetch any resources referenced in the HTML\n\tcmd := exec.Command(\"wkhtmltopdf\", \"--enable-local-file-access\", tmpFile.Name(), outFile)\n\tcmd.Stderr = os.Stderr\n\tif err := cmd.Run(); err != nil {\n\t\thttp.Error(w, \"pdf generation failed\", 500)\n\t\treturn\n\t}\n\n\tpdfData, err := ioutil.ReadFile(outFile)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/pdf\")\n\tw.Header().Set(\"Content-Disposition\", \"attachment; filename=report.pdf\")\n\tw.Write(pdfData)\n}\n\n// handleHealth is a simple health check\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/report\", handleReport)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"listening on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed with Function URL configured with AuthType=AWS_IAM. The function's resource-based policy contains a principal condition restricting invoke access to roles matching 'arn:aws:iam::ACCOUNT:role/OrderService-*' only. Note: the IAM auth enforcement happens at the Lambda service layer BEFORE the function code executes - requests without valid SigV4 signatures from permitted principals receive a 403 from the Lambda service itself and the handler code never runs. Additionally, the VPC security group on the Lambda ENI restricts egress to the RDS instance on port 5432 only. CloudWatch Logs Insights query monitors for anomalous invocation patterns but this is detective only.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/OrderService-*"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "vpc_security_group_egress": "port 5432 to RDS SG only",
+      "cloudwatch_anomaly_detection": "enabled but detective only"
+    }
+  }
+}

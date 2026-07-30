@@ -1,0 +1,28 @@
+{
+  "id": "16ce1448",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"os\"\n\t\"strings\"\n\t\"unicode\"\n\n\t\"github.com/segmentio/kafka-go\"\n\t_ \"github.com/lib/pq\"\n\t\"golang.org/x/text/unicode/norm\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput performs basic input validation\nfunc sanitizeInput(input string) string {\n\t// Remove null bytes\n\tinput = strings.ReplaceAll(input, \"\\x00\", \"\")\n\t// Trim whitespace\n\tinput = strings.TrimSpace(input)\n\t// Basic length check\n\tif len(input) > 512 {\n\t\tinput = input[:512]\n\t}\n\treturn input\n}\n\n// normalizeUsername applies NFKC normalization for consistent storage\nfunc normalizeUsername(raw string) string {\n\t// First validate against obvious injection\n\tblocked := []string{\"--\", \";\", \"/*\", \"*/\", \"xp_\", \"UNION\", \"union\"}\n\tfor _, b := range blocked {\n\t\tif strings.Contains(raw, b) {\n\t\t\tlog.Printf(\"Blocked suspicious input: %q\", raw)\n\t\t\treturn \"\"\n\t\t}\n\t}\n\t// Apply NFKC normalization AFTER the blocklist check\n\tnormalized := norm.NFKC.String(raw)\n\treturn normalized\n}\n\n// isAlphanumericish checks if string looks safe (allows unicode letters)\nfunc isAlphanumericish(s string) bool {\n\tfor _, r := range s {\n\t\tif !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '-' && r != '.' && r != '@' {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n\n// processUserEvent handles user registration events from Kafka\nfunc processUserEvent(msg kafka.Message) error {\n\tusername := sanitizeInput(string(msg.Value))\n\n\tif username == \"\" {\n\t\treturn fmt.Errorf(\"empty username\")\n\t}\n\n\t// Normalize for consistent storage\n\tnormalized := normalizeUsername(username)\n\tif normalized == \"\" {\n\t\treturn fmt.Errorf(\"username rejected by filter\")\n\t}\n\n\t// Check character validity BEFORE normalization result is fully trusted\n\t// Note: isAlphanumericish allows unicode letters which may normalize to ASCII special chars\n\tif !isAlphanumericish(username) {\n\t\tlog.Printf(\"Username contains invalid characters: %q\", username)\n\t\treturn fmt.Errorf(\"invalid characters in username\")\n\t}\n\n\t// Store in database - using string formatting due to legacy schema constraints\n\t// The normalized form is used for the lookup column\n\tquery := fmt.Sprintf(\"INSERT INTO users (username, normalized_name, status) VALUES ('%s', '%s', 'pending')\", username, normalized)\n\t_, err := db.Exec(query)\n\tif err != nil {\n\t\tlog.Printf(\"DB error: %v\", err)\n\t\treturn err\n\t}\n\n\t// Send confirmation via external webhook\n\tgo sendWebhook(normalized)\n\treturn nil\n}\n\nfunc sendWebhook(username string) {\n\t// POST to external notification service\n\turl := fmt.Sprintf(\"https://hooks.internal.company.io/notify?user=%s\", username)\n\tresp, err := httpClient.Post(url, \"application/json\", nil)\n\tif err != nil {\n\t\tlog.Printf(\"Webhook failed: %v\", err)\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n}\n\nfunc main() {\n\treader := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers: strings.Split(os.Getenv(\"KAFKA_BROKERS\"), \",\"),\n\t\tTopic:   os.Getenv(\"KAFKA_TOPIC\"),\n\t\tGroupID: \"user-processor\",\n\t})\n\tdefer reader.Close()\n\n\tlog.Println(\"Starting user event processor...\")\n\tfor {\n\t\tmsg, err := reader.ReadMessage(context.Background())\n\t\tif err != nil {\n\t\t\tlog.Printf(\"Read error: %v\", err)\n\t\t\tcontinue\n\t\t}\n\t\tif err := processUserEvent(msg); err != nil {\n\t\t\tlog.Printf(\"Process error for offset %d: %v\", msg.Offset, err)\n\t\t}\n\t}\n}",
+  "environment": {
+    "description": "EKS pod deployed in private subnet (10.0.8.0/24) associated with route table rtb-0f8c2b4a6d. The subnet's route table contains only local VPC routes (10.0.0.0/16 -> local) and VPC endpoint routes for the MSK and RDS interfaces. There is no NAT gateway, internet gateway, or VPC peering connection providing a path to any non-VPC CIDR. The pod runs with a Kubernetes NetworkPolicy (calico) restricting egress to only the RDS endpoint (10.0.12.0/28 port 5432) and MSK broker ENIs (10.0.14.0/28 ports 9092-9094). DNS resolution is handled by a Route53 Resolver inbound endpoint within the VPC. The security group (sg-0d9e1f3a5b7c) attached to the pod ENI has outbound rules limited to 10.0.12.0/28:5432 and 10.0.14.0/28:9092-9094 with no other egress allowed. The RDS instance uses IAM database authentication with the pod's IRSA role granted only INSERT on users(username, normalized_name, status) via a PostgreSQL row-level function wrapper.",
+    "config": {
+      "subnet": "10.0.8.0/24",
+      "route_table": "rtb-0f8c2b4a6d",
+      "routes": [
+        "10.0.0.0/16 -> local"
+      ],
+      "nat_gateway": "none",
+      "internet_gateway": "none",
+      "vpc_peering": "none",
+      "network_policy": "calico egress allow 10.0.12.0/28:5432, 10.0.14.0/28:9092-9094; deny all other",
+      "security_group_egress": [
+        "10.0.12.0/28:5432",
+        "10.0.14.0/28:9092-9094"
+      ],
+      "dns": "Route53 Resolver inbound endpoint (10.0.8.2)",
+      "rds_auth": "IAM database authentication via IRSA",
+      "db_permissions": "EXECUTE on function insert_user(text, text) only - function validates and parameterizes internally",
+      "rds_endpoint": "10.0.12.5:5432",
+      "kafka_brokers": "10.0.14.3:9094,10.0.14.4:9094,10.0.14.5:9094"
+    }
+  }
+}

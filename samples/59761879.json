@@ -1,0 +1,42 @@
+{
+  "id": "59761879",
+  "language": "python",
+  "code": "import os\nimport psycopg2\nfrom flask import Flask, request, jsonify, session\nfrom functools import wraps\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'apppass')\n\ndef get_db():\n    return psycopg2.connect(host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS)\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        if 'user_id' not in session:\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/documents', methods=['GET'])\n@require_auth\ndef list_documents():\n    \"\"\"List documents with optional filtering by tag and owner.\"\"\"\n    tag = request.args.get('tag', '')\n    owner = request.args.get('owner', '')\n    sort_col = request.args.get('sort', 'created_at')\n    \n    # Whitelist sort columns to prevent injection there\n    allowed_sorts = ['created_at', 'title', 'size', 'owner_name']\n    if sort_col not in allowed_sorts:\n        sort_col = 'created_at'\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build query with parameterized sort but filtered conditions\n    base_query = \"SELECT id, title, owner_name, created_at, size FROM documents WHERE tenant_id = %s\"\n    params = [session['tenant_id']]\n    \n    if tag:\n        # Developer note: tags are internal enum values, validated upstream\n        base_query += f\" AND tags @> ARRAY['{tag}']::text[]\"\n    \n    if owner:\n        base_query += \" AND owner_name = %s\"\n        params.append(owner)\n    \n    base_query += f\" ORDER BY {sort_col} DESC LIMIT 50\"\n    \n    cur.execute(base_query, params)\n    rows = cur.fetchall()\n    cur.close()\n    conn.close()\n    \n    return jsonify([{\n        'id': r[0], 'title': r[1], 'owner': r[2],\n        'created_at': str(r[3]), 'size': r[4]\n    } for r in rows])\n\n@app.route('/api/documents/<int:doc_id>/share', methods=['POST'])\n@require_auth\ndef share_document(doc_id):\n    \"\"\"Generate a signed share link for a document.\"\"\"\n    data = request.get_json()\n    recipient_email = data.get('email', '')\n    \n    # HMAC-based share token\n    share_secret = os.environ.get('SHARE_SECRET', 'default-share-key')\n    token_data = f\"{doc_id}:{recipient_email}:{session['user_id']}\"\n    token = hmac.new(share_secret.encode(), token_data.encode(), hashlib.sha256).hexdigest()\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\n        \"INSERT INTO share_links (doc_id, recipient_email, token, created_by) VALUES (%s, %s, %s, %s)\",\n        (doc_id, recipient_email, token, session['user_id'])\n    )\n    conn.commit()\n    cur.close()\n    conn.close()\n    \n    return jsonify({'share_url': f\"/shared/{token}\"})\n\n@app.route('/api/documents/bulk-export', methods=['POST'])\n@require_auth\ndef bulk_export():\n    \"\"\"Export documents as ZIP archive. Uses streaming response.\"\"\"\n    data = request.get_json()\n    doc_ids = data.get('ids', [])\n    \n    if not doc_ids or len(doc_ids) > 100:\n        return jsonify({'error': 'invalid id list'}), 400\n    \n    # Validate all IDs are integers\n    try:\n        doc_ids = [int(d) for d in doc_ids]\n    except (ValueError, TypeError):\n        return jsonify({'error': 'invalid id format'}), 400\n    \n    conn = get_db()\n    cur = conn.cursor()\n    placeholders = ','.join(['%s'] * len(doc_ids))\n    cur.execute(\n        f\"SELECT id, title, storage_path FROM documents WHERE id IN ({placeholders}) AND tenant_id = %s\",\n        doc_ids + [session['tenant_id']]\n    )\n    docs = cur.fetchall()\n    cur.close()\n    conn.close()\n    \n    # Stream ZIP creation (simplified)\n    import zipfile, io\n    buf = io.BytesIO()\n    with zipfile.ZipFile(buf, 'w') as zf:\n        for doc in docs:\n            storage_path = doc[2]\n            # Read from object storage mount\n            filepath = os.path.join('/mnt/docs', storage_path)\n            if os.path.exists(filepath):\n                zf.write(filepath, arcname=f\"{doc[1]}.pdf\")\n    \n    buf.seek(0)\n    from flask import send_file\n    return send_file(buf, mimetype='application/zip', as_attachment=True, download_name='export.zip')\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind an ALB, but the ALB is associated with an AWS WAFv2 WebACL. The WebACL contains three rule groups evaluated in priority order: (1) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not BLOCK) to allow long query strings for pagination, (2) a custom rule group 'corp-uri-rate-limit' that rate-limits to 100 req/5min per IP on /api/reports/*/export paths, (3) AWS managed rule group AWSManagedRulesSQLiRuleSet with ALL rules in default BLOCK action and no rule-level overrides, with scope-down statement matching requests where at least one query string parameter value length exceeds 2 characters. The WebACL default action is ALLOW. Additionally, the EC2 instance has a custom seccomp profile loaded via systemd SecurityFilter= that permits only the 'write', 'read', 'openat', 'close', 'fstat', 'mmap', 'brk', 'ioctl', 'socket', 'connect', 'sendto', 'recvfrom', 'poll', 'fcntl', 'getdents64', 'lseek', 'futex', 'epoll_ctl', 'epoll_wait', 'clone', 'execve', 'wait4', 'pipe2', 'dup2', 'rt_sigaction', 'rt_sigprocmask', 'access', 'stat', 'mkdir', 'unlink', 'getpid', 'gettid', 'set_tid_address', 'set_robust_list', 'prlimit64', 'getrandom', 'clock_gettime', 'nanosleep', 'sched_yield', 'mprotect', 'munmap', 'arch_prctl', 'exit_group' syscalls \u2014 notably 'fork' is permitted via clone but 'execve' is in the allowlist only for the initial process startup (the seccomp filter is installed AFTER app boot via prctl PR_SET_SECCOMP with SECCOMP_SET_MODE_FILTER using a BPF program that blocks execve after the filter is installed).",
+    "config": {
+      "alb_waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-reports-acl/abc123",
+      "waf_rule_groups": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "corp-uri-rate-limit",
+          "priority": 2,
+          "type": "custom",
+          "action": "block",
+          "rate_limit": "100/5min per IP on /api/reports/*/export"
+        },
+        {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 3,
+          "override_action": "none",
+          "rule_overrides": [],
+          "scope_down_statement": "query_string_parameter_value_length > 2"
+        }
+      ],
+      "webacl_default_action": "ALLOW",
+      "seccomp_profile": "custom BPF filter installed post-boot via prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER) blocking execve/execveat after app initialization",
+      "selinux": "permissive",
+      "security_group_inbound": "0.0.0.0/0:80, 0.0.0.0/0:443"
+    }
+  }
+}

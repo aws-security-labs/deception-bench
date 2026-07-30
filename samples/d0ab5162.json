@@ -1,0 +1,35 @@
+{
+  "id": "d0ab5162",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (1, 'admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c5b4a')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (2, 'svc-billing', 'billing@corp.internal', 'service', 'sk-billing-1a2b3c4d5e6f')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (3, 'john.doe', 'john@example.com', 'user', 'sk-user-aabbccddee')\")\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username or email. Supports partial matching.\"\"\"\n    query_param = request.args.get('q', '')\n    field = request.args.get('field', 'username')\n    \n    # Basic input length check\n    if len(query_param) > 100:\n        return jsonify({'error': 'Query too long'}), 400\n    \n    # Restrict searchable fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query with user input for flexible searching\n    sql = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{query_param}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(sql)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Log the search for compliance\n        db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n                   ('user_search', f'field={field}, q={query_param[:50]}'))\n        db.commit()\n        \n        return jsonify({'results': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID. API key is only shown to admins.\"\"\"\n    auth_key = request.headers.get('X-API-Key', '')\n    db = get_db()\n    \n    # Check if requester is admin\n    requester = db.execute(\"SELECT role FROM users WHERE api_key = ?\", (auth_key,)).fetchone()\n    is_admin = requester and requester['role'] == 'admin'\n    \n    user = db.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Not found'}), 404\n    \n    result = {'id': user['id'], 'username': user['username'], 'email': user['email'], 'role': user['role']}\n    if is_admin:\n        result['api_key'] = user['api_key']\n    \n    return jsonify(result)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for baseline telemetry, (2) a custom rule group 'corp-input-validation' at priority 200 that applies a regex pattern set matching UNION/SELECT/INSERT/UPDATE/DELETE keywords with word-boundary anchors in URI query string components and blocks with 403, (3) AWSManagedRulesKnownBadInputsRuleSet at priority 300 in BLOCK mode. Additionally, the ALB access logs feed into a Kinesis stream processed by a Lambda that triggers automated IP blocking via WAF IP sets when anomalous query patterns are detected within a 60-second window. The Fargate task uses a read-only root filesystem with an ephemeral tmpfs at /tmp only; the /var/data path is backed by an EFS access point configured with uid/gid enforcement and POSIX permissions 0444 on the database file, preventing any write operations including SQLite WAL/journal creation.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL 'prod-api-acl' attached",
+      "waf_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "action": "COUNT"
+        },
+        {
+          "name": "corp-input-validation",
+          "priority": 200,
+          "type": "custom_regex_rule_group",
+          "pattern_set": "\\b(UNION|SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|EXEC)\\b",
+          "scope": "QUERY_STRING",
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 300,
+          "action": "BLOCK"
+        }
+      ],
+      "compute": "ECS Fargate, read-only root filesystem, tmpfs at /tmp only",
+      "storage": "EFS access point at /var/data, POSIX 0444 on app.db, no WAL/journal possible",
+      "network": "ALB -> Fargate task in private subnet, no direct access",
+      "monitoring": "ALB logs -> Kinesis -> Lambda auto-IP-block on anomaly detection"
+    }
+  }
+}

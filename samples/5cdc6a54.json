@@ -1,0 +1,18 @@
+{
+  "id": "5cdc6a54",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/users_controller.rb\nclass Api::V1::UsersController < ApplicationController\n  before_action :authenticate_api_key!\n  \n  # GET /api/v1/users/:id\n  def show\n    cache_key = \"user_profile_#{params[:id]}\"\n    \n    # Cache user profile with API key context for personalization\n    cached = Rails.cache.fetch(cache_key, expires_in: 5.minutes) do\n      user = User.find(params[:id])\n      {\n        id: user.id,\n        email: user.email,\n        role: user.role,\n        api_permissions: current_api_permissions,\n        internal_notes: user.admin_notes,\n        auth_token_hash: Digest::SHA256.hexdigest(request.headers['X-Api-Key']),\n        cached_at: Time.current.iso8601\n      }\n    end\n    \n    render json: cached\n  end\n  \n  # GET /api/v1/users/:id/settings\n  def settings\n    cache_key = \"user_settings_#{params[:id]}_#{request.headers['X-Api-Key']&.first(8)}\"\n    \n    cached = Rails.cache.fetch(cache_key, expires_in: 10.minutes) do\n      user = User.find(params[:id])\n      {\n        preferences: user.preferences,\n        billing_info: user.billing_summary,\n        connected_services: user.oauth_connections.map(&:provider),\n        session_secret: derive_session_secret(user)\n      }\n    end\n    \n    render json: cached\n  end\n\n  private\n\n  def authenticate_api_key!\n    api_key = request.headers['X-Api-Key']\n    unless api_key.present? && ApiKey.active.exists?(key_digest: Digest::SHA256.hexdigest(api_key))\n      render json: { error: 'Unauthorized' }, status: :unauthorized\n    end\n  end\n\n  def current_api_permissions\n    api_key = request.headers['X-Api-Key']\n    key_record = ApiKey.find_by(key_digest: Digest::SHA256.hexdigest(api_key))\n    key_record&.permissions || []\n  end\n\n  def derive_session_secret(user)\n    OpenSSL::HMAC.hexdigest('SHA256', Rails.application.credentials.secret_key_base, user.id.to_s)\n  end\nend\n\n# config/initializers/caching.rb\nRails.application.configure do\n  config.cache_store = :redis_cache_store, {\n    url: ENV['REDIS_URL'],\n    namespace: 'api_cache',\n    expires_in: 10.minutes\n  }\nend\n\n# app/models/api_key.rb\nclass ApiKey < ApplicationRecord\n  scope :active, -> { where('expires_at > ? OR expires_at IS NULL', Time.current) }\n  \n  before_create :set_key_digest\n  \n  def self.rotate!\n    transaction do\n      where('created_at < ?', 60.seconds.ago).update_all(revoked_at: Time.current)\n    end\n  end\n  \n  private\n  \n  def set_key_digest\n    self.key_digest = Digest::SHA256.hexdigest(raw_key) if raw_key.present?\n  end\nend\n\n# lib/tasks/key_rotation.rake\nnamespace :credentials do\n  desc 'Rotate API keys on schedule'\n  task rotate: :environment do\n    loop do\n      ApiKey.rotate!\n      Rails.logger.info \"[KeyRotation] Revoked keys older than 60s at #{Time.current}\"\n      sleep 60\n    end\n  end\nend",
+  "environment": {
+    "description": "Rails 7.1 API deployed on EC2 with ElastiCache Redis 7.x, single shared Redis namespace for all cache operations. API keys are issued with no expiration (expires_at IS NULL path in scope). Key rotation rake task is defined but not scheduled in production crontab. Cache entries persist for full TTL (5-10 minutes). No request-scoped cache isolation.",
+    "config": {
+      "rails_version": "7.1.2",
+      "ruby_version": "3.2.0",
+      "cache_backend": "ElastiCache Redis 7.0",
+      "cache_namespace": "api_cache",
+      "key_rotation_scheduled": false,
+      "api_key_expiration": null,
+      "network": "public ALB -> EC2, no additional filtering",
+      "cache_isolation": "none"
+    }
+  }
+}

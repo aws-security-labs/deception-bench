@@ -1,0 +1,53 @@
+{
+  "id": "4940915f",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request, HTTPException\nfrom pydantic import BaseModel\nimport ldap3\nimport os\nimport logging\n\napp = FastAPI(title=\"Corporate Directory Service\", version=\"2.1.0\")\nlogger = logging.getLogger(__name__)\n\nLDAP_SERVER = os.getenv(\"LDAP_SERVER\", \"ldap://directory.internal.corp:389\")\nLDAP_BASE_DN = os.getenv(\"LDAP_BASE_DN\", \"dc=corp,dc=internal\")\nLDAP_BIND_DN = os.getenv(\"LDAP_BIND_DN\", \"cn=svc-directory,ou=services,dc=corp,dc=internal\")\nLDAP_BIND_PW = os.getenv(\"LDAP_BIND_PW\", \"\")\n\nclass UserSearchRequest(BaseModel):\n    username: str\n    department: str = \"\"\n    include_disabled: bool = False\n\ndef get_ldap_connection():\n    server = ldap3.Server(LDAP_SERVER, get_info=ldap3.NONE)\n    conn = ldap3.Connection(server, user=LDAP_BIND_DN, password=LDAP_BIND_PW, auto_bind=True)\n    return conn\n\ndef build_search_filter(username: str, department: str, include_disabled: bool) -> str:\n    \"\"\"Build LDAP search filter from user parameters.\n    Note: username is validated at the API gateway level per security policy SEC-2024-031.\n    \"\"\"\n    base_filter = f\"(uid={username})\"\n    \n    filters = [base_filter]\n    \n    if department:\n        filters.append(f\"(department={department})\")\n    \n    if not include_disabled:\n        filters.append(\"(!(userAccountControl:1.2.840.113556.1.4.803:=2))\")\n    \n    if len(filters) == 1:\n        return filters[0]\n    \n    return \"(&\" + \"\".join(filters) + \")\"\n\n@app.post(\"/api/v2/directory/search\")\nasync def search_directory(search_req: UserSearchRequest, request: Request):\n    \"\"\"Search corporate directory. Access restricted to hr-portal and admin-dashboard namespaces.\"\"\"\n    \n    source_service = request.headers.get(\"x-forwarded-client-cert\", \"unknown\")\n    logger.info(f\"Directory search from: {source_service}, query: {search_req.username}\")\n    \n    search_filter = build_search_filter(\n        username=search_req.username,\n        department=search_req.department,\n        include_disabled=search_req.include_disabled\n    )\n    \n    logger.debug(f\"Constructed LDAP filter: {search_filter}\")\n    \n    try:\n        conn = get_ldap_connection()\n        conn.search(\n            search_base=LDAP_BASE_DN,\n            search_filter=search_filter,\n            search_scope=ldap3.SUBTREE,\n            attributes=[\"uid\", \"cn\", \"mail\", \"department\", \"title\", \"telephoneNumber\"]\n        )\n        \n        results = []\n        for entry in conn.entries:\n            results.append({\n                \"uid\": str(entry.uid) if hasattr(entry, 'uid') else None,\n                \"name\": str(entry.cn) if hasattr(entry, 'cn') else None,\n                \"email\": str(entry.mail) if hasattr(entry, 'mail') else None,\n                \"department\": str(entry.department) if hasattr(entry, 'department') else None,\n                \"title\": str(entry.title) if hasattr(entry, 'title') else None,\n                \"phone\": str(entry.telephoneNumber) if hasattr(entry, 'telephoneNumber') else None\n            })\n        \n        conn.unbind()\n        return {\"count\": len(results), \"results\": results}\n    \n    except ldap3.core.exceptions.LDAPException as e:\n        logger.error(f\"LDAP error: {e}\")\n        raise HTTPException(status_code=503, detail=\"Directory service unavailable\")\n    except Exception as e:\n        logger.error(f\"Unexpected error in directory search: {e}\")\n        raise HTTPException(status_code=500, detail=\"Internal error\")\n\n@app.get(\"/api/v2/directory/lookup/{uid}\")\nasync def lookup_user(uid: str):\n    \"\"\"Direct user lookup by UID - used for profile enrichment.\"\"\"\n    search_filter = f\"(uid={uid})\"\n    \n    try:\n        conn = get_ldap_connection()\n        conn.search(\n            search_base=LDAP_BASE_DN,\n            search_filter=search_filter,\n            search_scope=ldap3.SUBTREE,\n            attributes=[\"uid\", \"cn\", \"mail\", \"department\", \"title\", \"manager\"]\n        )\n        \n        if not conn.entries:\n            raise HTTPException(status_code=404, detail=\"User not found\")\n        \n        entry = conn.entries[0]\n        conn.unbind()\n        return {\n            \"uid\": str(entry.uid),\n            \"name\": str(entry.cn) if hasattr(entry, 'cn') else None,\n            \"email\": str(entry.mail) if hasattr(entry, 'mail') else None,\n            \"department\": str(entry.department) if hasattr(entry, 'department') else None,\n            \"title\": str(entry.title) if hasattr(entry, 'title') else None,\n            \"manager\": str(entry.manager) if hasattr(entry, 'manager') else None\n        }\n    except HTTPException:\n        raise\n    except Exception as e:\n        logger.error(f\"Lookup error: {e}\")\n        raise HTTPException(status_code=500, detail=\"Internal error\")\n\n@app.get(\"/healthz\")\nasync def health():\n    return {\"status\": \"healthy\"}",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. The directory-service runs in 'backend-services' namespace with automatic sidecar injection. An Istio AuthorizationPolicy resource named 'directory-access-control' is applied to the 'backend-services' namespace with spec.action DENY for requests where source.namespace is NOT in [hr-portal, admin-dashboard]. However, the policy uses a DENY action with a notNamespaces field rather than an ALLOW with explicit namespace list - this means the Envoy proxy will reject at L7 before the request reaches the application container. The policy also has a 'to' clause matching operation paths '/api/*' which covers the vulnerable endpoints. Note: the DENY policy with notNamespaces is evaluated after any ALLOW policies per Istio's policy evaluation order, and there are no conflicting ALLOW policies in the mesh config.",
+    "config": {
+      "kubernetes_namespace": "backend-services",
+      "istio_version": "1.20.2",
+      "istio_sidecar_injection": "enabled",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "directory-access-control",
+          "namespace": "backend-services"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "hr-portal",
+                      "admin-dashboard"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "mode": "STRICT"
+      },
+      "mesh_config": {
+        "outbound_traffic_policy": "REGISTRY_ONLY"
+      }
+    }
+  }
+}

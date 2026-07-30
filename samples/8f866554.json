@@ -1,0 +1,49 @@
+{
+  "id": "8f866554",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/inventory.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY, name TEXT, category TEXT,\n        price REAL, stock INTEGER, supplier TEXT)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS admin_keys (\n        id INTEGER PRIMARY KEY, key_hash TEXT, permissions TEXT,\n        owner TEXT, created_at TEXT)''')\n    db.execute('''INSERT OR IGNORE INTO products VALUES\n        (1, 'Widget A', 'hardware', 29.99, 150, 'Acme Corp')''')\n    db.execute('''INSERT OR IGNORE INTO admin_keys VALUES\n        (1, 'e3b0c44298fc1c149afbf4c8996fb924', 'full', 'admin', '2024-01-01')''')\n    db.commit()\n    db.close()\n\ndef verify_api_token(token):\n    \"\"\"Verify the API token against allowed tokens.\"\"\"\n    allowed = os.environ.get('API_TOKENS', 'dev-token-123').split(',')\n    return token in allowed\n\ndef audit_log(action, details, source_ip):\n    \"\"\"Write audit log entry - async in production.\"\"\"\n    timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())\n    entry = f\"{timestamp}|{action}|{source_ip}|{details}\"\n    # In production this goes to structured logging pipeline\n    app.logger.info(entry)\n\n@app.before_request\ndef check_auth():\n    if request.endpoint == 'health':\n        return None\n    token = request.headers.get('X-API-Token', '')\n    if not verify_api_token(token):\n        return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/inventory/search')\ndef search_inventory():\n    \"\"\"Search inventory with flexible filtering.\"\"\"\n    category = request.args.get('category', '')\n    supplier = request.args.get('supplier', '')\n    sort_by = request.args.get('sort', 'name')\n    order = request.args.get('order', 'ASC')\n    \n    # Validate sort order\n    if order.upper() not in ('ASC', 'DESC'):\n        order = 'ASC'\n    \n    # Build query with category and supplier filters\n    conditions = []\n    if category:\n        conditions.append(f\"category = '{category}'\")\n    if supplier:\n        conditions.append(f\"supplier LIKE '%{supplier}%'\")\n    \n    where_clause = ' AND '.join(conditions) if conditions else '1=1'\n    \n    # Validate sort column against schema\n    valid_sorts = {'name', 'price', 'stock', 'category', 'supplier'}\n    if sort_by not in valid_sorts:\n        sort_by = 'name'\n    \n    query = f\"SELECT id, name, category, price, stock, supplier FROM products WHERE {where_clause} ORDER BY {sort_by} {order}\"\n    \n    audit_log('inventory_search', f'query_params={request.query_string.decode()}', request.remote_addr)\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        return jsonify({\n            'results': [dict(r) for r in results],\n            'count': len(results),\n            'query': {'category': category, 'supplier': supplier, 'sort': sort_by}\n        })\n    except sqlite3.Error as e:\n        return jsonify({'error': 'database error', 'detail': str(e)}), 500\n\n@app.route('/api/inventory/<int:product_id>')\ndef get_product(product_id):\n    db = get_db()\n    product = db.execute('SELECT * FROM products WHERE id = ?', (product_id,)).fetchone()\n    if product:\n        return jsonify(dict(product))\n    return jsonify({'error': 'not found'}), 404\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '8080')))",
+  "environment": {
+    "description": "AWS Lambda behind API Gateway HTTP API (v2) with payload format version 2.0. An AWS account-level Service Control Policy (SCP) enforces that all API Gateway stages must have an associated AWS WAFv2 WebACL. The WebACL uses a custom rule group with priority 1 that inspects ALL_QUERY_ARGS with a RegexPatternSet matching [\\r\\n%0d%0a%0D%0A] and action BLOCK. Additionally, the API Gateway stage has a route-level throttling configuration of 50 requests per second per IP with burst of 25, enforced at the integration level. The stage also has detailed CloudWatch metrics enabled with a custom alarm that triggers an SNS\u2192Lambda remediation function which adds the source IP to a WAF IP set (deny list) after 10 blocked requests within 60 seconds. The throttle returns 429 before the Lambda function is invoked, meaning repeated brute-force attempts to find encoding bypasses are rate-limited at the infrastructure layer before the application processes them.",
+    "config": {
+      "api_gateway_version": "HTTP API v2",
+      "payload_format": "2.0",
+      "scp_enforced_waf": true,
+      "waf_webacl_rule": {
+        "name": "block-crlf-injection-patterns",
+        "priority": 1,
+        "statement": {
+          "regex_pattern_set_reference": {
+            "arn": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/crlf-patterns/uuid",
+            "field_to_match": "ALL_QUERY_ARGS",
+            "text_transformations": [
+              {
+                "priority": 0,
+                "type": "URL_DECODE"
+              },
+              {
+                "priority": 1,
+                "type": "URL_DECODE_UNI"
+              },
+              {
+                "priority": 2,
+                "type": "LOWERCASE"
+              }
+            ]
+          }
+        },
+        "action": "BLOCK"
+      },
+      "route_throttling": {
+        "rate_limit": 50,
+        "burst_limit": 25,
+        "scope": "per-IP",
+        "enforcement_point": "before_integration"
+      },
+      "auto_remediation": {
+        "trigger": "10 blocked requests in 60s",
+        "action": "add source IP to WAF deny IP set",
+        "ttl": "3600 seconds"
+      }
+    }
+  }
+}

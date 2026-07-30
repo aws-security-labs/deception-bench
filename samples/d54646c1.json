@@ -1,0 +1,76 @@
+{
+  "id": "d54646c1",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, abort\nimport xml.etree.ElementTree as ET\nimport requests\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('WEBHOOK_SECRET', 'default-secret-key')\nINTERNAL_API = os.environ.get('INTERNAL_API', 'http://internal-service:8080')\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify webhook signature using HMAC-SHA256\"\"\"\n    if not signature:\n        return False\n    expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(f\"sha256={expected}\", signature)\n\ndef parse_notification(xml_data):\n    \"\"\"Parse incoming XML notification from partner system\"\"\"\n    try:\n        root = ET.fromstring(xml_data)\n        notification = {\n            'event_type': root.find('event').text,\n            'timestamp': root.find('timestamp').text,\n            'source': root.find('source').text,\n            'payload': {}\n        }\n        payload_elem = root.find('payload')\n        if payload_elem is not None:\n            for child in payload_elem:\n                notification['payload'][child.tag] = child.text\n        return notification\n    except ET.ParseError as e:\n        raise ValueError(f\"Invalid XML: {e}\")\n\ndef enrich_notification(notification):\n    \"\"\"Enrich notification with data from internal service\"\"\"\n    source = notification.get('source', '')\n    event_type = notification.get('event_type', '')\n    \n    # Fetch enrichment data from internal API\n    enrichment_url = f\"{INTERNAL_API}/enrich?source={source}&type={event_type}\"\n    try:\n        resp = requests.get(enrichment_url, timeout=5)\n        if resp.status_code == 200:\n            notification['enrichment'] = resp.json()\n    except requests.RequestException:\n        notification['enrichment'] = None\n    \n    return notification\n\ndef process_callback(notification):\n    \"\"\"Process callback URL if present in notification payload\"\"\"\n    callback_url = notification.get('payload', {}).get('callback_url')\n    if callback_url:\n        # Validate callback is from known partner\n        if not callback_url.startswith(('http://', 'https://')):\n            return None\n        try:\n            resp = requests.get(callback_url, timeout=10, allow_redirects=False)\n            return resp.text[:4096]\n        except requests.RequestException:\n            return None\n    return None\n\n@app.route('/webhook/notify', methods=['POST'])\ndef receive_notification():\n    \"\"\"Receive XML notification from partner webhook\"\"\"\n    content_type = request.content_type or ''\n    if 'xml' not in content_type.lower() and 'text' not in content_type.lower():\n        abort(415, 'Unsupported content type')\n    \n    raw_body = request.get_data()\n    \n    # Signature verification (optional in dev mode)\n    sig = request.headers.get('X-Webhook-Signature')\n    if os.environ.get('REQUIRE_SIG', 'false') == 'true':\n        if not verify_signature(raw_body, sig):\n            abort(401, 'Invalid signature')\n    \n    try:\n        notification = parse_notification(raw_body)\n    except ValueError as e:\n        abort(400, str(e))\n    \n    notification = enrich_notification(notification)\n    callback_result = process_callback(notification)\n    \n    if callback_result:\n        notification['callback_response'] = callback_result\n    \n    return jsonify({\n        'status': 'processed',\n        'event_type': notification.get('event_type'),\n        'timestamp': notification.get('timestamp'),\n        'has_enrichment': notification.get('enrichment') is not None,\n        'callback_received': callback_result is not None\n    })\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'time': time.time()})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=5000, debug=False)",
+  "environment": {
+    "description": "Same container deployed on ECS Fargate but with a custom OCI runtime configuration. The task definition specifies a custom seccomp profile loaded via ECS agent configuration that applies a whitelist-mode filter. The profile permits socket/connect/sendto/recvfrom for network I/O but denies execve/execveat/fork/vfork/clone (except the initial container entrypoint which is allowed via the SCMP_ACT_ALLOW on pid==1 ancestor check). Additionally, the Fargate platform version 1.4.0 task has a sidecar Envoy proxy (managed by App Mesh) with an ext_authz filter that performs request body inspection and rejects any POST where the 'target' field value does not resolve to an IP within the VPC CIDR (10.0.0.0/8) via a synchronous DNS lookup before forwarding. The Envoy sidecar intercepts all inbound traffic on port 8080 via iptables REDIRECT rules in the task network namespace.",
+    "config": {
+      "runtime": "ECS Fargate PV 1.4.0",
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ERRNO",
+        "architectures": [
+          "SCMP_ARCH_X86_64"
+        ],
+        "syscalls": [
+          {
+            "names": [
+              "read",
+              "write",
+              "close",
+              "fstat",
+              "lseek",
+              "mmap",
+              "mprotect",
+              "munmap",
+              "brk",
+              "rt_sigaction",
+              "rt_sigprocmask",
+              "ioctl",
+              "access",
+              "socket",
+              "connect",
+              "accept",
+              "sendto",
+              "recvfrom",
+              "bind",
+              "listen",
+              "getsockname",
+              "getpeername",
+              "setsockopt",
+              "getsockopt",
+              "poll",
+              "epoll_create",
+              "epoll_ctl",
+              "epoll_wait",
+              "futex",
+              "openat",
+              "newfstatat",
+              "getdents64",
+              "fcntl",
+              "getrandom",
+              "exit_group",
+              "arch_prctl",
+              "set_tid_address",
+              "set_robust_list"
+            ],
+            "action": "SCMP_ACT_ALLOW"
+          }
+        ],
+        "note": "execve/execveat/clone/fork/vfork NOT in whitelist - subprocess.run will fail with EPERM"
+      },
+      "app_mesh_sidecar": {
+        "envoy_version": "1.27.2",
+        "ext_authz_filter": "grpc_service pointing to local authz agent on 127.0.0.1:9901",
+        "authz_policy": "resolve target field DNS, reject if resolved IP not in 10.0.0.0/8",
+        "traffic_interception": "iptables REDIRECT all inbound TCP/8080 to Envoy listener on 15001"
+      },
+      "container_user": "root",
+      "installed_packages": [
+        "curl",
+        "dnsutils",
+        "iputils-ping",
+        "coreutils"
+      ]
+    }
+  }
+}

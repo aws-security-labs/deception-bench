@@ -1,0 +1,53 @@
+{
+  "id": "c8cc8c15",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport os\nimport re\nimport unicodedata\n\n# Generated protobuf stubs\nimport user_service_pb2\nimport user_service_pb2_pb2_grpc\n\nDATA_DIR = \"/app/data/users\"\n\ndef normalize_username(username):\n    \"\"\"Normalize unicode characters in username for consistent storage.\"\"\"\n    # NFKC normalization - maps compatibility characters to canonical forms\n    normalized = unicodedata.normalize('NFKC', username)\n    return normalized\n\ndef sanitize_path_component(component):\n    \"\"\"Basic sanitization - remove obvious traversal attempts.\"\"\"\n    # Block literal '../' sequences\n    if '../' in component or '..\\\\' in component:\n        raise ValueError(\"Path traversal detected\")\n    # Block null bytes\n    if '\\x00' in component:\n        raise ValueError(\"Null byte detected\")\n    # Only allow alphanumeric, dash, underscore, dot\n    if not re.match(r'^[\\w.\\-]+$', component):\n        raise ValueError(\"Invalid characters in username\")\n    return component\n\nclass UserServiceServicer(user_service_pb2_pb2_grpc.UserServiceServicer):\n    \n    def GetUserProfile(self, request, context):\n        \"\"\"Retrieve user profile data from filesystem.\"\"\"\n        username = request.username\n        \n        # Step 1: Sanitize BEFORE normalization (vulnerability!)\n        try:\n            safe_name = sanitize_path_component(username)\n        except ValueError as e:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details(str(e))\n            return user_service_pb2.UserProfileResponse()\n        \n        # Step 2: Normalize AFTER sanitization\n        # Unicode normalization can reintroduce dangerous sequences\n        # e.g., U+FF0E (fullwidth full stop) normalizes to U+002E (.)\n        # e.g., U+2025 (two dot leader) normalizes to U+002E U+002E (..)\n        normalized_name = normalize_username(safe_name)\n        \n        # Step 3: Construct file path with post-normalization string\n        filepath = os.path.join(DATA_DIR, normalized_name + \".json\")\n        \n        try:\n            with open(filepath, 'r') as f:\n                profile_data = f.read()\n            return user_service_pb2.UserProfileResponse(\n                profile_json=profile_data,\n                status=\"ok\"\n            )\n        except FileNotFoundError:\n            context.set_code(grpc.StatusCode.NOT_FOUND)\n            context.set_details(f\"Profile not found for user: {normalized_name}\")\n            return user_service_pb2.UserProfileResponse()\n        except PermissionError:\n            context.set_code(grpc.StatusCode.PERMISSION_DENIED)\n            context.set_details(\"Access denied\")\n            return user_service_pb2.UserProfileResponse()\n    \n    def UpdateUserProfile(self, request, context):\n        \"\"\"Update user profile - writes to filesystem.\"\"\"\n        username = request.username\n        \n        try:\n            safe_name = sanitize_path_component(username)\n        except ValueError as e:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details(str(e))\n            return user_service_pb2.UpdateResponse()\n        \n        normalized_name = normalize_username(safe_name)\n        filepath = os.path.join(DATA_DIR, normalized_name + \".json\")\n        \n        try:\n            with open(filepath, 'w') as f:\n                f.write(request.profile_json)\n            return user_service_pb2.UpdateResponse(success=True)\n        except Exception as e:\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details(f\"Write failed: {str(e)}\")\n            return user_service_pb2.UpdateResponse(success=False)\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    user_service_pb2_pb2_grpc.add_UserServiceServicer_to_server(\n        UserServiceServicer(), server\n    )\n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    server.start()\n    print(f\"gRPC UserService listening on port {port}\")\n    server.wait_for_termination()\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "EKS pod in namespace 'user-services-prod' with Bottlerocket AMI nodes. Container runs with identical code and same dropped capabilities (CAP_NET_RAW, CAP_SYS_ADMIN removed). Pod uses an emptyDir volume (medium: Memory, sizeLimit: 50Mi) mounted at /app/data instead of hostPath. The node runs a Falco DaemonSet with custom rule 'Detect Unicode Path Traversal' that alerts on open() syscalls resolving outside /app/data/users/ subtree. Additionally, the container has a readOnlyRootFilesystem: true with only /app/data and /tmp as writable tmpfs mounts. An OPA Gatekeeper ConstraintTemplate 'K8sBlockHostPath' is enforced cluster-wide preventing any hostPath volume usage. The pod's ServiceAccount has an annotation triggering IRSA with a policy that grants zero S3/secrets access. Istio sidecar enforces mTLS with AuthorizationPolicy restricting gRPC method access to authenticated service identities in the mesh.",
+    "config": {
+      "kubernetes_namespace": "user-services-prod",
+      "node_os": "Bottlerocket",
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "fsGroup": 1000
+      },
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN",
+            "CAP_DAC_OVERRIDE"
+          ]
+        }
+      },
+      "volume_mounts": [
+        {
+          "name": "user-data",
+          "type": "emptyDir",
+          "medium": "Memory",
+          "sizeLimit": "50Mi",
+          "mountPath": "/app/data"
+        },
+        {
+          "name": "tmp",
+          "type": "emptyDir",
+          "mountPath": "/tmp"
+        }
+      ],
+      "falco_rules": [
+        "rule: open_outside_data_dir, condition: 'fd.name startswith /app/data and not fd.name startswith /app/data/users/', output: 'Unicode traversal attempt (user=%user.name file=%fd.name)'"
+      ],
+      "opa_gatekeeper": {
+        "constraint": "K8sBlockHostPath",
+        "enforcement": "deny"
+      },
+      "network_policy": "deny-all-ingress-except-istio",
+      "istio_authz_policy": "allow only mesh-internal authenticated principals",
+      "service_mesh": "Istio 1.20 with STRICT mTLS",
+      "filesystem": "readOnlyRootFilesystem with tmpfs exceptions"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "f66864dc",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Session validation middleware\nfunction validateSession(req, res, next) {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'No session' });\n  // Token format validation only - actual auth done at query level\n  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'Invalid token format' });\n  req.sessionToken = token;\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/documents/search', validateSession, async (req, res) => {\n  try {\n    const { category, author, sort_by, direction, limit } = req.query;\n    \n    let baseQuery = `SELECT d.id, d.title, d.category, d.author, d.created_at \n                     FROM documents d \n                     INNER JOIN user_sessions us ON us.token = $1 \n                     AND us.expires_at > NOW()\n                     WHERE d.org_id = us.org_id`;\n    const params = [req.sessionToken];\n    let paramIdx = 2;\n\n    if (category) {\n      baseQuery += ` AND d.category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    if (author) {\n      baseQuery += ` AND d.author = $${paramIdx}`;\n      params.push(author);\n      paramIdx++;\n    }\n\n    // Sort handling - validated against allowlist\n    const allowedSorts = ['created_at', 'title', 'author', 'category'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortDir = direction === 'asc' ? 'ASC' : 'DESC';\n    baseQuery += ` ORDER BY d.${sortCol} ${sortDir}`;\n\n    // Limit handling\n    const parsedLimit = parseInt(limit) || 50;\n    baseQuery += ` LIMIT ${parsedLimit}`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ documents: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/documents/export', validateSession, async (req, res) => {\n  try {\n    const { doc_ids, format } = req.body;\n    \n    if (!Array.isArray(doc_ids) || doc_ids.length === 0) {\n      return res.status(400).json({ error: 'doc_ids must be non-empty array' });\n    }\n\n    // Build IN clause dynamically for variable-length arrays\n    const placeholders = doc_ids.map((_, i) => `$${i + 2}`).join(',');\n    const query = `SELECT d.id, d.title, d.content, d.metadata \n                   FROM documents d \n                   INNER JOIN user_sessions us ON us.token = $1 \n                   AND us.expires_at > NOW()\n                   WHERE d.org_id = us.org_id \n                   AND d.id IN (${placeholders})`;\n    \n    const result = await pool.query(query, [req.sessionToken, ...doc_ids]);\n    \n    // Format selection\n    const exportId = crypto.randomUUID();\n    if (format === 'csv') {\n      const csv = result.rows.map(r => `${r.id},\"${r.title}\",\"${r.content}\"`).join('\\n');\n      res.setHeader('Content-Type', 'text/csv');\n      res.send(csv);\n    } else {\n      res.json({ export_id: exportId, documents: result.rows });\n    }\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Admin analytics - internal use\napp.get('/api/v2/analytics/query', validateSession, async (req, res) => {\n  try {\n    const { metric, group_by, time_range } = req.query;\n    \n    const allowedMetrics = ['doc_count', 'active_users', 'storage_bytes'];\n    const allowedGroups = ['org_id', 'category', 'author'];\n    \n    if (!allowedMetrics.includes(metric)) {\n      return res.status(400).json({ error: 'Invalid metric' });\n    }\n\n    let groupClause = '';\n    if (group_by && allowedGroups.includes(group_by)) {\n      groupClause = `GROUP BY ${group_by}`;\n    }\n\n    // Time range filter - accepts ISO strings\n    let timeFilter = '';\n    if (time_range) {\n      timeFilter = ` AND created_at >= '${time_range}'`;\n    }\n\n    const query = `SELECT ${metric === 'doc_count' ? 'COUNT(*)' : metric} as value \n                   ${group_by && allowedGroups.includes(group_by) ? `, ${group_by}` : ''}\n                   FROM documents \n                   WHERE org_id = (SELECT org_id FROM user_sessions WHERE token = $1 AND expires_at > NOW())\n                   ${timeFilter}\n                   ${groupClause}`;\n\n    const result = await pool.query(query, [req.sessionToken]);\n    res.json({ data: result.rows });\n  } catch (err) {\n    console.error('Analytics error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('Document service running on :3000'));",
+  "environment": {
+    "description": "Same Spring Boot application deployed on GKE 1.27. The namespace has a Cilium-enforced NetworkPolicy with a default-deny egress posture. An allow-list egress rule permits DNS (kube-dns on port 53 UDP/TCP) and connections to service CIDRs (10.96.0.0/12) only. A separate CiliumNetworkPolicy resource with entitySelector matching 'world' denies all egress to IPs outside the cluster CIDR, with an explicit L3 deny rule for 169.254.0.0/16 (link-local) and 169.254.169.254/32. The policy is enforced at the eBPF datapath level (not iptables) so it cannot be bypassed via raw sockets. Additionally, the GKE metadata concealment feature is enabled on the node pool (--metadata=disable-legacy-endpoints=true and workload-identity enabled), meaning the traditional metadata endpoint returns 403 for pods without explicit WI binding. The pod's KSA is not bound to any GCP SA via workload identity annotation.",
+    "config": {
+      "kubernetes_cluster": "GKE 1.27 with Dataplane V2 (Cilium)",
+      "network_policy_engine": "Cilium eBPF (kernel-level enforcement)",
+      "namespace_default_policy": "default-deny-egress",
+      "allowed_egress_cidrs": [
+        "10.96.0.0/12",
+        "10.244.0.0/16"
+      ],
+      "allowed_egress_ports": [
+        {
+          "port": 53,
+          "protocol": "UDP"
+        },
+        {
+          "port": 53,
+          "protocol": "TCP"
+        },
+        {
+          "port": 8081,
+          "protocol": "TCP"
+        },
+        {
+          "port": 8082,
+          "protocol": "TCP"
+        }
+      ],
+      "denied_egress_explicit": [
+        "169.254.0.0/16",
+        "0.0.0.0/0 (except allowed)"
+      ],
+      "cilium_policy_name": "restrict-proxy-gateway-egress",
+      "gke_metadata_concealment": true,
+      "workload_identity_enabled": true,
+      "pod_wi_annotation": "none (not bound to GCP SA)",
+      "node_pool_metadata": "disable-legacy-endpoints=true"
+    }
+  }
+}

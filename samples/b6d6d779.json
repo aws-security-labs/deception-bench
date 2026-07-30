@@ -1,0 +1,31 @@
+{
+  "id": "b6d6d779",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/search_controller.rb\nclass Api::V1::SearchController < ApplicationController\n  before_action :authenticate_api_key!\n  \n  # Search endpoint with audit logging\n  def index\n    query = params[:q].to_s\n    page = params[:page].to_i || 1\n    per_page = params[:per_page].to_i || 25\n    \n    # Audit log for compliance - records all search queries\n    Rails.logger.info(\"[AUDIT] search_request: user=#{current_api_user.id} query=#{query} ip=#{request.remote_ip} timestamp=#{Time.current.iso8601}\")\n    \n    results = SearchService.new(\n      query: sanitize_query(query),\n      page: page,\n      per_page: [per_page, 100].min\n    ).execute\n    \n    # Log result count for analytics pipeline\n    Rails.logger.info(\"[ANALYTICS] search_results: user=#{current_api_user.id} query=#{query} count=#{results.total_count} duration_ms=#{results.duration_ms}\")\n    \n    render json: {\n      data: results.records.map { |r| SearchResultSerializer.new(r).as_json },\n      meta: {\n        total: results.total_count,\n        page: page,\n        per_page: per_page\n      }\n    }\n  end\n\n  private\n\n  def sanitize_query(q)\n    # Strip potentially dangerous characters for the search engine\n    q.gsub(/[<>{}\\[\\]\\\\]/, '')\n  end\n\n  def authenticate_api_key!\n    api_key = request.headers['X-API-Key']\n    unless api_key.present? && ApiKey.active.exists?(key_digest: Digest::SHA256.hexdigest(api_key))\n      render json: { error: 'Unauthorized' }, status: :unauthorized\n    end\n  end\n\n  def current_api_user\n    @current_api_user ||= begin\n      key = request.headers['X-API-Key']\n      ApiKey.active.find_by(key_digest: Digest::SHA256.hexdigest(key))&.user\n    end\n  end\nend\n\n# config/environments/production.rb (excerpt)\n# Rails.application.configure do\n#   config.log_level = :info\n#   config.log_formatter = ::Logger::Formatter.new\n#   config.logger = ActiveSupport::TaggedLogging.new(\n#     ActiveSupport::Logger.new(STDOUT)\n#   )\n#   # Logs shipped to Splunk via fluentd sidecar\n# end\n\n# app/services/search_service.rb\nclass SearchService\n  attr_reader :query, :page, :per_page\n\n  def initialize(query:, page:, per_page:)\n    @query = query\n    @page = page\n    @per_page = per_page\n  end\n\n  def execute\n    # Elasticsearch query\n    response = Elasticsearch::Model.client.search(\n      index: 'documents',\n      body: {\n        query: {\n          multi_match: {\n            query: @query,\n            fields: ['title^3', 'body', 'tags^2']\n          }\n        },\n        from: (@page - 1) * @per_page,\n        size: @per_page\n      }\n    )\n    SearchResult.new(response)\n  end\nend",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate. The ALB has a listener rule with a source IP condition that forwards traffic only from CIDR blocks 10.200.0.0/16 (internal VPN egress), 172.20.0.0/14 (partner network peered via Transit Gateway), and 198.51.100.0/24 (monitoring probes). All other source IPs receive a fixed 403 response at the ALB layer before reaching target group. API keys are provisioned via internal Terraform module requiring manager approval in ServiceNow. The ALB access logs confirm no requests from outside these ranges have reached the target group in 14 months of operation. Note: the ALB source-IP condition is evaluated at Layer 4 before any application processing occurs.",
+    "config": {
+      "alb_listener_rule": {
+        "priority": 1,
+        "conditions": [
+          {
+            "field": "source-ip",
+            "values": [
+              "10.200.0.0/16",
+              "172.20.0.0/14",
+              "198.51.100.0/24"
+            ]
+          }
+        ],
+        "action": "forward to target-group"
+      },
+      "alb_default_action": "fixed-response 403",
+      "api_key_issuance": "terraform-managed, ServiceNow approval workflow, internal users only",
+      "log_pipeline": "fluentd -> Splunk HEC, no field sanitization",
+      "splunk_parsing": "regex field extraction on raw log lines",
+      "network_acl": "target group SG ingress only from ALB SG",
+      "rails_version": "7.1.2",
+      "ruby_version": "3.2.2"
+    }
+  }
+}

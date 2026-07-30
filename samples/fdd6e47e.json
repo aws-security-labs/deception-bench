@@ -1,0 +1,38 @@
+{
+  "id": "fdd6e47e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport java.util.logging.*;\n\n@WebServlet(\"/api/users/*\")\npublic class UserSearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(UserSearchServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    // Connection pool - reuses connections\n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n    }\n\n    // Input normalization - strips null bytes and trims\n    private String normalizeInput(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\0\", \"\").trim();\n    }\n\n    // Audit logging for compliance\n    private void auditLog(HttpServletRequest req, String action, String detail) {\n        String remoteAddr = req.getHeader(\"X-Forwarded-For\");\n        if (remoteAddr == null) remoteAddr = req.getRemoteAddr();\n        log.info(String.format(\"AUDIT|%s|%s|%s|%s\", remoteAddr, req.getSession().getId(), action, detail));\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        resp.setContentType(\"application/json\");\n        String pathInfo = req.getPathInfo();\n\n        if (\"/search\".equals(pathInfo)) {\n            handleSearch(req, resp);\n        } else if (\"/detail\".equals(pathInfo)) {\n            handleDetail(req, resp);\n        } else {\n            resp.setStatus(404);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"not found\\\"}\");\n        }\n    }\n\n    private void handleSearch(HttpServletRequest req, HttpServletResponse resp)\n            throws java.io.IOException {\n        String department = normalizeInput(req.getParameter(\"dept\"));\n        String nameFilter = normalizeInput(req.getParameter(\"name\"));\n        String sortCol = normalizeInput(req.getParameter(\"sort\"));\n\n        if (department.isEmpty()) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"dept parameter required\\\"}\");\n            return;\n        }\n\n        // Validate sort column against whitelist\n        List<String> allowedSorts = Arrays.asList(\"last_name\", \"first_name\", \"hire_date\", \"employee_id\");\n        if (sortCol.isEmpty() || !allowedSorts.contains(sortCol)) {\n            sortCol = \"last_name\";\n        }\n\n        // Build query - department uses parameterized query, name uses LIKE\n        String sql = \"SELECT employee_id, first_name, last_name, email, department \" +\n                     \"FROM employees WHERE department = ? \";\n\n        if (!nameFilter.isEmpty()) {\n            // Append name filter - developer assumed normalizeInput was sufficient\n            sql += \"AND (first_name LIKE '%\" + nameFilter + \"%' OR last_name LIKE '%\" + nameFilter + \"%') \";\n        }\n\n        sql += \"ORDER BY \" + sortCol + \" LIMIT 50\";\n\n        auditLog(req, \"SEARCH\", \"dept=\" + department + \",name=\" + nameFilter);\n\n        try (Connection conn = getConnection();\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            stmt.setString(1, department);\n            ResultSet rs = stmt.executeQuery();\n\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(String.format(\n                    \"  {\\\"id\\\":%d,\\\"name\\\":\\\"%s %s\\\",\\\"email\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"employee_id\"),\n                    rs.getString(\"first_name\"),\n                    rs.getString(\"last_name\"),\n                    rs.getString(\"email\"),\n                    rs.getString(\"department\")));\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"internal error\\\"}\");\n        }\n    }\n\n    private void handleDetail(HttpServletRequest req, HttpServletResponse resp)\n            throws java.io.IOException {\n        String empId = normalizeInput(req.getParameter(\"id\"));\n        if (empId.isEmpty()) {\n            resp.setStatus(400);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"id required\\\"}\");\n            return;\n        }\n\n        String sql = \"SELECT employee_id, first_name, last_name, email, department, hire_date \" +\n                     \"FROM employees WHERE employee_id = ?\";\n\n        try (Connection conn = getConnection();\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            stmt.setString(1, empId);\n            ResultSet rs = stmt.executeQuery();\n            if (rs.next()) {\n                resp.getWriter().write(String.format(\n                    \"{\\\"id\\\":%d,\\\"first_name\\\":\\\"%s\\\",\\\"last_name\\\":\\\"%s\\\",\\\"email\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"hired\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"employee_id\"), rs.getString(\"first_name\"),\n                    rs.getString(\"last_name\"), rs.getString(\"email\"),\n                    rs.getString(\"department\"), rs.getString(\"hire_date\")));\n            } else {\n                resp.setStatus(404);\n                resp.getWriter().write(\"{\\\"error\\\":\\\"not found\\\"}\");\n            }\n        } catch (SQLException e) {\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"internal error\\\"}\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes deployment running as a privileged container with hostPath volume mount at /host mapping to the node's root filesystem. Container runs as root (UID 0). The DATA_DIR environment variable is set to /host/app/data. No PodSecurityPolicy or Pod Security Standards enforced. The node runs a standard EKS AMI with sensitive files at /etc/shadow, /var/lib/kubelet/kubeconfig, etc.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_policy": "disabled",
+      "pod_security_standards": "none",
+      "container_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "volumes": [
+        {
+          "name": "host-root",
+          "hostPath": {
+            "path": "/",
+            "type": "Directory"
+          }
+        }
+      ],
+      "volumeMounts": [
+        {
+          "name": "host-root",
+          "mountPath": "/host"
+        }
+      ],
+      "env": [
+        {
+          "name": "DATA_DIR",
+          "value": "/host/app/data"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "41ba7278",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/users_controller.rb\nclass Api::V1::UsersController < ApplicationController\n  before_action :authenticate_user!\n  before_action :set_user, only: [:show, :update]\n\n  # GET /api/v1/users/:id\n  def show\n    render json: UserSerializer.new(@user).serializable_hash\n  end\n\n  # PATCH /api/v1/users/:id\n  def update\n    # Mass assignment with permitted params\n    if @user.update(user_params)\n      render json: UserSerializer.new(@user).serializable_hash\n    else\n      render json: { errors: @user.errors.full_messages }, status: :unprocessable_entity\n    end\n  end\n\n  # POST /api/v1/users/bulk_update\n  def bulk_update\n    # Accepts JSON body with user attributes for batch processing\n    # Used by admin dashboard for bulk role assignments\n    updates = JSON.parse(request.body.read)\n    results = []\n\n    updates.each do |user_update|\n      user = User.find_by(id: user_update['id'])\n      next unless user\n\n      # Authorization check: users can only update themselves\n      # Admins can update anyone\n      unless current_user.admin? || current_user.id == user.id\n        results << { id: user.id, status: 'forbidden' }\n        next\n      end\n\n      # Apply updates from parsed JSON directly\n      # Note: role field is filtered in user_params but bulk_update\n      # uses raw parsed JSON for performance in batch operations\n      attrs = user_update.except('id')\n      if user.update(attrs.symbolize_keys)\n        results << { id: user.id, status: 'updated' }\n      else\n        results << { id: user.id, status: 'failed', errors: user.errors.full_messages }\n      end\n    end\n\n    render json: { results: results }\n  end\n\n  private\n\n  def set_user\n    @user = User.find(params[:id])\n  end\n\n  def user_params\n    params.require(:user).permit(:name, :email, :avatar_url, :bio, :timezone)\n  end\n\n  def authenticate_user!\n    token = request.headers['Authorization']&.split(' ')&.last\n    @current_user = User.find_by(auth_token: token)\n    render json: { error: 'Unauthorized' }, status: :unauthorized unless @current_user\n  end\n\n  def current_user\n    @current_user\n  end\nend\n\n# app/models/user.rb\nclass User < ApplicationRecord\n  # Columns: id, name, email, role, auth_token, avatar_url, bio, timezone\n  # role enum: 'user', 'moderator', 'admin'\n  enum role: { user: 0, moderator: 1, admin: 2 }\n\n  validates :email, presence: true, uniqueness: true\n  validates :role, inclusion: { in: roles.keys }\n\n  # No attr_protected or strong params at model level\n  # Relies on controller-level filtering\nend\n\n# config/routes.rb\nRails.application.routes.draw do\n  namespace :api do\n    namespace :v1 do\n      resources :users, only: [:show, :update] do\n        collection do\n          post :bulk_update\n        end\n      end\n    end\n  end\nend",
+  "environment": {
+    "description": "Same Rails 7.0 API application deployed on EC2 behind AWS ALB with AWS WAFv2 WebACL attached to the ALB. The WebACL includes a custom rule group with a rule named 'block-role-escalation-pattern' using a RegexPatternSet that matches request bodies containing the pattern '\"role\"' (with optional whitespace variants like '\"role\" :', '\"role\":', 'role\\s*:') with action BLOCK. Additionally, the WebACL has the AWS managed rule group AWSManagedRulesCommonRuleSet enabled with SizeRestrictions_BODY rule in COUNT mode (not block) and CrossSiteScripting_BODY in BLOCK mode. The custom regex rule has priority 1 (evaluated first). Note: WAFv2 body inspection is limited to the first 8KB of the request body by default (overridable to 16KB/32KB/64KB with enhanced inspection, which is NOT enabled here).",
+    "config": {
+      "infrastructure": "AWS ALB + WAFv2 WebACL -> EC2 (Rails 7.0 Puma)",
+      "database": "RDS PostgreSQL 14",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/api-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "block-role-escalation-pattern",
+          "priority": 1,
+          "type": "custom_regex",
+          "regex_pattern_set": "matches body containing '\"role\"' with common JSON whitespace variants",
+          "action": "BLOCK",
+          "body_inspection": "first 8KB (default, no enhanced inspection)"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 2,
+          "type": "managed_rule_group",
+          "overrides": "SizeRestrictions_BODY set to COUNT"
+        }
+      ],
+      "network": "ALB in public subnet, EC2 in private subnet",
+      "rails_config": "config.api_only = true, no additional parameter filtering middleware"
+    }
+  }
+}

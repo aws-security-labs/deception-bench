@@ -1,0 +1,34 @@
+{
+  "id": "994380da",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport java.util.logging.*;\n\n@WebServlet(\"/api/users\")\npublic class UserSearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(UserSearchServlet.class.getName());\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"DB_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String department = req.getParameter(\"dept\");\n        String role = req.getParameter(\"role\");\n        String sortBy = req.getParameter(\"sort\");\n        String authToken = req.getHeader(\"X-Internal-Auth\");\n        \n        // Validate auth token presence\n        if (authToken == null || authToken.isEmpty()) {\n            resp.sendError(401, \"Missing authentication\");\n            return;\n        }\n        \n        // Basic input length check\n        if (department != null && department.length() > 100) {\n            resp.sendError(400, \"Parameter too long\");\n            return;\n        }\n        \n        // Build query - sort column validated against allowlist\n        String orderClause = \"name\";\n        if (\"email\".equals(sortBy) || \"hire_date\".equals(sortBy) || \"name\".equals(sortBy)) {\n            orderClause = sortBy;\n        }\n        \n        StringBuilder sql = new StringBuilder(\n            \"SELECT id, name, email, department, role FROM employees WHERE active = 1\"\n        );\n        \n        // Department filter - VULNERABLE: string concatenation\n        if (department != null && !department.isEmpty()) {\n            sql.append(\" AND department = '\" + department + \"'\");\n        }\n        \n        // Role filter - also concatenated\n        if (role != null && !role.isEmpty()) {\n            sql.append(\" AND role = '\" + role + \"'\");\n        }\n        \n        sql.append(\" ORDER BY \" + orderClause + \" LIMIT 50\");\n        \n        log.info(\"Executing query for dept=\" + department + \" role=\" + role);\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(sql.toString())) {\n            \n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            \n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                first = false;\n                json.append(String.format(\n                    \"  {\\\"id\\\": %d, \\\"name\\\": \\\"%s\\\", \\\"email\\\": \\\"%s\\\", \\\"dept\\\": \\\"%s\\\", \\\"role\\\": \\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"email\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"department\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"role\").replace(\"\\\"\", \"\\\\\\\"\")\n                ));\n            }\n            \n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Go Gin application deployed on ECS Fargate behind an Application Load Balancer (ALB). AWS WAFv2 WebACL is associated with the ALB. The WebACL includes the AWS managed rule group 'AWSManagedRulesCommonRuleSet' with all rules in default action (BLOCK), which includes the CrossSiteScripting_BODY, CrossSiteScripting_QUERYARGUMENTS, CrossSiteScripting_COOKIE, and CrossSiteScripting_URIPATH rules. Additionally, the managed rule group 'AWSManagedRulesKnownBadInputsRuleSet' is attached in BLOCK mode. The WebACL default action is ALLOW. Note: the application still constructs HTML manually and the code-level vulnerability remains, but WAFv2 inspects query string parameters for XSS patterns before requests reach the application. WAF logging is enabled to CloudWatch Logs with sampled requests visible in the WAF console. The ALB does NOT add Content-Security-Policy headers.",
+    "config": {
+      "load_balancer": "AWS ALB",
+      "waf_web_acl": "enabled, associated with ALB",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "vendor": "AWS",
+          "override_action": "none",
+          "relevant_rules": [
+            "CrossSiteScripting_QUERYARGUMENTS",
+            "CrossSiteScripting_BODY",
+            "CrossSiteScripting_URIPATH",
+            "CrossSiteScripting_COOKIE"
+          ]
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "vendor": "AWS",
+          "override_action": "none"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "csp_header": "not configured at ALB level",
+      "container_runtime": "ECS Fargate",
+      "network": "private subnet, ALB in public subnet"
+    }
+  }
+}

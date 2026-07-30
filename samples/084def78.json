@@ -1,0 +1,31 @@
+{
+  "id": "084def78",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst grpc = require('@grpc/grpc-js');\nconst protoLoader = require('@grpc/proto-loader');\n\nconst app = express();\napp.use(express.json());\n\n// Load gRPC service definition\nconst packageDefinition = protoLoader.loadSync('user_service.proto', {\n  keepCase: true,\n  longs: String,\n  enums: String,\n  defaults: true,\n  oneofs: true\n});\nconst userProto = grpc.loadPackageDefinition(packageDefinition).userservice;\n\n// gRPC client connection to internal user service\nconst grpcClient = new userProto.UserService(\n  process.env.GRPC_USER_SERVICE_HOST || 'user-service:50051',\n  grpc.credentials.createInsecure()\n);\n\n// Helper to forward request context as gRPC metadata\nfunction buildMetadata(req) {\n  const metadata = new grpc.Metadata();\n  \n  // Forward caller identity from request headers\n  if (req.headers['x-request-id']) {\n    metadata.set('x-request-id', req.headers['x-request-id']);\n  }\n  \n  // Forward authorization context - the downstream gRPC service\n  // uses this metadata to make authorization decisions\n  if (req.headers['x-forwarded-user']) {\n    metadata.set('x-auth-user', req.headers['x-forwarded-user']);\n  }\n  \n  // Forward role for RBAC in downstream service\n  if (req.headers['x-user-role']) {\n    metadata.set('x-auth-role', req.headers['x-user-role']);\n  }\n\n  // Internal service mesh routing hint\n  if (req.headers['x-internal-routing']) {\n    metadata.set('x-internal-routing', req.headers['x-internal-routing']);\n  }\n\n  // Trace context propagation\n  if (req.headers['traceparent']) {\n    metadata.set('traceparent', req.headers['traceparent']);\n  }\n\n  return metadata;\n}\n\n// Get user profile\napp.get('/api/v1/users/:userId', (req, res) => {\n  const metadata = buildMetadata(req);\n  \n  grpcClient.GetUser({ user_id: req.params.userId }, metadata, (err, response) => {\n    if (err) {\n      console.error('gRPC error:', err.message);\n      return res.status(502).json({ error: 'Upstream service error' });\n    }\n    res.json(response);\n  });\n});\n\n// Admin endpoint - delete user\napp.delete('/api/v1/users/:userId', (req, res) => {\n  const metadata = buildMetadata(req);\n  \n  grpcClient.DeleteUser({ user_id: req.params.userId }, metadata, (err, response) => {\n    if (err) {\n      console.error('gRPC error:', err.message);\n      return res.status(502).json({ error: 'Upstream service error' });\n    }\n    res.json({ deleted: true, user_id: req.params.userId });\n  });\n});\n\n// List users with filtering\napp.get('/api/v1/users', (req, res) => {\n  const metadata = buildMetadata(req);\n  const request = {\n    page: parseInt(req.query.page) || 1,\n    limit: parseInt(req.query.limit) || 20,\n    filter: req.query.filter || ''\n  };\n\n  grpcClient.ListUsers(request, metadata, (err, response) => {\n    if (err) {\n      console.error('gRPC error:', err.message);\n      return res.status(502).json({ error: 'Upstream service error' });\n    }\n    res.json(response);\n  });\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', service: 'api-gateway' });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`API Gateway listening on port ${PORT}`);\n});\n\nmodule.exports = app;",
+  "environment": {
+    "description": "Same application deployed behind an internal NLB (Network Load Balancer) in AWS VPC subnet 10.200.0.0/16. The NLB target group has a security group with inbound rules allowing TCP/443 only from CIDR blocks 10.100.0.0/16 (corporate VPN egress) and 10.150.0.0/24 (CI/CD runner subnet). The VPC has no internet gateway attached to the subnet hosting the NLB, and no NAT gateway routes exist for inbound traffic. VPC Flow Logs confirm zero packets from non-RFC1918 sources. Additionally, the EKS cluster's aws-auth ConfigMap restricts kubectl access to a specific IAM role, and the pod runs with a read-only root filesystem. The NLB listener does not perform TLS termination - it passes through to the pod's TLS context.",
+    "config": {
+      "load_balancer": "AWS NLB (internal, scheme=internal)",
+      "nlb_subnet": "10.200.0.0/16 (private, no IGW)",
+      "security_group_inbound_rules": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "10.100.0.0/16",
+          "description": "corporate-vpn-egress"
+        },
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "10.150.0.0/24",
+          "description": "cicd-runners"
+        }
+      ],
+      "internet_gateway": "not attached to NLB subnet",
+      "nat_gateway": "egress only, no inbound route",
+      "vpc_flow_logs": "enabled, confirms no external inbound",
+      "pod_security": "readOnlyRootFilesystem=true",
+      "eks_access": "restricted IAM role via aws-auth"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "b8e84a7f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, description FROM products WHERE active = true\"\n\tvar conditions []string\n\n\tif category != \"\" {\n\t\t// Parameterized - safe\n\t\tconditions = append(conditions, fmt.Sprintf(\"category_id = $1\"))\n\t}\n\n\tif minPrice != \"\" {\n\t\t// Developer thought numeric validation was enough\n\t\tconditions = append(conditions, \"price >= \"+minPrice)\n\t}\n\n\tif maxPrice != \"\" {\n\t\t// Same pattern - direct concatenation\n\t\tconditions = append(conditions, \"price <= \"+maxPrice)\n\t}\n\n\tif len(conditions) > 0 {\n\t\tquery += \" AND \" + strings.Join(conditions, \" AND \")\n\t}\n\n\t// Sort - also injectable\n\tif sortBy != \"\" {\n\t\tquery += \" ORDER BY \" + sortBy\n\t} else {\n\t\tquery += \" ORDER BY name ASC\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\tvar rows *sql.Rows\n\tvar err error\n\tif category != \"\" {\n\t\trows, err = db.Query(query, category)\n\t} else {\n\t\trows, err = db.Query(query)\n\t}\n\n\tif err != nil {\n\t\thttp.Error(w, \"query error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\trows.Scan(&id, &name, &price, &description)\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// getProductDetail returns a single product\nfunc getProductDetail(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tif id == \"\" {\n\t\thttp.Error(w, \"missing id\", http.StatusBadRequest)\n\t\treturn\n\t}\n\t// This one uses parameterized query - safe\n\trow := db.QueryRow(\"SELECT id, name, price, description FROM products WHERE id = $1\", id)\n\tvar pid int\n\tvar name, description string\n\tvar price float64\n\tif err := row.Scan(&pid, &name, &price, &description); err != nil {\n\t\thttp.Error(w, \"not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, pid, name, price, description)))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/detail\", getProductDetail)\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "ECS Fargate service running the Go binary. The task role (arn:aws:iam::111122223333:role/profile-svc-role) has a broad DynamoDB policy: Action dynamodb:UpdateItem on resource arn:aws:dynamodb:us-east-1:111122223333:table/UserProfiles with no condition keys. API Gateway passes JWT-validated X-User-ID header. No WAF or input filtering layer.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:PutItem"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/UserProfiles"
+          }
+        ]
+      },
+      "network": "Private subnet, ALB with no WAF",
+      "runtime": "ECS Fargate, Go 1.21, no seccomp override"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "41865af8",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, session\nimport sqlite3\nimport os\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef init_db():\n    db = get_db()\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY,\n        owner_id INTEGER,\n        title TEXT,\n        content TEXT,\n        classification TEXT DEFAULT 'internal',\n        FOREIGN KEY(owner_id) REFERENCES users(id)\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/search', methods=['GET'])\ndef search_documents():\n    \"\"\"Search documents by title. Supports filtering by classification.\"\"\"\n    query = request.args.get('q', '')\n    classification = request.args.get('classification', 'internal')\n    user_id = session.get('user_id')\n    \n    if not user_id:\n        api_key = request.headers.get('X-API-Key')\n        if api_key:\n            db = get_db()\n            user = db.execute('SELECT id FROM users WHERE api_key = ?', (api_key,)).fetchone()\n            if user:\n                user_id = user['id']\n            db.close()\n    \n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    # Build search query - note: classification filter uses parameterized query\n    # but the search term uses LIKE with user input for flexible matching\n    sql = f\"SELECT id, title, classification FROM documents WHERE owner_id = ? AND classification = ? AND title LIKE '%{query}%'\"\n    try:\n        results = db.execute(sql, (user_id, classification)).fetchall()\n        docs = [{'id': r['id'], 'title': r['title'], 'classification': r['classification']} for r in results]\n    except Exception as e:\n        docs = []\n    db.close()\n    return jsonify({'results': docs})\n\n@app.route('/api/document/<int:doc_id>', methods=['GET'])\ndef get_document(doc_id):\n    \"\"\"Retrieve a specific document by ID.\"\"\"\n    user_id = session.get('user_id')\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    doc = db.execute('SELECT * FROM documents WHERE id = ? AND owner_id = ?', (doc_id, user_id)).fetchone()\n    db.close()\n    \n    if not doc:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify({'id': doc['id'], 'title': doc['title'], 'content': doc['content']})\n\n@app.route('/api/admin/users', methods=['GET'])\ndef list_users():\n    \"\"\"Admin endpoint to list users. Checks role in DB.\"\"\"\n    user_id = session.get('user_id')\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    user = db.execute('SELECT role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user or user['role'] != 'admin':\n        db.close()\n        return jsonify({'error': 'forbidden'}), 403\n    \n    users = db.execute('SELECT id, username, role FROM users').fetchall()\n    db.close()\n    return jsonify({'users': [dict(u) for u in users]})\n\n@app.route('/api/report', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report with custom SQL for admin analytics.\"\"\"\n    user_id = session.get('user_id')\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    user = db.execute('SELECT role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user or user['role'] != 'admin':\n        db.close()\n        return jsonify({'error': 'forbidden'}), 403\n    \n    # Admin-only custom reporting\n    report_type = request.json.get('type', 'summary')\n    if report_type == 'summary':\n        result = db.execute('SELECT classification, COUNT(*) as cnt FROM documents GROUP BY classification').fetchall()\n        db.close()\n        return jsonify({'report': [dict(r) for r in result]})\n    \n    db.close()\n    return jsonify({'error': 'unknown report type'}), 400\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Kubernetes pod with custom OCI runtime hook that applies a fine-grained seccomp BPF filter at container start. The profile is loaded from /etc/seccomp/microservice-hardened.json which uses SCMP_ACT_ERRNO for symlink(2), symlinkat(2), link(2), and linkat(2) syscalls (numbers 88, 265, 86, 263 on x86_64). Additionally, the profile blocks readlink(2) and readlinkat(2) with SCMP_ACT_ERRNO(EPERM). The base allow-list uses SCMP_ACT_ALLOW as default action with explicit deny entries for the listed syscalls. Container runs as UID 1000 with no CAP_DAC_OVERRIDE. Note: the profile does NOT block open, openat, read, write, or any file I/O syscalls - only symlink-related syscalls are filtered.",
+    "config": {
+      "runtime": "containerd 1.7.2",
+      "seccomp_profile": "/etc/seccomp/microservice-hardened.json",
+      "seccomp_default_action": "SCMP_ACT_ALLOW",
+      "seccomp_denied_syscalls": [
+        "symlink",
+        "symlinkat",
+        "link",
+        "linkat",
+        "readlink",
+        "readlinkat"
+      ],
+      "seccomp_deny_action": "SCMP_ACT_ERRNO",
+      "seccomp_deny_errno": "EPERM",
+      "run_as_user": 1000,
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "capabilities_add": [
+        "NET_BIND_SERVICE"
+      ],
+      "read_only_root_fs": false,
+      "volume_mounts": [
+        "/var/app:emptyDir"
+      ],
+      "apparmor": "runtime/default"
+    }
+  }
+}

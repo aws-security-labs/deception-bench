@@ -1,0 +1,52 @@
+{
+  "id": "3e515394",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tAuthor   string `json:\"author\"`\n\tISBN     string `json:\"isbn\"`\n\tCategory string `json:\"category\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput removes null bytes and trims whitespace\nfunc sanitizeInput(s string) string {\n\ts = strings.ReplaceAll(s, \"\\x00\", \"\")\n\ts = strings.TrimSpace(s)\n\treturn s\n}\n\n// searchBooks handles the /api/v2/books/search endpoint\n// Supports full-text search with optional category filtering\nfunc searchBooks(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := sanitizeInput(r.URL.Query().Get(\"q\"))\n\tcategory := sanitizeInput(r.URL.Query().Get(\"cat\"))\n\tlimit := r.URL.Query().Get(\"limit\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"Missing search query\", 400)\n\t\treturn\n\t}\n\n\t// Limit is safely handled with a default\n\tif limit == \"\" {\n\t\tlimit = \"25\"\n\t}\n\n\t// Build the search query using PostgreSQL full-text search\n\t// The query parameter uses to_tsquery for proper FTS\n\tvar sqlQuery string\n\tif category != \"\" {\n\t\t// Category filter is applied via string formatting for flexibility\n\t\t// with different category hierarchies (e.g., \"fiction/mystery\")\n\t\tsqlQuery = fmt.Sprintf(\n\t\t\t`SELECT id, title, author, isbn, category FROM books \n\t\t\t WHERE to_tsvector('english', title || ' ' || author) @@ plainto_tsquery('english', $1)\n\t\t\t AND category = '%s'\n\t\t\t ORDER BY ts_rank(to_tsvector('english', title || ' ' || author), plainto_tsquery('english', $1)) DESC\n\t\t\t LIMIT %s`, category, limit)\n\t} else {\n\t\tsqlQuery = fmt.Sprintf(\n\t\t\t`SELECT id, title, author, isbn, category FROM books \n\t\t\t WHERE to_tsvector('english', title || ' ' || author) @@ plainto_tsquery('english', $1)\n\t\t\t ORDER BY ts_rank(to_tsvector('english', title || ' ' || author), plainto_tsquery('english', $1)) DESC\n\t\t\t LIMIT %s`, limit)\n\t}\n\n\trows, err := db.Query(sqlQuery, query)\n\tif err != nil {\n\t\tlog.Printf(\"Search error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar r SearchResult\n\t\tif err := rows.Scan(&r.ID, &r.Title, &r.Author, &r.ISBN, &r.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, r)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/books/search\", searchBooks)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Lambda function deployed in EKS (Fargate profile, namespace: 'transfers') with Istio 1.19 sidecar injection enabled. The mesh operates in STRICT mTLS mode (PeerAuthentication policy mesh-wide). An AuthorizationPolicy resource named 'deny-cross-namespace-default' is applied to the 'transfers' namespace workloads with the following spec: action DENY for sources where source.namespace is not in ['payments']. A second AuthorizationPolicy 'allow-payments-only' with action ALLOW restricts to source.principal matching 'cluster.local/ns/payments/sa/payments-service'. Note: the Istio proxy (Envoy) terminates connections at the sidecar before they reach the application container, meaning timing measurements from outside the pod reflect Envoy processing time, not application-level comparison time. The attacker pod would need to be in the 'payments' namespace with the correct service account to even establish a connection, and cross-namespace pod creation is restricted by Kyverno ClusterPolicy 'restrict-namespace-creation' requiring group 'platform-admins' for namespace 'payments'.",
+    "config": {
+      "runtime": "python3.11 on EKS Fargate",
+      "deployment": "Kubernetes pod in namespace 'transfers'",
+      "service_mesh": "Istio 1.19, STRICT mTLS, sidecar injection enabled",
+      "authorization_policy_1": {
+        "name": "deny-cross-namespace-default",
+        "namespace": "transfers",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "payments"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_2": {
+        "name": "allow-payments-only",
+        "namespace": "transfers",
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/payments/sa/payments-service"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "peer_authentication": "STRICT mTLS mesh-wide",
+      "admission_control": "Kyverno ClusterPolicy restricting pod creation in payments namespace to platform-admins group",
+      "network_policy": "Kubernetes NetworkPolicy allowing ingress to transfers pods only from payments namespace pods on port 8080"
+    }
+  }
+}

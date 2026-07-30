@@ -1,0 +1,36 @@
+{
+  "id": "342a9b8d",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/var/lib/app/users.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        department TEXT,\n        active INTEGER DEFAULT 1\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        target_user TEXT,\n        performed_by TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department and role filters.\n    Supports partial matching on department name.\"\"\"\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    active_only = request.args.get('active', '1')\n    \n    db = get_db()\n    \n    # Build query with filters\n    base_query = \"SELECT id, username, role, department, active FROM users WHERE active = ?\"\n    params = [active_only]\n    \n    if department:\n        # Allow partial department matching for autocomplete feature\n        base_query += \" AND department LIKE '\" + department + \"%'\"\n    \n    if role:\n        base_query += \" AND role = ?\"\n        params.append(role)\n    \n    try:\n        cursor = db.execute(base_query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    cursor = db.execute(\n        \"SELECT id, username, role, department, active FROM users WHERE id = ?\",\n        (user_id,)\n    )\n    user = cursor.fetchone()\n    if user is None:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute(\n            \"INSERT INTO users (username, password_hash, role, department) VALUES (?, ?, ?, ?)\",\n            (data['username'], password_hash, data.get('role', 'user'), data.get('department', ''))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/users/<int:user_id>/deactivate', methods=['POST'])\ndef deactivate_user(user_id):\n    db = get_db()\n    db.execute(\"UPDATE users SET active = 0 WHERE id = ?\", (user_id,))\n    db.commit()\n    db.execute(\n        \"INSERT INTO audit_log (action, target_user, performed_by) VALUES (?, ?, ?)\",\n        ('deactivate', str(user_id), request.headers.get('X-Authenticated-User', 'system'))\n    )\n    db.commit()\n    return jsonify({'status': 'deactivated'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. ALB access logs enabled to S3 but no active monitoring. No WAF WebACL attached to the ALB. Application runs as systemd service under non-root user 'appuser'. SQLite database stored at /var/lib/app/users.db with filesystem permissions 0644.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "ec2": {
+        "instance_type": "t3.medium",
+        "security_group_ingress": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "source": "0.0.0.0/0"
+          }
+        ],
+        "os": "Amazon Linux 2"
+      },
+      "application": {
+        "runtime": "Python 3.9, Flask 2.3.2, gunicorn 21.2.0",
+        "workers": 4,
+        "db_path": "/var/lib/app/users.db"
+      }
+    }
+  }
+}

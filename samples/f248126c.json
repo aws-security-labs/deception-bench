@@ -1,0 +1,62 @@
+{
+  "id": "f248126c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tDescription string  `json:\"description\"`\n\tPrice       float64 `json:\"price\"`\n\tSKU         string  `json:\"sku\"`\n\tInternal    string  `json:\"internal_notes,omitempty\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\tif category == \"\" {\n\t\tcategory = \"all\"\n\t}\n\tif sortBy == \"\" {\n\t\tsortBy = \"name\"\n\t}\n\n\t// Build query with filters\n\tbaseQuery := \"SELECT id, name, description, price, sku FROM products WHERE active = true\"\n\n\tif category != \"all\" {\n\t\t// Category filter - parameterized\n\t\tbaseQuery += fmt.Sprintf(\" AND category_id = (SELECT id FROM categories WHERE slug = '%s')\", category)\n\t}\n\n\tif minPrice != \"\" {\n\t\tbaseQuery += \" AND price >= \" + minPrice\n\t}\n\n\t// Sort validation - only allow known columns\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"created_at\": true}\n\tif !allowedSorts[sortBy] {\n\t\tsortBy = \"name\"\n\t}\n\tbaseQuery += \" ORDER BY \" + sortBy + \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// getProductDetail returns full product info including internal notes for staff\nfunc getProductDetail(w http.ResponseWriter, r *http.Request) {\n\tproductID := strings.TrimPrefix(r.URL.Path, \"/api/products/\")\n\t// This uses parameterized query - safe\n\trow := db.QueryRow(\"SELECT id, name, description, price, sku, internal_notes FROM products WHERE id = $1\", productID)\n\n\tvar p Product\n\tvar internal sql.NullString\n\tif err := row.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.SKU, &internal); err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\t// Check if requester is staff via header (set by upstream auth proxy)\n\tif r.Header.Get(\"X-Staff-Role\") == \"true\" && internal.Valid {\n\t\tp.Internal = internal.String\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\n// healthCheck for LB probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/\", getProductDetail)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate behind an AWS ALB. An Envoy sidecar proxy (v1.28) is deployed as a secondary container in the same task definition, configured with a local rate limit filter (envoy.filters.http.local_ratelimit) set to 3 requests per 10-second window per unique combination of source IP and X-API-Key header value, returning HTTP 429 with no request forwarding to the Rails app when exceeded. The Envoy config also includes a header mutation filter (envoy.filters.http.header_mutation) in the request path that strips any inbound header matching the regex pattern ^x-grpc-metadata-(authorization|x-caller-id|grpc-timeout).*$ before the request reaches the Rails process, applied via a typed_per_filter_config on the route level with disabled=false.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate with Envoy sidecar",
+      "envoy_version": "1.28.1",
+      "local_ratelimit": {
+        "stat_prefix": "api_proxy_rl",
+        "token_bucket": {
+          "max_tokens": 3,
+          "tokens_per_fill": 3,
+          "fill_interval": "10s"
+        },
+        "filter_enabled": {
+          "runtime_key": "local_rate_limit_enabled",
+          "default_value": {
+            "numerator": 100,
+            "denominator": "HUNDRED"
+          }
+        },
+        "filter_enforced": {
+          "runtime_key": "local_rate_limit_enforced",
+          "default_value": {
+            "numerator": 100,
+            "denominator": "HUNDRED"
+          }
+        },
+        "descriptors": [
+          {
+            "entries": [
+              {
+                "key": "x-api-key"
+              },
+              {
+                "key": "remote_address"
+              }
+            ]
+          }
+        ]
+      },
+      "header_mutation_filter": {
+        "mutations": {
+          "request_mutations": [
+            {
+              "remove": "x-grpc-metadata-authorization"
+            },
+            {
+              "remove": "x-grpc-metadata-x-caller-id"
+            },
+            {
+              "remove": "x-grpc-metadata-grpc-timeout"
+            }
+          ]
+        }
+      },
+      "network": "VPC with permissive security groups between services"
+    }
+  }
+}

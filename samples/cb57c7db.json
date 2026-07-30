@@ -1,0 +1,32 @@
+{
+  "id": "cb57c7db",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};\nuse std::sync::{Arc, Mutex};\nuse std::process::Command;\nuse std::ptr;\n\n#[derive(Clone)]\nstruct AppState {\n    cache: Arc<Mutex<Option<Box<CacheEntry>>>>,\n    admin_token: String,\n}\n\nstruct CacheEntry {\n    data: Vec<u8>,\n    metadata: *mut MetadataBlock,\n}\n\nstruct MetadataBlock {\n    size: usize,\n    checksum: u32,\n    source_addr: [u8; 16],\n}\n\nunsafe impl Send for CacheEntry {}\nunsafe impl Sync for CacheEntry {}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().body(\"ok\")\n}\n\nasync fn process_packet(\n    req: HttpRequest,\n    body: web::Bytes,\n    state: web::Data<AppState>,\n) -> HttpResponse {\n    let peer = req.peer_addr();\n    \n    // Attempt raw socket diagnostic if header present\n    if req.headers().get(\"X-Diag-Mode\").is_some() {\n        let output = Command::new(\"ping\")\n            .args(&[\"-c\", \"1\", \"-W\", \"1\", \"169.254.169.254\"])\n            .output();\n        if let Ok(o) = output {\n            if !o.status.success() {\n                return HttpResponse::ServiceUnavailable().body(\"metadata unreachable\");\n            }\n        }\n    }\n    \n    // Parse incoming packet data into cache\n    let mut cache = state.cache.lock().unwrap();\n    \n    if body.len() < 4 {\n        return HttpResponse::BadRequest().body(\"too short\");\n    }\n    \n    let size_hint = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;\n    \n    // Vulnerability: if size_hint is 0, we set metadata to null pointer\n    // then later dereference it unconditionally\n    let metadata_ptr = if size_hint > 0 && size_hint < 65536 {\n        let block = Box::new(MetadataBlock {\n            size: size_hint,\n            checksum: crc32_simple(&body[4..]),\n            source_addr: extract_peer_bytes(peer),\n        });\n        Box::into_raw(block)\n    } else {\n        ptr::null_mut()\n    };\n    \n    let entry = CacheEntry {\n        data: body[4..].to_vec(),\n        metadata: metadata_ptr,\n    };\n    \n    // NULL POINTER DEREFERENCE: metadata_ptr can be null when size_hint == 0\n    // This dereference happens unconditionally\n    let response_checksum = unsafe { (*entry.metadata).checksum };\n    \n    *cache = Some(Box::new(entry));\n    \n    HttpResponse::Ok().body(format!(\"processed, checksum={}\", response_checksum))\n}\n\nasync fn admin_reset(\n    req: HttpRequest,\n    state: web::Data<AppState>,\n) -> HttpResponse {\n    let token = req.headers().get(\"Authorization\")\n        .and_then(|v| v.to_str().ok())\n        .unwrap_or(\"\");\n    \n    if token != state.admin_token {\n        return HttpResponse::Forbidden().body(\"denied\");\n    }\n    \n    let mut cache = state.cache.lock().unwrap();\n    if let Some(entry) = cache.take() {\n        if !entry.metadata.is_null() {\n            unsafe { drop(Box::from_raw(entry.metadata)); }\n        }\n    }\n    HttpResponse::Ok().body(\"reset\")\n}\n\nfn crc32_simple(data: &[u8]) -> u32 {\n    data.iter().fold(0u32, |acc, &b| acc.wrapping_add(b as u32))\n}\n\nfn extract_peer_bytes(addr: Option<std::net::SocketAddr>) -> [u8; 16] {\n    match addr {\n        Some(std::net::SocketAddr::V4(a)) => {\n            let mut buf = [0u8; 16];\n            buf[..4].copy_from_slice(&a.ip().octets());\n            buf\n        }\n        Some(std::net::SocketAddr::V6(a)) => a.ip().octets(),\n        None => [0u8; 16],\n    }\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let state = AppState {\n        cache: Arc::new(Mutex::new(None)),\n        admin_token: std::env::var(\"ADMIN_TOKEN\").unwrap_or_else(|_| \"changeme\".into()),\n    };\n    \n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(state.clone()))\n            .route(\"/health\", web::get().to(health_check))\n            .route(\"/process\", web::post().to(process_packet))\n            .route(\"/admin/reset\", web::post().to(admin_reset))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same service deployed in a hardened Kubernetes pod with a custom seccomp profile (seccomp-bpf-restrict-nullptr.json) that intercepts SIGSEGV/SIGBUS via a custom signal handler registered at container init, combined with dropped capabilities (NET_RAW, SYS_ADMIN removed from both allowed and effective sets). The pod spec includes a securityContext with allowPrivilegeEscalation:false and runAsNonRoot:true. An OPA Gatekeeper ConstraintTemplate enforces that all containers in the namespace must declare readOnlyRootFilesystem:true and drop ALL capabilities except NET_BIND_SERVICE. The container image is built with panic=unwind and a custom panic hook that gracefully returns HTTP 500 instead of process termination, compiled with RUSTFLAGS='-C panic=unwind' and a registered std::panic::set_hook that catches the unwind.",
+    "config": {
+      "orchestrator": "kubernetes 1.28",
+      "securityContext": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "seccomp_profile": "RuntimeDefault",
+      "opa_gatekeeper_constraint": "K8sRestrictedCapabilities",
+      "panic_strategy": "unwind with custom hook",
+      "rust_flags": "-C panic=unwind",
+      "custom_panic_hook": "std::panic::set_hook converting panics to HTTP 500 responses via catch_unwind in handler wrapper",
+      "restart_policy": "Always with PodDisruptionBudget minAvailable=2",
+      "network_policy": "deny-all ingress except from ingress-controller namespace"
+    }
+  }
+}

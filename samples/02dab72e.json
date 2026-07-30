@@ -1,0 +1,34 @@
+{
+  "id": "02dab72e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tCategory string `json:\"category\"`\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, category FROM products WHERE 1=1\"\n\n\tif category != \"\" {\n\t\t// Parameterized - safe\n\t\tquery += \" AND category = $1\"\n\t}\n\n\tif minPrice != \"\" {\n\t\t// Parameterized - safe\n\t\tquery += \" AND price >= $2\"\n\t}\n\n\t// Sort handling - VULNERABLE: sortBy injected directly\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"id\": true}\n\tif sortBy != \"\" {\n\t\tif allowedSorts[strings.ToLower(sortBy)] {\n\t\t\tquery += \" ORDER BY \" + sortBy\n\t\t} else {\n\t\t\t// Developer intended to reject unknown sorts but instead\n\t\t\t// falls through with user input for \"complex\" sort expressions\n\t\t\tif strings.Contains(sortBy, \",\") {\n\t\t\t\t// Multi-column sort: user passes \"name,price\" -> allows injection\n\t\t\t\tquery += \" ORDER BY \" + sortBy\n\t\t\t}\n\t\t}\n\t} else {\n\t\tquery += \" ORDER BY id\"\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tswitch {\n\tcase category != \"\" && minPrice != \"\":\n\t\trows, err = db.Query(query, category, minPrice)\n\tcase category != \"\":\n\t\trows, err = db.Query(query, category)\n\tcase minPrice != \"\":\n\t\trows, err = db.Query(query, minPrice)\n\tdefault:\n\t\trows, err = db.Query(query)\n\t}\n\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// healthCheck endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tfmt.Fprintf(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

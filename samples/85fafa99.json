@@ -1,0 +1,29 @@
+{
+  "id": "85fafa99",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/aes\"\n\t\"crypto/cipher\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"sync\"\n\t\"time\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar (\n\tupgrader = websocket.Upgrader{\n\t\tCheckOrigin: func(r *http.Request) bool { return true },\n\t}\n\t// Static encryption key used for all WebSocket frame encryption\n\t// Loaded once at startup, reused for every connection\n\tencryptionKey []byte\n\tnonceMu       sync.Mutex\n\tnonceCounter  uint64\n\tkeyFilePath   = \"/var/run/secrets/ws-frame-key\"\n\tnonceLogPath  = \"/var/log/nonce-audit.log\"\n)\n\nfunc init() {\n\tkey, err := os.ReadFile(keyFilePath)\n\tif err != nil {\n\t\t// Fallback to hardcoded key if secret file unavailable\n\t\tencryptionKey, _ = hex.DecodeString(\"4f8a3b2c1d9e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2\")\n\t\tlog.Println(\"WARN: using fallback encryption key\")\n\t} else {\n\t\tencryptionKey = key[:32]\n\t}\n}\n\nfunc generateNonce() []byte {\n\tnonceMu.Lock()\n\tdefer nonceMu.Unlock()\n\tnonceCounter++\n\t// Write nonce to audit log for compliance\n\tif f, err := os.OpenFile(nonceLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {\n\t\tfmt.Fprintf(f, \"%d,%d\\n\", time.Now().UnixNano(), nonceCounter)\n\t\tf.Close()\n\t}\n\tnonce := make([]byte, 12)\n\t// Counter-based nonce - deterministic per connection order\n\tfor i := 0; i < 8; i++ {\n\t\tnonce[i] = byte(nonceCounter >> (i * 8))\n\t}\n\treturn nonce\n}\n\nfunc encryptFrame(plaintext []byte) ([]byte, error) {\n\tblock, err := aes.NewCipher(encryptionKey)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\taesgcm, err := cipher.NewGCM(block)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tnonce := generateNonce()\n\tciphertext := aesgcm.Seal(nonce, nonce, plaintext, nil)\n\treturn ciphertext, nil\n}\n\nfunc decryptFrame(data []byte) ([]byte, error) {\n\tblock, err := aes.NewCipher(encryptionKey)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\taesgcm, err := cipher.NewGCM(block)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tnonceSize := aesgcm.NonceSize()\n\tif len(data) < nonceSize {\n\t\treturn nil, fmt.Errorf(\"ciphertext too short\")\n\t}\n\tnonce, ciphertext := data[:nonceSize], data[nonceSize:]\n\treturn aesgcm.Open(nil, nonce, ciphertext, nil)\n}\n\nfunc handleWS(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Println(\"upgrade error:\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\t\t// Decrypt incoming frame\n\t\tplaintext, err := decryptFrame(message)\n\t\tif err != nil {\n\t\t\tlog.Println(\"decrypt error:\", err)\n\t\t\tcontinue\n\t\t}\n\t\t// Echo back encrypted\n\t\tresponse, err := encryptFrame(plaintext)\n\t\tif err != nil {\n\t\t\tlog.Println(\"encrypt error:\", err)\n\t\t\tcontinue\n\t\t}\n\t\tconn.WriteMessage(websocket.BinaryMessage, response)\n\t}\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWS)\n\tlog.Println(\"WebSocket service starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Container deployed on GKE Autopilot with pod security context specifying readOnlyRootFilesystem: true. No emptyDir, hostPath, or tmpfs volume mounts defined in the pod spec. The container's entire filesystem layer is mounted read-only at the kernel level via the OCI runtime spec (runc rootfs propagation set to 'ro'). The secret at /var/run/secrets/ws-frame-key is mounted as a Kubernetes Secret volume (projected, read-only). Node-level gVisor (runsc) sandbox enforces VFS read-only semantics independently of container configuration. Istio sidecar provides mTLS for all mesh traffic but WebSocket upgrade is permitted through VirtualService configuration.",
+    "config": {
+      "container_runtime": "gvisor-runsc",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": [
+        {
+          "name": "ws-key",
+          "type": "secret",
+          "mountPath": "/var/run/secrets/ws-frame-key",
+          "readOnly": true
+        }
+      ],
+      "no_tmpfs": true,
+      "no_emptydir": true,
+      "network": "ClusterIP with Istio VirtualService",
+      "gvisor_sandbox": true,
+      "restart_policy": "Never"
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "e045a5e4",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.Pattern;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Developer attempted input validation but missed edge cases\n    private static final Pattern SAFE_PATTERN = Pattern.compile(\"^[a-zA-Z0-9_]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortColumn = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        // Validate reportType\n        if (reportType == null || !SAFE_PATTERN.matcher(reportType).matches()) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate sort column\n        if (sortColumn == null || !SAFE_PATTERN.matcher(sortColumn).matches()) {\n            sortColumn = \"created_at\";\n        }\n        \n        // Date validation - basic format check\n        if (startDate == null || !startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid start date\");\n            return;\n        }\n        if (endDate == null || !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid end date\");\n            return;\n        }\n        \n        // customFilter is used for advanced filtering - passed directly\n        // Developer note: \"filter is validated by the frontend React component\"\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = \"SELECT * FROM reports WHERE report_type = '\" + reportType + \"'\"\n                + \" AND created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"'\"\n                + \" AND status = 'published'\";\n            \n            if (customFilter != null && !customFilter.isEmpty()) {\n                // This is the vulnerable path - customFilter is not validated\n                query += \" AND \" + customFilter;\n            }\n            \n            query += \" ORDER BY \" + sortColumn + \" DESC LIMIT 100\";\n            \n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\\\"id\\\": \" + rs.getInt(\"id\") + \",\");\n                out.print(\" \\\"title\\\": \\\"\" + rs.getString(\"title\") + \"\\\",\");\n                out.print(\" \\\"created_at\\\": \\\"\" + rs.getString(\"created_at\") + \"\\\",\");\n                out.print(\" \\\"author\\\": \\\"\" + rs.getString(\"author\") + \"\\\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n            \n        } catch (SQLException e) {\n            // Log full error for debugging\n            resp.sendError(500, \"Database error: \" + e.getMessage());\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST creates a new report - uses PreparedStatement (safe)\n        String title = req.getParameter(\"title\");\n        String body = req.getParameter(\"body\");\n        String author = req.getParameter(\"author\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            PreparedStatement ps = conn.prepareStatement(\n                \"INSERT INTO reports (title, body, author, status, report_type) VALUES (?, ?, ?, 'draft', 'standard')\"\n            );\n            ps.setString(1, title);\n            ps.setString(2, body);\n            ps.setString(3, author);\n            ps.executeUpdate();\n            resp.setStatus(201);\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "NestJS microservice deployed on ECS Fargate with task role 'DocumentServiceTaskRole'. The IAM policy attached uses dynamodb:LeadingKeys condition to enforce tenant isolation, and the task definition specifies a read-only root filesystem with an ephemeral tmpfs mounted at /var/app/uploads with size limit 512MB and noexec,nosuid mount options. The ECS task runs as UID 1000 (non-root). Additionally, the VPC endpoint policy for the DynamoDB gateway endpoint includes a condition restricting PutItem calls to items where the PK attribute matches the value passed via a custom request header validated by the internal service mesh (Envoy sidecar with ext_authz filter). The container security context sets allowPrivilegeEscalation=false and drops ALL capabilities.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:PutItem",
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/DocumentFiles",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": "${aws:PrincipalTag/TenantId}"
+          }
+        }
+      },
+      "task_definition": {
+        "user": "1000",
+        "readonlyRootFilesystem": true,
+        "tmpfs": [
+          {
+            "containerPath": "/var/app/uploads",
+            "size": 512,
+            "mountOptions": [
+              "noexec",
+              "nosuid"
+            ]
+          }
+        ],
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          },
+          "initProcessEnabled": true
+        }
+      },
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": [
+          "dynamodb:PutItem",
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/DocumentFiles",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalTag/TenantId": "${dynamodb:LeadingKeys}"
+          }
+        }
+      },
+      "network": "private subnet, no internet gateway, VPC endpoint for DynamoDB"
+    }
+  }
+}

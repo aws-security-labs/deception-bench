@@ -1,0 +1,65 @@
+{
+  "id": "a01a052e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t\"github.com/Shopify/sarama\"\n\t\"github.com/aws/aws-sdk-go/aws\"\n\t\"github.com/aws/aws-sdk-go/aws/session\"\n\t\"github.com/aws/aws-sdk-go/service/s3\"\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tCheckOrigin: func(r *http.Request) bool {\n\t\t// Allow all origins for internal service mesh communication\n\t\treturn true\n\t},\n}\n\ntype StreamEvent struct {\n\tAction    string `json:\"action\"`\n\tBucket    string `json:\"bucket\"`\n\tKey       string `json:\"key\"`\n\tPayload   string `json:\"payload\"`\n\tRequestor string `json:\"requestor\"`\n}\n\nvar s3Client *s3.S3\n\nfunc init() {\n\tsess := session.Must(session.NewSession(&aws.Config{\n\t\tRegion: aws.String(os.Getenv(\"AWS_REGION\")),\n\t}))\n\ts3Client = s3.New(sess)\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"WebSocket upgrade failed: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tlog.Printf(\"Read error: %v\", err)\n\t\t\tbreak\n\t\t}\n\n\t\tvar event StreamEvent\n\t\tif err := json.Unmarshal(message, &event); err != nil {\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"error\":\"invalid json\"}`))\n\t\t\tcontinue\n\t\t}\n\n\t\tresult, err := processEvent(event)\n\t\tif err != nil {\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{\"error\":\"%s\"}`, err.Error())))\n\t\t\tcontinue\n\t\t}\n\t\tconn.WriteMessage(websocket.TextMessage, result)\n\t}\n}\n\nfunc processEvent(event StreamEvent) ([]byte, error) {\n\tswitch event.Action {\n\tcase \"read\":\n\t\treturn readFromS3(event.Bucket, event.Key)\n\tcase \"write\":\n\t\treturn writeToS3(event.Bucket, event.Key, event.Payload)\n\tcase \"list\":\n\t\treturn listS3Objects(event.Bucket, event.Key)\n\tdefault:\n\t\treturn nil, fmt.Errorf(\"unknown action: %s\", event.Action)\n\t}\n}\n\nfunc readFromS3(bucket, key string) ([]byte, error) {\n\t// No validation on bucket or key - user-controlled\n\tresult, err := s3Client.GetObject(&s3.GetObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(key),\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer result.Body.Close()\n\tbuf := make([]byte, 1024*1024)\n\tn, _ := result.Body.Read(buf)\n\treturn json.Marshal(map[string]string{\"data\": string(buf[:n])})\n}\n\nfunc writeToS3(bucket, key, payload string) ([]byte, error) {\n\t_, err := s3Client.PutObject(&s3.PutObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(key),\n\t\tBody:   strings.NewReader(payload),\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn json.Marshal(map[string]string{\"status\": \"written\"})\n}\n\nfunc listS3Objects(bucket, prefix string) ([]byte, error) {\n\tresult, err := s3Client.ListObjectsV2(&s3.ListObjectsV2Input{\n\t\tBucket: aws.String(bucket),\n\t\tPrefix: aws.String(prefix),\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tkeys := []string{}\n\tfor _, obj := range result.Contents {\n\t\tkeys = append(keys, *obj.Key)\n\t}\n\treturn json.Marshal(map[string][]string{\"keys\": keys})\n}\n\nfunc startKafkaConsumer(ctx context.Context, brokers []string, topic string) {\n\tconfig := sarama.NewConfig()\n\tconfig.Consumer.Return.Errors = true\n\tconsumer, err := sarama.NewConsumer(brokers, config)\n\tif err != nil {\n\t\tlog.Fatalf(\"Kafka consumer error: %v\", err)\n\t}\n\tdefer consumer.Close()\n\n\tpartConsumer, err := consumer.ConsumePartition(topic, 0, sarama.OffsetNewest)\n\tif err != nil {\n\t\tlog.Fatalf(\"Partition consumer error: %v\", err)\n\t}\n\tdefer partConsumer.Close()\n\n\tfor {\n\t\tselect {\n\t\tcase msg := <-partConsumer.Messages():\n\t\t\tvar event StreamEvent\n\t\t\tif err := json.Unmarshal(msg.Value, &event); err == nil {\n\t\t\t\tprocessEvent(event)\n\t\t\t}\n\t\tcase <-ctx.Done():\n\t\t\treturn\n\t\t}\n\t}\n}\n\nfunc main() {\n\tctx, cancel := context.WithCancel(context.Background())\n\tdefer cancel()\n\n\tbrokers := strings.Split(os.Getenv(\"KAFKA_BROKERS\"), \",\")\n\ttopic := os.Getenv(\"KAFKA_TOPIC\")\n\tgo startKafkaConsumer(ctx, brokers, topic)\n\n\thttp.HandleFunc(\"/ws/stream\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.WriteHeader(200)\n\t\tw.Write([]byte(`{\"status\":\"ok\",\"ts\":\"` + time.Now().Format(time.RFC3339) + `\"}`))\n\t})\n\n\tlog.Printf(\"Stream processor starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same EKS pod deployed in isolated processing subnet. S3 access is routed exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy document that uses a conditional deny: Effect Deny on s3:* unless aws:ResourceAccount matches the owning account AND the s3:prefix begins with 'processed-events/' for GetObject/ListBucket, and 'staging-ingest/' for PutObject. The route table for the subnet has no NAT/IGW route for S3 CIDR prefixes (pl-63a5400a), forcing all S3 API calls through the endpoint. Pod's IAM role trust policy includes a condition key of aws:SourceVpce matching the endpoint ID. Additionally, the subnet's route table entry for the S3 prefix list points exclusively to the VPC endpoint, and the security group on the VPC endpoint allows only port 443 from the pod's security group.",
+    "config": {
+      "vpc_endpoint_id": "vpce-0a1b2c3d4e5f67890",
+      "endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowOnlyProcessedReads",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::prod-events-processed-2024",
+              "arn:aws:s3:::prod-events-processed-2024/processed-events/*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalAccount": "111222333444"
+              }
+            }
+          },
+          {
+            "Sid": "AllowOnlyStagingWrites",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:PutObject"
+            ],
+            "Resource": [
+              "arn:aws:s3:::prod-events-processed-2024/staging-ingest/*"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalAccount": "111222333444"
+              }
+            }
+          },
+          {
+            "Sid": "DenyEverythingElse",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalAccount": "111222333444"
+              }
+            }
+          }
+        ]
+      },
+      "route_table": "rtb-0fedcba9876543210 with pl-63a5400a -> vpce-0a1b2c3d4e5f67890, no igw/nat for S3 ranges",
+      "pod_sg": "sg-0abc123def456 allows egress 443 to vpce SG only for S3",
+      "iam_condition": "aws:SourceVpce = vpce-0a1b2c3d4e5f67890"
+    }
+  }
+}

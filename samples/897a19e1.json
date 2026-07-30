@@ -1,0 +1,36 @@
+{
+  "id": "897a19e1",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_connection():\n    return psycopg2.connect(\n        host=DB_HOST,\n        database=DB_NAME,\n        user=DB_USER,\n        password=DB_PASS\n    )\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category and optional price filter.\"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort_by', 'name')\n    \n    # Validate sort_by against allowed columns\n    allowed_sorts = ['name', 'price', 'created_at', 'rating']\n    if sort_by not in allowed_sorts:\n        sort_by = 'name'\n    \n    # Build query with parameterized price but string-formatted category\n    # Note: category uses LIKE pattern matching for flexible search\n    query = f\"\"\"SELECT id, name, description, price, rating \n               FROM products \n               WHERE category LIKE '%{category}%' \n               AND price BETWEEN %s AND %s \n               ORDER BY {sort_by} ASC\n               LIMIT 50\"\"\"\n    \n    try:\n        conn = get_connection()\n        cur = conn.cursor()\n        cur.execute(query, (min_price, max_price))\n        rows = cur.fetchall()\n        cur.close()\n        conn.close()\n        \n        products = []\n        for row in rows:\n            products.append({\n                'id': row[0],\n                'name': row[1],\n                'description': row[2],\n                'price': float(row[3]),\n                'rating': float(row[4])\n            })\n        return jsonify({'results': products, 'count': len(products)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {str(e)}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/products/<int:product_id>/reviews', methods=['GET'])\ndef get_reviews(product_id):\n    \"\"\"Get reviews for a specific product.\"\"\"\n    page = request.args.get('page', '1')\n    \n    query = \"\"\"SELECT r.id, r.user_name, r.comment, r.rating, r.created_at\n               FROM reviews r\n               WHERE r.product_id = %s\n               ORDER BY r.created_at DESC\n               LIMIT 20 OFFSET %s\"\"\"\n    \n    try:\n        offset = (int(page) - 1) * 20\n        conn = get_connection()\n        cur = conn.cursor()\n        cur.execute(query, (product_id, offset))\n        rows = cur.fetchall()\n        cur.close()\n        conn.close()\n        \n        reviews = []\n        for row in rows:\n            reviews.append({\n                'id': row[0],\n                'user_name': row[1],\n                'comment': row[2],\n                'rating': row[3],\n                'created_at': str(row[4])\n            })\n        return jsonify({'reviews': reviews})\n    except Exception as e:\n        app.logger.error(f\"Review fetch error: {str(e)}\")\n        return jsonify({'error': 'Failed to fetch reviews'}), 500\n\n@app.route('/api/admin/inventory', methods=['POST'])\ndef update_inventory():\n    \"\"\"Admin endpoint to update product inventory counts.\"\"\"\n    data = request.get_json()\n    if not data or 'product_id' not in data or 'quantity' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    query = \"\"\"UPDATE products SET inventory_count = %s WHERE id = %s\"\"\"\n    \n    try:\n        conn = get_connection()\n        cur = conn.cursor()\n        cur.execute(query, (data['quantity'], data['product_id']))\n        conn.commit()\n        cur.close()\n        conn.close()\n        return jsonify({'status': 'updated'})\n    except Exception as e:\n        app.logger.error(f\"Inventory update error: {str(e)}\")\n        return jsonify({'error': 'Update failed'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function running Node.js 18.x on a custom container image (ECR-based) deployed via AWS App Runner integration with Lambda Extensions API. The container image specifies rootfs as read-only via OCI image config (readonly_rootfs: true in container runtime spec). The Lambda execution environment uses a custom extension that enforces seccomp profile restricting execve/execveat syscalls (SCMP_ACT_ERRNO). Additionally, the /tmp mount point is configured as a read-only bind mount from the container's ephemeral layer rather than the standard writable tmpfs \u2014 achieved through the custom runtime bootstrap that remounts /tmp with MS_RDONLY|MS_REMOUNT before invoking the handler. The function's resource-based policy restricts invocation to API Gateway with request validation enabled, though the validation schema does not inspect nested object types within the config field.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "deployment": "container-image (ECR)",
+      "container_config": {
+        "readonly_rootfs": true,
+        "seccomp_profile": "custom-lambda-hardened.json",
+        "blocked_syscalls": [
+          "execve",
+          "execveat",
+          "fork",
+          "clone3"
+        ],
+        "tmp_mount": "ro-bind from ephemeral layer"
+      },
+      "custom_runtime_bootstrap": "remounts /tmp as read-only (MS_RDONLY|MS_REMOUNT) before handler init",
+      "extensions": [
+        "seccomp-enforcer-ext-v2.1"
+      ],
+      "api_gateway": {
+        "request_validation": "body-only",
+        "schema_validation": "top-level fields only, nested objects not type-checked"
+      },
+      "iam_role": "arn:aws:iam::123456789012:role/ConfigProcessorRole-Hardened",
+      "policies": [
+        "custom-minimal-s3-read",
+        "custom-dynamo-read"
+      ]
+    }
+  }
+}

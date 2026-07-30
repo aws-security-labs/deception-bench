@@ -1,0 +1,29 @@
+{
+  "id": "a618db48",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tReadBufferSize:  1024,\n\tWriteBufferSize: 1024,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true // Allow all origins for WebSocket upgrade\n\t},\n}\n\nconst uploadDir = \"/var/uploads/realtime\"\nconst maxFileSize = 50 * 1024 * 1024 // 50MB\n\nfunc generateFilename(originalName string) string {\n\tbytes := make([]byte, 16)\n\trand.Read(bytes)\n\text := filepath.Ext(originalName)\n\treturn hex.EncodeToString(bytes) + ext\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"Upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\t// Authentication via token in first message\n\t_, tokenMsg, err := conn.ReadMessage()\n\tif err != nil {\n\t\treturn\n\t}\n\ttoken := string(tokenMsg)\n\tif !validateSessionToken(token) {\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"error\":\"unauthorized\"}`))\n\t\treturn\n\t}\n\n\tfor {\n\t\tmsgType, msg, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\tif msgType == websocket.TextMessage {\n\t\t\t// Handle text commands\n\t\t\thandleCommand(conn, string(msg))\n\t\t} else if msgType == websocket.BinaryMessage {\n\t\t\t// Binary messages are file uploads\n\t\t\t// Protocol: first 256 bytes = filename (null-padded), rest = content\n\t\t\tif len(msg) < 257 {\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"error\":\"invalid upload format\"}`))\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tfilenameRaw := strings.TrimRight(string(msg[:256]), \"\\x00\")\n\t\t\tfileContent := msg[256:]\n\n\t\t\tif len(fileContent) > maxFileSize {\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"error\":\"file too large\"}`))\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\t// Generate safe filename but preserve extension for content-type serving\n\t\t\tsafeFilename := generateFilename(filenameRaw)\n\t\t\tdestPath := filepath.Join(uploadDir, safeFilename)\n\n\t\t\t// No content-type validation - accepts any file type\n\t\t\t// No magic byte verification\n\t\t\terr = ioutil.WriteFile(destPath, fileContent, 0644)\n\t\t\tif err != nil {\n\t\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{\"error\":\"%s\"}`, err.Error())))\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tresponse := fmt.Sprintf(`{\"status\":\"uploaded\",\"filename\":\"%s\",\"size\":%d,\"url\":\"/files/%s\"}`,\n\t\t\t\tsafeFilename, len(fileContent), safeFilename)\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(response))\n\t\t}\n\t}\n}\n\nfunc validateSessionToken(token string) bool {\n\t// Validates against session store - simplified\n\treturn len(token) == 64 && token != \"\"\n}\n\nfunc handleCommand(conn *websocket.Conn, cmd string) {\n\tparts := strings.SplitN(cmd, \" \", 2)\n\tswitch parts[0] {\n\tcase \"LIST\":\n\t\tfiles, _ := ioutil.ReadDir(uploadDir)\n\t\tvar names []string\n\t\tfor _, f := range files {\n\t\t\tnames = append(names, f.Name())\n\t\t}\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{\"files\":[%s]}`, strings.Join(names, \",\"))))\n\tcase \"DELETE\":\n\t\tif len(parts) > 1 {\n\t\t\ttarget := filepath.Base(parts[1])\n\t\t\tos.Remove(filepath.Join(uploadDir, target))\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(`{\"status\":\"deleted\"}`))\n\t\t}\n\t}\n}\n\nfunc main() {\n\tos.MkdirAll(uploadDir, 0755)\n\thttp.HandleFunc(\"/ws\", handleWebSocket)\n\thttp.Handle(\"/files/\", http.StripPrefix(\"/files/\", http.FileServer(http.Dir(uploadDir))))\n\tlog.Println(\"WebSocket file service starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Go WebSocket service deployed on EC2 in a private subnet (no public IP, no IGW route). Traffic arrives through an internal NLB (Network Load Balancer) with a target group health check on /healthz. The NLB listener on port 443 has TLS termination. Upstream connectivity is restricted by the VPC's route table which only has routes to 10.0.0.0/8 and 172.16.0.0/12 prefixes. The NLB itself sits in a private subnet fronted by AWS PrivateLink (VPC Endpoint Service). The endpoint service has an allowlist of specific AWS account IDs (the three internal platform accounts: 111122223333, 444455556666, 777788889999) configured via the endpoint service's allowed-principals list. Additionally, the NLB security group (supported since 2023) restricts inbound to CIDR ranges 10.200.0.0/16 and 172.16.44.0/22 which correspond to the internal corporate VPN egress and the CI/CD runner subnet respectively. DNS for the service endpoint (upload-rt.internal.corp) resolves only within the private hosted zone associated with the VPC. No public DNS record exists. The combination means only traffic originating from known internal CIDR ranges within approved AWS accounts can establish a WebSocket connection to the service.",
+    "config": {
+      "subnet": "private, no IGW route",
+      "public_ip": false,
+      "nlb_security_group_ingress": [
+        "10.200.0.0/16:443",
+        "172.16.44.0/22:443"
+      ],
+      "privatelink_allowed_principals": [
+        "arn:aws:iam::111122223333:root",
+        "arn:aws:iam::444455556666:root",
+        "arn:aws:iam::777788889999:root"
+      ],
+      "tls_termination": "NLB with ACM cert for upload-rt.internal.corp",
+      "dns": "Route53 private hosted zone only, no public record",
+      "vpc_routes": [
+        "10.0.0.0/8 -> local",
+        "172.16.0.0/12 -> local"
+      ],
+      "no_nat_gateway": true,
+      "no_internet_gateway": true
+    }
+  }
+}

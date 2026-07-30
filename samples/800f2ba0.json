@@ -1,0 +1,25 @@
+{
+  "id": "800f2ba0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"regexp\"\n\t\"strings\"\n\t\"text/template\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tCheckOrigin: func(r *http.Request) bool { return true },\n}\n\ntype TemplateContext struct {\n\tUser     string\n\tRole     string\n\tSession  string\n\tData     map[string]interface{}\n}\n\nvar funcMap = template.FuncMap{\n\t\"env\":     os.Getenv,\n\t\"exec\":    execCommand,\n\t\"lookup\":  dnsLookup,\n\t\"sprintf\": fmt.Sprintf,\n}\n\nfunc execCommand(cmd string) string {\n\t// Used for internal health formatting\n\tout, err := execShell(cmd)\n\tif err != nil {\n\t\treturn \"error\"\n\t}\n\treturn string(out)\n}\n\nfunc execShell(cmd string) ([]byte, error) {\n\timport_exec := getExecPackage()\n\treturn import_exec.Command(\"sh\", \"-c\", cmd).Output()\n}\n\nfunc getExecPackage() interface{ Command(string, ...string) *exec.Cmd } {\n\treturn exec.CommandContext\n}\n\nfunc dnsLookup(host string) string {\n\t// Internal service discovery helper\n\taddrs, _ := net.LookupHost(host)\n\treturn strings.Join(addrs, \",\")\n}\n\nvar sanitizePattern = regexp.MustCompile(`[;|&$]`)\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Println(\"Upgrade error:\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tctx := TemplateContext{\n\t\tUser:    r.Header.Get(\"X-Auth-User\"),\n\t\tRole:    r.Header.Get(\"X-Auth-Role\"),\n\t\tSession: r.Header.Get(\"X-Session-ID\"),\n\t\tData:    make(map[string]interface{}),\n\t}\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\ttemplateStr := string(message)\n\n\t\t// Basic input validation - block obvious shell metacharacters in raw input\n\t\tif sanitizePattern.MatchString(templateStr) {\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(\"invalid characters detected\"))\n\t\t\tcontinue\n\t\t}\n\n\t\t// Parse and execute template with user-provided expression\n\t\ttmpl, err := template.New(\"msg\").Funcs(funcMap).Parse(templateStr)\n\t\tif err != nil {\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(\"template parse error\"))\n\t\t\tcontinue\n\t\t}\n\n\t\tvar buf strings.Builder\n\t\terr = tmpl.Execute(&buf, ctx)\n\t\tif err != nil {\n\t\t\tconn.WriteMessage(websocket.TextMessage, []byte(\"template exec error\"))\n\t\t\tcontinue\n\t\t}\n\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(buf.String()))\n\t}\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tlog.Printf(\"WebSocket service starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "ECS Fargate task running in a public subnet with an Internet Gateway route. Task IAM role has ssm:GetParameter and s3:GetObject permissions. Security group allows all outbound traffic (0.0.0.0/0). Service is exposed via an NLB with no request inspection. Container runs as root with NET_RAW capability.",
+    "config": {
+      "subnet_type": "public",
+      "internet_gateway": true,
+      "nat_gateway": true,
+      "security_group_egress": "0.0.0.0/0 all ports",
+      "task_role_permissions": [
+        "ssm:GetParameter",
+        "s3:GetObject",
+        "secretsmanager:GetSecretValue"
+      ],
+      "load_balancer": "NLB (layer 4, no inspection)",
+      "container_user": "root",
+      "capabilities": [
+        "NET_RAW",
+        "SYS_PTRACE"
+      ]
+    }
+  }
+}

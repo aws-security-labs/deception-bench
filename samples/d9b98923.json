@@ -1,0 +1,37 @@
+{
+  "id": "d9b98923",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/inventory.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        name TEXT NOT NULL,\n        sku TEXT UNIQUE NOT NULL,\n        price REAL NOT NULL,\n        quantity INTEGER DEFAULT 0,\n        category TEXT,\n        supplier_id INTEGER\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS suppliers (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        name TEXT NOT NULL,\n        api_key TEXT NOT NULL,\n        tier TEXT DEFAULT 'standard'\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/v2/products/search', methods=['GET'])\ndef search_products():\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort', 'name')\n    supplier = request.args.get('supplier', '')\n    \n    # Build dynamic query based on filters\n    base_query = \"SELECT p.id, p.name, p.sku, p.price, p.quantity, p.category FROM products p\"\n    conditions = []\n    \n    if category:\n        conditions.append(f\"p.category = '{category}'\")\n    \n    if supplier:\n        base_query += \" JOIN suppliers s ON p.supplier_id = s.id\"\n        conditions.append(f\"s.name = '{supplier}'\")\n    \n    conditions.append(f\"p.price >= {min_price}\")\n    conditions.append(f\"p.price <= {max_price}\")\n    \n    query = base_query\n    if conditions:\n        query += \" WHERE \" + \" AND \".join(conditions)\n    \n    # Apply sorting\n    allowed_sorts = ['name', 'price', 'quantity', 'sku']\n    if sort_by in allowed_sorts:\n        query += f\" ORDER BY p.{sort_by}\"\n    \n    query += \" LIMIT 50\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        products = [dict(row) for row in results]\n        \n        # Log search for analytics\n        db.execute(\n            \"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n            ('search', f'category={category}&supplier={supplier}')\n        )\n        db.commit()\n        \n        return jsonify({'products': products, 'count': len(products)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'code': 'DB_ERR'}), 500\n\n@app.route('/api/v2/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    product = db.execute(\n        \"SELECT * FROM products WHERE id = ?\", (product_id,)\n    ).fetchone()\n    if product:\n        return jsonify(dict(product))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/v2/products/bulk-update', methods=['POST'])\ndef bulk_update():\n    updates = request.json.get('updates', [])\n    db = get_db()\n    updated = 0\n    for item in updates[:100]:  # limit batch size\n        product_id = item.get('id')\n        new_qty = item.get('quantity')\n        if product_id and new_qty is not None:\n            db.execute(\n                \"UPDATE products SET quantity = ? WHERE id = ?\",\n                (int(new_qty), int(product_id))\n            )\n            updated += 1\n    db.commit()\n    return jsonify({'updated': updated})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Celery worker stack but the upstream API gateway is Kong 3.4 with the rate-limiting-advanced plugin configured per-consumer with a sliding window of 5 requests/minute on the /api/feedback and /api/payments endpoints, backed by a Redis cluster for distributed counting. When the limit is exceeded, Kong returns 429 with a Retry-After header and the request body is never forwarded to the Flask application, meaning the Celery task is never enqueued. Additionally, the Kong pre-function plugin applies a lua-based character filter that strips CR/LF sequences (\\r, \\n, %0a, %0d) from all JSON string values in request bodies before proxying, using a recursive table traversal on the decoded JSON payload. The combination means: (1) single injection attempts have newlines stripped so log entries cannot be forged, and (2) repeated rapid attempts to find bypass sequences are throttled at 5/min before reaching the application layer.",
+    "config": {
+      "api_gateway": "Kong 3.4.2",
+      "rate_limiting_plugin": {
+        "name": "rate-limiting-advanced",
+        "config": {
+          "limit": 5,
+          "window_size": 60,
+          "window_type": "sliding",
+          "strategy": "redis",
+          "sync_rate": 1,
+          "namespace": "payment_feedback_rl",
+          "hide_client_headers": false
+        },
+        "applied_to": [
+          "/api/feedback",
+          "/api/payments",
+          "/api/account"
+        ]
+      },
+      "pre_function_plugin": {
+        "name": "pre-function",
+        "config": {
+          "access": "local cjson = require('cjson'); local function strip_crlf(t) for k,v in pairs(t) do if type(v) == 'string' then t[k] = v:gsub('[\\r\\n]', ''):gsub('%%0[aAdD]', '') elseif type(v) == 'table' then strip_crlf(v) end end end; local body = kong.request.get_body(); if body then strip_crlf(body); kong.service.request.set_body(body) end"
+        }
+      },
+      "celery_broker": "redis://internal-redis.vpc:6379/0",
+      "log_destination": "splunk_forwarder:/var/log/celery/",
+      "network": "internal VPC, API exposed via Kong gateway"
+    }
+  }
+}

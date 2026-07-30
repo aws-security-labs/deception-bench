@@ -1,0 +1,39 @@
+{
+  "id": "c266e517",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n\n        // Session validation - checks token format only\n        if (sessionToken == null || !sessionToken.matches(\"[A-Za-z0-9]{32,64}\")) {\n            resp.sendError(401, \"Invalid session\");\n            return;\n        }\n\n        // Audit logging for compliance\n        log.info(String.format(\"Report access: id=%s format=%s token=%s remote=%s\",\n            reportId, format, sessionToken.substring(0, 8) + \"...\",\n            req.getRemoteAddr()));\n\n        // Input length check - prevents extremely long payloads\n        if (reportId != null && reportId.length() > 200) {\n            resp.sendError(400, \"Parameter too long\");\n            return;\n        }\n\n        // Character filter - blocks some special chars but not all\n        if (reportId != null && reportId.matches(\".*[<>{}\\\\|].*\")) {\n            resp.sendError(400, \"Invalid characters in report ID\");\n            return;\n        }\n\n        Connection conn = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n\n            // Build query - uses string concatenation for legacy compatibility\n            // NOTE: reportId is validated above for length and special chars\n            String query = \"SELECT report_name, report_data, created_at FROM reports \"\n                         + \"WHERE report_id = '\" + reportId + \"' \"\n                         + \"AND tenant_id = (SELECT tenant_id FROM sessions WHERE token = '\" + sessionToken + \"')\";\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n\n            if (rs.next()) {\n                String name = rs.getString(\"report_name\");\n                String data = rs.getString(\"report_data\");\n                String created = rs.getString(\"created_at\");\n                out.printf(\"{\\\"name\\\":\\\"%s\\\",\\\"data\\\":\\\"%s\\\",\\\"created\\\":\\\"%s\\\"}\",\n                    name, data, created);\n            } else {\n                resp.sendError(404, \"Report not found\");\n            }\n\n            rs.close();\n            stmt.close();\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST creates a new report - also vulnerable but requires write perms\n        String title = req.getParameter(\"title\");\n        String body = req.getParameter(\"body\");\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n\n        if (sessionToken == null || !sessionToken.matches(\"[A-Za-z0-9]{32,64}\")) {\n            resp.sendError(401, \"Invalid session\");\n            return;\n        }\n\n        Connection conn = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            String insert = \"INSERT INTO reports (report_name, report_data, tenant_id) \"\n                          + \"VALUES ('\" + title + \"', '\" + body + \"', \"\n                          + \"(SELECT tenant_id FROM sessions WHERE token = '\" + sessionToken + \"'))\";\n            Statement stmt = conn.createStatement();\n            stmt.executeUpdate(insert);\n            resp.setStatus(201);\n        } catch (SQLException e) {\n            log.severe(\"Insert error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n}",
+  "environment": {
+    "description": "Deployed on EKS 1.29 with Cilium CNI in strict mode. Pod runs in namespace 'prod-exec' with a CiliumNetworkPolicy (apiVersion: cilium.io/v2) that applies L7 HTTP-aware filtering: egress from the pod is denied except to the logging collector on port 9200, and ingress to port 8080 is only permitted from entities with label 'app.kubernetes.io/component=mesh-gateway' (the Istio ingress gateway). The Istio AuthorizationPolicy on the workload requires a valid SPIFFE identity (spiffe://cluster.local/ns/prod-exec/sa/api-gateway) for any request to paths matching '/api/internal/*'. Additionally, the pod's ServiceAccount has an annotation triggering the Hashicorp Vault Agent sidecar which intercepts token issuance and enforces a 'num_uses: 1' lease constraint with a TTL of 45s (shorter than the application's 60s). The Vault policy (path 'transit/sign/exec-svc') requires entity alias matching the pod's projected service account token audience. Token rotation is driven by Vault's own lease revocation (revoke-prefix on the transit backend every 45 seconds), meaning even if a token is captured in-flight, the Vault-side lease is already expired before an attacker can replay it through the gateway path. The CiliumNetworkPolicy also drops any packet with TCP payload containing '/bin/' or 'bash' in the HTTP body via its L7 regex rule (matchPattern: '(?i)(\\\\x2fbin\\\\x2f|bash|sh\\\\s+-c)'), providing defense-in-depth against command injection payloads that bypass authentication.",
+    "config": {
+      "kubernetes_namespace": "prod-exec",
+      "cni": "cilium-1.15-strict",
+      "cilium_l7_policy": {
+        "ingress_from_labels": [
+          "app.kubernetes.io/component=mesh-gateway"
+        ],
+        "http_body_deny_regex": "(?i)(\\x2fbin\\x2f|bash|sh\\s+-c)",
+        "egress_allow": [
+          {
+            "port": 9200,
+            "to": "logging-collector"
+          }
+        ]
+      },
+      "istio_authz_policy": {
+        "source_principal": "spiffe://cluster.local/ns/prod-exec/sa/api-gateway",
+        "paths": [
+          "/api/internal/*"
+        ],
+        "action": "DENY_unless_matched"
+      },
+      "vault_agent_sidecar": {
+        "lease_ttl": "45s",
+        "num_uses": 1,
+        "revoke_prefix_interval": "45s",
+        "required_audience": "vault.prod-exec"
+      },
+      "pod_security_standard": "restricted",
+      "container_user": "nonroot-65534"
+    }
+  }
+}

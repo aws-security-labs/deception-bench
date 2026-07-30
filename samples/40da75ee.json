@@ -1,0 +1,35 @@
+{
+  "id": "40da75ee",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        email TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, email) VALUES ('admin', ?, 'admin', 'admin@corp.internal')\",\n               (hashlib.sha256(b'supersecret').hexdigest(),))\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query with validated field name but user-supplied value\n    query = f\"SELECT id, username, role, email FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, role, email FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/audit', methods=['GET'])\ndef get_audit_log():\n    \"\"\"Retrieve audit log entries. Requires admin role (checked by upstream).\"\"\"\n    limit = request.args.get('limit', '50')\n    # Note: limit is parameterized properly here\n    db = get_db()\n    results = db.execute('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?', (limit,)).fetchall()\n    return jsonify([dict(r) for r in results])\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute('INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',\n                   (data['username'], password_hash, data.get('email', '')))\n        db.commit()\n        # Log the action\n        db.execute('INSERT INTO audit_log (action, details) VALUES (?, ?)',\n                   ('user_created', f\"User {data['username']} created\"))\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', '0') == '1')",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with default action, (2) AWSManagedRulesKnownBadInputsRuleSet with default action, (3) a custom rule with ByteMatchStatement on query string values matching regex patterns for common union/subquery constructs with NONE text transformation applied and BLOCK action. The WebACL default action is ALLOW. CloudWatch metrics confirm all three rule groups are actively evaluating. Additionally, the ALB access logs are shipped to S3 with a 5-minute delivery interval, and a Lambda function triggers on new log delivery to parse and alert on blocked requests via SNS.",
+    "config": {
+      "load_balancer": "AWS ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "statement": "managed_rule_group_statement"
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none",
+          "statement": "managed_rule_group_statement"
+        },
+        {
+          "priority": 3,
+          "name": "custom-sqli-query-param-block",
+          "action": "BLOCK",
+          "statement": "byte_match on QUERY_STRING with regex_pattern_set containing UNION|SELECT|INSERT|UPDATE|DELETE|DROP|EXEC|--|;|0x with URL_DECODE and LOWERCASE transforms"
+        }
+      ],
+      "web_acl_default_action": "ALLOW",
+      "runtime": "ECS Fargate, Python 3.11, gunicorn 21.2.0",
+      "network": "private subnet, ALB in public subnet",
+      "monitoring": "CloudWatch WAF metrics active, ALB access logs to S3, Lambda alerting on blocks"
+    }
+  }
+}

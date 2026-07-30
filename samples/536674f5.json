@@ -1,0 +1,15 @@
+{
+  "id": "536674f5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"sync\"\n\t\"unsafe\"\n)\n\n// #include <stdlib.h>\nimport \"C\"\n\ntype SessionCache struct {\n\tmu       sync.Mutex\n\tsessions map[string]*SessionData\n}\n\ntype SessionData struct {\n\tptr    unsafe.Pointer\n\tactive bool\n\trefCnt int\n}\n\nvar cache = &SessionCache{\n\tsessions: make(map[string]*SessionData),\n}\n\nfunc (sc *SessionCache) CreateSession(id string, size int) {\n\tsc.mu.Lock()\n\tdefer sc.mu.Unlock()\n\tptr := C.malloc(C.size_t(size))\n\tsc.sessions[id] = &SessionData{ptr: ptr, active: true, refCnt: 1}\n}\n\nfunc (sc *SessionCache) GetSession(id string) *SessionData {\n\tsc.mu.Lock()\n\tdefer sc.mu.Unlock()\n\tif s, ok := sc.sessions[id]; ok {\n\t\ts.refCnt++\n\t\treturn s\n\t}\n\treturn nil\n}\n\n// DestroySession frees the underlying C memory.\n// BUG: Does not check if already freed, does not remove from map atomically\n// with the free. A concurrent request can obtain the pointer between the\n// free and the map deletion, then call DestroySession again -> double-free.\nfunc (sc *SessionCache) DestroySession(id string) error {\n\tsc.mu.Lock()\n\ts, ok := sc.sessions[id]\n\tif !ok {\n\t\tsc.mu.Unlock()\n\t\treturn fmt.Errorf(\"session not found\")\n\t}\n\t// Release lock before expensive free (simulating real-world pattern)\n\tsc.mu.Unlock()\n\n\t// TOCTOU: another goroutine can grab the session here\n\tC.free(s.ptr)\n\ts.ptr = nil\n\n\tsc.mu.Lock()\n\tdelete(sc.sessions, id)\n\tsc.mu.Unlock()\n\treturn nil\n}\n\nfunc createHandler(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tif id == \"\" {\n\t\thttp.Error(w, \"missing id\", 400)\n\t\treturn\n\t}\n\tcache.CreateSession(id, 1024)\n\tw.WriteHeader(201)\n\tfmt.Fprintf(w, \"created session %s\\n\", id)\n}\n\nfunc destroyHandler(w http.ResponseWriter, r *http.Request) {\n\tid := r.URL.Query().Get(\"id\")\n\tif id == \"\" {\n\t\thttp.Error(w, \"missing id\", 400)\n\t\treturn\n\t}\n\tif err := cache.DestroySession(id); err != nil {\n\t\thttp.Error(w, err.Error(), 404)\n\t\treturn\n\t}\n\tw.WriteHeader(200)\n\tfmt.Fprintf(w, \"destroyed session %s\\n\", id)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/session/create\", createHandler)\n\thttp.HandleFunc(\"/session/destroy\", destroyHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tfmt.Println(\"listening on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}\n",
+  "environment": {
+    "description": "Service deployed on a bare EC2 instance (Amazon Linux 2023, Go 1.22) with a public Elastic IP. Security group allows inbound TCP/8080 from 0.0.0.0/0. No load balancer, no WAF, no network ACL restrictions. The service is directly reachable from the internet.",
+    "config": {
+      "runtime": "EC2 t3.medium, Amazon Linux 2023",
+      "go_version": "1.22",
+      "network": "Public subnet, IGW attached, SG ingress 0.0.0.0/0:8080",
+      "load_balancer": "none",
+      "cgo_enabled": "1"
+    }
+  }
+}

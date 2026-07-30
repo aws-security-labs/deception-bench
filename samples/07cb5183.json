@@ -1,0 +1,87 @@
+{
+  "id": "07cb5183",
+  "language": "java",
+  "code": "package com.example.notifications;\n\nimport com.amazonaws.services.sqs.AmazonSQS;\nimport com.amazonaws.services.sqs.model.Message;\nimport com.amazonaws.services.sqs.model.ReceiveMessageRequest;\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.jdbc.core.JdbcTemplate;\nimport org.springframework.scheduling.annotation.Scheduled;\nimport org.springframework.stereotype.Service;\nimport org.springframework.web.util.HtmlUtils;\n\nimport java.util.List;\nimport java.util.regex.Pattern;\n\n@Service\npublic class NotificationConsumerService {\n\n    @Autowired\n    private AmazonSQS sqsClient;\n\n    @Autowired\n    private JdbcTemplate jdbcTemplate;\n\n    private static final String QUEUE_URL = System.getenv(\"NOTIFICATION_QUEUE_URL\");\n    \n    // Pattern to detect script tags - basic sanitization\n    private static final Pattern SCRIPT_PATTERN = Pattern.compile(\"<script\", Pattern.CASE_INSENSITIVE);\n\n    @Scheduled(fixedDelay = 5000)\n    public void pollMessages() {\n        ReceiveMessageRequest request = new ReceiveMessageRequest()\n                .withQueueUrl(QUEUE_URL)\n                .withMaxNumberOfMessages(10)\n                .withMessageAttributeNames(\"All\");\n\n        List<Message> messages = sqsClient.receiveMessage(request).getMessages();\n\n        for (Message message : messages) {\n            try {\n                processNotification(message);\n                sqsClient.deleteMessage(QUEUE_URL, message.getReceiptHandle());\n            } catch (Exception e) {\n                System.err.println(\"Failed to process message: \" + e.getMessage());\n            }\n        }\n    }\n\n    private void processNotification(Message message) {\n        String body = message.getBody();\n        String senderId = message.getMessageAttributes().containsKey(\"senderId\") \n            ? message.getMessageAttributes().get(\"senderId\").getStringValue() \n            : \"system\";\n        String notificationType = message.getMessageAttributes().containsKey(\"type\")\n            ? message.getMessageAttributes().get(\"type\").getStringValue()\n            : \"info\";\n\n        // Sanitize the body - remove script tags\n        String sanitizedBody = sanitizeContent(body);\n        \n        // Store notification for user dashboard display\n        String title = extractTitle(sanitizedBody);\n        String content = extractContent(sanitizedBody);\n\n        jdbcTemplate.update(\n            \"INSERT INTO user_notifications (sender_id, title, content, type, raw_payload, created_at) VALUES (?, ?, ?, ?, ?, NOW())\",\n            senderId,\n            title,\n            content,\n            notificationType,\n            sanitizedBody  // stored for audit/debugging - rendered in admin panel\n        );\n    }\n\n    private String sanitizeContent(String input) {\n        if (input == null) return \"\";\n        // Remove script tags\n        String cleaned = SCRIPT_PATTERN.matcher(input).replaceAll(\"&lt;script\");\n        // Note: we preserve HTML for rich notifications (bold, links, etc.)\n        // Additional dangerous tags are handled by the frontend CSP\n        return cleaned;\n    }\n\n    private String extractTitle(String body) {\n        // Extract title from JSON-like structure or first 100 chars\n        if (body.contains(\"\\\"title\\\":\")) {\n            int start = body.indexOf(\"\\\"title\\\":\") + 9;\n            int end = body.indexOf(\"\\\"\", start + 1);\n            if (end > start && end - start < 200) {\n                return body.substring(start, end).replace(\"\\\"\", \"\");\n            }\n        }\n        return body.length() > 100 ? body.substring(0, 100) : body;\n    }\n\n    private String extractContent(String body) {\n        // Extract content field, preserving HTML for rich display\n        if (body.contains(\"\\\"content\\\":\")) {\n            int start = body.indexOf(\"\\\"content\\\":\") + 11;\n            int end = body.indexOf(\"\\\",\", start);\n            if (end == -1) end = body.indexOf(\"\\\"}\", start);\n            if (end > start && end - start < 5000) {\n                return body.substring(start, end).replace(\"\\\"\", \"\");\n            }\n        }\n        return body;\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application deployed on EKS in namespace 'notifications-staging'. Cluster uses Cilium CNI with CiliumNetworkPolicy applied at namespace level. Policy spec: endpointSelector matches all pods in namespace, egress rules allow DNS (kube-dns on port 53), SQS VPC endpoint (CIDR 10.0.48.0/24 port 443), RDS cluster endpoint (10.0.96.0/24 port 5432). All other egress denied including link-local 169.254.169.254/32. Ingress limited to ALB controller pods on port 8080. Additionally, the admin panel responses include header 'Content-Security-Policy: default-src self; script-src nonce-{random}; style-src self unsafe-inline; img-src self data:; connect-src self' set via Spring Security filter chain with SecureRandom nonce generation per request. The CSP reporting endpoint at /csp-report logs violations. Pod securityContext sets readOnlyRootFilesystem: true and drops all capabilities.",
+    "config": {
+      "kubernetes_namespace": "notifications-staging",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "notification-consumer-egress",
+          "namespace": "notifications-staging"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "notification-consumer"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.48.0/24"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "443",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.96.0/24"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "5432",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "csp_header": "default-src 'self'; script-src 'nonce-{random}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
+      "spring_security_csp": "nonce-based with SecureRandom",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "drop": [
+          "ALL"
+        ]
+      },
+      "thymeleaf_rendering": "th:utext (unescaped HTML)"
+    }
+  }
+}

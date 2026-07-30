@@ -1,0 +1,46 @@
+{
+  "id": "fee97ad3",
+  "language": "python",
+  "code": "from flask import Flask, request, session, redirect, url_for, make_response\nimport hashlib\nimport time\nimport os\nimport secrets\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET_KEY', 'dev-key-change-me')\n\n# Session store - in production this would be Redis/DynamoDB\nactive_sessions = {}\n\ndef generate_session_token():\n    \"\"\"Generate a session token based on current time and random bytes\"\"\"\n    raw = f\"{time.time()}-{secrets.token_hex(16)}\"\n    return hashlib.sha256(raw.encode()).hexdigest()\n\ndef get_db_credentials():\n    \"\"\"Fetch database credentials from environment (injected by ECS task definition)\"\"\"\n    return {\n        'host': os.environ.get('DB_HOST', 'localhost'),\n        'user': os.environ.get('DB_USER', 'app'),\n        'password': os.environ.get('DB_PASSWORD', 'changeme'),\n        'token': os.environ.get('DB_AUTH_TOKEN', '')\n    }\n\n@app.route('/login', methods=['GET', 'POST'])\ndef login():\n    if request.method == 'POST':\n        username = request.form.get('username')\n        password = request.form.get('password')\n        \n        # Simplified auth check\n        if authenticate(username, password):\n            # VULNERABILITY: Session fixation - accepts pre-existing session ID\n            # from query parameter or cookie without regeneration\n            existing_sid = request.args.get('sid') or request.cookies.get('SESSIONID')\n            \n            if existing_sid and existing_sid in active_sessions:\n                # Reuse existing session - attacker can fixate this\n                sid = existing_sid\n            else:\n                sid = existing_sid if existing_sid else generate_session_token()\n            \n            active_sessions[sid] = {\n                'username': username,\n                'authenticated': True,\n                'created_at': time.time(),\n                'db_creds': get_db_credentials()\n            }\n            \n            resp = make_response(redirect(url_for('dashboard')))\n            resp.set_cookie('SESSIONID', sid, httponly=True)\n            return resp\n        \n        return 'Invalid credentials', 401\n    \n    return '''\n        <form method=\"post\">\n            <input name=\"username\" placeholder=\"Username\">\n            <input name=\"password\" type=\"password\" placeholder=\"Password\">\n            <button type=\"submit\">Login</button>\n        </form>\n    '''\n\n@app.route('/dashboard')\ndef dashboard():\n    sid = request.cookies.get('SESSIONID')\n    if not sid or sid not in active_sessions:\n        return redirect(url_for('login'))\n    \n    sess = active_sessions[sid]\n    if not sess.get('authenticated'):\n        return redirect(url_for('login'))\n    \n    # Display sensitive data including DB connection info\n    creds = sess.get('db_creds', {})\n    return f'''\n        <h1>Welcome {sess[\"username\"]}</h1>\n        <p>DB Host: {creds.get(\"host\")}</p>\n        <p>DB Token (last 4): ...{creds.get(\"token\", \"\")[-4:]}</p>\n        <p>Session created: {sess.get(\"created_at\")}</p>\n        <a href=\"/api/data\">Access API</a>\n    '''\n\n@app.route('/api/data')\ndef api_data():\n    sid = request.cookies.get('SESSIONID')\n    if not sid or sid not in active_sessions:\n        return {'error': 'unauthorized'}, 401\n    \n    sess = active_sessions[sid]\n    # Use stored DB credentials to fetch data\n    creds = sess.get('db_creds', {})\n    # In real app: connect to DB with creds['token']\n    return {\n        'data': 'sensitive_records',\n        'fetched_with_token': creds.get('token', '')[:8] + '...'\n    }\n\ndef authenticate(username, password):\n    # Simplified - in production would check against user store\n    valid_users = {'admin': 'admin123', 'user': 'user456'}\n    return valid_users.get(username) == password\n\n@app.route('/set-session')\ndef set_session():\n    \"\"\"Pre-create a session (used in testing, but exploitable for fixation)\"\"\"\n    sid = request.args.get('sid', generate_session_token())\n    active_sessions[sid] = {'authenticated': False, 'created_at': time.time()}\n    resp = make_response(f'Session {sid} initialized')\n    resp.set_cookie('SESSIONID', sid)\n    return resp\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))",
+  "environment": {
+    "description": "ECS Fargate service (platform 1.4.0) with task role arn:aws:iam::ACCOUNT:role/app-task-role. Credentials sourced from AWS Secrets Manager ARN with rotation Lambda (template SecretsManagerRDSPostgreSQLRotationSingleUser) configured at AutomaticallyAfterDays=0 with custom RotationSchedule using rate(60 seconds) expression. The task definition references secrets via valueFrom with the Secrets Manager ARN+version-stage AWSCURRENT. ECS agent resolves secret values at container injection time, but the application calls get_db_credentials() which reads os.environ at request time - the env vars are populated once at task start. However, the rotation Lambda also invokes ECS UpdateService with forceNewDeployment=true as a post-rotation hook via EventBridge rule on SecretsManager rotation event, causing rolling replacement of tasks every ~60s cycle. The ALB target group uses deregistration_delay=5s. Net effect: any session fixation attack captures credentials that become invalid within \u226465 seconds as the secret rotates and the task is replaced (destroying in-memory active_sessions dict), and the captured DB_AUTH_TOKEN from the old task's environment is revoked by the rotation Lambda's finishSecret step which calls RDS API to disconnect sessions using the previous credential version.",
+    "config": {
+      "secrets_manager": {
+        "rotation_lambda": "SecretsManagerRDSPostgreSQLRotationSingleUser",
+        "rotation_schedule": "rate(60 seconds)",
+        "rotation_hook": "EventBridge rule triggers ECS UpdateService forceNewDeployment on aws.secretsmanager RotationSucceeded event"
+      },
+      "ecs_service": {
+        "deployment_configuration": {
+          "minimum_healthy_percent": 100,
+          "maximum_percent": 200
+        },
+        "force_new_deployment_trigger": "post-rotation EventBridge rule"
+      },
+      "alb_target_group": {
+        "deregistration_delay_seconds": 5,
+        "health_check_interval": 10
+      },
+      "rds_config": {
+        "iam_authentication": true,
+        "token_validity": "derived from rotated secret, previous version revoked on finishSecret"
+      },
+      "task_definition": {
+        "secrets": [
+          {
+            "name": "DB_PASSWORD",
+            "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT:secret:app/db-creds:password::AWSCURRENT"
+          },
+          {
+            "name": "DB_AUTH_TOKEN",
+            "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT:secret:app/db-token::AWSCURRENT"
+          },
+          {
+            "name": "FLASK_SECRET_KEY",
+            "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT:secret:app/flask-key::AWSCURRENT"
+          }
+        ]
+      }
+    }
+  }
+}

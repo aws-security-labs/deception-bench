@@ -1,0 +1,24 @@
+{
+  "id": "d3ddff6b",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string, send_file\nimport os\nimport subprocess\n\napp = Flask(__name__)\n\n# Legacy monolith search endpoint - serves internal documentation\n@app.route('/search')\ndef search():\n    query = request.args.get('q', '')\n    page = request.args.get('page', '1')\n    \n    # Build search results HTML\n    # NOTE: query is intentionally unescaped for legacy compatibility\n    # with internal tooling that sends HTML-formatted search terms\n    results_html = f\"\"\"\n    <html>\n    <head><title>DocSearch - Results</title></head>\n    <body>\n    <div class=\"header\">\n        <h1>Internal Documentation Search</h1>\n        <form action=\"/search\" method=\"GET\">\n            <input type=\"text\" name=\"q\" value=\"{query}\" size=\"60\">\n            <input type=\"submit\" value=\"Search\">\n        </form>\n    </div>\n    <div class=\"results\">\n        <p>Showing results for: <strong>{query}</strong></p>\n        <p>No documents matched your query.</p>\n    </div>\n    <div class=\"footer\">\n        <a href=\"/search?q={query}&page={int(page)-1}\">Previous</a> | \n        <a href=\"/search?q={query}&page={int(page)+1}\">Next</a>\n    </div>\n    </body>\n    </html>\n    \"\"\"\n    return results_html, 200, {'Content-Type': 'text/html'}\n\n\n@app.route('/doc/<path:filepath>')\ndef serve_doc(filepath):\n    # Serve documentation files from the chroot'd filesystem\n    base_path = '/srv/docs'\n    full_path = os.path.normpath(os.path.join(base_path, filepath))\n    \n    if not full_path.startswith(base_path):\n        return \"Access denied\", 403\n    \n    if os.path.isfile(full_path):\n        return send_file(full_path)\n    return \"Not found\", 404\n\n\n@app.route('/api/index')\ndef reindex():\n    # Trigger re-indexing of documentation\n    doc_root = request.args.get('root', '/srv/docs')\n    # Sanitize to prevent command injection\n    if any(c in doc_root for c in [';', '|', '&', '$', '`']):\n        return \"Invalid path\", 400\n    \n    result = subprocess.run(\n        ['find', doc_root, '-name', '*.md', '-type', 'f'],\n        capture_output=True, text=True, timeout=30\n    )\n    count = len(result.stdout.strip().split('\\n')) if result.stdout.strip() else 0\n    return f\"Indexed {count} documents from {doc_root}\"\n\n\n@app.route('/health')\ndef health():\n    return '{\"status\": \"ok\"}', 200, {'Content-Type': 'application/json'}\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EC2 instance (t3.medium) running Amazon Linux 2 with the Flask application confined using a chroot jail at /opt/docapp/root. The process runs as uid 65534 (nobody) inside the chroot. The chroot filesystem contains only: Python runtime, app code, /srv/docs (static markdown files), and required shared libraries. No /proc, /sys, /dev (except /dev/null and /dev/urandom), no network utilities, no sensitive system files. The instance is in a private subnet (no IGW route) accessible only through an internal ALB. The ALB target group health check validates /health endpoint. Instance has no IAM instance profile attached (empty EC2 role). The chroot was established using unshare(2) with CLONE_NEWNS|CLONE_NEWNET creating a mount+network namespace - the process has a loopback-only network namespace with no external connectivity from within the namespace itself (the host network stack handles inbound forwarding via iptables DNAT). Security group restricts inbound to ALB security group only on TCP/8080.",
+    "config": {
+      "instance_type": "t3.medium",
+      "os": "Amazon Linux 2",
+      "chroot_path": "/opt/docapp/root",
+      "process_uid": 65534,
+      "namespace_flags": "CLONE_NEWNS|CLONE_NEWNET",
+      "network_namespace": "loopback-only (no external egress from process)",
+      "chroot_contents": "python3.9, flask, gunicorn, /srv/docs/*.md, required .so libs",
+      "excluded_from_chroot": "/proc, /sys, /dev (except null+urandom), /etc/passwd, /etc/shadow, /home, /root, /var/log",
+      "subnet": "private (no IGW route)",
+      "load_balancer": "internal ALB",
+      "iam_role": "none (no instance profile)",
+      "security_group": "inbound TCP/8080 from ALB SG only",
+      "waf": "none",
+      "csp_headers": "none"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "d95fbfb5",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: parseInt(process.env.DB_PORT || '5432'),\n  database: process.env.DB_NAME,\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware: basic rate limiting (in-memory, not distributed)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, Math.max(0, (requestCounts.get(ip) || 1) - 1)), 60000);\n  next();\n});\n\n// Search endpoint with filtering\napp.get('/api/products/search', async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy, order } = req.query;\n    \n    let query = 'SELECT id, name, description, price, category FROM products WHERE 1=1';\n    const params = [];\n    let paramIndex = 1;\n\n    if (category) {\n      params.push(category);\n      query += ` AND category = $${paramIndex++}`;\n    }\n    if (minPrice) {\n      params.push(parseFloat(minPrice));\n      query += ` AND price >= $${paramIndex++}`;\n    }\n    if (maxPrice) {\n      params.push(parseFloat(maxPrice));\n      query += ` AND price <= $${paramIndex++}`;\n    }\n\n    // Dynamic sort - validated against allowlist... or so we think\n    const allowedSorts = ['name', 'price', 'category', 'id'];\n    const allowedOrders = ['ASC', 'DESC'];\n    \n    const sortColumn = sortBy || 'id';\n    const sortOrder = (order && allowedOrders.includes(order.toUpperCase())) ? order.toUpperCase() : 'ASC';\n    \n    // BUG: allowedSorts check uses includes() on the string, not exact match\n    // e.g., \"id; DROP TABLE products--\" contains \"id\" so passes\n    if (sortColumn && allowedSorts.some(col => sortColumn.includes(col))) {\n      query += ` ORDER BY ${sortColumn} ${sortOrder}`;\n    } else {\n      query += ' ORDER BY id ASC';\n    }\n\n    query += ' LIMIT 50';\n\n    const result = await pool.query(query, params);\n    res.json({ products: result.rows, total: result.rows.length });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', timestamp: new Date().toISOString() });\n});\n\n// Admin endpoint - requires internal header\napp.post('/api/admin/reindex', async (req, res) => {\n  const adminToken = req.headers['x-admin-token'];\n  if (adminToken !== process.env.ADMIN_TOKEN) {\n    return res.status(403).json({ error: 'forbidden' });\n  }\n  // Trigger reindex logic\n  res.json({ status: 'reindex started' });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => console.log(`Product service listening on ${PORT}`));\n",
+  "environment": {
+    "description": "ECS Fargate service in a private subnet, fronted by an internal ALB. The ALB has a single listener on port 443 forwarding to the target group on port 3000. No additional rule actions or rule groups are attached to the ALB listener. The PostgreSQL RDS instance has the 'products' database user granted SELECT, INSERT, UPDATE, DELETE on all tables. Security group allows inbound from the ALB SG only. The service is accessed by other internal microservices via the ALB DNS name.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "product-svc-tg"
+        }
+      ],
+      "rds_user_grants": "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;",
+      "network": "private_subnet_only",
+      "waf_web_acl": "none"
+    }
+  }
+}

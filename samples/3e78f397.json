@@ -1,0 +1,42 @@
+{
+  "id": "3e78f397",
+  "language": "java",
+  "code": "package com.example.handler;\n\nimport javax.ws.rs.POST;\nimport javax.ws.rs.Path;\nimport javax.ws.rs.Consumes;\nimport javax.ws.rs.Produces;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport com.fasterxml.jackson.databind.ObjectMapper;\nimport com.fasterxml.jackson.databind.JsonNode;\nimport com.fasterxml.jackson.databind.node.ObjectNode;\nimport java.io.Serializable;\nimport java.util.Base64;\nimport java.io.ByteArrayInputStream;\nimport java.io.ObjectInputStream;\n\n@Path(\"/api/v1/transform\")\npublic class DataTransformHandler {\n\n    private static final ObjectMapper mapper = new ObjectMapper();\n\n    // Internal type registry for polymorphic deserialization\n    interface DataPayload extends Serializable {\n        String getType();\n        Object getValue();\n    }\n\n    static class StringPayload implements DataPayload {\n        private String value;\n        public StringPayload(String v) { this.value = v; }\n        public String getType() { return \"string\"; }\n        public Object getValue() { return value; }\n    }\n\n    static class NumericPayload implements DataPayload {\n        private Number value;\n        public NumericPayload(Number v) { this.value = v; }\n        public String getType() { return \"numeric\"; }\n        public Object getValue() { return value; }\n    }\n\n    @POST\n    @Path(\"/process\")\n    @Consumes(MediaType.APPLICATION_JSON)\n    @Produces(MediaType.APPLICATION_JSON)\n    public Response processTransform(String body) {\n        try {\n            JsonNode root = mapper.readTree(body);\n            String encoding = root.has(\"encoding\") ? root.get(\"encoding\").asText() : \"json\";\n            \n            Object result;\n            \n            if (\"native\".equals(encoding)) {\n                // Legacy support: accept pre-serialized Java objects from trusted internal services\n                String serializedData = root.get(\"data\").asText();\n                byte[] rawBytes = Base64.getDecoder().decode(serializedData);\n                ByteArrayInputStream bais = new ByteArrayInputStream(rawBytes);\n                ObjectInputStream ois = new ObjectInputStream(bais);\n                // Type check: ensure deserialized object implements our interface\n                Object deserialized = ois.readObject();\n                if (!(deserialized instanceof DataPayload)) {\n                    return Response.status(400)\n                        .entity(\"{\\\"error\\\": \\\"Type mismatch: expected DataPayload\\\"}\")\n                        .build();\n                }\n                DataPayload payload = (DataPayload) deserialized;\n                result = payload.getValue();\n            } else {\n                // Standard JSON path\n                JsonNode dataNode = root.get(\"data\");\n                if (dataNode == null) {\n                    return Response.status(400)\n                        .entity(\"{\\\"error\\\": \\\"Missing data field\\\"}\")\n                        .build();\n                }\n                result = dataNode.asText();\n            }\n\n            ObjectNode response = mapper.createObjectNode();\n            response.put(\"status\", \"processed\");\n            response.put(\"result\", String.valueOf(result));\n            response.put(\"resultType\", result.getClass().getSimpleName());\n            \n            return Response.ok(response.toString()).build();\n            \n        } catch (Exception e) {\n            return Response.status(500)\n                .entity(\"{\\\"error\\\": \\\"\" + e.getMessage() + \"\\\"}\")\n                .build();\n        }\n    }\n\n    @POST\n    @Path(\"/health\")\n    @Produces(MediaType.APPLICATION_JSON)\n    public Response healthCheck() {\n        ObjectNode status = mapper.createObjectNode();\n        status.put(\"status\", \"UP\");\n        status.put(\"handler\", \"DataTransformHandler\");\n        status.put(\"capabilities\", \"json,native\");\n        return Response.ok(status.toString()).build();\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus 2.16 handler deployed on OpenShift 4.13 Serverless (Knative) with pod security admission set to 'restricted' profile. The pod spec includes securityContext with allowPrivilegeEscalation=false and a seccomp profile of RuntimeDefault. Container capabilities are explicitly dropped via spec.containers[0].securityContext.capabilities.drop containing CAP_NET_RAW and CAP_SYS_ADMIN. The Knative service revision template also specifies resource limits of 256Mi memory. Additionally, the cluster runs CRI-O 1.26 with a custom seccomp profile that blocks the execve family of syscalls for containers in the 'serverless-restricted' namespace.",
+    "config": {
+      "runtime": "quarkus-native-2.16",
+      "platform": "openshift-4.13-serverless-knative",
+      "jdk": "17",
+      "serialization_filter": "none",
+      "classpath_includes": [
+        "commons-collections4-4.0",
+        "jackson-databind-2.14.0"
+      ],
+      "pod_security_admission": "restricted",
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "capabilities_drop": [
+          "CAP_NET_RAW",
+          "CAP_SYS_ADMIN"
+        ],
+        "seccomp_profile": "RuntimeDefault"
+      },
+      "crio_custom_seccomp": {
+        "namespace": "serverless-restricted",
+        "blocked_syscalls": [
+          "execve",
+          "execveat",
+          "fork",
+          "vfork",
+          "clone3"
+        ],
+        "profile_name": "serverless-hardened-v2"
+      },
+      "resource_limits": {
+        "memory": "256Mi"
+      },
+      "network_policy": "deny-egress-except-dns"
+    }
+  }
+}

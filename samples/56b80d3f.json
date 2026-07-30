@@ -1,0 +1,33 @@
+{
+  "id": "56b80d3f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype AuditEntry struct {\n\tAction  string `json:\"action\"`\n\tDetails string `json:\"details\"`\n\tUserID  string `json:\"user_id\"`\n}\n\n// insertAuditLog writes to the audit_log table\nfunc insertAuditLog(entry AuditEntry) error {\n\t// Developer note: using fmt.Sprintf here because the ORM had issues\n\t// with the JSONB column. TODO: fix this properly.\n\tquery := fmt.Sprintf(\n\t\t\"INSERT INTO audit_log (action, details, user_id) VALUES ('%s', '%s', '%s')\",\n\t\tentry.Action, entry.Details, entry.UserID,\n\t)\n\t_, err := db.Exec(query)\n\treturn err\n}\n\n// getAuditLogs retrieves audit entries for a user (parameterized - safe)\nfunc getAuditLogs(userID string) ([]AuditEntry, error) {\n\trows, err := db.Query(\"SELECT action, details, user_id FROM audit_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50\", userID)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tdefer rows.Close()\n\tvar entries []AuditEntry\n\tfor rows.Next() {\n\t\tvar e AuditEntry\n\t\tif err := rows.Scan(&e.Action, &e.Details, &e.UserID); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\tentries = append(entries, e)\n\t}\n\treturn entries, nil\n}\n\nfunc auditHandler(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tswitch r.Method {\n\tcase http.MethodPost:\n\t\tvar entry AuditEntry\n\t\tif err := json.NewDecoder(r.Body).Decode(&entry); err != nil {\n\t\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\t// Sanitize: remove null bytes only (known postgres issue)\n\t\tentry.Details = strings.ReplaceAll(entry.Details, \"\\x00\", \"\")\n\t\tentry.Action = strings.ReplaceAll(entry.Action, \"\\x00\", \"\")\n\t\tentry.UserID = userID\n\n\t\tif len(entry.Action) > 64 || len(entry.Details) > 512 {\n\t\t\thttp.Error(w, \"payload too large\", http.StatusRequestEntityTooLarge)\n\t\t\treturn\n\t\t}\n\n\t\tif err := insertAuditLog(entry); err != nil {\n\t\t\tlog.Printf(\"audit insert error: %v\", err)\n\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n\t\tw.WriteHeader(http.StatusCreated)\n\n\tcase http.MethodGet:\n\t\tentries, err := getAuditLogs(userID)\n\t\tif err != nil {\n\t\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n\t\tjson.NewEncoder(w).Encode(entries)\n\n\tdefault:\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t}\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/audit\", auditHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Printf(\"starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application container deployed to ECS Fargate behind ALB. CloudFront distribution in front with origin pointing to ALB. AWS WAF v2 WebACL attached to the CloudFront distribution with three rule groups: (1) AWSManagedRulesCommonRuleSet priority 1, (2) AWSManagedRulesKnownBadInputsRuleSet priority 2, (3) a custom rule group 'corp-query-inspection' priority 3 with a RegexPatternSet matching on query string values using pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with action BLOCK. Additionally, CloudFront is configured with a custom origin header 'X-CF-Secret' that the ALB listener rule requires (fixed-response 403 if absent), preventing direct ALB access.",
+    "config": {
+      "cdn": "CloudFront distribution d1234abcdef.cloudfront.net",
+      "waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:global/webacl/prod-api-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override_action": "none"
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 2,
+          "override_action": "none"
+        },
+        {
+          "name": "corp-query-inspection",
+          "priority": 3,
+          "action": "BLOCK",
+          "regex_pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()"
+        }
+      ],
+      "origin_verification": "CloudFront custom header X-CF-Secret required by ALB listener rule; direct ALB access returns 403",
+      "compute": "ECS Fargate, Python 3.11, Flask 3.0",
+      "network": "ALB in private subnet, only CloudFront IP ranges in SG ingress"
+    }
+  }
+}

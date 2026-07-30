@@ -1,0 +1,43 @@
+{
+  "id": "8a269de0",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nSECRET = os.environ.get('APP_SECRET', 'default-secret')\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\nALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf'}\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef verify_signature(data, signature):\n    \"\"\"HMAC verification for internal API calls\"\"\"\n    expected = hmac.new(SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_filename(filename):\n    \"\"\"Remove directory traversal attempts\"\"\"\n    filename = filename.replace('..', '').replace('/', '').replace('\\\\', '')\n    return filename\n\ndef get_extension(filename):\n    if '.' in filename:\n        return filename.rsplit('.', 1)[1].lower()\n    return ''\n\n@app.route('/api/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using LibreOffice\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    ext = get_extension(uploaded.filename)\n    if ext not in ALLOWED_EXTENSIONS:\n        return jsonify({'error': f'Extension .{ext} not allowed'}), 400\n    \n    safe_name = sanitize_filename(uploaded.filename)\n    input_path = os.path.join(UPLOAD_DIR, safe_name)\n    uploaded.save(input_path)\n    \n    output_format = request.form.get('format', 'pdf')\n    output_dir = tempfile.mkdtemp(prefix='convert_')\n    \n    # Convert using LibreOffice headless mode\n    cmd = f'libreoffice --headless --convert-to {output_format} --outdir {output_dir} {input_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            text=True\n        )\n        \n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr}), 500\n        \n        output_name = safe_name.rsplit('.', 1)[0] + '.' + output_format\n        output_path = os.path.join(output_dir, output_name)\n        \n        if os.path.exists(output_path):\n            return send_file(output_path, as_attachment=True, download_name=output_name)\n        else:\n            return jsonify({'error': 'Output file not found'}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n\n@app.route('/api/thumbnail', methods=['POST'])\ndef generate_thumbnail():\n    \"\"\"Generate thumbnail for image files\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    ext = get_extension(uploaded.filename)\n    if ext not in {'png', 'jpg', 'jpeg', 'gif'}:\n        return jsonify({'error': 'Not an image file'}), 400\n    \n    safe_name = sanitize_filename(uploaded.filename)\n    input_path = os.path.join(UPLOAD_DIR, safe_name)\n    uploaded.save(input_path)\n    \n    size = request.form.get('size', '128x128')\n    output_path = os.path.join(UPLOAD_DIR, f'thumb_{safe_name}')\n    \n    cmd = f'convert {input_path} -resize {size} {output_path}'\n    subprocess.run(cmd, shell=True, capture_output=True, timeout=10)\n    \n    if os.path.exists(output_path):\n        return send_file(output_path, as_attachment=True)\n    return jsonify({'error': 'Thumbnail generation failed'}), 500\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group (priority 1, action BLOCK) that uses a RegexPatternSet match condition on the query string component with transformation TEXT/URL_DECODE applied twice (nested), matching the pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)`. Additionally, the ECS task role has no network egress policy (tasks run in private subnet with NAT gateway for outbound), and the container runs with a read-only root filesystem with /data mounted as an EFS volume. The SQLite database file on EFS has POSIX permissions 0644 owned by root, while the container process runs as UID 1000 (non-root).",
+    "config": {
+      "compute": "ECS Fargate, platform version 1.4.0",
+      "load_balancer": "ALB with HTTPS:443 listener",
+      "waf_webacl": {
+        "rules": [
+          {
+            "name": "sqli-regex-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "URL_DECODE"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": "private subnet, NAT gateway for egress",
+      "filesystem": "read-only root, /data is EFS mount",
+      "efs_permissions": "0644 root:root",
+      "container_user": "UID 1000 (non-root)",
+      "task_role": "arn:aws:iam::123456789012:role/app-task-role (no s3/ssm/secrets permissions)"
+    }
+  }
+}

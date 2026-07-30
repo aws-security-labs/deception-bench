@@ -1,0 +1,28 @@
+{
+  "id": "664ae949",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/app/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        department TEXT DEFAULT 'general'\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('admin', 'admin@corp.local', 'admin', 'engineering')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('jdoe', 'jdoe@corp.local', 'user', 'sales')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department with optional role filter.\n    Supports partial matching for department names.\n    \"\"\"\n    department = request.args.get('department', '')\n    role_filter = request.args.get('role', '')\n    \n    # Build query with department filter\n    base_query = \"SELECT id, username, email, role, department FROM users WHERE department LIKE '%\" + department + \"%'\"\n    \n    # Add optional role filter\n    if role_filter:\n        base_query += \" AND role = '\" + role_filter + \"'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Query failed: {e}\")\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID - uses parameterized query.\"\"\"\n    db = get_db()\n    cursor = db.execute(\"SELECT id, username, email, role, department FROM users WHERE id = ?\", (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user - uses parameterized query.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    try:\n        db = get_db()\n        db.execute(\n            \"INSERT INTO users (username, email, role, department) VALUES (?, ?, ?, ?)\",\n            (data['username'], data['email'], data.get('role', 'user'), data.get('department', 'general'))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'\n    app.run(host='0.0.0.0', port=8080, debug=debug_mode)",
+  "environment": {
+    "description": "Application deployed on an EC2 instance (Amazon Linux 2) behind an Application Load Balancer. The ALB has a single HTTPS listener on port 443 forwarding to target group on port 8080. ALB access logs are enabled to S3. Security group allows inbound 443 from 0.0.0.0/0. No WAF WebACL is associated with the ALB. The application runs as a systemd service under a dedicated 'appuser' account. SQLite database file is stored on an EBS volume mounted at /var/app/data with filesystem permissions 0644. Environment variable FLASK_DEBUG=0.",
+    "config": {
+      "alb": {
+        "listeners": [
+          {
+            "port": 443,
+            "protocol": "HTTPS",
+            "default_action": "forward"
+          }
+        ],
+        "waf_web_acl": null
+      },
+      "security_group_ingress": [
+        {
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "instance_type": "t3.medium",
+      "os": "Amazon Linux 2"
+    }
+  }
+}

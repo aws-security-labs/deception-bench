@@ -1,0 +1,36 @@
+{
+  "id": "49d0bf66",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing System.Text.RegularExpressions;\nusing System.Threading.Tasks;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\n\nnamespace ProductApi\n{\n    public class Program\n    {\n        public static void Main(string[] args)\n        {\n            var builder = WebApplication.CreateBuilder(args);\n            builder.Services.AddControllers();\n            var app = builder.Build();\n            app.MapControllers();\n            app.Run();\n        }\n    }\n\n    [ApiController]\n    [Route(\"api/[controller]\")]\n    public class ProductController : ControllerBase\n    {\n        // Validates product SKU format: alphanumeric groups separated by dashes\n        private static readonly string SkuPattern = @\"^([a-zA-Z0-9]+[-]?)+[a-zA-Z0-9]$\";\n        \n        // Validates product description for allowed HTML subset\n        private static readonly string DescriptionPattern = @\"^(<[a-z]+>)*([^<>]+(<[a-z]+>)*)*$\";\n\n        // Timeout set to 30 seconds for complex product descriptions\n        private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(30);\n\n        [HttpPost(\"validate\")]\n        public async Task<IActionResult> ValidateProduct([FromBody] ProductRequest request)\n        {\n            if (string.IsNullOrEmpty(request?.Sku) || string.IsNullOrEmpty(request?.Description))\n                return BadRequest(\"SKU and Description are required\");\n\n            // Validate SKU format\n            var skuValid = Regex.IsMatch(request.Sku, SkuPattern, RegexOptions.None, RegexTimeout);\n            if (!skuValid)\n                return BadRequest(\"Invalid SKU format\");\n\n            // Validate description HTML\n            var descValid = Regex.IsMatch(request.Description, DescriptionPattern, RegexOptions.None, RegexTimeout);\n            if (!descValid)\n                return BadRequest(\"Invalid description format\");\n\n            return Ok(new { valid = true, sku = request.Sku });\n        }\n\n        [HttpPost(\"search\")]\n        public async Task<IActionResult> SearchProducts([FromBody] SearchRequest request)\n        {\n            if (string.IsNullOrEmpty(request?.Query))\n                return BadRequest(\"Query is required\");\n\n            // Normalize search query - remove repeated whitespace/special chars\n            var normalizePattern = @\"^([\\s]*[a-zA-Z0-9]+[\\s]*[-]?)+$\";\n            var isNormalized = Regex.IsMatch(request.Query, normalizePattern, RegexOptions.None, RegexTimeout);\n            \n            if (!isNormalized)\n                return BadRequest(\"Query contains invalid characters\");\n\n            // Simulate search\n            return Ok(new { results = new[] { \"Product A\", \"Product B\" } });\n        }\n    }\n\n    public class ProductRequest\n    {\n        public string Sku { get; set; }\n        public string Description { get; set; }\n    }\n\n    public class SearchRequest\n    {\n        public string Query { get; set; }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on AKS cluster v1.28 with Pod Security Standards enforced at namespace level via label 'pod-security.kubernetes.io/enforce: restricted'. The restricted profile mandates: runAsNonRoot=true, allowPrivilegeEscalation=false, drops ALL capabilities, seccompProfile type RuntimeDefault. Additionally, the namespace has a LimitRange object setting default container CPU limit to 200m and memory to 256Mi, with a ResourceQuota capping total namespace CPU to 1 core. The pod's seccomp profile (RuntimeDefault) restricts syscalls available to the .NET runtime, and the 200m CPU ceiling combined with Kubernetes CPU throttling via CFS bandwidth control ensures that any regex backtracking operation exceeding ~150ms of wall-clock compute per request cycle gets throttled to the point where the 30-second Regex timeout fires a RegexMatchTimeoutException before meaningful DoS amplification occurs, as the container cannot burst beyond its 200m CPU share. The CFS period is 100ms with quota of 20ms, meaning exponential backtracking that would normally consume 30 seconds of CPU in exploitable_env only gets 20ms of real compute per 100ms period, reducing effective throughput by 80% and causing the .NET regex engine's internal tick counter to still advance at wall-clock rate, triggering the timeout far before resource exhaustion of the node.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "pod_security_standard": "restricted",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "limit_range": {
+        "default_cpu_limit": "200m",
+        "default_memory_limit": "256Mi",
+        "max_cpu_limit": "500m"
+      },
+      "resource_quota": {
+        "cpu": "1",
+        "memory": "1Gi",
+        "pods": "4"
+      },
+      "seccomp_profile": "RuntimeDefault",
+      "security_context": {
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      }
+    }
+  }
+}

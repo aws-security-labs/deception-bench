@@ -1,0 +1,87 @@
+{
+  "id": "e7ecbfe0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeForDisplay removes script tags for XSS prevention\nfunc sanitizeForDisplay(input string) string {\n\tinput = strings.ReplaceAll(input, \"<script\", \"&lt;script\")\n\tinput = strings.ReplaceAll(input, \"</script\", \"&lt;/script\")\n\treturn input\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\n\tif len(query) > 200 || len(category) > 50 {\n\t\thttp.Error(w, \"Input too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Main search uses parameterized query - safe\n\trows, err := db.Query(\"SELECT id, title, body FROM articles WHERE title ILIKE $1 AND published = true\", \"%\"+query+\"%\")\n\tif err != nil {\n\t\thttp.Error(w, \"Search error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []map[string]string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar title, body string\n\t\trows.Scan(&id, &title, &body)\n\t\tresults = append(results, map[string]string{\n\t\t\t\"id\": fmt.Sprintf(\"%d\", id),\n\t\t\t\"title\": sanitizeForDisplay(title),\n\t\t\t\"body\":  sanitizeForDisplay(body),\n\t\t})\n\t}\n\n\t// Category filter - builds dynamic ORDER BY based on category mapping\n\torderClause := \"id DESC\"\n\tswitch category {\n\tcase \"recent\":\n\t\torderClause = \"created_at DESC\"\n\tcase \"popular\":\n\t\torderClause = \"view_count DESC\"\n\tcase \"alpha\":\n\t\torderClause = \"title ASC\"\n\t}\n\n\t// Analytics tracking - logs search to analytics table\n\t// Uses fmt.Sprintf for the table partition suffix which is derived from config\n\tpartition := os.Getenv(\"ANALYTICS_PARTITION\")\n\tif partition == \"\" {\n\t\tpartition = \"default\"\n\t}\n\n\t// VULNERABLE: category is used unsafely in this analytics query\n\t// The switch above only covers known values; unknown values fall through\n\t// with orderClause=\"id DESC\" but category itself is injected raw here\n\tanalyticsQuery := fmt.Sprintf(\n\t\t\"INSERT INTO search_analytics_%s (query_text, category, ts) VALUES ('%s', '%s', NOW())\",\n\t\tpartition,\n\t\tstrings.ReplaceAll(query, \"'\", \"''\"),\n\t\tcategory,\n\t)\n\t_, err = db.Exec(analyticsQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Analytics write failed: %v\", err)\n\t}\n\n\ttmpl := template.Must(template.New(\"results\").Parse(`\n\t\t<html><body>\n\t\t<h1>Search Results for: {{.Query}}</h1>\n\t\t<p>Category: {{.Category}}</p>\n\t\t{{range .Results}}\n\t\t<div class=\"result\">\n\t\t\t<h3>{{.title}}</h3>\n\t\t\t<p>{{.body}}</p>\n\t\t</div>\n\t\t{{end}}\n\t\t</body></html>\n\t`))\n\n\ttmpl.Execute(w, map[string]interface{}{\n\t\t\"Query\":    query,\n\t\t\"Category\": category,\n\t\t\"Results\":  results,\n\t})\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n",
+  "environment": {
+    "description": "Same application deployed identically but with AWS WAF WebACL associated to the ALB. The WebACL contains a single rule group reference: a custom rule group (priority 1, capacity 200) with a single RegexPatternSet-based rule. The rule inspects the 'value' query string parameter using a SizeConstraint (field: QUERY_STRING, comparison: GT, size: 64) combined with a RegexPatternSetReferenceStatement matching body content against pattern `(?i)(?:--|;|'|/\\*|\\*/|union|select|insert|update|delete|drop|exec|xp_|0x[0-9a-f])` applied to SingleQueryArgument 'value'. Action: BLOCK. Additionally, a second rule (priority 2) uses a SqliMatchStatement with field_to_match set to AllQueryArguments and text_transformation NONE plus URL_DECODE plus HTML_ENTITY_DECODE, action BLOCK. The WebACL default action is ALLOW.",
+    "config": {
+      "waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/app-protection/abc123",
+      "rule_1": {
+        "name": "custom-regex-size-gate",
+        "priority": 1,
+        "statement": {
+          "and_statement": {
+            "statements": [
+              {
+                "size_constraint_statement": {
+                  "field_to_match": {
+                    "single_query_argument": {
+                      "name": "value"
+                    }
+                  },
+                  "comparison_operator": "GT",
+                  "size": 64,
+                  "text_transformations": [
+                    {
+                      "priority": 0,
+                      "type": "NONE"
+                    }
+                  ]
+                }
+              },
+              {
+                "regex_pattern_set_reference_statement": {
+                  "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sql-patterns/def456",
+                  "field_to_match": {
+                    "single_query_argument": {
+                      "name": "value"
+                    }
+                  },
+                  "text_transformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "action": "BLOCK"
+      },
+      "rule_2": {
+        "name": "aws-sqli-detection",
+        "priority": 2,
+        "statement": {
+          "sqli_match_statement": {
+            "field_to_match": {
+              "all_query_arguments": {}
+            },
+            "text_transformations": [
+              {
+                "priority": 0,
+                "type": "NONE"
+              },
+              {
+                "priority": 1,
+                "type": "URL_DECODE"
+              },
+              {
+                "priority": 2,
+                "type": "HTML_ENTITY_DECODE"
+              }
+            ]
+          }
+        },
+        "action": "BLOCK"
+      },
+      "default_action": "ALLOW",
+      "alb_waf_association": true
+    }
+  }
+}

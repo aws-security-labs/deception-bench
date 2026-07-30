@@ -1,0 +1,84 @@
+{
+  "id": "f785082d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rsa\"\n\t\"crypto/rand\"\n\t\"crypto/x509\"\n\t\"encoding/pem\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"time\"\n\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema\"\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/plugin\"\n)\n\nvar cachedKey *rsa.PrivateKey\nvar keyGeneratedAt time.Time\n\n// generateOrReuseKey returns a cached RSA key if generated within the last 24h,\n// otherwise generates a new one. This avoids expensive key generation on every apply.\nfunc generateOrReuseKey(bits int) (*rsa.PrivateKey, error) {\n\tif cachedKey != nil && time.Since(keyGeneratedAt) < 24*time.Hour {\n\t\treturn cachedKey, nil\n\t}\n\tkey, err := rsa.GenerateKey(rand.Reader, bits)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tcachedKey = key\n\tkeyGeneratedAt = time.Now()\n\treturn key, nil\n}\n\n// fetchCloudMetadata retrieves instance identity for tagging resources\nfunc fetchCloudMetadata() (string, error) {\n\tclient := &http.Client{Timeout: 2 * time.Second}\n\tresp, err := client.Get(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\")\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\tdefer resp.Body.Close()\n\tbody, err := ioutil.ReadAll(resp.Body)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\t// Fetch the actual credentials\n\troleName := string(body)\n\tresp2, err := client.Get(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\" + roleName)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\tdefer resp2.Body.Close()\n\tcreds, _ := ioutil.ReadAll(resp2.Body)\n\treturn string(creds), nil\n}\n\nfunc resourceTLSCert() *schema.Resource {\n\treturn &schema.Resource{\n\t\tCreate: resourceTLSCertCreate,\n\t\tRead:   resourceTLSCertRead,\n\t\tDelete: resourceTLSCertDelete,\n\t\tSchema: map[string]*schema.Schema{\n\t\t\t\"key_bits\": {\n\t\t\t\tType:    schema.TypeInt,\n\t\t\t\tOptional: true,\n\t\t\t\tDefault: 2048,\n\t\t\t},\n\t\t\t\"private_key_pem\": {\n\t\t\t\tType:      schema.TypeString,\n\t\t\t\tComputed:  true,\n\t\t\t\tSensitive: true,\n\t\t\t},\n\t\t\t\"instance_role\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tComputed: true,\n\t\t\t},\n\t\t},\n\t}\n}\n\nfunc resourceTLSCertCreate(d *schema.ResourceData, meta interface{}) error {\n\tbits := d.Get(\"key_bits\").(int)\n\t// Reuse key across multiple resource instances for performance\n\tkey, err := generateOrReuseKey(bits)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to generate key: %w\", err)\n\t}\n\tkeyBytes := x509.MarshalPKCS1PrivateKey(key)\n\tpemBlock := pem.EncodeToMemory(&pem.Block{Type: \"RSA PRIVATE KEY\", Bytes: keyBytes})\n\td.Set(\"private_key_pem\", string(pemBlock))\n\n\t// Enrich resource with cloud context for audit logging\n\tif metadata, err := fetchCloudMetadata(); err == nil {\n\t\td.Set(\"instance_role\", metadata)\n\t\t// Log to provider debug output\n\t\tif os.Getenv(\"TF_LOG\") == \"DEBUG\" {\n\t\t\tfmt.Fprintf(os.Stderr, \"[DEBUG] cloud context: %s\\n\", metadata)\n\t\t}\n\t}\n\n\td.SetId(fmt.Sprintf(\"tls-cert-%d\", time.Now().UnixNano()))\n\treturn nil\n}\n\nfunc resourceTLSCertRead(d *schema.ResourceData, meta interface{}) error {\n\treturn nil\n}\n\nfunc resourceTLSCertDelete(d *schema.ResourceData, meta interface{}) error {\n\td.SetId(\"\")\n\treturn nil\n}\n\nfunc main() {\n\tplugin.Serve(&plugin.ServeOpts{\n\t\tProviderFunc: func() *schema.Provider {\n\t\t\treturn &schema.Provider{\n\t\t\t\tResourcesMap: map[string]*schema.Resource{\n\t\t\t\t\t\"custom_tls_cert\": resourceTLSCert(),\n\t\t\t\t},\n\t\t\t}\n\t\t},\n\t})\n}",
+  "environment": {
+    "description": "Same Terraform provider running in namespace 'ci-runners' on EKS 1.28. Cluster has Cilium CNI with a CiliumNetworkPolicy applied at namespace level. The policy spec uses a combination of entity-based egress rules: it allows DNS (kube-dns on port 53), allows egress to CIDR 10.0.0.0/8 (internal VPC), and allows egress to 0.0.0.0/0 EXCEPT link-local range. Specifically, the policy includes an egressDeny rule matching toEndpoints with reserved:world and toCIDR 169.254.0.0/16. Note: this is NOT a standard Kubernetes NetworkPolicy \u2014 it's a CiliumNetworkPolicy with L3/L4 filtering only (no L7 inspection). The deny rule is evaluated before allow rules per Cilium's policy precedence model. Additionally, the cluster has IMDSv2 enforced at the node level with HttpPutResponseHopLimit=1, but since Cilium's deny rule operates at L3 before packets reach the node's iptables IMDS rules, the network deny is the primary control.",
+    "config": {
+      "kubernetes_cluster": "EKS 1.28",
+      "namespace": "ci-runners",
+      "cni": "Cilium 1.14",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress",
+          "namespace": "ci-runners"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app.kubernetes.io/managed-by": "terraform"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.0.0/16"
+              ]
+            },
+            {
+              "toCIDR": [
+                "fd00:ec2::254/128"
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.0.0/8"
+              ]
+            },
+            {
+              "toCIDR": [
+                "0.0.0.0/0"
+              ],
+              "toCIDRSet": [
+                {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "169.254.0.0/16"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "imds_version": "IMDSv2 with HttpPutResponseHopLimit=1",
+      "pod_labels": {
+        "app.kubernetes.io/managed-by": "terraform"
+      }
+    }
+  }
+}

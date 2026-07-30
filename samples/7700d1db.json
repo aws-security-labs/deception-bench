@@ -1,0 +1,87 @@
+{
+  "id": "7700d1db",
+  "language": "typescript",
+  "code": "// src/users/users.controller.ts\nimport { Controller, Get, Query, Inject } from '@nestjs/common';\nimport { Pool } from 'pg';\nimport { Logger } from '@nestjs/common';\n\n@Controller('users')\nexport class UsersController {\n  private readonly logger = new Logger(UsersController.name);\n\n  constructor(@Inject('PG_POOL') private readonly pool: Pool) {}\n\n  @Get('search')\n  async searchUsers(\n    @Query('name') name: string,\n    @Query('department') department: string,\n    @Query('limit') limit: string,\n  ) {\n    // Input sanitization - strip obvious attack patterns\n    const sanitizedName = name ? name.replace(/[;--]/g, '') : '';\n    const sanitizedDept = department ? department.replace(/[;--]/g, '') : '';\n    \n    // Build dynamic query for flexible search\n    let query = `SELECT id, username, email, department, role FROM users WHERE 1=1`;\n    \n    if (sanitizedName) {\n      query += ` AND (username ILIKE '%${sanitizedName}%' OR display_name ILIKE '%${sanitizedName}%')`;\n    }\n    \n    if (sanitizedDept) {\n      query += ` AND department = '${sanitizedDept}'`;\n    }\n    \n    const parsedLimit = parseInt(limit) || 50;\n    query += ` LIMIT ${parsedLimit > 200 ? 200 : parsedLimit}`;\n    \n    this.logger.log(`Executing user search query for department: ${sanitizedDept}`);\n    \n    try {\n      const result = await this.pool.query(query);\n      return {\n        count: result.rowCount,\n        users: result.rows.map(row => ({\n          id: row.id,\n          username: row.username,\n          email: row.email,\n          department: row.department,\n          role: row.role,\n        })),\n      };\n    } catch (error) {\n      this.logger.error(`Search query failed: ${error.message}`);\n      return { count: 0, users: [], error: 'Search failed' };\n    }\n  }\n\n  @Get('profile')\n  async getProfile(@Query('id') id: string) {\n    // This endpoint uses parameterized queries correctly\n    const result = await this.pool.query(\n      'SELECT id, username, email, department, role, created_at FROM users WHERE id = $1',\n      [id]\n    );\n    if (result.rowCount === 0) {\n      return { error: 'User not found' };\n    }\n    return result.rows[0];\n  }\n\n  @Get('departments')\n  async listDepartments() {\n    const result = await this.pool.query(\n      'SELECT DISTINCT department FROM users ORDER BY department'\n    );\n    return result.rows.map(r => r.department);\n  }\n}\n\n// src/users/users.module.ts\nimport { Module } from '@nestjs/common';\nimport { Pool } from 'pg';\nimport { UsersController } from './users.controller';\n\n@Module({\n  controllers: [UsersController],\n  providers: [\n    {\n      provide: 'PG_POOL',\n      useFactory: () => new Pool({\n        host: process.env.DB_HOST || 'localhost',\n        port: parseInt(process.env.DB_PORT) || 5432,\n        database: process.env.DB_NAME || 'userservice',\n        user: process.env.DB_USER || 'app_user',\n        password: process.env.DB_PASSWORD,\n        max: 20,\n        ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : false,\n      }),\n    },\n  ],\n})\nexport class UsersModule {}",
+  "environment": {
+    "description": "Same NestJS microservice deployed in Kubernetes namespace 'backend-services' with Istio 1.20 service mesh. Sidecar injection is enabled (istio-injection=enabled label on namespace). An AuthorizationPolicy resource is applied that uses a source principal match with a namespace-scoped SPIFFE identity. The policy specifies 'action: ALLOW' with a single rule requiring source.namespaces=['backend-services'], meaning only workloads with mTLS identities originating from the same namespace can reach this service. The API gateway lives in namespace 'gateway' and its SPIFFE identity is spiffe://cluster.local/ns/gateway/sa/gateway-sa. Since the gateway's namespace does not match the allow-list, Envoy sidecar returns 403 RBAC denied before the request reaches the application container. A separate AuthorizationPolicy with 'action: DENY' and source.namespaces=['*'] acts as a default-deny fallback. Internal traffic from the 'data-pipeline' namespace batch job (which previously called this endpoint for user lookups) is also blocked.",
+    "config": {
+      "kubernetes_namespace": "backend-services",
+      "istio_version": "1.20.2",
+      "istio_injection": "enabled",
+      "mtls_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "user-service-intra-ns-only",
+          "namespace": "backend-services"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "user-service"
+            }
+          },
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "namespaces": [
+                      "backend-services"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "default_deny_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "default-deny-all",
+          "namespace": "backend-services"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "user-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "backend-services"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "backend-services"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "gateway_namespace": "gateway",
+      "gateway_service_account": "gateway-sa"
+    }
+  }
+}

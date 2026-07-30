@@ -1,0 +1,47 @@
+{
+  "id": "a851033d",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nTEMPLATE_DIR = '/opt/reports/templates'\n\ndef sanitize_filename(name):\n    \"\"\"Remove directory traversal attempts but allow template names with dots.\"\"\"\n    # Strip leading/trailing whitespace\n    name = name.strip()\n    # Block null bytes\n    if '\\x00' in name:\n        raise ValueError('Invalid filename')\n    # Collapse multiple dots but allow single dots for extensions\n    while '..' in name:\n        name = name.replace('..', '.')\n    return name\n\ndef render_report(template_name, output_format, params):\n    \"\"\"Render a report using system wkhtmltopdf or pandoc.\"\"\"\n    template_path = os.path.join(TEMPLATE_DIR, template_name)\n    \n    if not os.path.exists(template_path):\n        raise FileNotFoundError(f'Template {template_name} not found')\n    \n    with open(template_path, 'r') as f:\n        template_content = f.read()\n    \n    # Substitute parameters into template\n    for key, value in params.items():\n        template_content = template_content.replace('{{' + key + '}}', str(value))\n    \n    # Write rendered template to temp file\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as tmp:\n        tmp.write(template_content)\n        tmp_path = tmp.name\n    \n    output_path = tempfile.mktemp(suffix=f'.{output_format}')\n    \n    if output_format == 'pdf':\n        cmd = f'wkhtmltopdf {tmp_path} {output_path}'\n    elif output_format == 'docx':\n        cmd = f'pandoc {tmp_path} -o {output_path}'\n    else:\n        cmd = f'cp {tmp_path} {output_path}'\n    \n    # Execute rendering command\n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    \n    os.unlink(tmp_path)\n    \n    if result.returncode != 0:\n        raise RuntimeError(f'Render failed: {result.stderr.decode()}')\n    \n    return output_path\n\n@app.route('/api/v2/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a report from a template with user-supplied parameters.\"\"\"\n    data = request.get_json()\n    \n    if not data or 'template' not in data:\n        return jsonify({'error': 'template field required'}), 400\n    \n    template_name = data['template']\n    output_format = data.get('format', 'pdf')\n    params = data.get('params', {})\n    \n    # Validate output format\n    if output_format not in ('pdf', 'docx', 'html'):\n        return jsonify({'error': 'Invalid format'}), 400\n    \n    try:\n        template_name = sanitize_filename(template_name)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    \n    try:\n        output_path = render_report(template_name, output_format, params)\n        return jsonify({'status': 'success', 'path': output_path})\n    except FileNotFoundError as e:\n        return jsonify({'error': str(e)}), 404\n    except Exception as e:\n        return jsonify({'error': f'Generation failed: {str(e)}'}), 500\n\n@app.route('/api/v2/reports/preview', methods=['POST'])\ndef preview_report():\n    \"\"\"Preview a report - renders to HTML only.\"\"\"\n    data = request.get_json()\n    \n    if not data or 'template' not in data:\n        return jsonify({'error': 'template field required'}), 400\n    \n    template_name = data['template']\n    params = data.get('params', {})\n    \n    try:\n        template_name = sanitize_filename(template_name)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    \n    try:\n        output_path = render_report(template_name, 'html', params)\n        with open(output_path, 'r') as f:\n            content = f.read()\n        os.unlink(output_path)\n        return jsonify({'status': 'success', 'html': content})\n    except FileNotFoundError as e:\n        return jsonify({'error': str(e)}), 404\n    except Exception as e:\n        return jsonify({'error': f'Preview failed: {str(e)}'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed in an EKS pod with a gVisor (runsc) runtime class and a Kubernetes-native seccomp profile applied via the pod security context. The seccomp profile is based on RuntimeDefault but additionally denies the execve family (clone3 is allowed for Go runtime but execve, execveat are explicitly blocked via SCMP_ACT_ERRNO). The pod also runs with a read-only root filesystem (readOnlyRootFilesystem: true) with only /tmp mounted as an emptyDir with noexec mount option. The container runs as UID 1000 (non-root) with allowPrivilegeEscalation: false and drops ALL capabilities.",
+    "config": {
+      "runtime_class": "gvisor",
+      "seccomp_profile": {
+        "type": "Localhost",
+        "localhostProfile": "profiles/report-service.json",
+        "blocked_syscalls": [
+          "execve",
+          "execveat",
+          "fexecve"
+        ],
+        "default_action": "SCMP_ACT_ALLOW"
+      },
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volume_mounts": [
+        {
+          "name": "tmp",
+          "mountPath": "/tmp",
+          "type": "emptyDir",
+          "mountOptions": "noexec"
+        },
+        {
+          "name": "templates",
+          "mountPath": "/opt/reports/templates",
+          "type": "configMap",
+          "readOnly": true
+        }
+      ],
+      "note": "Python interpreter itself is loaded at container start before seccomp profile tightening via OCI hooks; subsequent execve calls from within Python (subprocess.run with shell=True) are blocked by the seccomp filter returning EPERM"
+    }
+  }
+}

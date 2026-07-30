@@ -1,0 +1,15 @@
+{
+  "id": "56445154",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/gob\"\n\t\"bytes\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"github.com/gin-gonic/gin\"\n\t\"encoding/base64\"\n)\n\n// Task represents a serialized job submitted by authenticated clients\ntype Task struct {\n\tName    string\n\tCommand string\n\tArgs    []string\n}\n\n// CommandResult wraps execution output\ntype CommandResult struct {\n\tOutput string `json:\"output\"`\n\tError  string `json:\"error,omitempty\"`\n}\n\nfunc init() {\n\tgob.Register(Task{})\n}\n\n// executeTask deserializes and runs a task payload\nfunc executeTask(payload []byte) (*CommandResult, error) {\n\tbuf := bytes.NewBuffer(payload)\n\tdec := gob.NewDecoder(buf)\n\n\tvar task Task\n\tif err := dec.Decode(&task); err != nil {\n\t\treturn nil, fmt.Errorf(\"decode error: %w\", err)\n\t}\n\n\t// Execute the task command\n\tcmd := exec.Command(task.Command, task.Args...)\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\treturn &CommandResult{\n\t\t\tOutput: string(output),\n\t\t\tError:  err.Error(),\n\t\t}, nil\n\t}\n\n\treturn &CommandResult{Output: string(output)}, nil\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Health check endpoint\n\tr.GET(\"/health\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"ok\"})\n\t})\n\n\t// Task submission endpoint - accepts base64-encoded gob payloads\n\t// Only reachable via CloudFront signed URLs in production\n\tr.POST(\"/api/v1/tasks/execute\", func(c *gin.Context) {\n\t\tencodedPayload := c.PostForm(\"payload\")\n\t\tif encodedPayload == \"\" {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"missing payload\"})\n\t\t\treturn\n\t\t}\n\n\t\tpayload, err := base64.StdEncoding.DecodeString(encodedPayload)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid base64\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Size limit check\n\t\tif len(payload) > 4096 {\n\t\t\tc.JSON(http.StatusRequestEntityTooLarge, gin.H{\"error\": \"payload too large\"})\n\t\t\treturn\n\t\t}\n\n\t\tresult, err := executeTask(payload)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": err.Error()})\n\t\t\treturn\n\t\t}\n\n\t\tc.JSON(http.StatusOK, result)\n\t})\n\n\t// Internal metrics (not exposed via CloudFront)\n\tr.GET(\"/internal/metrics\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"requests\": 0})\n\t})\n\n\tr.Run(\":8080\")\n}\n",
+  "environment": {
+    "description": "Go Gin application deployed on EC2 instance with public IP (elastic IP 54.x.x.x), security group allows inbound TCP/8080 from 0.0.0.0/0. No reverse proxy or CDN in front. Application listens directly on port 8080. Container runs as root with no seccomp profile. No network ACL restrictions beyond default VPC settings.",
+    "config": {
+      "deployment": "EC2 t3.medium, Amazon Linux 2023",
+      "security_group": "sg-0abc123: inbound TCP/8080 from 0.0.0.0/0",
+      "network": "public subnet, IGW attached, no NAT-only restriction",
+      "container_user": "root",
+      "cloudfront": "none"
+    }
+  }
+}

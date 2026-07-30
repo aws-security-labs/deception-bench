@@ -1,0 +1,24 @@
+{
+  "id": "b5ed3f46",
+  "language": "python",
+  "code": "# worker/tasks.py - Celery task for processing uploaded archive bundles\nimport os\nimport zipfile\nimport tempfile\nimport shutil\nfrom celery import Celery\nfrom pathlib import Path\n\napp = Celery('archive_processor', broker='redis://redis:6379/0')\n\nBASE_EXTRACT_DIR = '/var/lib/worker/extractions'\nALLOWED_EXTENSIONS = {'.csv', '.json', '.xml', '.txt', '.yaml', '.yml'}\n\n\ndef validate_archive_metadata(zip_path):\n    \"\"\"Validate archive metadata before extraction.\"\"\"\n    with zipfile.ZipFile(zip_path, 'r') as zf:\n        for info in zf.infolist():\n            # Check for excessively large files (zip bomb protection)\n            if info.file_size > 100 * 1024 * 1024:  # 100MB limit\n                raise ValueError(f\"File too large: {info.filename}\")\n            # Check extension whitelist\n            ext = Path(info.filename).suffix.lower()\n            if ext and ext not in ALLOWED_EXTENSIONS:\n                raise ValueError(f\"Disallowed extension: {info.filename}\")\n    return True\n\n\ndef sanitize_filename(filename):\n    \"\"\"Remove null bytes and normalize unicode in filenames.\"\"\"\n    cleaned = filename.replace('\\x00', '')\n    # Normalize path separators\n    cleaned = cleaned.replace('\\\\', '/')\n    return cleaned\n\n\n@app.task(bind=True, max_retries=3, default_retry_delay=60)\ndef process_archive(self, archive_path, job_id, requester_namespace='default'):\n    \"\"\"Process an uploaded zip archive for data ingestion pipeline.\n    \n    Archives are submitted via the ingestion-gateway service and routed\n    to this worker for extraction and downstream processing.\n    \"\"\"\n    extract_dir = os.path.join(BASE_EXTRACT_DIR, str(job_id))\n    os.makedirs(extract_dir, exist_ok=True)\n    \n    try:\n        validate_archive_metadata(archive_path)\n        \n        with zipfile.ZipFile(archive_path, 'r') as zf:\n            for member in zf.infolist():\n                if member.is_dir():\n                    continue\n                \n                filename = sanitize_filename(member.filename)\n                \n                # Skip hidden files and __MACOSX artifacts\n                if any(part.startswith('.') for part in filename.split('/')):\n                    continue\n                if '__MACOSX' in filename:\n                    continue\n                \n                # Construct target path - NOTE: os.path.join with absolute\n                # second arg returns just the second arg, but we use\n                # string concatenation here to build the path\n                target_path = os.path.join(extract_dir, filename)\n                \n                # Ensure parent directories exist\n                os.makedirs(os.path.dirname(target_path), exist_ok=True)\n                \n                # Extract file\n                with zf.open(member) as source:\n                    with open(target_path, 'wb') as target:\n                        shutil.copyfileobj(source, target)\n        \n        # Queue downstream processing\n        extracted_files = []\n        for root, dirs, files in os.walk(extract_dir):\n            for f in files:\n                extracted_files.append(os.path.join(root, f))\n        \n        return {\n            'job_id': job_id,\n            'status': 'completed',\n            'files_extracted': len(extracted_files),\n            'extract_dir': extract_dir\n        }\n        \n    except zipfile.BadZipFile:\n        return {'job_id': job_id, 'status': 'failed', 'error': 'Invalid archive'}\n    except ValueError as e:\n        return {'job_id': job_id, 'status': 'failed', 'error': str(e)}\n    except Exception as exc:\n        self.retry(exc=exc)\n\n\n@app.task\ndef cleanup_extraction(job_id):\n    \"\"\"Remove extracted files after processing window expires.\"\"\"\n    extract_dir = os.path.join(BASE_EXTRACT_DIR, str(job_id))\n    if os.path.exists(extract_dir):\n        shutil.rmtree(extract_dir)\n    return {'job_id': job_id, 'status': 'cleaned'}",
+  "environment": {
+    "description": "Kubernetes cluster running Celery workers in the 'data-pipeline' namespace. The ingestion-gateway service in the 'api-gateway' namespace accepts archive uploads via HTTP POST and publishes Celery tasks to Redis. No service mesh is deployed. The worker pod runs as root with hostPath volume mount at /var/lib/worker. Any service in the cluster can connect to the Redis broker at redis.data-pipeline.svc.cluster.local:6379 and submit tasks directly.",
+    "config": {
+      "kubernetes_namespace": "data-pipeline",
+      "service_mesh": "none",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "privileged": false
+      },
+      "volume_mounts": [
+        {
+          "hostPath": "/var/lib/worker",
+          "mountPath": "/var/lib/worker"
+        }
+      ],
+      "network_policy": "none",
+      "redis_auth": false
+    }
+  }
+}

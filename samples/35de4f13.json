@@ -1,0 +1,40 @@
+{
+  "id": "35de4f13",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_api_token(token):\n    \"\"\"Verify HMAC-based API token: base64(user_id):hmac_hex\"\"\"\n    if not token or ':' not in token:\n        return None\n    parts = token.split(':', 1)\n    user_id = parts[0]\n    provided_mac = parts[1]\n    expected_mac = hmac.new(SECRET_KEY.encode(), user_id.encode(), hashlib.sha256).hexdigest()\n    if hmac.compare_digest(provided_mac, expected_mac):\n        return user_id\n    return None\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by name or email. Requires valid API token.\"\"\"\n    auth = request.headers.get('Authorization', '')\n    if not auth.startswith('Bearer '):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    caller = verify_api_token(auth[7:])\n    if caller is None:\n        return jsonify({'error': 'invalid token'}), 403\n    \n    query_param = request.args.get('q', '')\n    field = request.args.get('field', 'name')\n    \n    # Input validation - only allow searching specific fields\n    allowed_fields = ['name', 'email', 'department', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'invalid field'}), 400\n    \n    # Build query with parameterized field but concatenated search value\n    # Note: field is validated above against allowlist\n    sql = f\"SELECT id, name, email, department, role FROM users WHERE {field} LIKE '%{query_param}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(sql)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    auth = request.headers.get('Authorization', '')\n    if not auth.startswith('Bearer '):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    caller = verify_api_token(auth[7:])\n    if caller is None:\n        return jsonify({'error': 'invalid token'}), 403\n    \n    db = get_db()\n    cursor = db.execute('SELECT id, name, email, department, role FROM users WHERE id = ?', (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user. Admin only.\"\"\"\n    auth = request.headers.get('Authorization', '')\n    if not auth.startswith('Bearer '):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    caller = verify_api_token(auth[7:])\n    if caller is None:\n        return jsonify({'error': 'invalid token'}), 403\n    \n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'no data'}), 400\n    \n    name = data.get('name', '')\n    email = data.get('email', '')\n    department = data.get('department', '')\n    role = data.get('role', 'viewer')\n    \n    db = get_db()\n    db.execute(\n        'INSERT INTO users (name, email, department, role) VALUES (?, ?, ?, ?)',\n        (name, email, department, role)\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 Web ACL with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count (not Block) to allow long search queries, (2) AWSManagedRulesKnownBadInputsRuleSet in default Block mode, (3) a custom rule group 'corp-query-sanitization' with a single RegexPatternSet rule matching request URI query string values against pattern `(?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|(?:--|#|\\/\\*).*$|'\\s*(?:or|and)\\s+['\"]?\\d)` with action BLOCK. The Web ACL default action is ALLOW. CloudWatch metrics confirm the custom rule fires on test payloads containing UNION SELECT patterns. Additionally, the ALB access logs are shipped to S3 with a 5-minute delivery SLA but this is monitoring only, not prevention.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "AWS ALB with WAFv2 Web ACL attached",
+      "wafv2_web_acl_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "Count"
+            }
+          ]
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none"
+        },
+        {
+          "priority": 3,
+          "name": "corp-query-sanitization",
+          "type": "RegexPatternSet on QueryString values",
+          "pattern": "(?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|(?:--|#|\\/\\*).*$|'\\s*(?:or|and)\\s+['\"]?\\d)",
+          "action": "BLOCK"
+        }
+      ],
+      "web_acl_default_action": "ALLOW",
+      "alb_access_logs": "S3 bucket with 5-min delivery (monitoring only)",
+      "database": "SQLite 3.40 with users table containing additional sensitive columns"
+    }
+  }
+}

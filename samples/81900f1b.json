@@ -1,0 +1,59 @@
+{
+  "id": "81900f1b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (1, 'admin', 'admin@corp.internal', 'superadmin', 'sk-prod-9f8a7b6c5d4e3f2a1b')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (2, 'svc-deploy', 'deploy@corp.internal', 'deployer', 'sk-prod-deploy-x7y8z9')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Query parameter q is required'}), 400\n    \n    # Build query with validated field name but injectable value\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID. API key is only shown to admins.\"\"\"\n    requesting_role = request.headers.get('X-User-Role', 'user')\n    db = get_db()\n    \n    if requesting_role == 'superadmin':\n        user = db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()\n    else:\n        user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    \n    if user is None:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    try:\n        db = get_db()\n        db.execute('SELECT 1')\n        return jsonify({'status': 'healthy', 'db': 'connected'})\n    except:\n        return jsonify({'status': 'degraded', 'db': 'disconnected'}), 503\n\n@app.before_request\ndef log_request():\n    \"\"\"Audit logging for compliance.\"\"\"\n    if request.endpoint and request.endpoint != 'health':\n        try:\n            db = get_db()\n            db.execute(\n                'INSERT INTO audit_log (action, actor) VALUES (?, ?)',\n                (f\"{request.method} {request.path}\", request.remote_addr)\n            )\n            db.commit()\n        except:\n            pass\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'corp-input-validation' with a RegexPatternSet match on query string values matching pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*--)|(?:%27|%2527)` with action BLOCK, (3) AWSManagedRulesSQLiRuleSet with all rules in COUNT mode. The ECS task role has an IAM permission boundary 'PB-NoSSMDescribe' attached. CloudWatch Logs Insights query scheduled every 5 minutes alerts on HTTP 500 responses.",
+    "config": {
+      "load_balancer": "AWS ALB with TLS termination",
+      "wafv2_web_acl": {
+        "rule_priority_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        "rule_priority_2": {
+          "name": "corp-input-validation",
+          "type": "custom_rule_group",
+          "capacity": 50,
+          "rules": [
+            {
+              "name": "block-sqli-patterns",
+              "action": "BLOCK",
+              "statement": {
+                "regex_pattern_set_match": {
+                  "field_to_match": "all_query_arguments_values",
+                  "regex_pattern_set_arn": "arn:aws:wafv2:us-east-1:111122223333:regional/regexpatternset/sqli-patterns/a1b2c3d4",
+                  "patterns": [
+                    "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|'\\s*--)|(?:%27|%2527)"
+                  ],
+                  "text_transformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "rule_priority_3": {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "override_action": "count"
+        }
+      },
+      "ecs_task_role_permission_boundary": "PB-NoSSMDescribe",
+      "monitoring": "CloudWatch Logs Insights alert on 5xx spike"
+    }
+  }
+}

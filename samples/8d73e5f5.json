@@ -1,0 +1,20 @@
+{
+  "id": "8d73e5f5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=db.internal port=5432 user=app_user dbname=inventory sslmode=require\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// SearchHandler allows warehouse staff to search inventory by product attributes\nfunc SearchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\twarehouse := r.URL.Query().Get(\"warehouse\")\n\tminQty := r.URL.Query().Get(\"min_qty\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category is required\", 400)\n\t\treturn\n\t}\n\n\t// Build dynamic query based on filters\n\tvar conditions []string\n\tconditions = append(conditions, fmt.Sprintf(\"category = '%s'\", category))\n\n\tif warehouse != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"warehouse_id = '%s'\", warehouse))\n\t}\n\n\tif minQty != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"quantity >= %s\", minQty))\n\t}\n\n\tquery := fmt.Sprintf(\"SELECT product_id, name, quantity, warehouse_id FROM inventory WHERE %s ORDER BY name LIMIT 100\",\n\t\tstrings.Join(conditions, \" AND \"))\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfor rows.Next() {\n\t\tvar productID, name, warehouseID string\n\t\tvar quantity int\n\t\tif err := rows.Scan(&productID, &name, &quantity, &warehouseID); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tfmt.Fprintf(w, \"%s | %s | %d | %s\\n\", productID, name, quantity, warehouseID)\n\t}\n}\n\n// BulkUpdateHandler processes CSV-style bulk quantity updates\nfunc BulkUpdateHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tlines := strings.Split(r.FormValue(\"updates\"), \"\\n\")\n\ttx, err := db.Begin()\n\tif err != nil {\n\t\thttp.Error(w, \"Transaction error\", 500)\n\t\treturn\n\t}\n\n\tfor _, line := range lines {\n\t\tparts := strings.Split(strings.TrimSpace(line), \",\")\n\t\tif len(parts) != 2 {\n\t\t\tcontinue\n\t\t}\n\t\tproductID := parts[0]\n\t\tnewQty := parts[1]\n\n\t\tupdateSQL := fmt.Sprintf(\"UPDATE inventory SET quantity = %s, updated_at = NOW() WHERE product_id = '%s'\",\n\t\t\tnewQty, productID)\n\t\t_, err := tx.Exec(updateSQL)\n\t\tif err != nil {\n\t\t\ttx.Rollback()\n\t\t\thttp.Error(w, fmt.Sprintf(\"Update failed: %v\", err), 500)\n\t\t\treturn\n\t\t}\n\t}\n\n\tif err := tx.Commit(); err != nil {\n\t\thttp.Error(w, \"Commit failed\", 500)\n\t\treturn\n\t}\n\tfmt.Fprintf(w, \"Updated %d records\", len(lines))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/inventory/search\", SearchHandler)\n\thttp.HandleFunc(\"/api/v2/inventory/bulk-update\", BulkUpdateHandler)\n\tlog.Println(\"Inventory service starting on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Laravel 10 application running on PHP-FPM 8.2 with pcntl extension enabled, deployed as a Kubernetes pod in the 'payments' namespace. The accounts-service runs in the 'finance' namespace with no network policies or service mesh. Pod runs with default service account. No rate limiting on webhook endpoint. The /api/admin/reprocess endpoint is exposed without authentication middleware.",
+    "config": {
+      "runtime": "PHP 8.2 with pcntl extension",
+      "framework": "Laravel 10",
+      "deployment": "Kubernetes, namespace: payments",
+      "network_policy": "none",
+      "service_mesh": "none",
+      "auth_middleware": "none on admin endpoints",
+      "php_extensions": [
+        "pcntl",
+        "posix"
+      ]
+    }
+  }
+}

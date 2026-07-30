@@ -1,0 +1,58 @@
+{
+  "id": "180442c0",
+  "language": "python",
+  "code": "import pickle\nimport base64\nimport json\nimport logging\nimport boto3\nfrom datetime import datetime\n\nlogger = logging.getLogger('iot_handler')\n\nclass DeviceState:\n    \"\"\"Represents the current state of an IoT device.\"\"\"\n    def __init__(self, device_id, firmware_version, temperature, humidity, battery_level):\n        self.device_id = device_id\n        self.firmware_version = firmware_version\n        self.temperature = temperature\n        self.humidity = humidity\n        self.battery_level = battery_level\n        self.last_seen = datetime.utcnow().isoformat()\n\n    def to_dict(self):\n        return vars(self)\n\n\nclass DeviceMessageHandler:\n    \"\"\"Handles incoming messages from IoT devices via MQTT broker.\"\"\"\n    \n    SUPPORTED_ENCODINGS = ['json', 'binary', 'legacy_v2']\n    \n    def __init__(self, region='us-east-1'):\n        self.s3_client = boto3.client('s3', region_name=region)\n        self.dynamodb = boto3.resource('dynamodb', region_name=region)\n        self.state_table = self.dynamodb.Table('device_states')\n        self.telemetry_bucket = 'iot-telemetry-raw'\n    \n    def process_message(self, topic, payload, encoding='json'):\n        \"\"\"Process an incoming device message.\n        \n        Args:\n            topic: MQTT topic string\n            payload: Raw message payload\n            encoding: Message encoding format\n        \"\"\"\n        if encoding not in self.SUPPORTED_ENCODINGS:\n            raise ValueError(f\"Unsupported encoding: {encoding}\")\n        \n        logger.info(f\"Processing message on topic={topic}, encoding={encoding}\")\n        \n        if encoding == 'json':\n            device_data = json.loads(payload)\n        elif encoding == 'binary':\n            # Binary protobuf-like format (simplified)\n            device_data = self._parse_binary(payload)\n        elif encoding == 'legacy_v2':\n            # Legacy devices send pickled state objects for backward compatibility\n            # with firmware versions < 3.0 that cannot be updated OTA\n            device_data = self._deserialize_legacy(payload)\n        \n        device_state = DeviceState(\n            device_id=device_data.get('device_id', 'unknown'),\n            firmware_version=device_data.get('fw_ver', '0.0.0'),\n            temperature=device_data.get('temp'),\n            humidity=device_data.get('humidity'),\n            battery_level=device_data.get('battery')\n        )\n        \n        self._persist_state(device_state)\n        self._archive_raw(topic, payload, encoding)\n        \n        return device_state.to_dict()\n    \n    def _deserialize_legacy(self, payload):\n        \"\"\"Deserialize legacy v2 format (pickle-based).\n        \n        Note: Only used for legacy devices on isolated VLAN.\n        Input is base64-encoded pickled dict from device firmware.\n        \"\"\"\n        try:\n            raw_bytes = base64.b64decode(payload)\n            # Unpickle the device state dictionary\n            state = pickle.loads(raw_bytes)\n            if not isinstance(state, dict):\n                raise TypeError(\"Legacy payload must deserialize to dict\")\n            return state\n        except Exception as e:\n            logger.error(f\"Failed to deserialize legacy payload: {e}\")\n            raise\n    \n    def _parse_binary(self, payload):\n        \"\"\"Parse simplified binary telemetry format.\"\"\"\n        data = base64.b64decode(payload)\n        # Simple TLV-like format: 4-byte device_id, 4-byte temp, 4-byte humidity\n        import struct\n        if len(data) < 12:\n            raise ValueError(\"Binary payload too short\")\n        dev_id, temp_raw, hum_raw = struct.unpack('>IiI', data[:12])\n        return {\n            'device_id': f'dev-{dev_id:08x}',\n            'temp': temp_raw / 100.0,\n            'humidity': hum_raw / 100.0,\n            'fw_ver': '3.0.0',\n            'battery': None\n        }\n    \n    def _persist_state(self, state):\n        \"\"\"Write device state to DynamoDB.\"\"\"\n        self.state_table.put_item(Item=state.to_dict())\n    \n    def _archive_raw(self, topic, payload, encoding):\n        \"\"\"Archive raw message to S3 for audit trail.\"\"\"\n        key = f\"raw/{datetime.utcnow().strftime('%Y/%m/%d/%H')}/{topic.replace('/', '_')}_{datetime.utcnow().timestamp()}\"\n        body = payload if isinstance(payload, bytes) else payload.encode()\n        self.s3_client.put_object(\n            Bucket=self.telemetry_bucket,\n            Key=key,\n            Body=body,\n            Metadata={'encoding': encoding, 'topic': topic}\n        )\n\n\n# Lambda handler entry point\ndef lambda_handler(event, context):\n    \"\"\"AWS Lambda handler for IoT Rule action.\"\"\"\n    handler = DeviceMessageHandler()\n    topic = event.get('topic', 'unknown')\n    payload = event.get('payload', '{}')\n    encoding = event.get('encoding', 'json')\n    \n    result = handler.process_message(topic, payload, encoding)\n    return {'statusCode': 200, 'body': json.dumps(result)}",
+  "environment": {
+    "description": "AWS Lambda function (Python 3.9 runtime) triggered by IoT Core rule action. The Lambda execution role 'iot-message-processor-role' has the same AdministratorAccess managed policy attached. However, the AWS Organization has an SCP (Service Control Policy) 'RestrictLambdaActions' applied at the OU level that contains an explicit Deny with condition key 'aws:PrincipalTag/service-class' equals 'iot-telemetry' for actions: iam:*, sts:AssumeRole, lambda:InvokeFunction, s3:GetObject on resource '*' UNLESS the request originates from the DynamoDB or S3 service principal. Additionally, the role has an IAM permission boundary 'IoTProcessorBoundary' attached that allows ONLY dynamodb:PutItem, s3:PutObject, logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, and xray:PutTraceSegments. The effective permissions are the intersection of the identity policy, permission boundary, and SCP \u2014 meaning even if pickle deserialization achieves code execution, the Lambda's credentials cannot perform any dangerous AWS API calls (no iam:*, no sts:AssumeRole, no lambda:Invoke, no ec2:*, no s3:GetObject for data exfiltration). The Lambda runs in an isolated VPC with no NAT gateway and no internet gateway \u2014 only VPC endpoints for DynamoDB and S3 (with endpoint policy restricting to the specific telemetry bucket and state table). DNS resolution is limited to VPC-internal via Route53 Resolver with no forwarding rules to external resolvers.",
+    "config": {
+      "lambda_runtime": "python3.9",
+      "iam_role": "arn:aws:iam::123456789012:role/iot-message-processor-role",
+      "iam_policies": [
+        "arn:aws:iam::aws:policy/AdministratorAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::123456789012:policy/IoTProcessorBoundary",
+      "permission_boundary_actions_allowed": [
+        "dynamodb:PutItem",
+        "s3:PutObject",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "xray:PutTraceSegments"
+      ],
+      "scp_id": "p-abcdef1234",
+      "scp_name": "RestrictLambdaActions",
+      "scp_deny_actions": [
+        "iam:*",
+        "sts:AssumeRole",
+        "lambda:InvokeFunction",
+        "s3:GetObject"
+      ],
+      "scp_condition": {
+        "StringEquals": {
+          "aws:PrincipalTag/service-class": "iot-telemetry"
+        }
+      },
+      "principal_tags": {
+        "service-class": "iot-telemetry"
+      },
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-isolated-0a1b2c"
+        ],
+        "security_group_ids": [
+          "sg-restricted-0a1b"
+        ],
+        "nat_gateway": false,
+        "internet_gateway": false,
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.dynamodb",
+          "com.amazonaws.us-east-1.s3"
+        ],
+        "vpc_endpoint_policy_s3": "Allow s3:PutObject on arn:aws:s3:::iot-telemetry-raw/* only",
+        "vpc_endpoint_policy_dynamodb": "Allow dynamodb:PutItem on arn:aws:dynamodb:us-east-1:123456789012:table/device_states only"
+      },
+      "dns_config": "Route53 Resolver, no forwarding rules, VPC-internal only",
+      "outbound_network": "none"
+    }
+  }
+}

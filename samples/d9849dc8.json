@@ -1,0 +1,47 @@
+{
+  "id": "d9849dc8",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class ReportExportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportExportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        if (sessionToken == null || sessionToken.isEmpty()) {\n            resp.sendError(401, \"Missing session token\");\n            return;\n        }\n\n        // Validate session exists (simplified)\n        if (!validateSession(sessionToken)) {\n            resp.sendError(403, \"Invalid session\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customFilter = req.getParameter(\"filter\");\n\n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Whitelist report types\n        if (!reportType.matches(\"(sales|inventory|users|audit)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date range validation - basic format check\n        if (!dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        try {\n            String csvData = generateReport(reportType, startDate, endDate, customFilter);\n            resp.setContentType(\"text/csv\");\n            resp.setHeader(\"Content-Disposition\", \"attachment; filename=report_\" + reportType + \".csv\");\n            resp.getWriter().write(csvData);\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String generateReport(String reportType, String startDate, String endDate, String customFilter)\n            throws SQLException {\n        Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n        StringBuilder csv = new StringBuilder();\n\n        // Base query uses parameterized dates\n        String baseQuery = \"SELECT * FROM \" + reportType + \"_report_view \"\n                + \"WHERE created_at BETWEEN ? AND ? \";\n\n        // Custom filter is appended directly for flexible reporting\n        // Note: reportType is already whitelisted above\n        if (customFilter != null && !customFilter.isEmpty()) {\n            baseQuery += \"AND \" + customFilter;\n        }\n\n        log.info(\"Executing report query for type: \" + reportType);\n\n        PreparedStatement stmt = conn.prepareStatement(baseQuery);\n        stmt.setString(1, startDate);\n        stmt.setString(2, endDate);\n\n        ResultSet rs = stmt.executeQuery();\n        ResultSetMetaData meta = rs.getMetaData();\n        int colCount = meta.getColumnCount();\n\n        // Header row\n        for (int i = 1; i <= colCount; i++) {\n            csv.append(meta.getColumnName(i));\n            if (i < colCount) csv.append(\",\");\n        }\n        csv.append(\"\\n\");\n\n        // Data rows\n        while (rs.next()) {\n            for (int i = 1; i <= colCount; i++) {\n                String val = rs.getString(i);\n                csv.append(val != null ? val.replace(\",\", \";\") : \"\");\n                if (i < colCount) csv.append(\",\");\n            }\n            csv.append(\"\\n\");\n        }\n\n        rs.close();\n        stmt.close();\n        conn.close();\n        return csv.toString();\n    }\n\n    private boolean validateSession(String token) {\n        // In production, validates against session store\n        return token.length() == 64 && token.matches(\"[a-f0-9]+\");\n    }\n}",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. The user-profile-service runs in namespace 'backend-services' with automatic sidecar injection (istio-injection=enabled). PeerAuthentication resource in the namespace enforces STRICT mTLS mode. An AuthorizationPolicy resource is applied with the following spec: action DENY for source principals not matching 'cluster.local/ns/backend-services/sa/*' \u2014 effectively rejecting any traffic originating from workloads outside the 'backend-services' namespace. A second AuthorizationPolicy with action ALLOW requires request.headers['x-internal-role'] to be absent OR source.principal to match 'cluster.local/ns/backend-services/sa/admin-gateway'. EnvoyFilter at namespace level strips x-internal-role and x-caller-namespace headers from any inbound request where the downstream peer certificate SAN does not contain 'admin-gateway' service account.",
+    "config": {
+      "kubernetes_namespace": "backend-services",
+      "istio_version": "1.20.2",
+      "sidecar_injection": "enabled",
+      "peer_authentication_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "action": "DENY",
+          "source_not_principals": [
+            "cluster.local/ns/backend-services/sa/*"
+          ]
+        },
+        {
+          "name": "restrict-admin-metadata",
+          "action": "ALLOW",
+          "when_conditions": [
+            {
+              "key": "request.headers[x-internal-role]",
+              "notValues": [
+                "platform-admin",
+                "support-agent"
+              ]
+            }
+          ],
+          "source_principal_override": "cluster.local/ns/backend-services/sa/admin-gateway"
+        }
+      ],
+      "envoy_filter": {
+        "name": "strip-privileged-headers",
+        "match_context": "SIDECAR_INBOUND",
+        "operation": "remove_header",
+        "headers": [
+          "x-internal-role",
+          "x-caller-namespace"
+        ],
+        "condition": "downstream_peer.san != 'spiffe://cluster.local/ns/backend-services/sa/admin-gateway'"
+      }
+    }
+  }
+}

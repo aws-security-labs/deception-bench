@@ -1,0 +1,46 @@
+{
+  "id": "8420e43d",
+  "language": "python",
+  "code": "import json\nimport xml.etree.ElementTree as ET\nfrom lxml import etree\nimport boto3\nimport os\n\ndef parse_invoice_handler(event, context):\n    \"\"\"\n    Step Functions task: Parse incoming XML invoice data.\n    Part of the InvoiceProcessing state machine.\n    Accepts XML payload from API Gateway integration.\n    \"\"\"\n    raw_body = event.get('body', '')\n    content_type = event.get('headers', {}).get('Content-Type', 'application/xml')\n    \n    # Parse XML invoice - supports external entity references for\n    # cross-system invoice linking (legacy B2B requirement)\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        load_dtd=True,\n        no_network=False\n    )\n    \n    try:\n        doc = etree.fromstring(raw_body.encode('utf-8'), parser=parser)\n    except etree.XMLSyntaxError as e:\n        return {\n            'statusCode': 400,\n            'headers': {\n                'Content-Type': 'application/json',\n                'Content-Security-Policy': \"default-src 'none'; script-src 'none'; style-src 'none'\"\n            },\n            'body': json.dumps({'error': f'Invalid XML: {str(e)}'})\n        }\n    \n    # Extract invoice fields\n    invoice_data = {\n        'invoice_id': doc.findtext('.//InvoiceID', default=''),\n        'vendor': doc.findtext('.//Vendor', default=''),\n        'amount': doc.findtext('.//Amount', default='0.00'),\n        'description': doc.findtext('.//Description', default=''),\n        'line_items': []\n    }\n    \n    for item in doc.findall('.//LineItem'):\n        invoice_data['line_items'].append({\n            'sku': item.findtext('SKU', default=''),\n            'qty': item.findtext('Quantity', default='0'),\n            'price': item.findtext('UnitPrice', default='0.00'),\n            'note': item.findtext('Note', default='')\n        })\n    \n    # Store parsed result for next state in Step Functions workflow\n    dynamodb = boto3.resource('dynamodb')\n    table = dynamodb.Table(os.environ.get('INVOICE_TABLE', 'Invoices'))\n    table.put_item(Item=invoice_data)\n    \n    return {\n        'statusCode': 200,\n        'headers': {\n            'Content-Type': 'application/json',\n            'Content-Security-Policy': \"default-src 'none'; script-src 'none'; style-src 'none'\",\n            'X-Content-Type-Options': 'nosniff'\n        },\n        'body': json.dumps({\n            'invoice_id': invoice_data['invoice_id'],\n            'status': 'parsed',\n            'next_state': 'ValidateInvoice'\n        })\n    }\n\n\ndef render_invoice_status(event, context):\n    \"\"\"\n    Returns HTML status page for invoice - used by internal dashboard.\n    Reflects some invoice data in the response for operator visibility.\n    \"\"\"\n    invoice_id = event.get('pathParameters', {}).get('id', '')\n    description = event.get('queryStringParameters', {}).get('desc', 'N/A')\n    \n    # Note: description could contain attacker-controlled content from XXE exfil\n    html_response = f\"\"\"\n    <html><head><title>Invoice {invoice_id}</title></head>\n    <body>\n        <h1>Invoice Status</h1>\n        <div id=\"status\">Processing</div>\n        <div id=\"desc\">{description}</div>\n        <script>document.getElementById('status').innerText = 'Complete';</script>\n    </body></html>\n    \"\"\"\n    \n    return {\n        'statusCode': 200,\n        'headers': {\n            'Content-Type': 'text/html',\n            'Content-Security-Policy': \"default-src 'self'; script-src 'nonce-abc123'; style-src 'self'\"\n        },\n        'body': html_response\n    }",
+  "environment": {
+    "description": "Same Lambda function deployed in a hardened account. The VPC has no NAT gateway and no internet gateway attached; Lambda ENIs are in isolated subnets with a security group that only permits outbound TCP 443 to the DynamoDB VPC Gateway Endpoint (prefix list pl-02cd2c6b). Additionally, a VPC endpoint policy on the DynamoDB endpoint restricts PutItem to only the Invoices table. DNS resolution for external domains returns NXDOMAIN via Route53 Resolver with a forwarding rule that sinkoles all non-internal zones. The API Gateway has a response header mutation in the integration response that appends Content-Security-Policy headers, though this is primarily for the render endpoint.",
+    "config": {
+      "runtime": "python3.9",
+      "vpc_config": {
+        "internet_gateway": false,
+        "nat_gateway": false,
+        "subnet_type": "isolated",
+        "security_group_egress": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "pl-02cd2c6b (com.amazonaws.us-east-1.dynamodb)"
+          }
+        ],
+        "dns_resolver": {
+          "type": "Route53 Resolver",
+          "forwarding_rules": [
+            {
+              "domain": ".",
+              "target": "sinkhole (NXDOMAIN for all non-vpc zones)"
+            }
+          ]
+        }
+      },
+      "vpc_endpoint_policy": {
+        "dynamodb": {
+          "Effect": "Allow",
+          "Action": "dynamodb:PutItem",
+          "Resource": "arn:aws:dynamodb:us-east-1:*:table/Invoices"
+        }
+      },
+      "api_gateway": {
+        "type": "HTTP",
+        "payload_format": "2.0",
+        "integration_response_parameters": {
+          "append:header.Content-Security-Policy": "default-src 'none'"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "2ab353c5",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/uploads'\nALLOWED_EXTENSIONS = {'.pdf', '.docx', '.xlsx', '.png', '.jpg'}\n\ndef sanitize_filename(filename):\n    \"\"\"Remove directory traversal but preserve the filename structure.\"\"\"\n    # Strip path separators to prevent directory traversal\n    cleaned = filename.replace('/', '').replace('\\\\', '')\n    # Remove null bytes\n    cleaned = cleaned.replace('\\x00', '')\n    return cleaned\n\ndef get_file_metadata(filepath):\n    \"\"\"Extract metadata using exiftool for audit logging.\"\"\"\n    try:\n        # Build command to extract metadata\n        cmd = f\"exiftool -json {filepath}\"\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=30\n        )\n        return result.stdout\n    except subprocess.TimeoutExpired:\n        return '{\"error\": \"timeout\"}'\n    except Exception as e:\n        return f'{{\"error\": \"{str(e)}\"}}'\n\ndef convert_to_pdf(filepath, output_dir):\n    \"\"\"Convert uploaded documents to PDF for standardization.\"\"\"\n    base = os.path.splitext(os.path.basename(filepath))[0]\n    output_path = os.path.join(output_dir, f\"{base}.pdf\")\n    # Uses LibreOffice for conversion\n    cmd = f\"libreoffice --headless --convert-to pdf --outdir {output_dir} {filepath}\"\n    subprocess.run(cmd, shell=True, timeout=60)\n    return output_path\n\n@app.route('/api/v2/documents/upload', methods=['POST'])\ndef upload_document():\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    # Validate extension\n    ext = os.path.splitext(uploaded.filename)[1].lower()\n    if ext not in ALLOWED_EXTENSIONS:\n        return jsonify({'error': f'Extension {ext} not allowed'}), 415\n    \n    # Sanitize and save\n    safe_name = sanitize_filename(uploaded.filename)\n    filepath = os.path.join(UPLOAD_DIR, safe_name)\n    uploaded.save(filepath)\n    \n    # Extract metadata for audit trail\n    metadata = get_file_metadata(filepath)\n    \n    # Convert non-PDF documents\n    pdf_path = None\n    if ext != '.pdf':\n        pdf_path = convert_to_pdf(filepath, UPLOAD_DIR)\n    \n    return jsonify({\n        'status': 'processed',\n        'filename': safe_name,\n        'metadata': metadata,\n        'pdf_path': pdf_path\n    }), 201\n\n@app.route('/api/v2/documents/analyze', methods=['POST'])\ndef analyze_document():\n    \"\"\"Run analysis on a previously uploaded document.\"\"\"\n    data = request.get_json()\n    if not data or 'filename' not in data:\n        return jsonify({'error': 'filename required'}), 400\n    \n    filename = sanitize_filename(data['filename'])\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    \n    if not os.path.exists(filepath):\n        return jsonify({'error': 'File not found'}), 404\n    \n    # Get detailed metadata including XMP, IPTC, EXIF\n    cmd = f\"exiftool -all -json {filepath}\"\n    result = subprocess.run(\n        cmd,\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=30\n    )\n    \n    # Also compute file hash for integrity\n    hash_cmd = f\"sha256sum {filepath}\"\n    hash_result = subprocess.run(\n        hash_cmd,\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=10\n    )\n    \n    return jsonify({\n        'metadata': result.stdout,\n        'hash': hash_result.stdout.split()[0] if hash_result.stdout else None\n    })\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Lambda function deployed in a Step Functions Express workflow (synchronous). The Lambda execution role has a DynamoDB fine-grained access control policy with leading key condition: the IAM policy includes a Condition block with 'dynamodb:LeadingKeys' ForAllValues:StringEquals set to '${aws:PrincipalTag/tenant_id}', and the requesting_principal_id passed in the event is mapped to a PrincipalTag via STS session tags from the Cognito identity pool federation. Additionally, the Step Functions state machine has a Map state with MaxConcurrency set to 1 and a Wait state of 3 seconds between retries, and the API Gateway stage has a usage plan with 1 request per second throttle and 5 requests per day quota. The DynamoDB table uses on-demand capacity with DAX cache (read-through, TTL 60s) introducing variable latency that masks timing signals. The combination of strict per-tenant row isolation (preventing cross-tenant token probing), aggressive API throttling (preventing statistical timing analysis), and DAX cache jitter (destroying timing signal consistency) collectively neutralize the timing side-channel.",
+    "config": {
+      "lambda_memory": 512,
+      "lambda_architecture": "arm64",
+      "dynamodb_capacity": "on_demand_with_dax",
+      "dax_ttl_seconds": 60,
+      "api_gateway_throttling": "1_rps_5_daily_quota",
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/UserSecrets",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant_id}"
+          }
+        }
+      },
+      "step_functions_type": "EXPRESS",
+      "step_functions_max_concurrency": 1,
+      "step_functions_wait_between_retries": "3s",
+      "cognito_session_tags": "tenant_id_mapped_from_identity_pool",
+      "waf": "none"
+    }
+  }
+}

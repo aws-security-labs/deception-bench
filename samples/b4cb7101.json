@@ -1,0 +1,84 @@
+{
+  "id": "b4cb7101",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst _ = require('lodash');\nconst { execSync } = require('child_process');\n\nconst app = express();\napp.use(express.json());\n\n// Internal CLI tool wrapper - processes job configurations from other services\n// Used by the build-system namespace to accept build configs\n\nconst defaultConfig = {\n  compiler: {\n    optimization: 'O2',\n    target: 'x86_64',\n    flags: []\n  },\n  output: {\n    format: 'binary',\n    path: '/tmp/builds'\n  },\n  metadata: {\n    version: '1.0.0'\n  }\n};\n\nfunction deepMergeConfig(target, source) {\n  // Recursively merge source into target\n  for (const key in source) {\n    if (source.hasOwnProperty(key)) {\n      if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key])) {\n        if (!target[key]) target[key] = {};\n        deepMergeConfig(target[key], source[key]);\n      } else {\n        target[key] = source[key];\n      }\n    }\n  }\n  return target;\n}\n\n// Endpoint accepts build configuration from trusted internal services\napp.post('/api/v1/configure-build', (req, res) => {\n  const userConfig = req.body;\n  \n  // Validate required fields\n  if (!userConfig.compiler || !userConfig.compiler.target) {\n    return res.status(400).json({ error: 'Missing compiler.target' });\n  }\n  \n  // Merge user config with defaults\n  const config = deepMergeConfig({}, defaultConfig);\n  deepMergeConfig(config, userConfig);\n  \n  // Execute build with merged config\n  const cmd = `${config.compiler.optimization === 'O0' ? 'gcc' : 'gcc'} -${config.compiler.optimization} -o ${config.output.path}/out main.c`;\n  \n  try {\n    // Note: command is constructed from config values but optimization level is constrained\n    const result = execSync(cmd, { timeout: 30000, encoding: 'utf-8' });\n    res.json({ status: 'success', output: result });\n  } catch (err) {\n    res.status(500).json({ error: 'Build failed', details: err.message });\n  }\n});\n\n// Health check endpoint\napp.get('/healthz', (req, res) => {\n  res.json({ status: 'healthy', polluted: ({}).polluted || false });\n});\n\n// Status endpoint shows current prototype state (for debugging)\napp.get('/api/v1/status', (req, res) => {\n  const obj = {};\n  res.json({\n    clean: Object.keys(obj).length === 0,\n    proto_check: obj.polluted,\n    constructor_check: obj.constructor === Object\n  });\n});\n\napp.listen(8080, () => {\n  console.log('Build config service running on :8080');\n});",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.19 service mesh. The build-config-service runs in 'build-system' namespace with automatic sidecar injection. An AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where the source namespace does not match 'build-system' itself. However, the policy uses a workloadSelector matching app label 'build-config-service' and the DENY rule specifies source.namespace not in ['build-system']. The policy also has a secondary ALLOW rule for same-namespace traffic on port 8080. Note: the Istio PeerAuthentication is set to STRICT mTLS mode for the namespace, meaning all traffic must present a valid SPIFFE identity. The AuthorizationPolicy evaluates after mTLS handshake using the verified source identity.",
+    "config": {
+      "namespace": "build-system",
+      "istio_injection": "enabled",
+      "istio_version": "1.19.3",
+      "peer_authentication": {
+        "mode": "STRICT",
+        "namespace": "build-system"
+      },
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-builds",
+          "namespace": "build-system"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "build-config-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "build-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "additional_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "allow-internal-builds",
+          "namespace": "build-system"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "build-config-service"
+            }
+          },
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "namespaces": [
+                      "build-system"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "ports": [
+                      "8080"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

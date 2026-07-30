@@ -1,0 +1,38 @@
+{
+  "id": "a0a3953d",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        username TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various criteria. Supports partial matching.\"\"\"\n    search_field = request.args.get('field', 'username')\n    search_value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'role', 'id']\n    if search_field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query with parameterized field but inline value for LIKE support\n    # Note: field is validated above so this is safe for the column name\n    query = f\"SELECT id, username, role FROM users WHERE {search_field} LIKE '%{search_value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    api_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)',\n            (data['username'], password_hash, api_key)\n        )\n        db.commit()\n        # Log the action\n        db.execute(\n            'INSERT INTO audit_log (action, username) VALUES (?, ?)',\n            ('user_created', data['username'])\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/api/admin/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export all user data for backup purposes.\"\"\"\n    auth_key = request.headers.get('X-Admin-Key')\n    if auth_key != os.environ.get('ADMIN_API_KEY'):\n        return jsonify({'error': 'Unauthorized'}), 403\n    \n    db = get_db()\n    users = db.execute('SELECT id, username, role, api_key FROM users').fetchall()\n    return jsonify([dict(row) for row in users])\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an Application Load Balancer (ALB). The ALB has three AWS WAF rule groups attached in evaluation order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'corp-uri-allowlist' that blocks requests to paths not matching /api/* or /health with a priority of 100, (3) AWSManagedRulesKnownBadInputsRuleSet in BLOCK mode. The WAF web ACL has CloudWatch metrics enabled with sampled requests. ALB access logs are shipped to S3. The ECS task role has no network egress except to the ALB target group. A VPC endpoint policy restricts S3 access to the specific logging bucket ARN only.",
+    "config": {
+      "load_balancer": "ALB with AWS WAF v2 web ACL attached",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "priority": 100,
+          "name": "corp-uri-allowlist",
+          "action": "block",
+          "statement": "NOT match /api/* OR /health"
+        },
+        {
+          "priority": 200,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "override_action": "none"
+        }
+      ],
+      "network": "ECS Fargate, no public IP, egress restricted via security group to ALB only",
+      "vpc_endpoint_policy": "s3:PutObject to arn:aws:s3:::corp-alb-logs-prod/* only",
+      "task_role": "arn:aws:iam::111122223333:role/ecs-app-task-role (no outbound network permissions beyond ALB)"
+    }
+  }
+}

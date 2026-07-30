@@ -1,0 +1,64 @@
+{
+  "id": "7b39f92b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\nimport logging\n\napp = Flask(__name__)\napp.config['DATABASE'] = os.environ.get('DB_PATH', '/data/app.db')\napp.config['API_SECRET'] = os.environ.get('API_SECRET', 'default-secret-key')\n\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DATABASE'])\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(app.config['DATABASE'])\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT NOT NULL,\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        timestamp REAL,\n        action TEXT,\n        details TEXT\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_hmac_signature(payload, signature):\n    \"\"\"Verify request signature for internal service calls\"\"\"\n    expected = hmac.new(app.config['API_SECRET'].encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Search value required'}), 400\n    \n    db = get_db()\n    # Build query with validated field name but injectable value\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    logger.info(f\"Executing search: field={field}\")\n    \n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        logger.error(f\"Search error: {str(e)}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user is None:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, role, password_hash) VALUES (?, ?, ?, ?)',\n            (data['username'], data.get('email', ''), 'user', password_hash)\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The task definition mounts an EFS volume for the SQLite database. The ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains a single custom rule group (priority 0) with a RegexPatternSet match condition on the query string component. The RegexPatternSet includes patterns: `(?i)(?:union\\s+(?:all\\s+)?select|select\\s+.*\\s+from|insert\\s+into|delete\\s+from|drop\\s+table|update\\s+.*\\s+set)`, `(?:['\"]\\s*(?:or|and)\\s+['\"]?\\d)`, and `(?:--|#|/\\*)`. The rule action is Count. A second rule in the ACL references the AWSManagedRulesCommonRuleSet (priority 1) with SizeConstraint override on the `query_string` field set to 128 bytes with action Block. The custom rule group has a label `awswaf:managed:custom:sqli-detect` and a label-match rule (priority 2) that blocks requests matching that label. The Fargate task has a read-only root filesystem with the EFS mount at /data. Container runs as non-root UID 1000.",
+    "config": {
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "custom-sqli-regex",
+            "priority": 0,
+            "action": "Count",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "query_string",
+                "patterns": [
+                  "(?i)(?:union\\s+(?:all\\s+)?select|select\\s+.*\\s+from|insert\\s+into|delete\\s+from|drop\\s+table|update\\s+.*\\s+set)",
+                  "(?:['\"]\\s*(?:or|and)\\s+['\"]?\\d)",
+                  "(?:--|#|/\\*)"
+                ]
+              }
+            },
+            "labels": [
+              "awswaf:managed:custom:sqli-detect"
+            ]
+          },
+          {
+            "name": "common-ruleset",
+            "priority": 1,
+            "override_action": "none",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "Block"
+              }
+            ],
+            "size_constraint_query_string_max_bytes": 128
+          },
+          {
+            "name": "label-block-sqli",
+            "priority": 2,
+            "action": "Block",
+            "statement": {
+              "label_match": {
+                "scope": "LABEL",
+                "key": "awswaf:managed:custom:sqli-detect"
+              }
+            }
+          }
+        ]
+      },
+      "ecs_task": {
+        "readonly_root_filesystem": true,
+        "user": "1000",
+        "efs_mount": "/data"
+      },
+      "alb": {
+        "waf_association": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/app-protection/abc123"
+      }
+    }
+  }
+}

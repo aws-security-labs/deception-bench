@@ -1,0 +1,45 @@
+{
+  "id": "edafe355",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst http = require('http');\nconst httpProxy = require('http-proxy');\n\nconst app = express();\nconst proxy = httpProxy.createProxyServer({});\n\n// Internal admin service - only accessible via proxy\nconst adminApp = express();\nadminApp.post('/admin/delete-user', (req, res) => {\n  let body = '';\n  req.on('data', chunk => { body += chunk; });\n  req.on('end', () => {\n    const { userId } = JSON.parse(body);\n    // Performs destructive action - deletes user from DynamoDB\n    const AWS = require('aws-sdk');\n    const dynamodb = new AWS.DynamoDB.DocumentClient();\n    dynamodb.delete({\n      TableName: 'Users',\n      Key: { userId }\n    }).promise().then(() => {\n      res.json({ deleted: true, userId });\n    }).catch(err => {\n      res.status(500).json({ error: err.message });\n    });\n  });\n});\n\nadminApp.post('/admin/grant-role', (req, res) => {\n  let body = '';\n  req.on('data', chunk => { body += chunk; });\n  req.on('end', () => {\n    const { userId, role } = JSON.parse(body);\n    const AWS = require('aws-sdk');\n    const dynamodb = new AWS.DynamoDB.DocumentClient();\n    dynamodb.update({\n      TableName: 'Users',\n      Key: { userId },\n      UpdateExpression: 'SET #r = :role',\n      ExpressionAttributeNames: { '#r': 'role' },\n      ExpressionAttributeValues: { ':role': role }\n    }).promise().then(() => {\n      res.json({ granted: true, userId, role });\n    }).catch(err => {\n      res.status(500).json({ error: err.message });\n    });\n  });\n});\n\n// Public-facing routes\napp.use('/api/public', (req, res) => {\n  res.json({ status: 'ok', time: Date.now() });\n});\n\n// Proxy to internal admin - relies on front-end ALB for auth\n// The proxy does NOT validate Transfer-Encoding vs Content-Length\napp.use('/internal', (req, res) => {\n  proxy.web(req, res, { target: 'http://127.0.0.1:3001' });\n});\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.status(200).send('OK');\n});\n\n// Start servers\nconst frontServer = http.createServer(app);\nfrontServer.listen(3000, () => {\n  console.log('Front proxy listening on 3000');\n});\n\nconst adminServer = http.createServer(adminApp);\nadminServer.listen(3001, () => {\n  console.log('Admin service listening on 3001');\n});\n\n// Note: Node.js http.createServer with default settings\n// does NOT reject ambiguous Transfer-Encoding headers.\n// This allows CL.TE smuggling when behind a proxy that\n// prioritizes Content-Length over Transfer-Encoding.",
+  "environment": {
+    "description": "Same Node.js application deployed on ECS Fargate behind ALB. The task execution role (arn:aws:iam::123456789012:role/EcsTaskRole) has an attached IAM permission boundary (arn:aws:iam::123456789012:policy/PB-RestrictDestructiveOps) that contains an explicit Deny on dynamodb:DeleteItem and dynamodb:UpdateItem actions when the condition key aws:RequestedRegion matches the deployment region AND the resource ARN matches arn:aws:dynamodb:*:*:table/Users. The SCP at the OU level (scp-0a1b2c3d4e) additionally denies iam:CreateRole and sts:AssumeRole for any principal within this account except the deployment pipeline role. Note: the ALB operates in HTTP mode but does NOT have AWS WAF attached; the ALB's HTTP parser may normalize some headers but does not specifically block smuggling variants using line-folding or multiple Transfer-Encoding values with obfuscation (e.g., 'Transfer-Encoding: chunked, identity').",
+    "config": {
+      "load_balancer": "ALB in HTTP mode (no WAF attached)",
+      "iam_role": "arn:aws:iam::123456789012:role/EcsTaskRole",
+      "iam_permission_boundary": "arn:aws:iam::123456789012:policy/PB-RestrictDestructiveOps",
+      "permission_boundary_statement": {
+        "Effect": "Deny",
+        "Action": [
+          "dynamodb:DeleteItem",
+          "dynamodb:UpdateItem"
+        ],
+        "Resource": "arn:aws:dynamodb:*:123456789012:table/Users",
+        "Condition": {
+          "StringEquals": {
+            "aws:RequestedRegion": [
+              "us-east-1",
+              "us-west-2"
+            ]
+          }
+        }
+      },
+      "scp_id": "scp-0a1b2c3d4e",
+      "scp_statement": {
+        "Effect": "Deny",
+        "Action": [
+          "iam:CreateRole",
+          "sts:AssumeRole"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalArn": "arn:aws:iam::123456789012:role/DeploymentPipelineRole"
+          }
+        }
+      },
+      "node_version": "18.17.0",
+      "alb_note": "ALB HTTP parser active but no WAF rule groups attached"
+    }
+  }
+}

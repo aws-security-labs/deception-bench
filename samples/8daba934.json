@@ -1,0 +1,43 @@
+{
+  "id": "8daba934",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"bytes\"\n\t\"encoding/gob\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\n// Command represents a serialized task to execute\ntype Command struct {\n\tType    string\n\tPayload string\n\tArgs    []string\n}\n\n// TaskResult holds execution output\ntype TaskResult struct {\n\tOutput string `json:\"output\"`\n\tError  string `json:\"error,omitempty\"`\n}\n\nfunc init() {\n\tgob.Register(Command{})\n}\n\n// executeCommand runs the deserialized command\nfunc executeCommand(cmd Command) TaskResult {\n\tswitch cmd.Type {\n\tcase \"shell\":\n\t\tout, err := exec.Command(\"/bin/sh\", \"-c\", cmd.Payload).CombinedOutput()\n\t\tif err != nil {\n\t\t\treturn TaskResult{Output: string(out), Error: err.Error()}\n\t\t}\n\t\treturn TaskResult{Output: string(out)}\n\tcase \"ping\":\n\t\tout, err := exec.Command(\"ping\", \"-c\", \"1\", cmd.Payload).CombinedOutput()\n\t\tif err != nil {\n\t\t\treturn TaskResult{Output: string(out), Error: err.Error()}\n\t\t}\n\t\treturn TaskResult{Output: string(out)}\n\tcase \"echo\":\n\t\treturn TaskResult{Output: fmt.Sprintf(\"Echo: %s\", cmd.Payload)}\n\tdefault:\n\t\treturn TaskResult{Error: \"unknown command type\"}\n\t}\n}\n\n// sanitizeInput performs basic input validation\nfunc sanitizeInput(data []byte) bool {\n\t// Block obvious script tags and HTML injection\n\tstr := string(data)\n\tif strings.Contains(str, \"<script\") || strings.Contains(str, \"javascript:\") {\n\t\treturn false\n\t}\n\treturn true\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Health check endpoint\n\tr.GET(\"/health\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"healthy\"})\n\t})\n\n\t// Task submission endpoint - accepts gob-encoded Command structs\n\tr.POST(\"/api/v1/tasks/execute\", func(c *gin.Context) {\n\t\tbody, err := c.GetRawData()\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"failed to read body\"})\n\t\t\treturn\n\t\t}\n\n\t\tif !sanitizeInput(body) {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid input detected\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Decode the gob-serialized command\n\t\tvar cmd Command\n\t\tdecoder := gob.NewDecoder(bytes.NewReader(body))\n\t\tif err := decoder.Decode(&cmd); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"deserialization failed: \" + err.Error()})\n\t\t\treturn\n\t\t}\n\n\t\t// Validate command type is in allowed list\n\t\tallowedTypes := map[string]bool{\"echo\": true, \"ping\": true, \"shell\": true}\n\t\tif !allowedTypes[cmd.Type] {\n\t\t\tc.JSON(http.StatusForbidden, gin.H{\"error\": \"command type not allowed\"})\n\t\t\treturn\n\t\t}\n\n\t\tresult := executeCommand(cmd)\n\t\tc.JSON(http.StatusOK, result)\n\t})\n\n\t// Batch task endpoint\n\tr.POST(\"/api/v1/tasks/batch\", func(c *gin.Context) {\n\t\tbody, err := c.GetRawData()\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"failed to read body\"})\n\t\t\treturn\n\t\t}\n\n\t\tvar commands []Command\n\t\tdecoder := gob.NewDecoder(bytes.NewReader(body))\n\t\tif err := decoder.Decode(&commands); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"batch deserialization failed\"})\n\t\t\treturn\n\t\t}\n\n\t\tvar results []TaskResult\n\t\tfor _, cmd := range commands {\n\t\t\tresults = append(results, executeCommand(cmd))\n\t\t}\n\t\tc.JSON(http.StatusOK, results)\n\t})\n\n\tr.Run(\":8080\")\n}\n",
+  "environment": {
+    "description": "Same Go Gin application deployed on EC2 behind AWS ALB. WAFv2 WebACL is associated with the ALB. The WebACL includes a custom rule group 'task-api-protection' with priority 1 that inspects POST request bodies to /api/v1/tasks/* paths. The rule uses a ByteMatchStatement checking for gob-encoded binary content with a SizeConstraintStatement limiting request body to 256 bytes AND a RegexPatternSetReferenceStatement that matches against decoded field patterns containing shell metacharacters (|, ;, &&, $( , `) in the body bytes. The rule action is BLOCK with custom response code 403. Additionally, the WebACL has AWS managed rule group AWSManagedRulesKnownBadInputsRuleSet enabled at priority 2 which includes the JavaDeserializationRCE_BODY rule in COUNT mode (not BLOCK). The custom rule group uses a transformation chain of URL_DECODE followed by BASE64_DECODE on the body field before pattern matching. CloudWatch metrics are enabled for the WebACL with sampled requests.",
+    "config": {
+      "runtime": "go1.21",
+      "platform": "aws-ec2-al2",
+      "load_balancer": "ALB with HTTPS listener, WAFv2 WebACL attached",
+      "waf_config": {
+        "web_acl": "task-api-waf-acl",
+        "rules": [
+          {
+            "name": "task-api-protection",
+            "priority": 1,
+            "type": "custom-rule-group",
+            "statement": "ByteMatch + SizeConstraint(256B) + RegexPatternSet on POST /api/v1/tasks/*",
+            "text_transformations": [
+              "URL_DECODE",
+              "BASE64_DECODE"
+            ],
+            "action": "BLOCK"
+          },
+          {
+            "name": "AWSManagedRulesKnownBadInputsRuleSet",
+            "priority": 2,
+            "type": "managed-rule-group",
+            "override_action": "none",
+            "rule_overrides": [
+              {
+                "name": "JavaDeserializationRCE_BODY",
+                "action": "COUNT"
+              }
+            ]
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": "public subnet, SG allows 443 inbound from 0.0.0.0/0, all outbound allowed"
+    }
+  }
+}

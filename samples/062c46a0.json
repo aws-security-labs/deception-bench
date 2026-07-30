@@ -1,0 +1,44 @@
+{
+  "id": "062c46a0",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst axios = require('axios');\nconst _ = require('lodash');\n\n// In-memory configuration store\nlet serverConfig = {\n  cache: { ttl: 300, maxSize: 1000 },\n  features: { analytics: true, logging: true },\n  security: { rateLimit: 100 }\n};\n\nconst typeDefs = gql`\n  type Config {\n    key: String\n    value: String\n  }\n\n  input ConfigUpdate {\n    path: String!\n    value: String!\n  }\n\n  type Query {\n    getConfig(path: String!): Config\n    healthCheck: String\n  }\n\n  type Mutation {\n    updateConfig(input: ConfigUpdate!): Config\n    mergeConfig(patch: String!): Boolean\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    getConfig: (_, { path }) => {\n      const value = _.get(serverConfig, path);\n      return { key: path, value: JSON.stringify(value) };\n    },\n    healthCheck: () => 'OK'\n  },\n  Mutation: {\n    updateConfig: (_, { input }) => {\n      _.set(serverConfig, input.path, input.value);\n      return { key: input.path, value: input.value };\n    },\n    mergeConfig: (_, { patch }) => {\n      try {\n        const patchObj = JSON.parse(patch);\n        // Deep merge user-provided patch into server config\n        // This uses a recursive merge without prototype checks\n        const deepMerge = (target, source) => {\n          for (const key in source) {\n            if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key])) {\n              if (!target[key]) target[key] = {};\n              deepMerge(target[key], source[key]);\n            } else {\n              target[key] = source[key];\n            }\n          }\n          return target;\n        };\n        deepMerge(serverConfig, patchObj);\n        return true;\n      } catch (e) {\n        return false;\n      }\n    }\n  }\n};\n\n// Background task: fetch cloud metadata for service identity\nasync function refreshServiceIdentity() {\n  try {\n    const metadataUrl = ({}).metadataEndpoint || 'http://169.254.169.254/latest/meta-data/iam/security-credentials/';\n    const resp = await axios.get(metadataUrl, { timeout: 2000, headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' } });\n    const roleName = resp.data.trim();\n    const credsResp = await axios.get(`${metadataUrl}${roleName}`, { timeout: 2000 });\n    console.log('[identity] Refreshed credentials for role:', roleName);\n    return credsResp.data;\n  } catch (err) {\n    console.log('[identity] Metadata fetch failed (non-critical):', err.message);\n    return null;\n  }\n}\n\n// Periodic credential refresh\nsetInterval(refreshServiceIdentity, 60000);\n\nconst app = express();\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  playground: false\n});\n\nserver.applyMiddleware({ app, path: '/graphql' });\n\napp.listen(4000, () => {\n  console.log('GraphQL server running on port 4000');\n  refreshServiceIdentity();\n});",
+  "environment": {
+    "description": "Same Node.js 18 Apollo GraphQL service on EKS 1.28. Pod runs in namespace 'api-services'. A Cilium-based NetworkPolicy with L3/L4 egress rules is applied: the policy spec uses a CiliumNetworkPolicy CRD with egressDeny rules matching CIDR 169.254.169.254/32 on all ports, combined with a default-allow for other egress (so DNS, external APIs still work). The policy is labeled with app=graphql-config-svc and enforced by Cilium agent v1.14 in strict mode. Additionally, the EKS node group has IMDSv2 enforced (HttpTokens: required, HttpPutResponseHopLimit: 1) which means even if a connection were established, the lack of a PUT-obtained token would cause 401 from IMDS. Pod uses a projected service account token with audience-bound IRSA, not instance profile credentials.",
+    "config": {
+      "kubernetes_namespace": "api-services",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress",
+          "namespace": "api-services"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "graphql-config-svc"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "toEntities": [
+                "world"
+              ]
+            }
+          ]
+        }
+      },
+      "imds_config": "HttpTokens: required, HttpPutResponseHopLimit: 1",
+      "pod_identity": "IRSA with projected service account token (sts.amazonaws.com audience)",
+      "cilium_version": "1.14.2",
+      "cilium_mode": "strict (policy enforcement always)"
+    }
+  }
+}

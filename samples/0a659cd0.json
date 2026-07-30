@@ -1,0 +1,82 @@
+{
+  "id": "0a659cd0",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.logging.Logger;\n\n@WebServlet(\"/report\")\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String sortCol = req.getParameter(\"sort\");\n\n        if (reportId == null || !reportId.matches(\"[0-9]+\")) {\n            resp.sendError(400, \"Invalid report ID\");\n            return;\n        }\n\n        // Template-based query construction for flexible sorting\n        Map<String, String> params = new HashMap<>();\n        params.put(\"report_id\", reportId);\n        params.put(\"sort_column\", sortCol != null ? sortCol : \"created_at\");\n        params.put(\"format\", format != null ? format : \"json\");\n\n        String queryTemplate = \"SELECT r.id, r.title, r.content, r.created_at, u.name as author \"\n            + \"FROM reports r JOIN users u ON r.author_id = u.id \"\n            + \"WHERE r.id = ${report_id} \"\n            + \"ORDER BY ${sort_column} DESC\";\n\n        StringSubstitutor sub = new StringSubstitutor(params);\n        String finalQuery = sub.replace(queryTemplate);\n\n        log.info(\"Executing report query for id=\" + reportId);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(finalQuery)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\");\n            if (rs.next()) {\n                out.print(\"\\\"id\\\":\" + rs.getInt(\"id\") + \",\");\n                out.print(\"\\\"title\\\":\\\"\" + escapeJson(rs.getString(\"title\")) + \"\\\",\");\n                out.print(\"\\\"content\\\":\\\"\" + escapeJson(rs.getString(\"content\")) + \"\\\",\");\n                out.print(\"\\\"author\\\":\\\"\" + escapeJson(rs.getString(\"author\")) + \"\\\",\");\n                out.print(\"\\\"created_at\\\":\\\"\" + rs.getTimestamp(\"created_at\") + \"\\\"\");\n            }\n            out.print(\"}\");\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Batch report generation - admin only (checked by upstream auth)\n        String ids = req.getParameter(\"ids\");\n        String query = \"SELECT id, title FROM reports WHERE id IN (\" + ids + \")\";\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.print(\"{\\\"id\\\":\" + rs.getInt(\"id\") + \",\");\n                out.print(\"\\\"title\\\":\\\"\" + escapeJson(rs.getString(\"title\")) + \"\\\"}\");\n                first = false;\n            }\n            out.print(\"]\");\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    private String escapeJson(String s) {\n        if (s == null) return \"\";\n        return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "ECS Fargate task deployed via AWS Cloud Map into an EKS-managed Fargate profile with Kubernetes NetworkPolicy enforcement through Calico CNI plugin (v3.26+). A GlobalNetworkPolicy named 'deny-link-local-egress' applies label-selector matching all pods in the 'production' namespace with spec.egress rules that deny traffic to CIDR 169.254.0.0/16 on all ports. Additionally, a second NetworkPolicy 'restrict-outbound-proxy' limits egress from the app pod to only the upstream API CIDR range (10.0.0.0/8) and the cluster DNS (kube-dns at 172.20.0.10/32 port 53). The Fargate profile's pod execution role has a permissions boundary (arn:aws:iam::123456789012:policy/FargateNoMetadataBoundary) that includes an explicit Deny on sts:AssumeRole for the task credential provider. Container also runs with a read-only root filesystem and drops NET_RAW capability.",
+    "config": {
+      "platform": "EKS Fargate Profile with Calico CNI v3.26",
+      "network_policies": [
+        {
+          "name": "deny-link-local-egress",
+          "type": "GlobalNetworkPolicy",
+          "spec": {
+            "selector": "projectcalico.org/namespace == 'production'",
+            "types": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "action": "Deny",
+                "destination": {
+                  "nets": [
+                    "169.254.0.0/16"
+                  ]
+                }
+              }
+            ],
+            "order": 100
+          }
+        },
+        {
+          "name": "restrict-outbound-proxy",
+          "type": "NetworkPolicy",
+          "namespace": "production",
+          "spec": {
+            "podSelector": {
+              "matchLabels": {
+                "app": "cache-proxy"
+              }
+            },
+            "policyTypes": [
+              "Egress"
+            ],
+            "egress": [
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "10.0.0.0/8"
+                    }
+                  }
+                ]
+              },
+              {
+                "to": [
+                  {
+                    "ipBlock": {
+                      "cidr": "172.20.0.10/32"
+                    }
+                  }
+                ],
+                "ports": [
+                  {
+                    "port": 53,
+                    "protocol": "UDP"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/FargateNoMetadataBoundary",
+      "pod_security": {
+        "readOnlyRootFilesystem": true,
+        "drop_capabilities": [
+          "NET_RAW"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "5f4ba932",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport time\nimport os\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives import padding\nfrom cryptography.hazmat.backends import default_backend\nimport hashlib\nimport struct\n\n# Generated protobuf stubs\nimport token_service_pb2\nimport token_service_pb2_grpc\n\nSECRET_KEY = os.environ.get('ENCRYPTION_KEY', 'default_key_for_dev_only_32b!').encode()[:32]\nIV_SIZE = 16\nBLOCK_SIZE = 128\n\nclass TokenValidationService(token_service_pb2_grpc.TokenValidationServiceServicer):\n    \"\"\"Service for validating encrypted session tokens in CBC mode.\"\"\"\n\n    def __init__(self):\n        self.backend = default_backend()\n        self._request_log = []\n\n    def _decrypt_token(self, encrypted_token: bytes) -> tuple:\n        \"\"\"Decrypt and validate token padding. Returns (success, plaintext_or_error).\"\"\"\n        if len(encrypted_token) < IV_SIZE + 16:\n            return False, \"Token too short\"\n\n        iv = encrypted_token[:IV_SIZE]\n        ciphertext = encrypted_token[IV_SIZE:]\n\n        if len(ciphertext) % 16 != 0:\n            return False, \"Invalid token length\"\n\n        cipher = Cipher(algorithms.AES(SECRET_KEY), modes.CBC(iv), backend=self.backend)\n        decryptor = cipher.decryptor()\n        padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()\n\n        # Manual PKCS7 padding validation\n        pad_byte = padded_plaintext[-1]\n        if pad_byte == 0 or pad_byte > 16:\n            return False, \"INVALID_PADDING\"\n\n        for i in range(pad_byte):\n            if padded_plaintext[-(i + 1)] != pad_byte:\n                return False, \"INVALID_PADDING\"\n\n        plaintext = padded_plaintext[:-pad_byte]\n        return True, plaintext\n\n    def ValidateToken(self, request, context):\n        \"\"\"Validate an encrypted session token.\"\"\"\n        encrypted_token = request.encrypted_token\n\n        success, result = self._decrypt_token(encrypted_token)\n\n        if not success:\n            # Distinguishable error responses enable padding oracle\n            if result == \"INVALID_PADDING\":\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details(\"Token validation failed: padding error\")\n                return token_service_pb2.ValidationResponse(\n                    valid=False,\n                    error_code=4001,\n                    error_message=\"Malformed token structure\"\n                )\n            else:\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details(\"Token validation failed: format error\")\n                return token_service_pb2.ValidationResponse(\n                    valid=False,\n                    error_code=4002,\n                    error_message=\"Invalid token format\"\n                )\n\n        # Parse plaintext token: user_id (4 bytes) + expiry (8 bytes) + role\n        if len(result) < 12:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            return token_service_pb2.ValidationResponse(\n                valid=False, error_code=4003, error_message=\"Token content invalid\")\n\n        user_id = struct.unpack('>I', result[:4])[0]\n        expiry = struct.unpack('>Q', result[4:12])[0]\n        role = result[12:].decode('utf-8', errors='replace')\n\n        if expiry < int(time.time()):\n            return token_service_pb2.ValidationResponse(\n                valid=False, error_code=4004, error_message=\"Token expired\")\n\n        return token_service_pb2.ValidationResponse(\n            valid=True,\n            user_id=user_id,\n            role=role,\n            error_code=0\n        )\n\n    def RefreshToken(self, request, context):\n        \"\"\"Re-encrypt a token with fresh IV (defense in depth).\"\"\"\n        success, plaintext = self._decrypt_token(request.encrypted_token)\n        if not success:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            return token_service_pb2.RefreshResponse(success=False)\n\n        iv = os.urandom(IV_SIZE)\n        padder = padding.PKCS7(BLOCK_SIZE).padder()\n        padded = padder.update(plaintext) + padder.finalize()\n        cipher = Cipher(algorithms.AES(SECRET_KEY), modes.CBC(iv), backend=self.backend)\n        encryptor = cipher.encryptor()\n        new_ciphertext = iv + encryptor.update(padded) + encryptor.finalize()\n\n        return token_service_pb2.RefreshResponse(\n            success=True, new_encrypted_token=new_ciphertext)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    token_service_pb2_grpc.add_TokenValidationServiceServicer_to_server(\n        TokenValidationService(), server)\n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    server.start()\n    print(f\"TokenValidationService listening on port {port}\")\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "EKS pod in namespace 'auth-services' on cluster 'prod-eu-west-1'. Envoy sidecar injected via Istio 1.20 with mesh-wide PeerAuthentication in STRICT mTLS mode. The sidecar has a local rate limit filter configured on the inbound listener (envoy.filters.http.local_ratelimit) with a token bucket of max_tokens=5, tokens_per_fill=5, fill_interval=60s applied per downstream connection (per_connection descriptor). Additionally, an EnvoyFilter resource applies a circuit breaker with consecutive_gateway_errors=3 and interval=30s on the cluster level. The Istio AuthorizationPolicy restricts source principals to 'cluster.local/ns/api-gateway/sa/gateway-sa' only. Pod also has annotation 'sidecar.istio.io/statsInclusionPrefixes: listener,cluster' for observability.",
+    "config": {
+      "cluster": "prod-eu-west-1",
+      "namespace": "auth-services",
+      "istio_version": "1.20",
+      "peer_authentication": "STRICT",
+      "envoy_local_ratelimit": {
+        "filter": "envoy.filters.http.local_ratelimit",
+        "max_tokens": 5,
+        "tokens_per_fill": 5,
+        "fill_interval_seconds": 60,
+        "scope": "per_connection"
+      },
+      "circuit_breaker": {
+        "consecutive_gateway_errors": 3,
+        "interval_seconds": 30
+      },
+      "authorization_policy": {
+        "action": "ALLOW",
+        "source_principals": [
+          "cluster.local/ns/api-gateway/sa/gateway-sa"
+        ]
+      },
+      "grpc_reflection": false,
+      "pod_security_standard": "restricted"
+    }
+  }
+}

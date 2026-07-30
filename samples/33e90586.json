@@ -1,0 +1,28 @@
+{
+  "id": "33e90586",
+  "language": "c",
+  "code": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/stat.h>\n\n#define MAX_ENTRIES 64\n#define ENTRY_SIZE 256\n\ntypedef struct {\n    char *name;\n    char *value;\n    int active;\n} ConfigEntry;\n\ntypedef struct {\n    ConfigEntry entries[MAX_ENTRIES];\n    int count;\n    char *scratch_file;\n} ConfigStore;\n\nstatic ConfigStore *g_store = NULL;\n\nvoid store_init(void) {\n    g_store = (ConfigStore *)calloc(1, sizeof(ConfigStore));\n    g_store->count = 0;\n    g_store->scratch_file = strdup(\"/tmp/.cfg_scratch\");\n}\n\nvoid store_add(const char *name, const char *value) {\n    if (g_store->count >= MAX_ENTRIES) return;\n    int idx = g_store->count++;\n    g_store->entries[idx].name = strdup(name);\n    g_store->entries[idx].value = strdup(value);\n    g_store->entries[idx].active = 1;\n}\n\nvoid store_remove(const char *name) {\n    for (int i = 0; i < g_store->count; i++) {\n        if (g_store->entries[i].active && strcmp(g_store->entries[i].name, name) == 0) {\n            free(g_store->entries[i].name);\n            free(g_store->entries[i].value);\n            g_store->entries[i].active = 0;\n            /* BUG: pointers not NULLed after free */\n            break;\n        }\n    }\n}\n\nchar *store_get(const char *name) {\n    for (int i = 0; i < g_store->count; i++) {\n        if (g_store->entries[i].active && strcmp(g_store->entries[i].name, name) == 0) {\n            return g_store->entries[i].value;\n        }\n    }\n    return NULL;\n}\n\nvoid store_update_dangling(const char *name, const char *new_value) {\n    /* Iterates ALL entries including inactive - uses dangling pointer */\n    for (int i = 0; i < g_store->count; i++) {\n        if (strcmp(g_store->entries[i].name, name) == 0) {\n            /* UAF: entries[i].name was freed but pointer still compared */\n            /* If heap is reused, this reads attacker-controlled data */\n            free(g_store->entries[i].value);\n            g_store->entries[i].value = strdup(new_value);\n            g_store->entries[i].active = 1;\n            break;\n        }\n    }\n}\n\nvoid persist_to_scratch(void) {\n    FILE *f = fopen(g_store->scratch_file, \"w\");\n    if (!f) {\n        fprintf(stderr, \"Warning: cannot write scratch file %s\\n\", g_store->scratch_file);\n        return;\n    }\n    for (int i = 0; i < g_store->count; i++) {\n        if (g_store->entries[i].active) {\n            fprintf(f, \"%s=%s\\n\", g_store->entries[i].name, g_store->entries[i].value);\n        }\n    }\n    fclose(f);\n}\n\nint process_command(char *line) {\n    char cmd[32], arg1[ENTRY_SIZE], arg2[ENTRY_SIZE];\n    int n = sscanf(line, \"%31s %255s %255[^\\n]\", cmd, arg1, arg2);\n    if (n < 1) return 0;\n\n    if (strcmp(cmd, \"ADD\") == 0 && n >= 3) {\n        store_add(arg1, arg2);\n    } else if (strcmp(cmd, \"DEL\") == 0 && n >= 2) {\n        store_remove(arg1);\n    } else if (strcmp(cmd, \"GET\") == 0 && n >= 2) {\n        char *v = store_get(arg1);\n        if (v) printf(\"%s\\n\", v);\n    } else if (strcmp(cmd, \"UPDATE\") == 0 && n >= 3) {\n        store_update_dangling(arg1, arg2);\n    } else if (strcmp(cmd, \"SAVE\") == 0) {\n        persist_to_scratch();\n    } else if (strcmp(cmd, \"QUIT\") == 0) {\n        return -1;\n    }\n    return 0;\n}\n\nint main(int argc, char **argv) {\n    store_init();\n    char line[512];\n    FILE *input = stdin;\n    if (argc > 1) {\n        input = fopen(argv[1], \"r\");\n        if (!input) { perror(\"fopen\"); return 1; }\n    }\n    while (fgets(line, sizeof(line), input)) {\n        if (process_command(line) < 0) break;\n    }\n    if (input != stdin) fclose(input);\n    return 0;\n}",
+  "environment": {
+    "description": "Container deployed via Kubernetes with pod security context specifying readOnlyRootFilesystem: true. The container image uses a distroless base (gcr.io/distroless/cc-debian12). No emptyDir, hostPath, or PVC volumes are mounted. The pod spec does not include any volumeMounts with writable backing. The container's /tmp does not exist as a separate mount - it is part of the read-only overlay filesystem. The OCI runtime (runc) enforces the rootfs as ro at the mount namespace level. Additionally, the container runs with allowPrivilegeEscalation: false and drops ALL capabilities. The tool is compiled with the same flags and receives input identically via a sidecar proxy.",
+    "config": {
+      "orchestrator": "kubernetes 1.29",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "volumes": "none",
+      "volumeMounts": "none",
+      "base_image": "gcr.io/distroless/cc-debian12",
+      "tmpfs_mounts": "none",
+      "compiler_flags": "-O2",
+      "network": "sidecar envoy proxy forwarding to stdin"
+    }
+  }
+}

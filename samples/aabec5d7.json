@@ -1,0 +1,45 @@
+{
+  "id": "aabec5d7",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string, jsonify\nimport boto3\nimport hashlib\nimport hmac\nimport json\nimport os\nfrom markupsafe import Markup\n\napp = Flask(__name__)\n\n# DynamoDB for storing comments\ndynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'us-east-1'))\ntable = dynamodb.Table(os.environ.get('COMMENTS_TABLE', 'comments'))\n\n# CloudHSM client for signing operations\nHSM_CLUSTER_ID = os.environ.get('HSM_CLUSTER_ID')\nKMS_KEY_ID = os.environ.get('KMS_KEY_ID')\n\nkms_client = boto3.client('kms', region_name=os.environ.get('AWS_REGION', 'us-east-1'))\n\ndef sign_content(content_bytes):\n    \"\"\"Sign content using KMS key backed by CloudHSM custom key store.\n    The raw key material never leaves the HSM boundary.\"\"\"\n    response = kms_client.sign(\n        KeyId=KMS_KEY_ID,\n        Message=content_bytes,\n        MessageType='RAW',\n        SigningAlgorithm='RSASSA_PKCS1_V1_5_SHA_256'\n    )\n    return response['Signature']\n\ndef verify_content(content_bytes, signature):\n    \"\"\"Verify content signature via KMS/HSM.\"\"\"\n    try:\n        kms_client.verify(\n            KeyId=KMS_KEY_ID,\n            Message=content_bytes,\n            Signature=signature,\n            MessageType='RAW',\n            SigningAlgorithm='RSASSA_PKCS1_V1_5_SHA_256'\n        )\n        return True\n    except kms_client.exceptions.KMSInvalidSignatureException:\n        return False\n\nCOMMENT_TEMPLATE = \"\"\"\n<!DOCTYPE html>\n<html>\n<head><title>Comments</title></head>\n<body>\n<h1>Community Comments</h1>\n<div id=\"comments\">\n{% for comment in comments %}\n  <div class=\"comment\">\n    <strong>{{ comment.author }}</strong>\n    <p>{{ comment.body }}</p>\n    <small>Verified: {{ comment.verified }}</small>\n  </div>\n{% endfor %}\n</div>\n<form method=\"POST\" action=\"/comment\">\n  <input name=\"author\" placeholder=\"Name\" required>\n  <textarea name=\"body\" placeholder=\"Comment\" required></textarea>\n  <button type=\"submit\">Post</button>\n</form>\n</body>\n</html>\n\"\"\"\n\n@app.route('/comments', methods=['GET'])\ndef get_comments():\n    result = table.scan()\n    comments = result.get('Items', [])\n    # Render comments - body is marked safe because it was \"signed\" at ingestion\n    rendered_comments = []\n    for c in comments:\n        rendered_comments.append({\n            'author': c.get('author', 'Anonymous'),\n            'body': Markup(c.get('body', '')),  # Trusted because signed content\n            'verified': '\u2713' if c.get('signature') else '\u2717'\n        })\n    return render_template_string(COMMENT_TEMPLATE, comments=rendered_comments)\n\n@app.route('/comment', methods=['POST'])\ndef post_comment():\n    author = request.form.get('author', 'Anonymous')\n    body = request.form.get('body', '')\n    \n    # Sign the content for integrity verification\n    content_to_sign = json.dumps({'author': author, 'body': body}).encode('utf-8')\n    signature = sign_content(content_to_sign)\n    \n    comment_id = hashlib.sha256(content_to_sign).hexdigest()[:16]\n    \n    table.put_item(Item={\n        'comment_id': comment_id,\n        'author': author,\n        'body': body,\n        'signature': signature\n    })\n    \n    return jsonify({'status': 'ok', 'id': comment_id}), 201\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'hsm_cluster': HSM_CLUSTER_ID})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)\n",
+  "environment": {
+    "description": "ECS Fargate service running behind an Application Load Balancer with an associated AWS WAFv2 WebACL. The WebACL includes a custom rule group with a RegexPatternSet-based rule that inspects the request Body field with text transformation 'HTML_ENTITY_DECODE' followed by 'URL_DECODE' and blocks requests matching patterns associated with script injection (angle brackets followed by known event handlers or script tags). Additionally, the CloudHSM cluster's key policy includes a condition that the kms:Sign operation will only succeed if the signing context includes 'content-type=text/plain' via kms:EncryptionContext, and the application sets this context. The Fargate task definition includes a read-only root filesystem with a tmpfs mount at /tmp only. The container image is built with a distroless base. The ALB also has a fixed-response rule that adds Content-Security-Policy: default-src 'self' header via a Lambda@Edge-like response modification through ALB's fixed response actions on the default rule, though the primary protection is the WAFv2 body inspection rule.",
+    "config": {
+      "platform": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "BodyXSSInspection",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:ACCOUNT:regional/regexpatternset/xss-body-patterns/uuid",
+                "field_to_match": "Body",
+                "text_transformations": [
+                  "HTML_ENTITY_DECODE",
+                  "URL_DECODE"
+                ]
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "task_role_permissions": [
+        "kms:Sign",
+        "kms:Verify",
+        "dynamodb:PutItem",
+        "dynamodb:Scan"
+      ],
+      "kms_key_policy_condition": "kms:EncryptionContext:content-type = text/plain",
+      "network": "Private subnet, ALB internet-facing",
+      "hsm": "CloudHSM custom key store backing KMS key",
+      "container": {
+        "readonly_root_filesystem": true,
+        "base_image": "distroless"
+      }
+    }
+  }
+}

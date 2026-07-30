@@ -1,0 +1,35 @@
+{
+  "id": "114cfa5a",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Storage;\nuse ZipArchive;\nuse Illuminate\\Support\\Facades\\Log;\n\nclass ArchiveController extends Controller\n{\n    /**\n     * Handle uploaded ZIP archives for document processing.\n     * Extracts contents to a temporary processing directory.\n     */\n    public function upload(Request $request)\n    {\n        $request->validate([\n            'archive' => 'required|file|mimes:zip|max:51200',\n            'project_id' => 'required|string|alpha_num',\n        ]);\n\n        $file = $request->file('archive');\n        $projectId = $request->input('project_id');\n        \n        // Store uploaded zip temporarily\n        $tmpPath = $file->store('tmp/uploads');\n        $fullTmpPath = storage_path('app/' . $tmpPath);\n        \n        $extractDir = storage_path('app/projects/' . $projectId . '/documents');\n        \n        if (!is_dir($extractDir)) {\n            mkdir($extractDir, 0755, true);\n        }\n\n        $zip = new ZipArchive();\n        $result = $zip->open($fullTmpPath);\n        \n        if ($result !== true) {\n            unlink($fullTmpPath);\n            return response()->json(['error' => 'Invalid archive file'], 422);\n        }\n\n        $extractedFiles = [];\n        \n        for ($i = 0; $i < $zip->numFiles; $i++) {\n            $entryName = $zip->getNameIndex($i);\n            \n            // Basic validation - skip hidden files and __MACOSX\n            if (str_starts_with($entryName, '.') || str_starts_with($entryName, '__MACOSX')) {\n                continue;\n            }\n            \n            // Skip directories\n            if (str_ends_with($entryName, '/')) {\n                continue;\n            }\n            \n            // Validate file extension\n            $allowedExtensions = ['pdf', 'doc', 'docx', 'txt', 'xlsx', 'csv'];\n            $ext = strtolower(pathinfo($entryName, PATHINFO_EXTENSION));\n            if (!in_array($ext, $allowedExtensions)) {\n                Log::warning('Skipped file with disallowed extension', ['file' => $entryName]);\n                continue;\n            }\n\n            // Extract file to destination\n            $destPath = $extractDir . '/' . $entryName;\n            $destDir = dirname($destPath);\n            \n            if (!is_dir($destDir)) {\n                mkdir($destDir, 0755, true);\n            }\n            \n            // Read from zip and write to destination\n            $stream = $zip->getStream($entryName);\n            if ($stream === false) {\n                continue;\n            }\n            \n            $contents = stream_get_contents($stream);\n            fclose($stream);\n            \n            file_put_contents($destPath, $contents);\n            $extractedFiles[] = $entryName;\n            \n            Log::info('Extracted file', ['path' => $destPath, 'size' => strlen($contents)]);\n        }\n\n        $zip->close();\n        unlink($fullTmpPath);\n\n        return response()->json([\n            'message' => 'Archive processed successfully',\n            'files_extracted' => count($extractedFiles),\n            'files' => $extractedFiles,\n        ]);\n    }\n\n    /**\n     * List documents for a project\n     */\n    public function listDocuments(Request $request, string $projectId)\n    {\n        $dir = storage_path('app/projects/' . $projectId . '/documents');\n        \n        if (!is_dir($dir)) {\n            return response()->json(['files' => []]);\n        }\n\n        $files = collect(scandir($dir))\n            ->filter(fn($f) => !in_array($f, ['.', '..']))\n            ->values();\n\n        return response()->json(['files' => $files]);\n    }\n}\n",
+  "environment": {
+    "description": "Same Laravel 10.x application deployed on ECS Fargate with a hardened task definition. The container security context drops CAP_NET_RAW and CAP_SYS_ADMIN from the effective capability set via the ECS task definition linuxParameters.capabilities.drop field. The container uses the php:8.2-fpm-alpine image with a non-root user (uid 1000). Storage is an EFS access point scoped to /projects with POSIX permissions enforcing uid 1000 ownership. The EFS access point has a root directory creation mode of 0750.",
+    "config": {
+      "container_image": "php:8.2-fpm-alpine",
+      "container_user": "appuser (uid 1000)",
+      "ecs_task_definition": {
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "CAP_NET_RAW",
+              "CAP_SYS_ADMIN"
+            ]
+          }
+        }
+      },
+      "efs_access_point": {
+        "root_directory": "/projects",
+        "posix_user": {
+          "uid": 1000,
+          "gid": 1000
+        },
+        "creation_info": {
+          "owner_uid": 1000,
+          "owner_gid": 1000,
+          "permissions": "0750"
+        }
+      },
+      "filesystem": "read-only rootfs except /tmp and /var/www/html/storage"
+    }
+  }
+}

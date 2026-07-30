@@ -1,0 +1,37 @@
+{
+  "id": "a2dac767",
+  "language": "python",
+  "code": "import flask\nfrom flask import Flask, request, jsonify, g\nimport sqlite3\nimport os\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nDATABASE = '/data/inventory.db'\nSECRET = os.environ.get('HMAC_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY,\n        name TEXT NOT NULL,\n        sku TEXT UNIQUE,\n        price REAL,\n        quantity INTEGER,\n        warehouse TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY,\n        key_hash TEXT NOT NULL,\n        owner TEXT,\n        scope TEXT DEFAULT 'read'\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        query_text TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    if not key:\n        return False\n    key_hash = hashlib.sha256(key.encode()).hexdigest()\n    db = get_db()\n    row = db.execute('SELECT * FROM api_keys WHERE key_hash = ?', (key_hash,)).fetchone()\n    return row is not None\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    warehouse = request.args.get('warehouse', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_col = request.args.get('sort', 'name')\n    order = request.args.get('order', 'ASC')\n    \n    # Validate sort column against whitelist\n    allowed_sorts = ['name', 'price', 'quantity', 'sku']\n    if sort_col not in allowed_sorts:\n        sort_col = 'name'\n    \n    # Build query - warehouse filter uses parameterized query\n    # but order direction is concatenated (limited to ASC/DESC... right?)\n    base_query = \"SELECT id, name, sku, price, quantity, warehouse FROM products WHERE price BETWEEN ? AND ?\"\n    params = [min_price, max_price]\n    \n    if warehouse:\n        base_query += \" AND warehouse = ?\"\n        params.append(warehouse)\n    \n    # Sort order injection point - developer assumed ORDER BY direction\n    # is safe since it's just ASC or DESC, but doesn't validate\n    full_query = base_query + f\" ORDER BY {sort_col} {order}\"\n    \n    try:\n        db = get_db()\n        # Log the query for debugging\n        db.execute('INSERT INTO audit_log (action, query_text) VALUES (?, ?)',\n                   ('search', full_query))\n        db.commit()\n        \n        results = db.execute(full_query, params).fetchall()\n        return jsonify({\n            'results': [dict(row) for row in results],\n            'count': len(results)\n        })\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)[:200]}), 500\n\n@app.route('/api/products/bulk-update', methods=['POST'])\ndef bulk_update():\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    updates = request.json\n    if not isinstance(updates, list):\n        return jsonify({'error': 'expected array'}), 400\n    \n    db = get_db()\n    count = 0\n    for item in updates[:100]:  # limit batch size\n        if 'sku' in item and 'quantity' in item:\n            db.execute('UPDATE products SET quantity = ? WHERE sku = ?',\n                       (item['quantity'], item['sku']))\n            count += 1\n    db.commit()\n    return jsonify({'updated': count})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALBv2 with AWS WAF WebACL attached. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestriction_BODY at priority 1, (2) a custom rule group 'corp-api-filters' at priority 2 containing a regex match rule on request body matching pattern '(?i)(union\\s+select|;\\s*select|into\\s+outfile|pg_sleep|information_schema|pg_catalog|current_setting|set_config)' with action BLOCK, (3) AWSManagedRulesSQLiRuleSet at priority 3 in COUNT mode only (for monitoring). The PostgreSQL RDS instance uses IAM database authentication; the ECS task role arn:aws:iam::ACCOUNT:role/ecs-webapp-task has rds-db:connect permission scoped to dbuser 'webapp_ro' which is granted SELECT-only on the 'users' table (no other tables, no pg_catalog access via row-level security policy denying access to system catalogs through this role). Network: private subnet, ALB in public subnet.",
+    "config": {
+      "load_balancer": "ALBv2 with AWS WAF WebACL 'prod-api-acl' attached",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "BLOCK",
+          "note": "Includes SizeRestriction_BODY limiting body to 8KB"
+        },
+        {
+          "priority": 2,
+          "name": "corp-api-filters",
+          "type": "custom-regex-rule-group",
+          "pattern": "(?i)(union\\s+select|;\\s*select|into\\s+outfile|pg_sleep|information_schema|pg_catalog|current_setting|set_config)",
+          "match_scope": "BODY",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 3,
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "action": "COUNT",
+          "note": "Monitoring mode only - does NOT block"
+        }
+      ],
+      "database": "RDS PostgreSQL 14 with IAM auth, role 'webapp_ro' has SELECT on users table only",
+      "database_rls": "Row-level security policy on pg_catalog tables denying access to webapp_ro role",
+      "network": "ECS tasks in private subnet, no direct internet access, ALB in public subnet",
+      "ecs_task_role": "arn:aws:iam::ACCOUNT:role/ecs-webapp-task with rds-db:connect to webapp_ro only"
+    }
+  }
+}

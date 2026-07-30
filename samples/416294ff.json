@@ -1,0 +1,82 @@
+{
+  "id": "416294ff",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n        String format = req.getParameter(\"format\");\n\n        // Validate report type against allowed list\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date validation\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = buildReportQuery(reportType, startDate, endDate, department, sortCol);\n            log.info(\"Executing report query for type=\" + reportType + \" dept=\" + department);\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            out.print(results.toString());\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildReportQuery(String type, String start, String end,\n                                     String department, String sortCol) {\n        String baseTable = getTableForReport(type);\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM \").append(baseTable);\n        sb.append(\" WHERE created_at BETWEEN '\").append(start).append(\"' AND '\").append(end).append(\"'\");\n\n        if (department != null && !department.isEmpty()) {\n            sb.append(\" AND department = '\").append(department).append(\"'\");\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            sb.append(\" ORDER BY \").append(sortCol);\n        }\n\n        return sb.toString();\n    }\n\n    private String getTableForReport(String type) {\n        switch (type) {\n            case \"sales\": return \"monthly_sales\";\n            case \"inventory\": return \"warehouse_inventory\";\n            case \"hr\": return \"employee_records\";\n            default: return \"monthly_sales\";\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"sales\") || type.equals(\"inventory\") || type.equals(\"hr\"));\n    }\n\n    private boolean isValidDate(String date) {\n        if (date == null) return false;\n        return date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with Pod Security Standards enforced at namespace level via label 'pod-security.kubernetes.io/enforce: restricted'. Additionally, a Cilium L7 NetworkPolicy is applied with spec.egress rules containing a CIDR deny for 169.254.0.0/16 and fd00:ec2::254/128 (link-local metadata ranges), and a toFQDNs allowlist restricting egress DNS resolution to *.default.svc.cluster.local only. The restricted PSS profile prevents hostNetwork, hostPID, hostIPC, privileged containers, and hostPath volume mounts - meaning even if an attacker achieves code execution via SSRF, they cannot escalate to node-level access through container breakout. The Cilium policy's L7 HTTP-aware filtering additionally inspects outbound requests and drops any with Host header matching metadata IP patterns.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "api-gateway"
+            }
+          },
+          "egress": [
+            {
+              "toCIDR": [
+                "10.0.0.0/8"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "8080",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [
+                {
+                  "matchPattern": "*.default.svc.cluster.local"
+                }
+              ]
+            },
+            {
+              "toCIDRSet": [
+                {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "169.254.0.0/16",
+                    "100.64.0.0/10"
+                  ]
+                }
+              ]
+            }
+          ],
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            },
+            {
+              "toCIDR": [
+                "fd00:ec2::254/128"
+              ]
+            }
+          ]
+        }
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        },
+        "allowPrivilegeEscalation": false
+      }
+    }
+  }
+}

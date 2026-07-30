@@ -1,0 +1,64 @@
+{
+  "id": "1221a550",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_request_signature(payload, signature):\n    \"\"\"Verify HMAC signature of request body for internal service auth\"\"\"\n    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_order_field(field):\n    \"\"\"Allow only specific order directions\"\"\"\n    if field.upper() in ('ASC', 'DESC'):\n        return field.upper()\n    return 'ASC'\n\n@app.route('/api/v2/users/search', methods=['POST'])\ndef search_users():\n    \"\"\"Search users with filtering capabilities.\n    Used by the internal dashboard and reporting microservice.\n    \"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n\n    # Extract search parameters\n    department = data.get('department', '')\n    role = data.get('role', '')\n    status = data.get('status', 'active')\n    sort_field = data.get('sort_by', 'last_name')\n    sort_dir = sanitize_order_field(data.get('sort_dir', 'ASC'))\n    page = int(data.get('page', 1))\n    limit = min(int(data.get('limit', 50)), 200)\n    offset = (page - 1) * limit\n\n    # Log request metadata for audit trail\n    app.logger.info(f\"Search request from {request.headers.get('X-Forwarded-For', 'unknown')} \"\n                    f\"dept={department} role={role} sort={sort_field}\")\n\n    # Build query with parameterized values for known fields\n    conditions = [\"status = ?\"]\n    params = [status]\n\n    if department:\n        conditions.append(\"department = ?\")\n        params.append(department)\n    if role:\n        conditions.append(\"role = ?\")\n        params.append(role)\n\n    where_clause = \" AND \".join(conditions)\n\n    # sort_field is used to allow flexible column ordering\n    # validated against a known set would be ideal but we allow\n    # any column name for forward compatibility with schema changes\n    query = f\"\"\"SELECT user_id, first_name, last_name, email, department, role, status\n               FROM users\n               WHERE {where_clause}\n               ORDER BY {sort_field} {sort_dir}\n               LIMIT ? OFFSET ?\"\"\"\n    params.extend([limit, offset])\n\n    try:\n        db = get_db()\n        cursor = db.execute(query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n\n        # Get total count for pagination\n        count_query = f\"SELECT COUNT(*) FROM users WHERE {where_clause}\"\n        total = db.execute(count_query, params[:-2]).fetchone()[0]\n\n        return jsonify({\n            'results': results,\n            'pagination': {\n                'page': page,\n                'limit': limit,\n                'total': total,\n                'pages': (total + limit - 1) // limit\n            }\n        })\n    except sqlite3.OperationalError as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Query execution failed', 'detail': str(e)}), 500\n    except Exception as e:\n        app.logger.error(f\"Unexpected error: {e}\")\n        return jsonify({'error': 'Internal server error'}), 500\n\n@app.route('/api/v2/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get single user by ID\"\"\"\n    db = get_db()\n    user = db.execute(\n        \"SELECT user_id, first_name, last_name, email, department, role, status FROM users WHERE user_id = ?\",\n        (user_id,)\n    ).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Lambda and Step Functions workflow deployed in EKS namespace 'workflow-processing'. Istio 1.19 service mesh with mTLS STRICT mode. An AuthorizationPolicy resource is applied at the namespace level: spec.rules allow traffic ONLY from principals in 'sa://cluster.local/ns/orchestrator/sa/step-functions-invoker'. A second AuthorizationPolicy with an empty rules list (deny-all baseline) is applied to the 'workflow-processing' namespace with action DENY for any source NOT matching the orchestrator namespace service account. The API Gateway endpoint routes through an internal NLB whose target group is the Istio ingress gateway in the 'orchestrator' namespace \u2014 however, external traffic arriving at the gateway is assigned the 'istio-ingressgateway' service account identity (not the 'step-functions-invoker' SA), meaning it fails the AuthorizationPolicy check. Only the Step Functions activity poller running as a pod in the 'orchestrator' namespace with the correct SA can reach the decryption endpoint. An attacker performing a padding oracle attack requires ~128 requests per byte \u00d7 16 bytes per block minimum, all of which would be rejected at the Envoy sidecar level with a 403 RBAC denial before reaching the Lambda function.",
+    "config": {
+      "runtime": "python3.9",
+      "eks_namespace": "workflow-processing",
+      "service_mesh": "Istio 1.19, PeerAuthentication STRICT mTLS",
+      "authorization_policy_1": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-all-default",
+          "namespace": "workflow-processing"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/orchestrator/sa/step-functions-invoker"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "authorization_policy_2": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "allow-orchestrator-only",
+          "namespace": "workflow-processing"
+        },
+        "spec": {
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/orchestrator/sa/step-functions-invoker"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "ingress_routing": "External traffic enters via istio-ingressgateway SA identity, not step-functions-invoker SA",
+      "api_gateway": "Internal NLB, routed through Istio ingress in orchestrator namespace",
+      "network_policy": "Kubernetes NetworkPolicy restricting ingress to workflow-processing pods from orchestrator namespace only"
+    }
+  }
+}

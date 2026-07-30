@@ -1,0 +1,28 @@
+{
+  "id": "5cc1b46b",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: rate limiting (basic, per-IP)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 100) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  setTimeout(() => requestCounts.set(ip, Math.max(0, (requestCounts.get(ip) || 1) - 1)), 60000);\n  next();\n});\n\n// Search products endpoint\napp.get('/api/products/search', async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy } = req.query;\n    \n    // Build base query\n    let query = `SELECT id, name, description, price, category, stock_count \n                 FROM products WHERE 1=1`;\n    const params = [];\n    let paramIdx = 1;\n\n    if (category) {\n      params.push(category);\n      query += ` AND category = $${paramIdx++}`;\n    }\n    if (minPrice) {\n      params.push(parseFloat(minPrice));\n      query += ` AND price >= $${paramIdx++}`;\n    }\n    if (maxPrice) {\n      params.push(parseFloat(maxPrice));\n      query += ` AND price <= $${paramIdx++}`;\n    }\n\n    // Sort - validated against allowlist... but sortBy can include direction\n    const allowedColumns = ['price', 'name', 'created_at', 'stock_count'];\n    if (sortBy) {\n      // Developer intended to validate but only checks prefix\n      const sortCol = sortBy.split(' ')[0];\n      if (allowedColumns.includes(sortCol)) {\n        query += ` ORDER BY ${sortBy}`;\n      } else {\n        query += ` ORDER BY created_at DESC`;\n      }\n    } else {\n      query += ` ORDER BY created_at DESC`;\n    }\n\n    query += ` LIMIT 50`;\n\n    const result = await pool.query(query, params);\n    \n    // Generate cache key for CDN\n    const cacheKey = crypto.createHash('md5')\n      .update(JSON.stringify(req.query))\n      .digest('hex');\n    res.set('X-Cache-Key', cacheKey);\n    res.set('Cache-Control', 'public, max-age=300');\n    \n    return res.json({\n      products: result.rows,\n      total: result.rows.length,\n      cache_key: cacheKey\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    return res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Product detail endpoint\napp.get('/api/products/:id', async (req, res) => {\n  try {\n    const { id } = req.params;\n    const result = await pool.query(\n      'SELECT id, name, description, price, category, stock_count FROM products WHERE id = $1',\n      [id]\n    );\n    if (result.rows.length === 0) {\n      return res.status(404).json({ error: 'Product not found' });\n    }\n    return res.json(result.rows[0]);\n  } catch (err) {\n    return res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => console.log(`Product service listening on ${PORT}`));",
+  "environment": {
+    "description": "Same Ktor microservice packaged as a container image deployed via AWS Lambda with a Function URL. The Function URL is configured with AuthType=AWS_IAM. The Lambda resource policy does not include any principal wildcard (*) statements - it specifies only the ARN of the internal API Gateway service role (arn:aws:iam::123456789012:role/apigw-invoke-notifications) as the allowed principal. There is no additional auth bypass mechanism; the Lambda service itself enforces SigV4 signature validation on the Function URL before the container receives any request. Unsigned or incorrectly signed requests receive HTTP 403 from the Lambda invoke endpoint before reaching application code. Note: the Function URL endpoint is publicly resolvable at https://abc123def456.lambda-url.us-east-1.on.aws/ but IAM auth enforcement occurs at the AWS infrastructure layer prior to cold start or request routing.",
+    "config": {
+      "runtime": "AWS Lambda container image (JVM 17 custom runtime)",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/apigw-invoke-notifications"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:123456789012:function:notification-service",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "public_dns": "https://abc123def456.lambda-url.us-east-1.on.aws/",
+      "smtp": "Amazon SES with production sending enabled",
+      "vpc": "No VPC attachment - runs in Lambda service VPC"
+    }
+  }
+}

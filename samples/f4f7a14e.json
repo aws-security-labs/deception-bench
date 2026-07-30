@@ -1,0 +1,43 @@
+{
+  "id": "f4f7a14e",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration script - migrates user records from LDAP directory to PostgreSQL.\n\nThis script is triggered via an internal API endpoint that accepts migration parameters\nincluding filter criteria for selecting which LDAP entries to migrate.\n\"\"\"\n\nimport ldap\nimport psycopg2\nimport json\nimport logging\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\nlogging.basicConfig(level=logging.INFO)\nlogger = logging.getLogger(__name__)\n\nLDAP_URI = \"ldap://directory.internal:389\"\nLDAP_BASE_DN = \"ou=users,dc=corp,dc=internal\"\nLDAP_BIND_DN = \"cn=migration-svc,ou=services,dc=corp,dc=internal\"\nLDAP_BIND_PW = \"svc-migrate-2024\"\n\nPG_DSN = \"host=pgmain.internal dbname=userdb user=migrator password=m1gr@t0r\"\n\n\ndef build_ldap_filter(department, role, status=\"active\"):\n    \"\"\"Construct LDAP search filter from migration parameters.\n    \n    Note: Parameters are expected to be pre-validated by upstream gateway.\n    Internal service-to-service calls bypass validation.\n    \"\"\"\n    # Build compound filter - department and role are directly interpolated\n    # since this is an internal-only endpoint\n    base_filter = f\"(&(objectClass=inetOrgPerson)(department={department})(role={role})(status={status}))\"\n    return base_filter\n\n\ndef fetch_ldap_entries(ldap_filter):\n    \"\"\"Query LDAP directory with constructed filter.\"\"\"\n    conn = ldap.initialize(LDAP_URI)\n    conn.simple_bind_s(LDAP_BIND_DN, LDAP_BIND_PW)\n    \n    results = conn.search_s(\n        LDAP_BASE_DN,\n        ldap.SCOPE_SUBTREE,\n        ldap_filter,\n        [\"uid\", \"cn\", \"mail\", \"department\", \"role\", \"employeeNumber\"]\n    )\n    conn.unbind_s()\n    return results\n\n\ndef migrate_to_postgres(entries):\n    \"\"\"Insert migrated entries into PostgreSQL.\"\"\"\n    conn = psycopg2.connect(PG_DSN)\n    cur = conn.cursor()\n    migrated = 0\n    \n    for dn, attrs in entries:\n        if dn is None:\n            continue\n        try:\n            cur.execute(\n                \"INSERT INTO users (uid, cn, email, department, role, employee_id) \"\n                \"VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (uid) DO UPDATE SET \"\n                \"cn=EXCLUDED.cn, email=EXCLUDED.email\",\n                (\n                    attrs.get(\"uid\", [b\"\"])[0].decode(),\n                    attrs.get(\"cn\", [b\"\"])[0].decode(),\n                    attrs.get(\"mail\", [b\"\"])[0].decode(),\n                    attrs.get(\"department\", [b\"\"])[0].decode(),\n                    attrs.get(\"role\", [b\"\"])[0].decode(),\n                    attrs.get(\"employeeNumber\", [b\"\"])[0].decode(),\n                )\n            )\n            migrated += 1\n        except Exception as e:\n            logger.error(f\"Failed to migrate {dn}: {e}\")\n    \n    conn.commit()\n    cur.close()\n    conn.close()\n    return migrated\n\n\n@app.route(\"/api/v2/migrate/ldap-to-pg\", methods=[\"POST\"])\ndef trigger_migration():\n    \"\"\"Endpoint to trigger LDAP-to-PostgreSQL migration.\n    \n    Expected JSON body:\n    {\n        \"department\": \"engineering\",\n        \"role\": \"developer\", \n        \"status\": \"active\",\n        \"dry_run\": false\n    }\n    \"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({\"error\": \"JSON body required\"}), 400\n    \n    department = data.get(\"department\", \"\")\n    role = data.get(\"role\", \"\")\n    status = data.get(\"status\", \"active\")\n    dry_run = data.get(\"dry_run\", False)\n    \n    # Construct the LDAP filter\n    ldap_filter = build_ldap_filter(department, role, status)\n    logger.info(f\"Migration filter: {ldap_filter}\")\n    \n    if dry_run:\n        return jsonify({\"filter\": ldap_filter, \"dry_run\": True, \"status\": \"preview\"})\n    \n    try:\n        entries = fetch_ldap_entries(ldap_filter)\n        count = migrate_to_postgres(entries)\n        return jsonify({\"migrated\": count, \"filter_used\": ldap_filter})\n    except ldap.LDAPError as e:\n        logger.error(f\"LDAP error: {e}\")\n        return jsonify({\"error\": \"LDAP query failed\"}), 500\n    except Exception as e:\n        logger.error(f\"Migration error: {e}\")\n        return jsonify({\"error\": \"Migration failed\"}), 500\n\n\n@app.route(\"/health\", methods=[\"GET\"])\ndef health():\n    return jsonify({\"status\": \"ok\"})\n\n\nif __name__ == \"__main__\":\n    app.run(host=\"0.0.0.0\", port=8080)",
+  "environment": {
+    "description": "Migration service deployed on ECS Fargate behind AWS API Gateway (HTTP API type, not REST) with a route /api/v2/migrate/ldap-to-pg configured with a request validation model. The model schema is defined as a JSON Schema draft-07 document attached to the route's integration request. The schema enforces 'department' and 'role' as type:string with pattern '^[a-zA-Z0-9 _-]{1,64}$' and 'status' as enum ['active','inactive','suspended']. However, note that AWS HTTP APIs (as opposed to REST APIs) have limited native request validation \u2014 the actual enforcement is done via a Lambda authorizer (request type) that performs JSON Schema validation using ajv with coerceTypes:false and additionalProperties:false before returning an Allow policy. The authorizer Lambda has a 3-second timeout and 128MB memory. The VPC link connects API Gateway to the internal ALB target. There is no direct network path to the service; the security group on the ECS tasks only allows ingress from the VPC link ENIs (sg-0a3f7c referenced as source).",
+    "config": {
+      "api_gateway_type": "HTTP API (ApiGatewayV2)",
+      "route": "POST /api/v2/migrate/ldap-to-pg",
+      "authorizer_type": "Lambda (REQUEST type)",
+      "authorizer_function": "migration-api-schema-validator",
+      "authorizer_runtime": "nodejs18.x",
+      "schema_validation": {
+        "department": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9 _-]{1,64}$"
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9 _-]{1,64}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "inactive",
+            "suspended"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        }
+      },
+      "ajv_options": {
+        "coerceTypes": false,
+        "additionalProperties": false,
+        "allErrors": false
+      },
+      "network_isolation": "ECS task SG ingress only from VPC link ENI security group sg-0a3f7c",
+      "vpc_link": "vpclink-0x8a9f2 connecting APIGW to internal ALB"
+    }
+  }
+}

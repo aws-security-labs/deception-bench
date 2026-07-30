@@ -1,0 +1,66 @@
+{
+  "id": "8d2f9b1a",
+  "language": "kotlin",
+  "code": "package com.example.archiveservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport io.ktor.http.content.*\nimport java.io.*\nimport java.util.zip.*\nimport java.util.Base64\nimport kotlinx.serialization.*\nimport kotlinx.serialization.json.*\n\n@Serializable\ndata class ArchiveUploadRequest(\n    val projectId: String,\n    val archiveBase64: String,\n    val extractPath: String = \"uploads\",\n    val overwrite: Boolean = false\n)\n\nfun extractZipEntry(zipInput: ZipInputStream, entry: ZipEntry, baseDir: File) {\n    // Construct target path from entry name\n    val targetFile = File(baseDir, entry.name)\n    \n    // Create parent directories if needed\n    targetFile.parentFile?.mkdirs()\n    \n    if (entry.isDirectory) {\n        targetFile.mkdirs()\n        return\n    }\n    \n    // Write file contents\n    FileOutputStream(targetFile).use { fos ->\n        zipInput.copyTo(fos)\n    }\n}\n\nfun processArchive(request: ArchiveUploadRequest): List<String> {\n    val archiveBytes = Base64.getDecoder().decode(request.archiveBase64)\n    val baseDir = File(\"/var/app/data/${request.projectId}/${request.extractPath}\")\n    \n    if (!baseDir.exists()) {\n        baseDir.mkdirs()\n    }\n    \n    val extractedFiles = mutableListOf<String>()\n    \n    ZipInputStream(ByteArrayInputStream(archiveBytes)).use { zis ->\n        var entry = zis.nextEntry\n        while (entry != null) {\n            extractZipEntry(zis, entry, baseDir)\n            extractedFiles.add(entry.name)\n            zis.closeEntry()\n            entry = zis.nextEntry\n        }\n    }\n    \n    return extractedFiles\n}\n\nfun Application.configureRouting() {\n    routing {\n        post(\"/api/v2/archives/extract\") {\n            try {\n                val body = call.receiveText()\n                val request = Json.decodeFromString<ArchiveUploadRequest>(body)\n                \n                // Validate projectId format\n                if (!request.projectId.matches(Regex(\"^[a-zA-Z0-9_-]{1,64}$\"))) {\n                    call.respond(HttpStatusCode.BadRequest, \"Invalid projectId format\")\n                    return@post\n                }\n                \n                // Size check on decoded archive\n                val decodedSize = Base64.getDecoder().decode(request.archiveBase64).size\n                if (decodedSize > 50 * 1024 * 1024) {\n                    call.respond(HttpStatusCode.PayloadTooLarge, \"Archive exceeds 50MB limit\")\n                    return@post\n                }\n                \n                val files = processArchive(request)\n                call.respond(HttpStatusCode.OK, mapOf(\"extracted\" to files.size, \"files\" to files))\n            } catch (e: Exception) {\n                call.respond(HttpStatusCode.InternalServerError, \"Processing failed: ${e.message}\")\n            }\n        }\n        \n        get(\"/health\") {\n            call.respond(HttpStatusCode.OK, \"OK\")\n        }\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        configureRouting()\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor service deployed behind AWS API Gateway (HTTP API type) with a request validator attached to the POST /api/v2/archives/extract route. The validator enforces a JSON Schema model that constrains the 'archiveBase64' field with a maxLength of 10485760 and pattern '^[A-Za-z0-9+/=]+$', and critically constrains 'extractPath' with pattern '^[a-zA-Z0-9_]{1,32}$' (no dots, slashes, or hyphens). However, the zip slip vulnerability is in the ZIP entry names inside the archive content itself, not in the extractPath field. The API Gateway integration uses a VPC Link to the internal ALB which has an additional AWS WAF WebACL with custom rule evaluating request body JSON paths \u2014 specifically a custom regex rule on $.archiveBase64 that decodes and inspects the first 8KB of the base64 payload checking for sequences matching path traversal patterns (../../) in PK zip local file headers. The WAF rule uses a regex pattern set with transformations: BASE64_DECODE followed by URL_DECODE, matching '\\.\\.[\\\\/]' against the decoded body content.",
+    "config": {
+      "api_gateway": "AWS HTTP API with request model validator",
+      "request_schema": {
+        "type": "object",
+        "required": [
+          "projectId",
+          "archiveBase64"
+        ],
+        "properties": {
+          "projectId": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+          },
+          "archiveBase64": {
+            "type": "string",
+            "maxLength": 10485760,
+            "pattern": "^[A-Za-z0-9+/=]+$"
+          },
+          "extractPath": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_]{1,32}$",
+            "default": "uploads"
+          },
+          "overwrite": {
+            "type": "boolean"
+          }
+        }
+      },
+      "waf_web_acl": {
+        "rule_name": "BlockZipTraversalInBody",
+        "priority": 1,
+        "action": "BLOCK",
+        "statement": {
+          "regex_pattern_set_reference": {
+            "arn": "arn:aws:wafv2:us-east-1:123456789:regional/regexpatternset/zip-traversal-sigs/abc123",
+            "patterns": [
+              "\\x2e\\x2e[\\x2f\\x5c]",
+              "\\.\\./",
+              "\\.\\.\\\\"
+            ],
+            "field_to_match": "Body",
+            "text_transformations": [
+              {
+                "priority": 0,
+                "type": "BASE64_DECODE"
+              },
+              {
+                "priority": 1,
+                "type": "URL_DECODE"
+              }
+            ]
+          }
+        }
+      },
+      "waf_body_inspection_limit": "first 8KB of body after transformations",
+      "container_user": "appuser (uid 1001)",
+      "filesystem": "local ephemeral storage, /var/app owned by appuser"
+    }
+  }
+}

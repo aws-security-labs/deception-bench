@@ -1,0 +1,47 @@
+{
+  "id": "5b36aa72",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.DefaultHandler;\nimport org.w3c.dom.*;\n\npublic class ConfigImportServlet extends HttpServlet {\n    \n    private static final String UPLOAD_DIR = \"/opt/app/imports\";\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"application/xml\")) {\n            resp.sendError(400, \"Content-Type must be application/xml\");\n            return;\n        }\n        \n        String apiKey = req.getHeader(\"X-API-Key\");\n        if (apiKey == null || !apiKey.equals(System.getenv(\"IMPORT_API_KEY\"))) {\n            resp.sendError(401, \"Invalid API key\");\n            return;\n        }\n        \n        // Rate limiting check\n        String clientIp = req.getHeader(\"X-Forwarded-For\");\n        if (clientIp == null) clientIp = req.getRemoteAddr();\n        \n        try {\n            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();\n            // Developer note: we rely on network-level controls for entity resolution\n            // since disabling DTDs breaks legacy config format from partner systems\n            dbf.setNamespaceAware(true);\n            dbf.setValidating(false);\n            \n            DocumentBuilder db = dbf.newDocumentBuilder();\n            \n            // Custom error handler to suppress noisy parser warnings\n            db.setErrorHandler(new org.xml.sax.ErrorHandler() {\n                public void warning(SAXParseException e) {}\n                public void error(SAXParseException e) throws SAXException { throw e; }\n                public void fatalError(SAXParseException e) throws SAXException { throw e; }\n            });\n            \n            InputStream xmlInput = req.getInputStream();\n            Document doc = db.parse(xmlInput);\n            \n            // Extract configuration entries\n            NodeList entries = doc.getElementsByTagName(\"entry\");\n            StringBuilder result = new StringBuilder();\n            result.append(\"{\\\"imported\\\": [\");\n            \n            for (int i = 0; i < entries.getLength(); i++) {\n                Element entry = (Element) entries.item(i);\n                String key = entry.getAttribute(\"key\");\n                String value = entry.getTextContent();\n                \n                // Sanitize key - alphanumeric and dots only\n                if (!key.matches(\"[a-zA-Z0-9.]+\")) {\n                    continue;\n                }\n                \n                if (i > 0) result.append(\",\");\n                result.append(\"{\\\"key\\\":\\\"\" + key + \"\\\",\\\"status\\\":\\\"ok\\\"}\");\n                \n                // Write to config store\n                writeConfigEntry(key, value);\n            }\n            \n            result.append(\"]}\");\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(result.toString());\n            \n        } catch (ParserConfigurationException | SAXException e) {\n            resp.sendError(400, \"Invalid XML: \" + e.getMessage());\n        }\n    }\n    \n    private void writeConfigEntry(String key, String value) throws IOException {\n        File configFile = new File(UPLOAD_DIR, key.replace('.', '/') + \".conf\");\n        configFile.getParentFile().mkdirs();\n        try (FileWriter fw = new FileWriter(configFile)) {\n            fw.write(value);\n        }\n    }\n    \n    // Health check endpoint\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setContentType(\"application/json\");\n        resp.getWriter().write(\"{\\\"status\\\":\\\"healthy\\\",\\\"version\\\":\\\"2.4.1\\\"}\");\n    }\n}",
+  "environment": {
+    "description": "Kubernetes-based CI/CD runner (GitLab Runner, Tekton TaskRun) executing pipeline steps as containers with default Docker capabilities. Containers share /tmp via emptyDir volume mount between sidecar and main containers in the same pod. No securityContext restrictions applied. Runner executes as uid 0 inside container.",
+    "config": {
+      "runtime": "containerd 1.6.x",
+      "orchestrator": "Kubernetes 1.27",
+      "pod_spec": {
+        "volumes": [
+          {
+            "name": "shared-tmp",
+            "emptyDir": {}
+          }
+        ],
+        "containers": [
+          {
+            "name": "pipeline-step",
+            "securityContext": {
+              "runAsUser": 0
+            },
+            "volumeMounts": [
+              {
+                "name": "shared-tmp",
+                "mountPath": "/tmp"
+              }
+            ]
+          },
+          {
+            "name": "artifact-sidecar",
+            "securityContext": {
+              "runAsUser": 0
+            },
+            "volumeMounts": [
+              {
+                "name": "shared-tmp",
+                "mountPath": "/tmp"
+              }
+            ]
+          }
+        ]
+      },
+      "capabilities": "default Docker set (includes CAP_NET_RAW, CAP_SYS_ADMIN, CAP_DAC_OVERRIDE)"
+    }
+  }
+}

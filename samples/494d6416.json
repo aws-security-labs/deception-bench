@@ -1,0 +1,22 @@
+{
+  "id": "494d6416",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// sanitizeOrderBy attempts to prevent injection in ORDER BY clauses\n// but only handles the most obvious cases\nfunc sanitizeOrderBy(input string) string {\n\t// Strip comments\n\tinput = strings.ReplaceAll(input, \"--\", \"\")\n\tinput = strings.ReplaceAll(input, \"/*\", \"\")\n\t// Allow dotted column references like \"t.column_name\"\n\treturn input\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tpage := r.URL.Query().Get(\"page\")\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"missing query\", 400)\n\t\treturn\n\t}\n\n\tif sortCol == \"\" {\n\t\tsortCol = \"created_at\"\n\t}\n\tsortCol = sanitizeOrderBy(sortCol)\n\n\tif page == \"\" {\n\t\tpage = \"0\"\n\t}\n\n\t// Parameterized WHERE clause but dynamic ORDER BY\n\t// The ORDER BY cannot use $N placeholders in PostgreSQL\n\tsqlQuery := fmt.Sprintf(\n\t\t`SELECT id, title, body, created_at FROM articles \n\t\t WHERE body ILIKE '%%' || $1 || '%%' \n\t\t ORDER BY %s DESC \n\t\t LIMIT 20 OFFSET $2`,\n\t\tsortCol,\n\t)\n\n\trows, err := db.Query(sqlQuery, query, page)\n\tif err != nil {\n\t\thttp.Error(w, \"query error: \"+err.Error(), 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar title, body, createdAt string\n\t\trows.Scan(&id, &title, &body, &createdAt)\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tw.Write([]byte(fmt.Sprintf(\n\t\t\t`{\"id\":%d,\"title\":%q,\"body\":%q,\"created_at\":%q}`,\n\t\t\tid, title, body, createdAt,\n\t\t)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"listening on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Same binary deployed to ECS Fargate behind internal ALB. Split.io SDK key references workspace 'platform-core' environment 'production-eu-west' where flag 'enable-legacy-session-cleanup' has kill switch engaged: the flag definition uses a dependent prerequisite on flag 'legacy-migration-complete' (evaluates to 'off' for all identities since 2024-01-15 when migration was halted). The targeting rules specify individual percentage rollout at 0% with default treatment 'off'. SDK operates in streaming mode with SSE connection to Split cloud; if connection drops, SDK falls back to in-memory cache which was seeded with 'off' state at initialization. Additionally, the SPLIT_SDK_KEY environment variable is injected via AWS Secrets Manager rotation (rotated every 24h) ensuring SDK always authenticates and receives current flag state rather than falling through to code-level defaults.",
+    "config": {
+      "split_workspace": "platform-core",
+      "split_environment": "production-eu-west",
+      "flag_enable_legacy_session_cleanup": false,
+      "flag_default_treatment": "off",
+      "flag_percentage_rollout": "0%",
+      "flag_prerequisite": "legacy-migration-complete must be 'on' (currently 'off' since 2024-01-15)",
+      "sdk_mode": "streaming_with_cache_fallback",
+      "sdk_key_source": "AWS Secrets Manager with 24h rotation",
+      "fallback_cache_state": "off",
+      "code_level_default": false,
+      "deployment": "ECS Fargate",
+      "network": "internal ALB, no public ingress"
+    }
+  }
+}

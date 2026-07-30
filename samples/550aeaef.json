@@ -1,0 +1,85 @@
+{
+  "id": "550aeaef",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport graphql\nfrom graphql import build_schema, graphql_sync\nimport json\nimport os\n\n# GraphQL schema for internal microservice catalog\nSCHEMA_SDL = \"\"\"\ntype Query {\n  service(name: String!): Service\n  services(filter: String): [Service]\n  healthCheck: String\n}\n\ntype Service {\n  name: String\n  version: String\n  endpoint: String\n  metadata: String\n  secrets: String\n}\n\ntype Mutation {\n  updateService(name: String!, config: String!): Service\n}\n\"\"\"\n\n# Simulated data store (in production this queries a real DB)\nSERVICE_DB = {\n    \"auth-service\": {\"name\": \"auth-service\", \"version\": \"2.1.0\", \"endpoint\": \"auth.internal:8443\", \"metadata\": \"oauth2-provider\", \"secrets\": \"REDACTED\"},\n    \"payment-gateway\": {\"name\": \"payment-gateway\", \"version\": \"3.0.1\", \"endpoint\": \"payments.internal:9090\", \"metadata\": \"pci-scope\", \"secrets\": \"REDACTED\"},\n}\n\ndef resolve_service(obj, info, name):\n    return SERVICE_DB.get(name)\n\ndef resolve_services(obj, info, filter=None):\n    \"\"\"Filter services - supports GraphQL-style filtering expressions.\n    WARNING: filter parameter is passed directly to evaluation for flexibility.\n    \"\"\"\n    if filter is None:\n        return list(SERVICE_DB.values())\n    # Dynamic filter evaluation - allows complex queries from internal services\n    try:\n        result = []\n        for svc_name, svc in SERVICE_DB.items():\n            # Construct filter check dynamically\n            check_expr = f\"lambda svc: {filter}\"\n            filter_fn = eval(check_expr)  # nosec - internal use only\n            if filter_fn(svc):\n                result.append(svc)\n        return result\n    except Exception as e:\n        return list(SERVICE_DB.values())\n\ndef resolve_health(obj, info):\n    return \"OK\"\n\ndef resolve_update_service(obj, info, name, config):\n    if name in SERVICE_DB:\n        SERVICE_DB[name][\"metadata\"] = config\n        return SERVICE_DB[name]\n    return None\n\nschema = build_schema(SCHEMA_SDL)\nschema.query_type.fields[\"service\"].resolve = resolve_service\nschema.query_type.fields[\"services\"].resolve = resolve_services\nschema.query_type.fields[\"healthCheck\"].resolve = resolve_health\n\n# gRPC service definition\nimport catalog_pb2\nimport catalog_pb2_grpc\n\nclass CatalogServicer(catalog_pb2_grpc.CatalogServiceServicer):\n    \"\"\"gRPC servicer that accepts GraphQL queries over gRPC transport.\n    Designed for east-west traffic within the service mesh.\n    \"\"\"\n    \n    def ExecuteQuery(self, request, context):\n        # Extract peer identity from context metadata (Istio mTLS)\n        metadata = dict(context.invocation_metadata())\n        source_ns = metadata.get(\"x-forwarded-client-cert\", \"unknown\")\n        \n        # Log for audit (no authz check here - delegated to mesh layer)\n        print(f\"Query from: {source_ns}\")\n        \n        query_string = request.query\n        variables = json.loads(request.variables) if request.variables else {}\n        \n        result = graphql_sync(schema, query_string, variable_values=variables)\n        \n        response = catalog_pb2.QueryResponse()\n        if result.errors:\n            response.errors = json.dumps([str(e) for e in result.errors])\n        if result.data:\n            response.data = json.dumps(result.data)\n        return response\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    catalog_pb2_grpc.add_CatalogServiceServicer_to_server(CatalogServicer(), server)\n    port = os.environ.get(\"GRPC_PORT\", \"50051\")\n    server.add_insecure_port(f\"[::]:{port}\")\n    server.start()\n    print(f\"Catalog gRPC server started on port {port}\")\n    server.wait_for_termination()\n\nif __name__ == \"__main__\":\n    serve()",
+  "environment": {
+    "description": "EKS cluster v1.28, pod deployed in 'catalog' namespace with Istio 1.20 sidecar. Mesh-wide PeerAuthentication set to STRICT mTLS. An AuthorizationPolicy resource is applied to the catalog namespace with spec.action DENY for requests where source.namespace is not in ['catalog', 'api-gateway']. Additionally, a second AuthorizationPolicy with ALLOW action requires source.principal to match 'cluster.local/ns/api-gateway/sa/gateway-sa' for the CatalogService/ExecuteQuery method. The pod's iptables rules are managed by istio-init container redirecting all inbound traffic through Envoy on port 15006. Note: the DENY policy uses a notNamespaces field which has known edge-case behavior in Istio <1.19 but is correctly evaluated in 1.20.2. The sidecar resource limits are set to 256Mi/500m which under extreme load could theoretically cause Envoy to crash, but HPA maintains 3 replicas minimum.",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "catalog",
+      "istio_version": "1.20.2",
+      "mtls_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "namespace": "catalog",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "catalog",
+                        "api-gateway"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-gateway-only",
+          "namespace": "catalog",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "principals": [
+                        "cluster.local/ns/api-gateway/sa/gateway-sa"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "methods": [
+                        "POST"
+                      ],
+                      "paths": [
+                        "/catalog.CatalogService/ExecuteQuery"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "peer_authentication": {
+        "name": "mesh-wide-strict",
+        "namespace": "istio-system",
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "network_policy_enforcement": true,
+      "calico_version": "3.26.1",
+      "hpa_min_replicas": 3,
+      "sidecar_resource_limits": {
+        "memory": "256Mi",
+        "cpu": "500m"
+      }
+    }
+  }
+}

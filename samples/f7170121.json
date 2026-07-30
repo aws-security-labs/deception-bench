@@ -1,0 +1,33 @@
+{
+  "id": "f7170121",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'dev-key-not-for-prod')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_session_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Session-Token')\n        if not token:\n            return jsonify({'error': 'unauthorized'}), 401\n        parts = token.split(':')\n        if len(parts) != 2:\n            return jsonify({'error': 'malformed token'}), 401\n        user_id, sig = parts\n        expected = hmac.new(SECRET_KEY.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:16]\n        if not hmac.compare_digest(sig, expected):\n            return jsonify({'error': 'invalid signature'}), 401\n        g.current_user_id = user_id\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/users/search', methods=['GET'])\n@verify_session_token\ndef search_users():\n    \"\"\"Search users by department and role for org chart display.\n    Supports partial matching on department name.\"\"\"\n    department = request.args.get('department', '')\n    role = request.args.get('role', '')\n    include_inactive = request.args.get('include_inactive', 'false')\n    \n    # Build query with filters\n    base_query = \"SELECT id, username, email, department, role, status FROM users WHERE 1=1\"\n    \n    if department:\n        # Sanitize department for LIKE query\n        base_query += f\" AND department LIKE '%{department}%'\"\n    \n    if role:\n        base_query += f\" AND role = '{role}'\"\n    \n    if include_inactive != 'true':\n        base_query += \" AND status = 'active'\"\n    \n    base_query += \" ORDER BY department, username LIMIT 100\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'internal error'}), 500\n\n@app.route('/api/users/<user_id>/profile', methods=['GET'])\n@verify_session_token\ndef get_profile(user_id):\n    \"\"\"Get user profile. Users can only view their own profile unless admin.\"\"\"\n    db = get_db()\n    viewer = db.execute(\"SELECT role FROM users WHERE id = ?\", (g.current_user_id,)).fetchone()\n    \n    if not viewer:\n        return jsonify({'error': 'viewer not found'}), 404\n    \n    if g.current_user_id != user_id and viewer['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    \n    user = db.execute(\"SELECT id, username, email, department, role, status, phone FROM users WHERE id = ?\", (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'not found'}), 404\n    \n    return jsonify(dict(user))\n\n@app.route('/api/departments/stats', methods=['GET'])\n@verify_session_token\ndef department_stats():\n    \"\"\"Get department statistics for dashboard.\"\"\"\n    dept = request.args.get('name', '')\n    \n    if not dept:\n        return jsonify({'error': 'name parameter required'}), 400\n    \n    query = f\"SELECT department, COUNT(*) as count, \" \\\n            f\"SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) as active \" \\\n            f\"FROM users WHERE department = '{dept}' GROUP BY department\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        row = cursor.fetchone()\n        if row:\n            return jsonify(dict(row))\n        return jsonify({'error': 'department not found'}), 404\n    except sqlite3.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'internal error'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Lambda function deployed via hardened container image (ECR) with a custom AppArmor profile loaded via Lambda Extension layer. The profile (docproc-confined) is applied at container init and enforces: deny read/write on paths outside {/tmp/workflow_state/**, /var/task/**, /opt/**}. Specifically, the profile includes 'deny /var/cache/** rwklx,' and 'deny /etc/** rwklx,' rules with no exceptions. The profile also sets 'file /** -> deny' as default with explicit allow-list. Note: the AppArmor profile is compiled and cached in the Lambda layer at /opt/apparmor.d/docproc-confined and loaded by the extension bootstrap. The Lambda Extension (arn:aws:lambda:us-east-1:123456789012:layer:apparmor-enforcer:7) calls aa-exec to confine the runtime process. Additionally, the Step Functions state machine definition uses InputPath and Parameters with static JSONPath expressions that only pass $.document_id and $.content fields, dropping any injected cache_path from external input.",
+    "config": {
+      "runtime": "python3.9",
+      "architecture": "x86_64",
+      "os": "Amazon Linux 2",
+      "apparmor_profile": "docproc-confined",
+      "apparmor_rules": [
+        "deny /var/cache/** rwklx,",
+        "deny /etc/** rwklx,",
+        "deny /proc/*/mem rwklx,",
+        "/tmp/workflow_state/** rw,",
+        "/var/task/** r,",
+        "/opt/** r,"
+      ],
+      "apparmor_default": "file /** -> deny",
+      "lambda_extension": "arn:aws:lambda:us-east-1:123456789012:layer:apparmor-enforcer:7",
+      "step_function_input_filtering": {
+        "InputPath": "$",
+        "Parameters": {
+          "document_id.$": "$.document_id",
+          "content.$": "$.content",
+          "step": "transform"
+        }
+      },
+      "api_gateway_request_validation": "body-only-with-schema"
+    }
+  }
+}

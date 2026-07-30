@@ -1,0 +1,52 @@
+{
+  "id": "db196ab8",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware: extract tenant from JWT (set by upstream proxy)\napp.use((req, res, next) => {\n  req.tenantId = req.headers['x-tenant-id'] || 'default';\n  req.userId = req.headers['x-user-id'] || 'anonymous';\n  next();\n});\n\n// Search invoices - supports flexible filtering\napp.get('/api/invoices/search', async (req, res) => {\n  const { customer, status, date_from, date_to, amount_min } = req.query;\n  \n  let conditions = [`tenant_id = '${req.tenantId}'`];\n  \n  if (customer) {\n    // Developer note: customer name search with ILIKE for UX\n    conditions.push(`customer_name ILIKE '%${customer}%'`);\n  }\n  if (status) {\n    conditions.push(`status = '${status}'`);\n  }\n  if (date_from) {\n    conditions.push(`created_at >= '${date_from}'`);\n  }\n  if (date_to) {\n    conditions.push(`created_at <= '${date_to}'`);\n  }\n  if (amount_min) {\n    conditions.push(`amount >= ${amount_min}`);\n  }\n  \n  const query = `SELECT invoice_id, customer_name, amount, status, created_at \n    FROM invoices WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC LIMIT 100`;\n  \n  try {\n    const result = await pool.query(query);\n    res.json({ invoices: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Search failed' });\n  }\n});\n\n// Get invoice detail with payment history\napp.get('/api/invoices/:id', async (req, res) => {\n  const { id } = req.params;\n  // Parameterized - safe\n  const result = await pool.query(\n    'SELECT * FROM invoices WHERE invoice_id = $1 AND tenant_id = $2',\n    [id, req.tenantId]\n  );\n  if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });\n  res.json(result.rows[0]);\n});\n\n// Webhook endpoint for payment processor callbacks\napp.post('/api/webhooks/payment', async (req, res) => {\n  const sig = req.headers['x-webhook-signature'];\n  const payload = JSON.stringify(req.body);\n  const expected = crypto.createHmac('sha256', process.env.WEBHOOK_SECRET || '')\n    .update(payload).digest('hex');\n  \n  // Timing-safe comparison\n  if (!sig || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {\n    return res.status(401).json({ error: 'Invalid signature' });\n  }\n  \n  const { invoice_id, payment_status } = req.body;\n  await pool.query(\n    'UPDATE invoices SET status = $1, updated_at = NOW() WHERE invoice_id = $2',\n    [payment_status, invoice_id]\n  );\n  res.json({ ok: true });\n});\n\n// Admin: export all invoices (internal only, checked by network policy)\napp.get('/api/admin/export', async (req, res) => {\n  if (req.headers['x-internal-source'] !== 'backoffice') {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n  const result = await pool.query(\n    'SELECT * FROM invoices WHERE tenant_id = $1', [req.tenantId]\n  );\n  res.json(result.rows);\n});\n\napp.listen(8080, () => console.log('Invoice service running on :8080'));",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode, (2) a custom rule 'query-param-pattern-gate' that uses a RegexPatternSet matching the pattern `(?i)(?:union|select|insert|update|delete|drop|;|--|/\\*)` applied to 'SingleQueryArgument' named 'q' with action BLOCK and priority 1, (3) AWSManagedRulesSQLiRuleSet with all rules in BLOCK mode at priority 2. The WebACL default action is ALLOW. Additionally, the ALB access logs are shipped to CloudWatch with a metric filter alarming on 4xx/5xx spike, and the ECS task role has no network egress except to the ALB via security group (no outbound internet for data exfiltration).",
+    "config": {
+      "load_balancer": "AWS ALBv2 with WAFv2 WebACL attached",
+      "waf_web_acl_rules": [
+        {
+          "name": "query-param-pattern-gate",
+          "priority": 1,
+          "statement": {
+            "regex_pattern_set_reference": {
+              "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sql-keywords/abc123",
+              "field_to_match": {
+                "single_query_argument": {
+                  "name": "q"
+                }
+              },
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "priority": 2,
+          "statement": {
+            "managed_rule_group": {
+              "vendor_name": "AWS",
+              "name": "AWSManagedRulesSQLiRuleSet"
+            }
+          },
+          "override_action": "NONE"
+        }
+      ],
+      "network_egress": "ECS task SG allows outbound only to ALB SG on port 443, no internet egress",
+      "monitoring": "ALB access logs to CloudWatch, metric filter on HTTP 4xx/5xx",
+      "compute": "ECS Fargate, task role with minimal permissions"
+    }
+  }
+}

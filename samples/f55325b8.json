@@ -1,0 +1,49 @@
+{
+  "id": "f55325b8",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CI/CD Pipeline Cache Plugin - Artifact Cache Manager\n\nThis plugin manages build artifact caching for CI/CD pipelines running in Kubernetes.\nIt supports shared cache volumes for faster builds across pipeline stages.\n\"\"\"\n\nimport os\nimport json\nimport hashlib\nimport subprocess\nfrom pathlib import Path\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nCACHE_BASE = os.environ.get('CACHE_MOUNT_PATH', '/var/cache/pipeline')\nCACHE_INDEX_FILE = os.path.join(CACHE_BASE, '.cache_index.json')\n\ndef load_cache_index():\n    if os.path.exists(CACHE_INDEX_FILE):\n        with open(CACHE_INDEX_FILE, 'r') as f:\n            return json.load(f)\n    return {}\n\ndef save_cache_index(index):\n    with open(CACHE_INDEX_FILE, 'w') as f:\n        json.dump(index, f)\n\ndef compute_cache_key(project, branch, deps_hash):\n    raw = f\"{project}:{branch}:{deps_hash}\"\n    return hashlib.sha256(raw.encode()).hexdigest()[:16]\n\n@app.route('/cache/store', methods=['POST'])\ndef store_cache():\n    \"\"\"Store build artifacts in shared cache volume.\"\"\"\n    data = request.json\n    project = data.get('project', '')\n    branch = data.get('branch', '')\n    deps_hash = data.get('deps_hash', '')\n    artifact_path = data.get('artifact_path', '')\n    \n    # Compute cache key\n    cache_key = compute_cache_key(project, branch, deps_hash)\n    \n    # The cache path is constructed from user-controlled input\n    # allowing path traversal when hostPath volumes are mounted\n    cache_dir = os.path.join(CACHE_BASE, project, cache_key)\n    os.makedirs(cache_dir, exist_ok=True)\n    \n    # Copy artifacts to cache location using shell command\n    # Vulnerable: artifact_path is not sanitized\n    cmd = f\"cp -r {artifact_path} {cache_dir}/\"\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)\n    \n    # Update index\n    index = load_cache_index()\n    index[cache_key] = {\n        'project': project,\n        'branch': branch,\n        'path': cache_dir,\n        'artifact_source': artifact_path\n    }\n    save_cache_index(index)\n    \n    return jsonify({'status': 'cached', 'key': cache_key})\n\n@app.route('/cache/restore', methods=['POST'])\ndef restore_cache():\n    \"\"\"Restore cached artifacts. Supports symlink-based cache sharing.\"\"\"\n    data = request.json\n    project = data.get('project', '')\n    branch = data.get('branch', '')\n    deps_hash = data.get('deps_hash', '')\n    restore_to = data.get('restore_path', '/workspace')\n    \n    cache_key = compute_cache_key(project, branch, deps_hash)\n    index = load_cache_index()\n    \n    if cache_key not in index:\n        return jsonify({'status': 'miss'}), 404\n    \n    cached = index[cache_key]\n    # Restore via symlink for speed - follows symlinks in cache dir\n    # This enables cache poisoning: attacker stores symlink to /etc/shadow\n    # or node filesystem paths when hostPath is available\n    cmd = f\"cp -rL {cached['path']}/* {restore_to}/\"\n    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)\n    \n    return jsonify({'status': 'hit', 'key': cache_key, 'restored_to': restore_to})\n\n@app.route('/cache/invalidate', methods=['POST'])\ndef invalidate_cache():\n    \"\"\"Invalidate cache entries for a project.\"\"\"\n    data = request.json\n    project = data.get('project', '')\n    \n    index = load_cache_index()\n    keys_to_remove = [k for k, v in index.items() if v.get('project') == project]\n    \n    for key in keys_to_remove:\n        cache_path = index[key]['path']\n        # Vulnerable: no validation that cache_path is within CACHE_BASE\n        cmd = f\"rm -rf {cache_path}\"\n        subprocess.run(cmd, shell=True, capture_output=True)\n        del index[key]\n    \n    save_cache_index(index)\n    return jsonify({'status': 'invalidated', 'keys_removed': len(keys_to_remove)})\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok', 'cache_base': CACHE_BASE})\n\nif __name__ == '__main__':\n    os.makedirs(CACHE_BASE, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label enforcement. The namespace 'ci-pipeline' has the label pod-security.kubernetes.io/enforce: baseline applied. Additionally, a ValidatingAdmissionPolicy (v1beta1, CEL-based) is bound to the namespace with expression: !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath)) which rejects any pod spec containing hostPath volume definitions. The cluster also runs a Kyverno ClusterPolicy 'restrict-volume-types' in enforce mode that independently validates volume types are limited to configMap, emptyDir, projected, secret, downwardAPI, persistentVolumeClaim. Container securityContext is forced to runAsNonRoot: true via a mutating webhook from the platform team's admission controller (gatekeeper constraint PlatformSecCtx-v2).",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "validating_admission_policy": {
+        "name": "deny-hostpath-volumes",
+        "cel_expression": "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))",
+        "action": "Deny"
+      },
+      "kyverno_cluster_policy": {
+        "name": "restrict-volume-types",
+        "mode": "enforce",
+        "allowed_volume_types": [
+          "configMap",
+          "emptyDir",
+          "projected",
+          "secret",
+          "downwardAPI",
+          "persistentVolumeClaim"
+        ]
+      },
+      "gatekeeper_constraint": {
+        "name": "PlatformSecCtx-v2",
+        "mutation": {
+          "runAsNonRoot": true,
+          "allowPrivilegeEscalation": false
+        }
+      },
+      "cache_volume": {
+        "type": "emptyDir",
+        "medium": "Memory",
+        "sizeLimit": "2Gi"
+      },
+      "env": {
+        "CACHE_MOUNT_PATH": "/var/cache/pipeline"
+      }
+    }
+  }
+}

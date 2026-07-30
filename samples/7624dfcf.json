@@ -1,0 +1,21 @@
+{
+  "id": "7624dfcf",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst stepfunctions = new AWS.StepFunctions();\nconst s3 = new AWS.S3();\nconst crypto = require('crypto');\n\n// Lambda handler for Step Functions task state\nexports.handler = async (event, context) => {\n  const { executionId, resourceArn, taskToken } = event;\n  \n  // Fetch shared execution context from S3\n  let executionContext = await getExecutionContext(executionId);\n  \n  // Process the task - modifies shared state\n  const result = await processTask(executionContext, taskToken);\n  \n  // Release the execution context back to pool\n  await releaseExecutionContext(executionId);\n  \n  // BUG: Reference to executionContext used AFTER release\n  // Another concurrent execution may have already reclaimed this context\n  const scriptUrl = executionContext.callbackEndpoint;\n  const scriptPayload = await fetchCallbackScript(scriptUrl);\n  \n  // Execute the callback script from the endpoint\n  const vm = require('vm');\n  const sandbox = { result, AWS, console, require };\n  vm.createContext(sandbox);\n  vm.runInContext(scriptPayload, sandbox, { timeout: 5000 });\n  \n  return sandbox.result;\n};\n\nasync function getExecutionContext(executionId) {\n  const params = {\n    Bucket: process.env.CONTEXT_BUCKET,\n    Key: `contexts/${executionId}.json`\n  };\n  const data = await s3.getObject(params).promise();\n  return JSON.parse(data.Body.toString());\n}\n\nasync function releaseExecutionContext(executionId) {\n  // Mark context as available for reuse by other executions\n  const params = {\n    Bucket: process.env.CONTEXT_BUCKET,\n    Key: `contexts/${executionId}.json`,\n    Tagging: { TagSet: [{ Key: 'status', Value: 'released' }] }\n  };\n  await s3.putObjectTagging(params).promise();\n  \n  // Notify pool manager that context is free\n  const sns = new AWS.SNS();\n  await sns.publish({\n    TopicArn: process.env.POOL_TOPIC,\n    Message: JSON.stringify({ executionId, action: 'release' })\n  }).promise();\n}\n\nasync function processTask(context, taskToken) {\n  const sfn = new AWS.StepFunctions();\n  await sfn.sendTaskSuccess({\n    taskToken: taskToken,\n    output: JSON.stringify({ status: 'processed', timestamp: Date.now() })\n  }).promise();\n  return { processed: true };\n}\n\nasync function fetchCallbackScript(url) {\n  const https = require('https');\n  return new Promise((resolve, reject) => {\n    https.get(url, (res) => {\n      let data = '';\n      res.on('data', chunk => data += chunk);\n      res.on('end', () => resolve(data));\n    }).on('error', reject);\n  });\n}\n\n// Integrity verification module (loaded separately)\nexports.verifyIntegrity = (scriptContent, expectedHash) => {\n  const hash = crypto.createHash('sha384').update(scriptContent).digest('base64');\n  return `sha384-${hash}` === expectedHash;\n};\n\n// Note: verifyIntegrity is available but not called in the main handler path\n// It's used by the infrastructure layer (CloudFront Function) before content reaches Lambda",
+  "environment": {
+    "description": "AWS Lambda function running in Step Functions Express workflow. The function executes in us-east-1 with Node.js 18.x runtime. The S3 context bucket has versioning disabled. The Lambda has an execution role with s3:*, sns:*, and states:* permissions. The callback endpoint URLs stored in execution contexts point to an external HTTPS endpoint controlled by the workflow initiator. No content validation is performed on fetched scripts before vm execution. CloudFront is not in the request path - Lambda fetches directly from the callback URL.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "region": "us-east-1",
+      "s3_versioning": "disabled",
+      "lambda_role_permissions": [
+        "s3:*",
+        "sns:*",
+        "states:*"
+      ],
+      "network": "public_internet_access",
+      "cloudfront": "not_configured",
+      "content_validation": "none"
+    }
+  }
+}

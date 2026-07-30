@@ -1,0 +1,47 @@
+{
+  "id": "db67ebd6",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"os\"\n\t\"os/signal\"\n\t\"sync\"\n\t\"syscall\"\n\t\"unsafe\"\n\n\t\"github.com/Shopify/sarama\"\n)\n\n// #include <stdlib.h>\nimport \"C\"\n\ntype MessageBuffer struct {\n\tptr    unsafe.Pointer\n\tsize   int\n\tfreed  bool\n\tmu     sync.Mutex\n}\n\nfunc NewMessageBuffer(size int) *MessageBuffer {\n\treturn &MessageBuffer{\n\t\tptr:  C.malloc(C.size_t(size)),\n\t\tsize: size,\n\t}\n}\n\nfunc (mb *MessageBuffer) Free() {\n\t// BUG: No proper synchronization on the freed flag check\n\t// Race condition allows double-free when concurrent consumers\n\t// process the same partition rebalance event\n\tif !mb.freed {\n\t\tC.free(mb.ptr)\n\t\tmb.freed = true\n\t}\n}\n\ntype StreamProcessor struct {\n\tconsumer sarama.ConsumerGroup\n\tbuffers  map[string]*MessageBuffer\n\tmu       sync.RWMutex\n}\n\nfunc NewStreamProcessor(brokers []string, group string) (*StreamProcessor, error) {\n\tconfig := sarama.NewConfig()\n\tconfig.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRoundRobin\n\tconfig.Consumer.Offsets.Initial = sarama.OffsetOldest\n\n\tconsumer, err := sarama.NewConsumerGroup(brokers, group, config)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\n\treturn &StreamProcessor{\n\t\tconsumer: consumer,\n\t\tbuffers:  make(map[string]*MessageBuffer),\n\t}, nil\n}\n\nfunc (sp *StreamProcessor) Setup(session sarama.ConsumerGroupSession) error {\n\tfor _, topic := range session.Claims() {\n\t\tfor _, partition := range topic {\n\t\t\tkey := fmt.Sprintf(\"%d\", partition)\n\t\t\tsp.mu.Lock()\n\t\t\tsp.buffers[key] = NewMessageBuffer(4096)\n\t\t\tsp.mu.Unlock()\n\t\t}\n\t}\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) Cleanup(session sarama.ConsumerGroupSession) error {\n\t// During rebalance, multiple goroutines may call Cleanup concurrently\n\t// The RWMutex protects the map but NOT the individual buffer Free() call\n\tsp.mu.RLock()\n\tfor _, buf := range sp.buffers {\n\t\tgo buf.Free() // Launched in goroutine - race with ConsumeClaim\n\t}\n\tsp.mu.RUnlock()\n\treturn nil\n}\n\nfunc (sp *StreamProcessor) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {\n\tfor msg := range claim.Messages() {\n\t\tkey := fmt.Sprintf(\"%d\", msg.Partition)\n\t\tsp.mu.RLock()\n\t\tbuf, exists := sp.buffers[key]\n\t\tsp.mu.RUnlock()\n\n\t\tif exists {\n\t\t\t// Process message using buffer - may race with Cleanup's Free()\n\t\t\tC.memcpy(buf.ptr, unsafe.Pointer(&msg.Value[0]), C.size_t(min(len(msg.Value), buf.size)))\n\t\t\t// After processing, free buffer for GC pressure relief\n\t\t\t// This creates double-free when Cleanup also frees\n\t\t\tif len(msg.Value) > 2048 {\n\t\t\t\tbuf.Free()\n\t\t\t}\n\t\t}\n\t\tsession.MarkMessage(msg, \"\")\n\t}\n\treturn nil\n}\n\nfunc min(a, b int) int {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n\nfunc main() {\n\tbrokers := []string{os.Getenv(\"KAFKA_BROKERS\")}\n\tsp, err := NewStreamProcessor(brokers, \"stream-processor-group\")\n\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Failed to create processor: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n\n\tctx, cancel := context.WithCancel(context.Background())\n\tsigs := make(chan os.Signal, 1)\n\tsignal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)\n\n\tgo func() {\n\t\t<-sigs\n\t\tcancel()\n\t}()\n\n\ttopics := []string{\"events.ingest\", \"events.dlq\"}\n\tfor {\n\t\tif err := sp.consumer.Consume(ctx, topics, sp); err != nil {\n\t\t\tfmt.Fprintf(os.Stderr, \"Consumer error: %v\\n\", err)\n\t\t}\n\t\tif ctx.Err() != nil {\n\t\t\tbreak\n\t\t}\n\t}\n}",
+  "environment": {
+    "description": "Same EKS 1.27 cluster but namespace has label pod-security.kubernetes.io/enforce: restricted (Pod Security Standards in enforce mode). Additionally, a Kyverno ClusterPolicy 'disallow-privilege-escalation' with validationFailureAction: Enforce denies any pod spec with securityContext.privileged=true OR hostPath volumes OR runAsUser < 1000. The container must run as non-root (UID 65534) with readOnlyRootFilesystem: true and drops ALL capabilities. The Go binary is compiled with CGO_ENABLED=1 but the allocator behavior under non-root with restricted seccomp profile (RuntimeDefault) means the double-free corruption cannot escalate beyond a SIGSEGV crash \u2014 the process has no capability to map host memory, write to host filesystem, or escalate privileges even if heap metadata is corrupted. The OOMKill and restart policy (restartPolicy: Always with memory limit 256Mi) ensures the crash is contained.",
+    "config": {
+      "kubernetes_version": "1.27",
+      "platform": "EKS",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.27"
+      },
+      "kyverno_policy": {
+        "name": "disallow-privilege-escalation",
+        "validationFailureAction": "Enforce",
+        "rules": [
+          "deny privileged containers",
+          "deny hostPath",
+          "require runAsNonRoot",
+          "require drop ALL capabilities"
+        ]
+      },
+      "securityContext": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "resources": {
+        "limits": {
+          "memory": "256Mi"
+        }
+      },
+      "restartPolicy": "Always"
+    }
+  }
+}

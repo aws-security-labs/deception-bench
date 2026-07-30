@@ -1,0 +1,23 @@
+{
+  "id": "355d3eae",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'inventory',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: { rejectUnauthorized: false },\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const authHeader = req.headers['authorization'];\n  if (!authHeader) return res.status(401).json({ error: 'No auth' });\n  try {\n    const payload = JSON.parse(Buffer.from(authHeader.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search products with filters\napp.get('/api/products/search', extractTenant, async (req, res) => {\n  const { category, min_price, max_price, sort_field, sort_dir } = req.query;\n  \n  // Validate sort direction\n  const validDirs = ['ASC', 'DESC'];\n  const direction = validDirs.includes((sort_dir || '').toUpperCase()) ? sort_dir.toUpperCase() : 'ASC';\n  \n  // Validate sort field against allowlist\n  const validSorts = ['name', 'price', 'created_at', 'stock_count'];\n  const sortColumn = validSorts.includes(sort_field) ? sort_field : 'name';\n  \n  // Build WHERE clause\n  let conditions = [`tenant_id = '${req.tenantId}'`];\n  let paramIndex = 1;\n  let params = [];\n  \n  if (category) {\n    // Category uses parameterized query\n    conditions.push(`category = $${paramIndex++}`);\n    params.push(category);\n  }\n  if (min_price) {\n    conditions.push(`price >= $${paramIndex++}`);\n    params.push(parseFloat(min_price));\n  }\n  if (max_price) {\n    conditions.push(`price <= $${paramIndex++}`);\n    params.push(parseFloat(max_price));\n  }\n\n  const query = `SELECT id, name, category, price, stock_count, created_at \n    FROM products \n    WHERE ${conditions.join(' AND ')}\n    ORDER BY ${sortColumn} ${direction}\n    LIMIT 100`;\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ products: result.rows, count: result.rowCount });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Database error' });\n  }\n});\n\n// Update stock level\napp.patch('/api/products/:id/stock', extractTenant, async (req, res) => {\n  const { id } = req.params;\n  const { adjustment, reason } = req.body;\n  \n  if (!Number.isInteger(adjustment)) {\n    return res.status(400).json({ error: 'adjustment must be integer' });\n  }\n\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    const update = await client.query(\n      `UPDATE products SET stock_count = stock_count + $1 WHERE id = $2 AND tenant_id = '${req.tenantId}' RETURNING *`,\n      [adjustment, id]\n    );\n    if (update.rowCount === 0) {\n      await client.query('ROLLBACK');\n      return res.status(404).json({ error: 'Product not found' });\n    }\n    await client.query(\n      'INSERT INTO stock_audit (product_id, adjustment, reason, user_id) VALUES ($1, $2, $3, $4)',\n      [id, adjustment, reason || 'manual', req.userId]\n    );\n    await client.query('COMMIT');\n    res.json({ product: update.rows[0] });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    console.error('Stock update error:', err.message);\n    res.status(500).json({ error: 'Update failed' });\n  } finally {\n    client.release();\n  }\n});\n\napp.listen(process.env.PORT || 3000);",
+  "environment": {
+    "description": "Quarkus Lambda deployed via AWS SAM in us-east-1. Lambda function runs in a VPC with default security group allowing all outbound traffic. The function has an attached IAM role with AmazonEC2ReadOnlyAccess and AWSLambdaVPCAccessExecutionRole. API Gateway (HTTP API) is publicly accessible. Lambda ENI is in a subnet with a NAT Gateway providing internet egress. No DNS filtering or firewall appliance in the VPC. IMDSv1 is enabled on any EC2 instances in the same VPC.",
+    "config": {
+      "runtime": "quarkus-amazon-lambda-http",
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-0a1b2c3d4e5f"
+        ],
+        "security_group_ids": [
+          "sg-default-allow-all-egress"
+        ]
+      },
+      "api_gateway": "public HTTP API",
+      "nat_gateway": true,
+      "dns_filtering": "none",
+      "imds_version": "v1"
+    }
+  }
+}

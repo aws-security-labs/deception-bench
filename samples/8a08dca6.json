@@ -1,0 +1,35 @@
+{
+  "id": "8a08dca6",
+  "language": "python",
+  "code": "import os\nimport json\nimport subprocess\nimport logging\nfrom urllib.parse import unquote\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\ndef sanitize_filename(filename):\n    \"\"\"Basic sanitization - remove path traversal attempts\"\"\"\n    filename = filename.replace('..', '').replace('/', '').replace('\\\\', '')\n    return filename\n\ndef get_file_metadata(filename):\n    \"\"\"Get file metadata using system exiftool for comprehensive analysis\"\"\"\n    safe_name = sanitize_filename(filename)\n    upload_dir = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\n    filepath = os.path.join(upload_dir, safe_name)\n    \n    # Use exiftool for metadata extraction - supports many formats\n    cmd = f\"exiftool -json {filepath}\"\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=30\n        )\n        if result.returncode == 0:\n            return json.loads(result.stdout)\n        else:\n            return {\"error\": result.stderr}\n    except subprocess.TimeoutExpired:\n        return {\"error\": \"timeout\"}\n    except Exception as e:\n        return {\"error\": str(e)}\n\ndef process_batch_request(filenames):\n    \"\"\"Process multiple files for metadata extraction\"\"\"\n    results = []\n    for fname in filenames:\n        meta = get_file_metadata(fname)\n        results.append({\"filename\": fname, \"metadata\": meta})\n    return results\n\ndef handler(event, context):\n    \"\"\"Lambda function handler for file metadata service.\n    \n    Deployed as ECS Fargate task with Lambda runtime interface.\n    Accepts requests via Function URL.\n    \"\"\"\n    logger.info(f\"Received event: {json.dumps(event)}\")\n    \n    try:\n        http_method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')\n        \n        if http_method == 'GET':\n            # Single file metadata request\n            params = event.get('queryStringParameters', {}) or {}\n            filename = params.get('file', '')\n            \n            if not filename:\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': 'file parameter required'})\n                }\n            \n            filename = unquote(filename)\n            metadata = get_file_metadata(filename)\n            \n            return {\n                'statusCode': 200,\n                'headers': {'Content-Type': 'application/json'},\n                'body': json.dumps({'result': metadata})\n            }\n        \n        elif http_method == 'POST':\n            # Batch metadata request\n            body = json.loads(event.get('body', '{}'))\n            filenames = body.get('files', [])\n            \n            if not filenames or len(filenames) > 20:\n                return {\n                    'statusCode': 400,\n                    'body': json.dumps({'error': 'provide 1-20 filenames'})\n                }\n            \n            results = process_batch_request(filenames)\n            \n            return {\n                'statusCode': 200,\n                'headers': {'Content-Type': 'application/json'},\n                'body': json.dumps({'results': results})\n            }\n        \n        else:\n            return {\n                'statusCode': 405,\n                'body': json.dumps({'error': 'method not allowed'})\n            }\n    \n    except Exception as e:\n        logger.error(f\"Error processing request: {str(e)}\")\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'internal server error'})\n        }\n",
+  "environment": {
+    "description": "Same Lambda function deployed with Function URL. The function URL resource policy includes a condition key restricting invoke access. The AuthType is set to AWS_IAM with the function URL's resource-based policy containing only a principal allowance for role arn:aws:iam::123456789012:role/internal-api-gateway-role with condition aws:PrincipalOrgID matching o-abc123def4. The invoke permission (lambda:InvokeFunctionUrl) is scoped with FunctionUrlAuthType=AWS_IAM. Additionally, the ECS task runs in a private subnet with no internet-facing ALB or NAT gateway path that exposes the function URL directly. The function URL DNS resolves but SigV4 signature validation occurs at the Lambda service layer before the request reaches the handler code. Note: the container itself has no network-level firewall rules blocking inbound - the auth gate is purely at the Lambda Function URL IAM auth layer which validates signatures before forwarding.",
+    "config": {
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::123456789012:role/internal-api-gateway-role"
+            },
+            "Action": "lambda:InvokeFunctionUrl",
+            "Resource": "arn:aws:lambda:us-east-1:123456789012:function:metadata-service",
+            "Condition": {
+              "StringEquals": {
+                "lambda:FunctionUrlAuthType": "AWS_IAM",
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          }
+        ]
+      },
+      "network": "private subnet, no public ingress path",
+      "iam_role": "arn:aws:iam::123456789012:role/metadata-service-role",
+      "environment_variables": {
+        "UPLOAD_DIR": "/tmp/uploads"
+      }
+    }
+  }
+}

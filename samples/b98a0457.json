@@ -1,0 +1,56 @@
+{
+  "id": "b98a0457",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype DocumentQuery struct {\n\tOwnerID   string `json:\"owner_id\"`\n\tCategory  string `json:\"category\"`\n\tSortField string `json:\"sort_field\"`\n\tSortDir   string `json:\"sort_dir\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// validateSortDirection checks sort direction is safe\nfunc validateSortDirection(dir string) string {\n\tif strings.ToUpper(dir) == \"DESC\" {\n\t\treturn \"DESC\"\n\t}\n\treturn \"ASC\"\n}\n\n// sanitizeIdentifier attempts to prevent injection in identifiers\nfunc sanitizeIdentifier(id string) string {\n\t// Remove obvious dangerous chars but this is insufficient\n\tid = strings.ReplaceAll(id, \";\", \"\")\n\tid = strings.ReplaceAll(id, \"--\", \"\")\n\treturn id\n}\n\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar q DocumentQuery\n\tif err := json.NewDecoder(r.Body).Decode(&q); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Validate sort direction properly\n\tsortDir := validateSortDirection(q.SortDir)\n\n\t// \"Sanitize\" the sort field - but this is bypassable\n\tsortField := sanitizeIdentifier(q.SortField)\n\n\t// Parameterized WHERE clause but dynamic ORDER BY\n\t// The sort_field is user-controlled and injectable\n\tquery := fmt.Sprintf(\n\t\t`SELECT id, title, content, classification FROM documents \n\t\t WHERE owner_id = $1 AND category = $2 \n\t\t ORDER BY %s %s LIMIT 50`,\n\t\tsortField, sortDir,\n\t)\n\n\trows, err := db.Query(query, q.OwnerID, q.Category)\n\tif err != nil {\n\t\thttp.Error(w, \"Query error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\ttype Doc struct {\n\t\tID             int    `json:\"id\"`\n\t\tTitle          string `json:\"title\"`\n\t\tContent        string `json:\"content\"`\n\t\tClassification string `json:\"classification\"`\n\t}\n\n\tvar results []Doc\n\tfor rows.Next() {\n\t\tvar d Doc\n\t\trows.Scan(&d.ID, &d.Title, &d.Content, &d.Classification)\n\t\tresults = append(results, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"Listening on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for baseline telemetry, (2) a custom rule at priority 200 that applies a regex pattern set matching UNION|SELECT|INSERT|DROP|--|;|'|%27 against query string values with action BLOCK and a custom 403 response body, (3) AWSManagedRulesSQLiRuleSet at priority 300 in BLOCK mode as defense-in-depth. The WebACL default action is ALLOW. Additionally, the ALB access logs are shipped to a GuardDuty-monitored S3 bucket but this is detective only.",
+    "config": {
+      "load_balancer": "AWS ALB (layer 7)",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "CommonRuleSetTelemetry",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "override_action": "COUNT"
+          },
+          {
+            "priority": 200,
+            "name": "CustomSQLPatternBlock",
+            "type": "RegexPatternSet",
+            "scope": "QUERY_STRING",
+            "patterns": [
+              "UNION",
+              "SELECT",
+              "INSERT",
+              "DROP",
+              "--",
+              ";",
+              "'",
+              "%27"
+            ],
+            "text_transformation": [
+              "URL_DECODE",
+              "LOWERCASE"
+            ],
+            "action": "BLOCK",
+            "custom_response": {
+              "response_code": 403,
+              "body": "Request blocked"
+            }
+          },
+          {
+            "priority": 300,
+            "name": "SQLiManagedRule",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "override_action": "BLOCK"
+          }
+        ]
+      },
+      "runtime": "Python 3.11, Flask 3.0.0, gunicorn on ECS Fargate",
+      "network": "private subnet, ALB in public subnet",
+      "alb_access_logs": "s3://corp-alb-logs/ with GuardDuty integration"
+    }
+  }
+}

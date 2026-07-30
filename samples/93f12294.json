@@ -1,0 +1,50 @@
+{
+  "id": "93f12294",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// getDocuments retrieves documents with optional filtering\n// The tenant_id is extracted from the validated JWT by the upstream proxy\nfunc getDocuments(w http.ResponseWriter, r *http.Request) {\n\ttenantID := r.Header.Get(\"X-Tenant-ID\")\n\tif tenantID == \"\" {\n\t\thttp.Error(w, \"missing tenant context\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\t// Build query with tenant isolation\n\tbaseQuery := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE tenant_id = '%s'\",\n\t\ttenantID,\n\t)\n\n\t// Apply optional classification filter from query param\n\tclassFilter := r.URL.Query().Get(\"classification\")\n\tif classFilter != \"\" {\n\t\t// Normalize input - strip obvious attack patterns for logging\n\t\tnormalized := strings.ToLower(classFilter)\n\t\tif strings.Contains(normalized, \"drop\") || strings.Contains(normalized, \"delete\") {\n\t\t\tlog.Printf(\"WARN: suspicious classification filter from tenant %s: %s\", tenantID, classFilter)\n\t\t}\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = '%s'\", classFilter)\n\t}\n\n\t// Apply optional owner filter\n\townerFilter := r.URL.Query().Get(\"owner\")\n\tif ownerFilter != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND owner_id = %s\", ownerFilter)\n\t}\n\n\tbaseQuery += \" ORDER BY id DESC LIMIT 50\"\n\n\trows, err := db.Query(baseQuery)\n\tif err != nil {\n\t\tlog.Printf(\"query error for tenant %s: %v\", tenantID, err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/documents\", getDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Deployed identically but fronted by AWS ALB with associated WAFv2 WebACL. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 with SizeRestriction_QUERYSTRING rule overridden to COUNT, (2) a custom rule group 'inventory-api-input-validation' at priority 200 containing a regex match rule on query string values matching pattern ['\";\\-\\-] with BLOCK action and TextTransformation of URL_DECODE followed by LOWERCASE, (3) AWSManagedRulesSQLiRuleSet at priority 300 in default BLOCK mode with no rule overrides. CloudWatch metrics confirm all three rule groups are actively evaluating requests with non-zero BlockedRequests metric in the past 24h.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL association",
+      "wafv2_web_acl_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "override_action": "none",
+          "rule_overrides": [
+            {
+              "name": "SizeRestriction_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "name": "inventory-api-input-validation",
+          "priority": 200,
+          "action": "block",
+          "statement": {
+            "regex_match": {
+              "field": "query_string_values",
+              "pattern": "['\";\\-\\-]",
+              "text_transformations": [
+                "URL_DECODE",
+                "LOWERCASE"
+              ]
+            }
+          }
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "priority": 300,
+          "override_action": "none",
+          "rule_overrides": []
+        }
+      ],
+      "instance_type": "t3.medium",
+      "security_group_inbound": "TCP/8080 from ALB security group only",
+      "runtime": "Python 3.11, Flask 3.0, gunicorn",
+      "database": "SQLite local file",
+      "cloudwatch_metrics": "BlockedRequests > 0 for all three rule groups in trailing 24h"
+    }
+  }
+}

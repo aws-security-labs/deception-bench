@@ -1,0 +1,26 @@
+{
+  "id": "88d10860",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport java.util.regex.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Pattern SAFE_ID = Pattern.compile(\"^[A-Za-z0-9_-]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        \n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n        \n        // Validate reportId format\n        if (!SAFE_ID.matcher(reportId).matches()) {\n            resp.sendError(400, \"Invalid report id format\");\n            return;\n        }\n        \n        Connection conn = null;\n        try {\n            conn = getConnection();\n            String query = buildQuery(reportId, format, conn);\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                out.print(\"  {\\\"name\\\": \\\"\" + rs.getString(1) + \"\\\", \\\"value\\\": \\\"\" + rs.getString(2) + \"\\\"}\");\n                first = false;\n            }\n            out.print(\"\\n]\");\n            rs.close();\n            stmt.close();\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n    \n    private String buildQuery(String reportId, String format, Connection conn) throws SQLException {\n        // reportId is validated above with regex - safe to use\n        String baseQuery = \"SELECT field_name, field_value FROM report_data WHERE report_id = '\" + reportId + \"'\";\n        \n        if (format != null && !format.isEmpty()) {\n            // format parameter controls output ordering/filtering\n            // Expected values: 'summary', 'detailed', 'csv'\n            // Using string concatenation for the ORDER BY / filter clause\n            String orderClause = getOrderClause(format);\n            baseQuery = baseQuery + \" \" + orderClause;\n        }\n        return baseQuery;\n    }\n    \n    private String getOrderClause(String format) {\n        // NOTE: format is user-controlled and NOT validated\n        // This allows SQL injection through the format parameter\n        switch (format) {\n            case \"summary\":\n                return \"ORDER BY field_name ASC LIMIT 5\";\n            case \"detailed\":\n                return \"ORDER BY field_name ASC\";\n            case \"csv\":\n                return \"ORDER BY field_value ASC\";\n            default:\n                // Dangerous: uses format directly in SQL for custom ordering\n                return \"ORDER BY \" + format;\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        if (url == null) url = \"jdbc:postgresql://localhost:5432/reports\";\n        if (user == null) user = \"app_user\";\n        if (pass == null) pass = \"\";\n        return DriverManager.getConnection(url, user, pass);\n    }\n}",
+  "environment": {
+    "description": "Container deployed on GKE Autopilot with the following pod security context: the container rootfs is mounted read-only (readOnlyRootFilesystem: true in securityContext), no tmpfs or emptyDir volumes are attached, and ephemeral storage is not provisioned. The pod runs with a distroless base image. An Istio sidecar (envoy proxy) is injected with protocol detection set to STRICT for HTTP, and the EnvoyFilter resource applies http_inspector listener filter with max_request_headers_kb: 60 and normalize_path: true. The Istio mesh policy enforces STRICT mTLS between all services. The envoy sidecar's HTTP connection manager has the following settings: allow_chunked_length: false, reject_unsupported_transfer_encodings: true, and merge_slashes: true in the route configuration.",
+    "config": {
+      "platform": "GKE Autopilot",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": "none (no emptyDir, no tmpfs, no PVC)",
+      "service_mesh": "Istio 1.20+ with STRICT protocol detection",
+      "envoy_http_connection_manager": {
+        "allow_chunked_length": false,
+        "reject_unsupported_transfer_encodings": true,
+        "merge_slashes": true,
+        "normalize_path": true
+      },
+      "mtls": "STRICT mesh-wide PeerAuthentication",
+      "base_image": "gcr.io/distroless/static-debian12"
+    }
+  }
+}

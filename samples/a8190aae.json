@@ -1,0 +1,21 @@
+{
+  "id": "a8190aae",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing System;\nusing System.Net.WebSockets;\nusing System.Text;\nusing System.Threading;\nusing System.Threading.Tasks;\nusing Amazon.S3;\nusing Amazon.S3.Model;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddAWSService<IAmazonS3>();\nvar app = builder.Build();\napp.UseWebSockets();\n\n// WebSocket endpoint for real-time data sync\napp.Map(\"/ws/sync\", async (HttpContext context) =>\n{\n    if (!context.WebSockets.IsWebSocketRequest)\n    {\n        context.Response.StatusCode = 400;\n        return;\n    }\n\n    // NOTE: No Origin header validation performed\n    // NOTE: No authentication token required for WebSocket upgrade\n    using var ws = await context.WebSockets.AcceptWebSocketAsync();\n    var buffer = new byte[4096];\n\n    while (ws.State == WebSocketState.Open)\n    {\n        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);\n        if (result.MessageType == WebSocketMessageType.Close)\n            break;\n\n        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);\n        var command = System.Text.Json.JsonSerializer.Deserialize<SyncCommand>(message);\n\n        if (command?.Action == \"read\")\n        {\n            var s3 = context.RequestServices.GetRequiredService<IAmazonS3>();\n            try\n            {\n                // User-controlled bucket and key - no authorization check\n                var response = await s3.GetObjectAsync(new GetObjectRequest\n                {\n                    BucketName = command.Bucket,\n                    Key = command.Key\n                });\n\n                using var reader = new System.IO.StreamReader(response.ResponseStream);\n                var content = await reader.ReadToEndAsync();\n                var responseBytes = Encoding.UTF8.GetBytes(content);\n                await ws.SendAsync(new ArraySegment<byte>(responseBytes),\n                    WebSocketMessageType.Text, true, CancellationToken.None);\n            }\n            catch (Exception ex)\n            {\n                var errBytes = Encoding.UTF8.GetBytes($\"{{\\\"error\\\":\\\"{ex.Message}\\\"}}\");\n                await ws.SendAsync(new ArraySegment<byte>(errBytes),\n                    WebSocketMessageType.Text, true, CancellationToken.None);\n            }\n        }\n        else if (command?.Action == \"write\")\n        {\n            var s3 = context.RequestServices.GetRequiredService<IAmazonS3>();\n            // User-controlled write to arbitrary bucket/key\n            await s3.PutObjectAsync(new PutObjectRequest\n            {\n                BucketName = command.Bucket,\n                Key = command.Key,\n                ContentBody = command.Data\n            });\n            var ack = Encoding.UTF8.GetBytes(\"{\\\"status\\\":\\\"written\\\"}\");\n            await ws.SendAsync(new ArraySegment<byte>(ack),\n                WebSocketMessageType.Text, true, CancellationToken.None);\n        }\n    }\n});\n\napp.Run(\"http://0.0.0.0:5000\");\n\npublic class SyncCommand\n{\n    public string Action { get; set; }\n    public string Bucket { get; set; }\n    public string Key { get; set; }\n    public string Data { get; set; }\n}",
+  "environment": {
+    "description": "ASP.NET Core 8 application deployed on EC2 instance in a public subnet with an IAM instance profile granting s3:GetObject and s3:PutObject on s3:*. The application listens on port 5000 exposed via an NLB with no additional filtering. WebSocket connections are accepted from any origin. The EC2 instance routes S3 traffic through the public internet gateway. No bucket policies restrict access beyond IAM permissions.",
+    "config": {
+      "runtime": "dotnet8",
+      "iam_role_policy": "arn:aws:iam::123456789012:policy/BroadS3Access",
+      "iam_permissions": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "iam_resource": "arn:aws:s3:::*/*",
+      "network": "public_subnet_with_igw",
+      "load_balancer": "NLB_passthrough",
+      "s3_routing": "internet_gateway",
+      "websocket_origin_check": false
+    }
+  }
+}

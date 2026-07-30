@@ -1,0 +1,33 @@
+{
+  "id": "fb1b6358",
+  "language": "java",
+  "code": "import java.io.IOException;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.WebServlet;\nimport org.apache.commons.text.StringEscapeUtils;\n\n@WebServlet(\"/api/reports\")\npublic class ReportServlet extends HttpServlet {\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String userId = (String) req.getSession().getAttribute(\"user_id\");\n        if (userId == null) {\n            resp.sendError(401);\n            return;\n        }\n        \n        String sortCol = req.getParameter(\"sort\");\n        String direction = req.getParameter(\"dir\");\n        String filterDate = req.getParameter(\"from_date\");\n        \n        // Whitelist sort direction\n        if (direction == null || (!direction.equalsIgnoreCase(\"ASC\") && !direction.equalsIgnoreCase(\"DESC\"))) {\n            direction = \"DESC\";\n        }\n        \n        // Validate sort column against allowed set\n        String[] allowedCols = {\"created_at\", \"amount\", \"status\", \"report_id\"};\n        boolean validCol = false;\n        for (String col : allowedCols) {\n            if (col.equals(sortCol)) { validCol = true; break; }\n        }\n        if (!validCol) sortCol = \"created_at\";\n        \n        // Build query - filterDate is used in WHERE clause\n        String query = buildReportQuery(userId, sortCol, direction, filterDate);\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                json.append(\"\\\"id\\\":\").append(rs.getInt(\"report_id\")).append(\",\");\n                json.append(\"\\\"amount\\\":\").append(rs.getDouble(\"amount\")).append(\",\");\n                json.append(\"\\\"status\\\":\\\"\")\n                   .append(StringEscapeUtils.escapeJson(rs.getString(\"status\")))\n                   .append(\"\\\",\");\n                json.append(\"\\\"created\\\":\\\"\")\n                   .append(StringEscapeUtils.escapeJson(rs.getString(\"created_at\")))\n                   .append(\"\\\"}\");\n                first = false;\n            }\n            json.append(\"]\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private String buildReportQuery(String userId, String sortCol, String direction, String filterDate) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT report_id, amount, status, created_at FROM expense_reports \");\n        sb.append(\"WHERE user_id = '\").append(userId).append(\"' \");\n        \n        if (filterDate != null && !filterDate.isEmpty()) {\n            // Developer note: date format validated client-side in React component\n            sb.append(\"AND created_at >= '\").append(filterDate).append(\"' \");\n        }\n        \n        sb.append(\"ORDER BY \").append(sortCol).append(\" \").append(direction);\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Laravel 10.x application deployed on ECS Fargate behind an ALB with session management delegated to a Redis-backed custom session handler. The infrastructure uses a credential rotation daemon (vault-agent sidecar) that cycles the APP_KEY and re-encrypts active session payloads every 60 seconds via a Lua script on the Redis cluster. Sessions are bound to a composite fingerprint (IP + User-Agent hash stored in the encrypted session payload). The ALB has a listener rule that inspects the Origin header and drops requests where Origin does not match the registered application FQDN (app.internal.corp) \u2014 implemented as a fixed-response 403 rule with priority 1 before the default forward rule. Additionally, the Redis session store uses a sliding-window token: each session record includes a monotonic 'seq' counter incremented on every authenticated request, and the session middleware rejects requests where the presented session seq is stale (differs by more than 1 from server-side seq), effectively making stolen session cookies expire within one request cycle even if somehow obtained.",
+    "config": {
+      "SESSION_DRIVER": "redis",
+      "SESSION_LIFETIME": 1,
+      "REDIS_SESSION_TTL_SECONDS": 60,
+      "VAULT_AGENT_ROTATION_INTERVAL": "60s",
+      "APP_KEY_ROTATION": "enabled",
+      "SESSION_BINDING": "ip+ua_hash",
+      "ALB_LISTENER_RULES": [
+        {
+          "priority": 1,
+          "condition": "http-header Origin not in [https://app.internal.corp]",
+          "action": "fixed-response 403"
+        },
+        {
+          "priority": 100,
+          "condition": "default",
+          "action": "forward to target-group"
+        }
+      ],
+      "SESSION_SEQ_VALIDATION": "enabled",
+      "SESSION_SEQ_MAX_DRIFT": 1,
+      "CORS_ALLOWED_ORIGINS": [
+        "https://app.internal.corp"
+      ]
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "id": "86154c37",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport fs from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Template rendering - custom lightweight engine\nfunction renderTemplate(templateName, context) {\n  const templatePath = `./templates/${templateName}.html`;\n  let template = fs.readFileSync(templatePath, 'utf8');\n  \n  // Replace {{variable}} patterns with context values\n  for (const [key, value] of Object.entries(context)) {\n    const regex = new RegExp(`\\\\{\\\\{\\\\s*${key}\\\\s*\\\\}\\\\}`, 'g');\n    template = template.replace(regex, String(value));\n  }\n  return template;\n}\n\n// Middleware: extract tenant from subdomain\napp.use((req, res, next) => {\n  const host = req.headers.host || '';\n  const parts = host.split('.');\n  req.tenantId = parts.length > 2 ? parts[0] : 'default';\n  next();\n});\n\n// Search endpoint - returns HTML page with results\napp.get('/search', async (req, res) => {\n  const { q, page = '1', format = 'html' } = req.query;\n  \n  if (!q || typeof q !== 'string') {\n    return res.status(400).json({ error: 'Missing search query' });\n  }\n\n  const pageNum = Math.max(1, Math.min(100, parseInt(page) || 1));\n  const offset = (pageNum - 1) * 20;\n\n  try {\n    // Parameterized query - safe from SQLi\n    const result = await pool.query(\n      'SELECT id, title, snippet, author FROM articles WHERE tenant_id = $1 AND search_vector @@ plainto_tsquery($2) ORDER BY ts_rank(search_vector, plainto_tsquery($2)) DESC LIMIT 20 OFFSET $3',\n      [req.tenantId, q, offset]\n    );\n\n    if (format === 'json') {\n      return res.json({ results: result.rows, query: q, page: pageNum });\n    }\n\n    // Render HTML with search results\n    const resultsHtml = result.rows.map(row => \n      `<div class=\"result\"><h3><a href=\"/article/${row.id}\">${row.title}</a></h3><p>${row.snippet}</p><span class=\"author\">${row.author}</span></div>`\n    ).join('');\n\n    const html = renderTemplate('search', {\n      query: q,\n      results: resultsHtml,\n      page: pageNum,\n      tenant: req.tenantId,\n      resultCount: result.rows.length,\n      nonce: crypto.randomBytes(16).toString('hex')\n    });\n\n    res.setHeader('Content-Type', 'text/html; charset=utf-8');\n    res.send(html);\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Article detail endpoint\napp.get('/article/:id', async (req, res) => {\n  const id = parseInt(req.params.id);\n  if (isNaN(id)) return res.status(400).json({ error: 'Invalid ID' });\n\n  const result = await pool.query(\n    'SELECT id, title, body, author, created_at FROM articles WHERE id = $1 AND tenant_id = $2',\n    [id, req.tenantId]\n  );\n\n  if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });\n  \n  const article = result.rows[0];\n  const html = renderTemplate('article', {\n    title: article.title,\n    body: article.body,\n    author: article.author,\n    date: article.created_at\n  });\n  \n  res.setHeader('Content-Type', 'text/html; charset=utf-8');\n  res.send(html);\n});\n\n// Health check\napp.get('/healthz', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(parseInt(process.env.PORT || '3000'), '0.0.0.0');",
+  "environment": {
+    "description": "Same application deployed in namespace 'data-plane-prod'. Istio sidecar injection enabled with PeerAuthentication policy set to STRICT mTLS for the namespace. AuthorizationPolicy resource scoped to the stream-processor workload requires request principals matching 'cluster.local/ns/api-gateway/sa/gateway-sa' for paths prefixed with '/ws/'. Additionally, the Envoy sidecar has a custom Lua filter (applied via EnvoyFilter CR targeting the inbound listener on port 8080) that validates the 'X-Request-Nonce' header against a per-connection ephemeral nonce issued by the control-plane's token-vending service, with nonce TTL of 5 seconds and single-use enforcement via a shared Redis bitmap. The HMAC signing key is sourced from a Vault transit engine with auto-rotation policy 'rotate-every-60s' and the previous key version is immediately revoked (not just rotated) via a custom Vault plugin that calls DELETE /transit/keys/:name/versions/:version.",
+    "config": {
+      "istio_peer_authentication": "STRICT",
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/api-gateway/sa/gateway-sa"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/ws/*"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter": {
+        "type": "Lua",
+        "target": "inbound:8080",
+        "validation": "X-Request-Nonce header checked against Redis bitmap, TTL 5s, single-use"
+      },
+      "vault_transit": {
+        "rotation_policy": "rotate-every-60s",
+        "revocation": "immediate_version_delete_via_custom_plugin",
+        "min_decryption_version": "current_only"
+      },
+      "network_policy": {
+        "ingress_from": "istio-system/istio-ingressgateway only",
+        "egress_to": "kafka-broker:9092, vault:8200, redis:6379"
+      }
+    }
+  }
+}

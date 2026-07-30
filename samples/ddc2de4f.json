@@ -1,0 +1,38 @@
+{
+  "id": "ddc2de4f",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\n\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('APP_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        last_login TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp REAL,\n        details TEXT\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_session_token(token):\n    \"\"\"Verify HMAC-based session token\"\"\"\n    if not token:\n        return None\n    parts = token.split(':')\n    if len(parts) != 3:\n        return None\n    user_id, timestamp, sig = parts\n    expected = hmac.new(SECRET_KEY.encode(), f\"{user_id}:{timestamp}\".encode(), hashlib.sha256).hexdigest()[:16]\n    if not hmac.compare_digest(sig, expected):\n        return None\n    if time.time() - float(timestamp) > 86400:\n        return None\n    return int(user_id)\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    limit = request.args.get('limit', '20')\n    \n    # Validate field against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'last_login']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query - field is validated above so safe to interpolate\n    # But value is user-controlled and directly interpolated\n    query = f\"SELECT id, username, email, role, last_login FROM users WHERE {field} LIKE '%{value}%' ORDER BY username LIMIT {limit}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role, last_login FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create new user account\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    password_hash = hashlib.sha256(data.get('password', '').encode()).hexdigest()\n    api_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    try:\n        db = get_db()\n        db.execute(\n            'INSERT INTO users (username, email, password_hash, api_key) VALUES (?, ?, ?, ?)',\n            (data['username'], data['email'], password_hash, api_key)\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALBv2. The ALB has an associated AWS WAFv2 WebACL with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override to COUNT, (2) a custom rule group 'app-input-validation' with a RegexPatternSet match on query string values matching pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with action BLOCK and priority 1, (3) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode. Additionally, the ECS task role has no network egress policy (VPC with no NAT gateway, no internet gateway on the private subnet, VPC endpoints only for ECR and CloudWatch Logs), preventing out-of-band data exfiltration channels.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0, private subnet",
+      "load_balancer": "ALBv2 with HTTP/HTTPS listeners",
+      "waf_web_acl": {
+        "rule_priority_1": {
+          "name": "app-input-validation",
+          "type": "custom-regex-rule-group",
+          "regex_pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()",
+          "match_scope": "QUERY_STRING_VALUES",
+          "action": "BLOCK"
+        },
+        "rule_priority_2": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING to COUNT"
+        },
+        "rule_priority_3": {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK (default)"
+        }
+      },
+      "network": {
+        "subnet": "private, no IGW, no NAT",
+        "vpc_endpoints": [
+          "com.amazonaws.region.ecr.dkr",
+          "com.amazonaws.region.logs"
+        ],
+        "egress_security_group": "allow 443 to VPC endpoint prefix list only"
+      },
+      "database": "SQLite on ephemeral Fargate storage"
+    }
+  }
+}

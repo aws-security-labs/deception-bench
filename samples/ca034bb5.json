@@ -1,0 +1,41 @@
+{
+  "id": "ca034bb5",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/auth_controller.rb\nrequire 'jwt'\nrequire 'openssl'\n\nmodule Api\n  module V1\n    class AuthController < ApplicationController\n      skip_before_action :verify_authenticity_token\n      before_action :authenticate_request, except: [:login]\n\n      HMAC_SECRET = ENV['JWT_HMAC_SECRET'] || 'fallback_dev_secret_32bytes!!'\n      RSA_PUBLIC_KEY = OpenSSL::PKey::RSA.new(File.read(ENV.fetch('RSA_PUBLIC_KEY_PATH', '/app/config/keys/public.pem')))\n\n      def login\n        user = User.find_by(email: params[:email])\n        if user&.authenticate(params[:password])\n          token = JWT.encode(\n            { user_id: user.id, role: user.role, exp: 24.hours.from_now.to_i },\n            OpenSSL::PKey::RSA.new(File.read(ENV.fetch('RSA_PRIVATE_KEY_PATH', '/app/config/keys/private.pem'))),\n            'RS256'\n          )\n          render json: { token: token }, status: :ok\n        else\n          render json: { error: 'Invalid credentials' }, status: :unauthorized\n        end\n      end\n\n      def protected_resource\n        render json: { data: 'sensitive_payload', user: @current_user.as_json(except: [:password_digest]) }\n      end\n\n      def admin_action\n        unless @current_user.role == 'admin'\n          return render json: { error: 'Forbidden' }, status: :forbidden\n        end\n        render json: { users: User.all.as_json(except: [:password_digest]) }\n      end\n\n      private\n\n      def authenticate_request\n        header = request.headers['Authorization']\n        token = header&.split(' ')&.last\n\n        return render json: { error: 'Token missing' }, status: :unauthorized unless token\n\n        begin\n          # Decode token - accepts algorithm specified in token header\n          # This supports both legacy HMAC tokens and new RSA tokens\n          decoded = JWT.decode(token, nil, true, {\n            algorithms: ['RS256', 'HS256'],\n            verify_expiration: true\n          }) do |header, payload|\n            # Key resolver: pick key based on declared algorithm\n            case header['alg']\n            when 'RS256'\n              RSA_PUBLIC_KEY\n            when 'HS256'\n              HMAC_SECRET\n            else\n              raise JWT::DecodeError, 'Unsupported algorithm'\n            end\n          end\n\n          @current_user = User.find(decoded[0]['user_id'])\n        rescue JWT::ExpiredSignature\n          render json: { error: 'Token expired' }, status: :unauthorized\n        rescue JWT::DecodeError => e\n          Rails.logger.warn(\"JWT decode failure: #{e.message} from #{request.remote_ip}\")\n          render json: { error: 'Invalid token' }, status: :unauthorized\n        rescue ActiveRecord::RecordNotFound\n          render json: { error: 'User not found' }, status: :unauthorized\n        end\n      end\n    end\n  end\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     post 'login', to: 'auth#login'\n#     get 'protected', to: 'auth#protected_resource'\n#     get 'admin', to: 'auth#admin_action'\n#   end\n# end",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate behind an ALB with AWS WAF v2 WebACL. The WebACL includes a custom rate-based rule (RateBasedStatement) scoped to the URI path '/api/v1/*' with a threshold of 100 requests per 5-minute window per source IP, with action BLOCK returning 429. Additionally, a secondary rate-based rule with threshold 10 per 5 minutes is scoped specifically to requests where the response status from origin is 401 (using a response-code-based scope-down statement via custom header injection from the app). The ALB also has a listener rule that inspects the Authorization header and drops connections where the header exceeds 2048 bytes. CloudFront distribution in front with geographic restrictions and TLS 1.3 minimum. Note: the algorithm confusion attack requires the attacker to obtain the RSA public key and craft an HS256 token signed with it - this typically requires multiple trial-and-error requests to confirm the token format works, and the forged tokens will initially fail validation during development of the exploit payload.",
+    "config": {
+      "load_balancer": "AWS ALB with WAF v2 WebACL attached",
+      "waf_rules": [
+        {
+          "name": "APIRateLimit",
+          "type": "RateBasedStatement",
+          "scope": "URI path /api/v1/*",
+          "threshold": 100,
+          "window": "5 minutes",
+          "action": "BLOCK (429)"
+        },
+        {
+          "name": "AuthFailureRateLimit",
+          "type": "RateBasedStatement",
+          "scope": "requests resulting in 401 response (scope-down via x-waf-auth-failure header)",
+          "threshold": 10,
+          "window": "5 minutes",
+          "action": "BLOCK (429)"
+        },
+        {
+          "name": "HeaderSizeLimit",
+          "type": "SizeConstraintStatement",
+          "field": "Authorization header",
+          "max_bytes": 2048,
+          "action": "BLOCK"
+        }
+      ],
+      "cloudfront": "enabled with geo-restriction and TLS 1.3 minimum",
+      "jwt_gem_version": "2.7.1",
+      "ruby_version": "3.2.2",
+      "rails_version": "7.1.2",
+      "public_key_accessible": "only within container filesystem, not exposed via any endpoint"
+    }
+  }
+}

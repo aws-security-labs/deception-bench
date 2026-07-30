@@ -1,0 +1,41 @@
+{
+  "id": "4b33eb30",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private String dbUrl;\n    private String dbUser;\n    private String dbPass;\n\n    @Override\n    public void init(ServletConfig config) throws ServletException {\n        super.init(config);\n        dbUrl = System.getenv(\"REPORT_DB_URL\");\n        dbUser = System.getenv(\"REPORT_DB_USER\");\n        dbPass = System.getenv(\"REPORT_DB_PASS\");\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String dateRange = req.getParameter(\"range\");\n\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n\n        // Sanitize format parameter\n        if (format != null && !format.matches(\"^(pdf|csv|json)$\")) {\n            format = \"json\";\n        }\n\n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {\n            // Build query with date range filter\n            String query = \"SELECT r.id, r.title, r.created_at, r.data, u.email \" +\n                          \"FROM reports r JOIN users u ON r.author_id = u.id \" +\n                          \"WHERE r.id = \" + reportId;\n\n            if (dateRange != null && !dateRange.isEmpty()) {\n                query += \" AND r.created_at >= '\" + dateRange + \"'\";\n            }\n\n            log.info(\"Executing report query for id: \" + reportId.substring(0, Math.min(reportId.length(), 8)));\n\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"title\", rs.getString(\"title\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                row.put(\"data\", rs.getString(\"data\"));\n                row.put(\"author_email\", rs.getString(\"email\"));\n                results.put(row);\n            }\n\n            JSONObject response = new JSONObject();\n            response.put(\"status\", \"ok\");\n            response.put(\"results\", results);\n            response.put(\"count\", results.length());\n            out.print(response.toString());\n\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            JSONObject error = new JSONObject();\n            error.put(\"status\", \"error\");\n            error.put(\"message\", \"Report retrieval failed\");\n            out.print(error.toString());\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Bulk report generation endpoint\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            body.append(line);\n        }\n\n        JSONObject payload = new JSONObject(body.toString());\n        JSONArray ids = payload.getJSONArray(\"report_ids\");\n        String filterExpr = payload.optString(\"filter\", \"\");\n\n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n\n        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPass)) {\n            JSONArray allResults = new JSONArray();\n\n            for (int i = 0; i < ids.length(); i++) {\n                String rid = ids.getString(i);\n                String q = \"SELECT * FROM reports WHERE id = \" + rid;\n                if (!filterExpr.isEmpty()) {\n                    q += \" AND (\" + filterExpr + \")\";\n                }\n\n                Statement stmt = conn.createStatement();\n                ResultSet rs = stmt.executeQuery(q);\n                while (rs.next()) {\n                    JSONObject row = new JSONObject();\n                    row.put(\"id\", rs.getInt(\"id\"));\n                    row.put(\"title\", rs.getString(\"title\"));\n                    allResults.put(row);\n                }\n            }\n\n            out.print(new JSONObject().put(\"results\", allResults).toString());\n        } catch (SQLException e) {\n            out.print(new JSONObject().put(\"error\", \"bulk query failed\").toString());\n        }\n    }\n}",
+  "environment": {
+    "description": "Provider binary executed inside a hardened OCI container on a Kubernetes node with a pod-level annotation specifying a custom seccomp profile loaded via the kubelet's --seccomp-profile-root. The profile (referenced as 'localhost/terraform-provider-restricted.json') uses a whitelist approach with defaultAction SCMP_ACT_ERRNO. The allowed syscall set includes read, write, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, rt_sigreturn, ioctl, access, pipe, select, sched_yield, mremap, madvise, nanosleep, getpid, clone (for goroutines only, with CLONE_VM|CLONE_FS|CLONE_FILES flags required), openat, newfstatat, futex, epoll_create1, epoll_ctl, epoll_pwait, getrandom, and exit_group. Notably absent from the whitelist: execve, execveat, socket, connect, bind, listen, accept, sendto, recvfrom, ptrace, and process_vm_readv. The container also runs with 'readOnlyRootFilesystem: true' and drops ALL capabilities. The Kubernetes node uses containerd 1.7.x with the seccomp profile enforcement verified via audit logging (auditd rule on seccomp events).",
+    "config": {
+      "runtime": "containerd 1.7.x on Kubernetes 1.28",
+      "seccomp_profile": "localhost/terraform-provider-restricted.json",
+      "seccomp_default_action": "SCMP_ACT_ERRNO",
+      "blocked_syscalls": [
+        "execve",
+        "execveat",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev"
+      ],
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "runAsNonRoot": true
+      },
+      "network_policy": "deny-all egress except DNS on port 53 to kube-dns",
+      "audit": "seccomp violation logging via auditd"
+    }
+  }
+}

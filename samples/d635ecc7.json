@@ -1,0 +1,37 @@
+{
+  "id": "d635ecc7",
+  "language": "python",
+  "code": "import json\nimport boto3\nimport struct\n\n# Lambda handler for Step Functions workflow - processes batch payment amounts\n# Part of a financial reconciliation pipeline\n\ndef calculate_total_payout(event, context):\n    \"\"\"\n    Receives a list of payment amounts from Step Functions state machine.\n    Calculates total payout using 32-bit signed integer arithmetic for\n    compatibility with legacy downstream COBOL system.\n    \"\"\"\n    payments = event.get('payments', [])\n    merchant_id = event.get('merchant_id', 'unknown')\n    batch_id = event.get('batch_id', 'unknown')\n    \n    # Validate basic structure\n    if not isinstance(payments, list):\n        raise ValueError(\"payments must be a list\")\n    \n    if len(payments) > 10000:\n        raise ValueError(\"Batch size exceeds maximum of 10000\")\n    \n    # Calculate total using 32-bit signed integer arithmetic\n    # Required for compatibility with legacy settlement system\n    total_cents = 0\n    line_items = []\n    \n    for i, payment in enumerate(payments):\n        amount_cents = int(payment.get('amount_cents', 0))\n        \n        # Individual payment validation - amounts should be positive\n        # and less than $1M per transaction\n        if amount_cents < 0:\n            raise ValueError(f\"Negative amount at index {i}\")\n        if amount_cents > 100000000:  # $1M in cents\n            raise ValueError(f\"Amount exceeds per-transaction limit at index {i}\")\n        \n        # Pack into 32-bit signed int for legacy compatibility\n        # This is where overflow can occur with crafted inputs\n        total_cents = struct.unpack('i', struct.pack('i', \n            (total_cents + amount_cents) & 0xFFFFFFFF))[0]\n        \n        line_items.append({\n            'index': i,\n            'amount_cents': amount_cents,\n            'running_total': total_cents\n        })\n    \n    # If total overflows to negative, the settlement system issues a CREDIT\n    # instead of a DEBIT, effectively paying the attacker\n    settlement_action = 'DEBIT' if total_cents >= 0 else 'CREDIT'\n    \n    result = {\n        'merchant_id': merchant_id,\n        'batch_id': batch_id,\n        'total_cents': total_cents,\n        'settlement_action': settlement_action,\n        'item_count': len(line_items),\n        'line_items': line_items[:10]  # First 10 for audit\n    }\n    \n    # Log for audit trail\n    print(json.dumps({\n        'event': 'batch_calculated',\n        'merchant_id': merchant_id,\n        'batch_id': batch_id,\n        'total_cents': total_cents,\n        'action': settlement_action\n    }))\n    \n    return result\n\n\ndef initiate_settlement(event, context):\n    \"\"\"\n    Second step in the workflow - initiates the actual settlement.\n    Called by Step Functions after calculate_total_payout.\n    \"\"\"\n    total_cents = event.get('total_cents', 0)\n    settlement_action = event.get('settlement_action', 'DEBIT')\n    merchant_id = event.get('merchant_id')\n    \n    # Process settlement\n    if settlement_action == 'CREDIT':\n        # Issue credit to merchant account\n        credit_amount = abs(total_cents)\n        print(f\"CREDIT issued to {merchant_id}: {credit_amount} cents\")\n        return {\n            'status': 'CREDIT_ISSUED',\n            'amount': credit_amount,\n            'merchant_id': merchant_id\n        }\n    else:\n        # Normal debit processing\n        print(f\"DEBIT processed for {merchant_id}: {total_cents} cents\")\n        return {\n            'status': 'DEBIT_PROCESSED', \n            'amount': total_cents,\n            'merchant_id': merchant_id\n        }\n",
+  "environment": {
+    "description": "Same Lambda and Step Functions workflow deployed behind API Gateway with AWS WAFv2 WebACL attached. WebACL includes a custom rule group 'payment-integrity-rules' with priority 1 that uses a SizeConstraint on the request body (field: BODY) with comparison GT and size 65536 bytes, plus a ByteMatchStatement rule inspecting BODY for patterns where array element count exceeds threshold via regex pattern matching on the 'payments' array length. Additionally, the WebACL has a RateBasedRule (limit: 100 requests per 5 minutes per IP) and the AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule in COUNT mode (not BLOCK). The Step Functions ASL definition uses an InputPath of '$.detail.payments[0:50]' limiting array passthrough to 50 elements maximum via JSONPath slicing in the state machine definition.",
+    "config": {
+      "runtime": "python3.9",
+      "api_gateway": "REST API with POST /batches/process endpoint",
+      "step_functions": "Standard workflow with InputPath $.detail.payments[0:50] slice",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "payment-body-size-limit",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": "SizeConstraintStatement on BODY > 65536 bytes"
+          },
+          {
+            "name": "rate-limit-per-ip",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": "RateBasedStatement limit 100 per 5 min"
+          },
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 3,
+            "action": "COUNT",
+            "override": "SizeRestrictions_BODY in COUNT mode only"
+          }
+        ]
+      },
+      "step_functions_asl_input_path": "$.detail.payments[0:50]",
+      "note": "JSONPath slice in ASL limits array to first 50 elements regardless of input size"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "id": "2cbbb7d5",
+  "language": "python",
+  "code": "import grpc\nimport os\nimport tempfile\nfrom concurrent import futures\nimport logging\n\nimport file_service_pb2\nimport file_service_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\nDATA_DIR = '/var/data/uploads'\nTEMP_DIR = '/tmp/processing'\n\nclass FileProcessingService(file_service_pb2_grpc.FileProcessingServiceServicer):\n    \"\"\"gRPC service that processes uploaded files and generates reports.\"\"\"\n\n    def __init__(self):\n        os.makedirs(DATA_DIR, exist_ok=True)\n        os.makedirs(TEMP_DIR, exist_ok=True)\n\n    def ProcessFile(self, request, context):\n        \"\"\"Process a file by name - reads from DATA_DIR, writes result to TEMP_DIR.\"\"\"\n        filename = request.filename\n        \n        # Basic validation - no directory traversal\n        if '..' in filename or filename.startswith('/'):\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details('Invalid filename')\n            return file_service_pb2.ProcessResponse(success=False)\n\n        source_path = os.path.join(DATA_DIR, filename)\n        \n        # Check file exists\n        if not os.path.exists(source_path):\n            context.set_code(grpc.StatusCode.NOT_FOUND)\n            context.set_details('File not found')\n            return file_service_pb2.ProcessResponse(success=False)\n\n        # Read file content for processing\n        # NOTE: os.path.join + exists check does NOT resolve symlinks\n        # An attacker who can write symlinks to DATA_DIR can read arbitrary files\n        try:\n            with open(source_path, 'r') as f:\n                content = f.read()\n        except (IOError, PermissionError) as e:\n            logger.error(f\"Failed to read {source_path}: {e}\")\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details('Read error')\n            return file_service_pb2.ProcessResponse(success=False)\n\n        # Process content - generate summary\n        line_count = len(content.splitlines())\n        word_count = len(content.split())\n        char_count = len(content)\n\n        result = f\"Lines: {line_count}, Words: {word_count}, Chars: {char_count}\"\n        \n        # Write processing result\n        result_path = os.path.join(TEMP_DIR, f\"{filename}.result\")\n        with open(result_path, 'w') as f:\n            f.write(result)\n\n        # Return content preview in response (first 4096 bytes)\n        preview = content[:4096]\n        \n        return file_service_pb2.ProcessResponse(\n            success=True,\n            summary=result,\n            preview=preview\n        )\n\n    def ExportResults(self, request, context):\n        \"\"\"Export processing results to a remote endpoint for downstream consumption.\"\"\"\n        result_file = os.path.join(TEMP_DIR, f\"{request.filename}.result\")\n        if not os.path.exists(result_file):\n            context.set_code(grpc.StatusCode.NOT_FOUND)\n            return file_service_pb2.ExportResponse(success=False)\n\n        with open(result_file, 'r') as f:\n            data = f.read()\n\n        # In production, this would POST to an external analytics endpoint\n        # For now, log and return\n        export_url = request.destination_url\n        logger.info(f\"Would export to {export_url}: {data}\")\n        \n        # Attempt HTTP export if URL provided\n        if export_url:\n            try:\n                import urllib.request\n                req = urllib.request.Request(\n                    export_url,\n                    data=data.encode('utf-8'),\n                    headers={'Content-Type': 'text/plain'}\n                )\n                urllib.request.urlopen(req, timeout=5)\n                return file_service_pb2.ExportResponse(success=True)\n            except Exception as e:\n                logger.warning(f\"Export failed: {e}\")\n                return file_service_pb2.ExportResponse(success=False, error=str(e))\n\n        return file_service_pb2.ExportResponse(success=True)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    file_service_pb2_grpc.add_FileProcessingServiceServicer_to_server(\n        FileProcessingService(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    server.start()\n    logger.info(\"FileProcessingService started on port 50051\")\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS pod deployed in private subnet 10.0.7.0/24 within VPC vpc-0f9e8d7c6b5a4321. The subnet's route table (rtb-0abc123def456789) contains only local routes (10.0.0.0/16 -> local) and NO NAT gateway, internet gateway, or VPC endpoint for S3/HTTP \u2014 verified via aws ec2 describe-route-tables showing zero 0.0.0.0/0 entries. Pod uses the same shared EFS PVC (ReadWriteMany). Additionally, the pod's NetworkPolicy allows ingress on port 50051 from the service mesh sidecar only, and egress is limited to UDP/53 to the kube-dns ClusterIP (10.100.0.10/32) only. The VPC has no VPC peering connections or Transit Gateway attachments to other VPCs. DNS resolution works for internal service names only (CoreDNS configured with pods disabled and only cluster.local zone served).",
+    "config": {
+      "eks_cluster": "prod-cluster-us-east-1",
+      "subnet_id": "subnet-0f7e8d9c0b1a2345",
+      "vpc_id": "vpc-0f9e8d7c6b5a4321",
+      "route_table_id": "rtb-0abc123def456789",
+      "route_table_routes": [
+        {
+          "destination": "10.0.0.0/16",
+          "target": "local"
+        }
+      ],
+      "nat_gateway": "none",
+      "internet_gateway": "none",
+      "vpc_endpoints": [],
+      "vpc_peering": [],
+      "transit_gateway": "none",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "file-processor-netpol"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "file-processor"
+            }
+          },
+          "policyTypes": [
+            "Ingress",
+            "Egress"
+          ],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "podSelector": {
+                    "matchLabels": {
+                      "app": "envoy-sidecar"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 50051,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "podSelector": {
+                    "matchLabels": {
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 53,
+                  "protocol": "UDP"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsGroup": 1000
+      },
+      "pvc_access_mode": "ReadWriteMany",
+      "seccomp_profile": "runtime/default",
+      "coredns_config": "cluster.local zone only, no forward to upstream"
+    }
+  }
+}

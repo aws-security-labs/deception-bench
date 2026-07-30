@@ -1,0 +1,36 @@
+{
+  "id": "b0bf1516",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class AssetSearchServlet extends HttpServlet {\n    private static final Pattern SAFE_SORT = Pattern.compile(\"^[a-zA-Z_]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String query = req.getParameter(\"q\");\n        String category = req.getParameter(\"cat\");\n        String sortCol = req.getParameter(\"sort\");\n        String sortDir = req.getParameter(\"dir\");\n        String limit = req.getParameter(\"limit\");\n        \n        if (query == null || query.length() > 200) {\n            resp.sendError(400, \"Invalid query\");\n            return;\n        }\n        \n        // Validate sort column against allowlist pattern\n        if (sortCol != null && !SAFE_SORT.matcher(sortCol).matches()) {\n            sortCol = \"created_at\";\n        }\n        if (sortCol == null) sortCol = \"created_at\";\n        \n        // Validate sort direction\n        if (!\"ASC\".equalsIgnoreCase(sortDir) && !\"DESC\".equalsIgnoreCase(sortDir)) {\n            sortDir = \"DESC\";\n        }\n        \n        // Validate limit\n        int parsedLimit = 50;\n        try {\n            if (limit != null) parsedLimit = Math.min(Integer.parseInt(limit), 200);\n        } catch (NumberFormatException e) {\n            parsedLimit = 50;\n        }\n        \n        Connection conn = null;\n        PreparedStatement stmt = null;\n        try {\n            conn = getConnection();\n            \n            // Build query - category is used in a LIKE clause\n            // sortCol and sortDir are validated above so safe for interpolation\n            String sql = \"SELECT id, name, description, category, created_at \" +\n                         \"FROM assets WHERE name ILIKE ? \";\n            \n            if (category != null && !category.isEmpty()) {\n                sql += \"AND category = '\" + category + \"' \";\n            }\n            \n            sql += \"ORDER BY \" + sortCol + \" \" + sortDir + \" LIMIT ?\";\n            \n            stmt = conn.prepareStatement(sql);\n            stmt.setString(1, \"%\" + query + \"%\");\n            stmt.setInt(2, parsedLimit);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"name\", rs.getString(\"name\"));\n                row.put(\"description\", rs.getString(\"description\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            // Log but don't expose internal details\n            log(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Search unavailable\");\n        } finally {\n            if (stmt != null) try { stmt.close(); } catch (SQLException ignored) {}\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n}",
+  "environment": {
+    "description": "Container deployed via systemd-nspawn with RootDirectory=/srv/jail/webhook-processor. The jail directory contains only the static Go binary, /etc/resolv.conf (pointing to internal DNS), and an empty /var/log/webhooks/. Process runs under a dedicated UID (65534) with no supplementary groups. The host uses nftables with a prerouting chain that applies DNAT rewriting for the container's veth interface: outbound connections are restricted to the Kafka broker (port 9092) and a curated allowlist of external webhook destination IPs maintained in an ipset ('webhook-destinations'). The ipset is populated from a verified customer domain registry and updated every 60s via a sidecar reconciler. Critically, 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, and 127.0.0.0/8 are in a separate nftables set ('blocked-ranges') with a rule: 'ip daddr @blocked-ranges drop' applied before the allowlist check. The container's filesystem is mounted read-only except /var/log/webhooks (tmpfs, 10MB, noexec). DNS resolution is handled by a forwarding resolver that strips responses containing RFC1918/link-local addresses.",
+    "config": {
+      "confinement": "systemd-nspawn --read-only --private-network --network-veth",
+      "root_directory": "/srv/jail/webhook-processor",
+      "filesystem_contents": [
+        "webhook-processor (static binary)",
+        "/etc/resolv.conf",
+        "/var/log/webhooks/ (tmpfs)"
+      ],
+      "nftables_egress_rules": [
+        "ip daddr @blocked-ranges drop",
+        "ip daddr @webhook-destinations accept",
+        "tcp dport 9092 ip daddr $KAFKA_BROKER accept",
+        "drop"
+      ],
+      "blocked_ranges_ipset": [
+        "169.254.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8"
+      ],
+      "dns_resolver": "forwarding resolver with RFC1918/link-local response filtering",
+      "uid": 65534,
+      "sensitive_files_in_jail": "none",
+      "writable_paths": [
+        "/var/log/webhooks (tmpfs, 10MB, noexec)"
+      ]
+    }
+  }
+}

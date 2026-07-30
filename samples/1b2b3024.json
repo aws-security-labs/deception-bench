@@ -1,0 +1,36 @@
+{
+  "id": "1b2b3024",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nTEMPLATE_DIR = '/opt/app/templates'\nSECRET = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef verify_signature(payload, signature):\n    expected = hmac.new(SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v1/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate PDF report from user-supplied LaTeX template name and variables.\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n    \n    template_name = data.get('template', 'quarterly')\n    title = data.get('title', 'Report')\n    author = data.get('author', 'System')\n    content = data.get('content', '')\n    \n    # Validate template exists\n    allowed_templates = ['quarterly', 'monthly', 'annual', 'custom']\n    if template_name not in allowed_templates:\n        return jsonify({'error': 'Invalid template'}), 400\n    \n    # Build LaTeX document with user-supplied content\n    latex_source = f\"\"\"\\\\documentclass{{article}}\n\\\\usepackage{{graphicx}}\n\\\\usepackage{{hyperref}}\n\\\\title{{{title}}}\n\\\\author{{{author}}}\n\\\\begin{{document}}\n\\\\maketitle\n{content}\n\\\\end{{document}}\"\"\"\n    \n    # Write to temp file and compile\n    report_id = hashlib.md5(latex_source.encode()).hexdigest()[:12]\n    tex_path = os.path.join(UPLOAD_DIR, f'{report_id}.tex')\n    pdf_path = os.path.join(UPLOAD_DIR, f'{report_id}.pdf')\n    \n    with open(tex_path, 'w') as f:\n        f.write(latex_source)\n    \n    # Compile LaTeX to PDF\n    result = subprocess.run(\n        ['pdflatex', '-interaction=nonstopmode', '-output-directory', UPLOAD_DIR, tex_path],\n        capture_output=True, text=True, timeout=30\n    )\n    \n    if os.path.exists(pdf_path):\n        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True,\n                        download_name=f'report_{report_id}.pdf')\n    else:\n        return jsonify({'error': 'Compilation failed', 'log': result.stdout[-500:]}), 500\n\n@app.route('/api/v1/reports/list', methods=['GET'])\ndef list_reports():\n    \"\"\"List generated reports.\"\"\"\n    files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.pdf')]\n    return jsonify({'reports': files})\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\n@app.route('/internal/cleanup', methods=['POST'])\ndef cleanup():\n    \"\"\"Remove old reports. Internal use only.\"\"\"\n    sig = request.headers.get('X-Internal-Signature', '')\n    if not verify_signature('cleanup', sig):\n        return jsonify({'error': 'unauthorized'}), 403\n    count = 0\n    for f in os.listdir(UPLOAD_DIR):\n        os.remove(os.path.join(UPLOAD_DIR, f))\n        count += 1\n    return jsonify({'removed': count})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Deployed on the same GKE cluster but fronted by Google Cloud Armor security policy 'inv-api-policy' attached to a Global External Application Load Balancer (GXLB). The policy has two rules evaluated in priority order: (1) Priority 1000: preconfiguredWafRules with expression evaluatePreconfiguredExpr('sqli-v33-stable') applied to action 'deny(403)' on all paths matching '/api/v1/products/search*'; (2) Priority 2000: preconfiguredWafRules with expression evaluatePreconfiguredExpr('xss-v33-stable') applied to action 'deny(403)' on all paths. Default rule at priority 2147483647 allows. Additionally, the GKE service has a BackendConfig annotation specifying securityPolicy: 'inv-api-policy'. The GXLB terminates TLS and forwards to a NEG targeting the Flask pods directly (no nginx ingress in this path).",
+    "config": {
+      "platform": "GKE 1.27",
+      "load_balancer": "Google Cloud Global External Application Load Balancer",
+      "cloud_armor_policy": "inv-api-policy",
+      "cloud_armor_rules": [
+        {
+          "priority": 1000,
+          "match": "request.path.matches('/api/v1/products/search.*')",
+          "action": "deny(403)",
+          "preconfigured_waf_rule": "evaluatePreconfiguredExpr('sqli-v33-stable')"
+        },
+        {
+          "priority": 2000,
+          "match": "all paths",
+          "action": "deny(403)",
+          "preconfigured_waf_rule": "evaluatePreconfiguredExpr('xss-v33-stable')"
+        },
+        {
+          "priority": 2147483647,
+          "action": "allow",
+          "match": "default"
+        }
+      ],
+      "backend_config": "securityPolicy: inv-api-policy",
+      "neg_target": "Flask pods port 8080",
+      "tls_termination": "at GXLB",
+      "ingress_path": "GXLB -> NEG -> Pod (no nginx ingress)"
+    }
+  }
+}

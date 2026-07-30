@@ -1,0 +1,41 @@
+{
+  "id": "3f50ca3c",
+  "language": "python",
+  "code": "import socket\nimport struct\nimport threading\nimport hashlib\nimport os\nimport sys\n\n# Redis-compatible protocol parser for internal cache service\n# Supports GET, SET, DEL, KEYS, EVAL commands\n\nclass RedisProtoHandler:\n    def __init__(self, data_store):\n        self.store = data_store\n        self.lua_enabled = os.environ.get('ENABLE_LUA_SCRIPTING', '1') == '1'\n\n    def parse_resp(self, data):\n        \"\"\"Parse RESP protocol messages\"\"\"\n        lines = data.split(b'\\r\\n')\n        if not lines[0].startswith(b'*'):\n            return None\n        num_args = int(lines[0][1:])\n        args = []\n        idx = 1\n        for _ in range(num_args):\n            if idx >= len(lines):\n                break\n            if lines[idx].startswith(b'$'):\n                length = int(lines[idx][1:])\n                idx += 1\n                if idx < len(lines):\n                    args.append(lines[idx][:length])\n            idx += 1\n        return args\n\n    def handle_command(self, args):\n        if not args:\n            return b'-ERR no command\\r\\n'\n        cmd = args[0].upper()\n        if cmd == b'GET':\n            return self._handle_get(args)\n        elif cmd == b'SET':\n            return self._handle_set(args)\n        elif cmd == b'DEL':\n            return self._handle_del(args)\n        elif cmd == b'KEYS':\n            return self._handle_keys(args)\n        elif cmd == b'EVAL':\n            return self._handle_eval(args)\n        elif cmd == b'AUTH':\n            return self._handle_auth(args)\n        elif cmd == b'CONFIG':\n            return self._handle_config(args)\n        return b'-ERR unknown command\\r\\n'\n\n    def _handle_get(self, args):\n        if len(args) < 2:\n            return b'-ERR wrong number of arguments\\r\\n'\n        key = args[1].decode('utf-8', errors='replace')\n        val = self.store.get(key)\n        if val is None:\n            return b'$-1\\r\\n'\n        encoded = val.encode() if isinstance(val, str) else val\n        return f'${len(encoded)}\\r\\n'.encode() + encoded + b'\\r\\n'\n\n    def _handle_set(self, args):\n        if len(args) < 3:\n            return b'-ERR wrong number of arguments\\r\\n'\n        key = args[1].decode('utf-8', errors='replace')\n        self.store[key] = args[2]\n        return b'+OK\\r\\n'\n\n    def _handle_del(self, args):\n        if len(args) < 2:\n            return b'-ERR wrong number of arguments\\r\\n'\n        key = args[1].decode('utf-8', errors='replace')\n        removed = 1 if key in self.store else 0\n        self.store.pop(key, None)\n        return f':{removed}\\r\\n'.encode()\n\n    def _handle_keys(self, args):\n        pattern = args[1].decode() if len(args) > 1 else '*'\n        keys = list(self.store.keys())\n        resp = f'*{len(keys)}\\r\\n'.encode()\n        for k in keys:\n            encoded = k.encode()\n            resp += f'${len(encoded)}\\r\\n'.encode() + encoded + b'\\r\\n'\n        return resp\n\n    def _handle_eval(self, args):\n        \"\"\"Execute Lua-like script evaluation - uses Python eval for PoC\"\"\"\n        if not self.lua_enabled:\n            return b'-ERR scripting disabled\\r\\n'\n        if len(args) < 2:\n            return b'-ERR wrong number of arguments\\r\\n'\n        script = args[1].decode('utf-8', errors='replace')\n        # Script execution context with store access\n        try:\n            result = eval(script, {'__builtins__': {}}, {'store': self.store, 'keys': list(self.store.keys())})\n            encoded = str(result).encode()\n            return f'${len(encoded)}\\r\\n'.encode() + encoded + b'\\r\\n'\n        except Exception as e:\n            return f'-ERR {str(e)}\\r\\n'.encode()\n\n    def _handle_auth(self, args):\n        # AUTH is a no-op in this implementation; access control handled externally\n        return b'+OK\\r\\n'\n\n    def _handle_config(self, args):\n        return b'-ERR CONFIG command disabled\\r\\n'\n\n\ndef client_handler(conn, addr, handler):\n    try:\n        while True:\n            data = conn.recv(4096)\n            if not data:\n                break\n            response = handler.handle_command(handler.parse_resp(data))\n            if response:\n                conn.sendall(response)\n    except (ConnectionResetError, BrokenPipeError):\n        pass\n    finally:\n        conn.close()\n\n\ndef main():\n    store = {}\n    handler = RedisProtoHandler(store)\n    bind_addr = os.environ.get('BIND_ADDR', '0.0.0.0')\n    port = int(os.environ.get('PORT', '6380'))\n    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    srv.bind((bind_addr, port))\n    srv.listen(128)\n    print(f'Cache service listening on {bind_addr}:{port}')\n    while True:\n        conn, addr = srv.accept()\n        t = threading.Thread(target=client_handler, args=(conn, addr, handler))\n        t.daemon = True\n        t.start()\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Containerized deployment on EKS with Nitro Enclaves integration. The pod runs with a read-only root filesystem (readOnlyRootFilesystem: true) and an emptyDir volume mounted at /opt/app/config_updates with a 50Mi sizeLimit. The container's seccomp profile is set to RuntimeDefault which restricts syscalls. Additionally, the pod security context sets allowPrivilegeEscalation: false and runs as UID 10001. The HSM access is via AWS CloudHSM PKCS#11 library with IAM roles for service accounts (IRSA) scoped to cloudhsm:DescribeClusters only. An AppArmor profile (runtime/default) is applied. The node uses a Bottlerocket AMI with dm-verity on the root partition. The /opt/app/config_updates emptyDir is the ONLY writable path in the container filesystem namespace.",
+    "config": {
+      "platform": "EKS 1.28 on Bottlerocket",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 10001,
+        "fsGroup": 10001,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "config-updates",
+          "emptyDir": {
+            "sizeLimit": "50Mi"
+          },
+          "mountPath": "/opt/app/config_updates"
+        }
+      ],
+      "apparmor_profile": "runtime/default",
+      "node_ami": "Bottlerocket with dm-verity",
+      "hsm": "AWS CloudHSM via PKCS#11",
+      "irsa_policy": "cloudhsm:DescribeClusters only"
+    }
+  }
+}

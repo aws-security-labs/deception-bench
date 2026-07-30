@@ -1,0 +1,79 @@
+{
+  "id": "4d22057d",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport time\nimport struct\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/inventory.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY, name TEXT, sku TEXT,\n        quantity INTEGER, warehouse TEXT, unit_cost REAL)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        key_hash TEXT PRIMARY KEY, owner TEXT, scope TEXT, created_at TEXT)''')\n    db.execute('''INSERT OR IGNORE INTO products VALUES\n        (1,'Widget A','WA-001',500,'east',2.50),\n        (2,'Widget B','WB-002',300,'west',3.75),\n        (3,'Gadget C','GC-003',150,'east',12.00)''')\n    db.commit()\n    db.close()\n\ndef verify_api_key(req):\n    key = req.headers.get('X-API-Key', '')\n    if not key:\n        return False\n    key_hash = hashlib.sha256(key.encode()).hexdigest()\n    db = get_db()\n    row = db.execute('SELECT scope FROM api_keys WHERE key_hash = ?', (key_hash,)).fetchone()\n    return row is not None\n\n@app.route('/api/v2/inventory/search', methods=['GET'])\ndef search_inventory():\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    warehouse = request.args.get('warehouse', '')\n    sku_prefix = request.args.get('sku_prefix', '')\n    min_qty = request.args.get('min_qty', '0')\n    sort_col = request.args.get('sort', 'name')\n    \n    # Validate sort column against allowlist\n    allowed_sorts = ['name', 'sku', 'quantity', 'unit_cost', 'warehouse']\n    if sort_col not in allowed_sorts:\n        sort_col = 'name'\n    \n    # Build query with filters\n    conditions = []\n    params = []\n    \n    if warehouse:\n        conditions.append('warehouse = ?')\n        params.append(warehouse)\n    \n    if sku_prefix:\n        conditions.append('sku LIKE ?')\n        params.append(sku_prefix + '%')\n    \n    where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''\n    \n    # min_qty used directly in HAVING clause for aggregate query\n    query = f\"\"\"SELECT warehouse, COUNT(*) as item_count, \n               SUM(quantity) as total_qty, AVG(unit_cost) as avg_cost\n               FROM products{where_clause}\n               GROUP BY warehouse\n               HAVING total_qty >= {min_qty}\n               ORDER BY {sort_col}\"\"\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query, params).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/inventory/item/<int:item_id>', methods=['GET'])\ndef get_item(item_id):\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    db = get_db()\n    row = db.execute('SELECT * FROM products WHERE id = ?', (item_id,)).fetchone()\n    if row:\n        return jsonify(dict(row))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/api/v2/inventory/restock', methods=['POST'])\ndef restock():\n    if not verify_api_key(request):\n        return jsonify({'error': 'unauthorized'}), 401\n    data = request.get_json()\n    if not data or 'sku' not in data or 'add_qty' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    db = get_db()\n    db.execute('UPDATE products SET quantity = quantity + ? WHERE sku = ?',\n               (int(data['add_qty']), data['sku']))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\n@app.route('/healthz')\ndef health():\n    return jsonify({'status': 'ok', 'ts': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind ALB, but the ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains three rule groups evaluated in order: (1) a custom rate-based rule limiting to 100 requests per 5 minutes per IP on URI path '/api/*', (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action overridden to COUNT, and (3) AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK), using sensitivity level HIGH for SqliExtendedPatterns_QUERYSTRING and SqliExtendedPatterns_BODY rules. The Web ACL default action is ALLOW. Additionally, the ALB has a listener rule that rewrites query string parameters exceeding 256 characters by truncating them before forwarding.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "condition": "query_string_length > 256",
+            "action": "fixed_response_413"
+          },
+          {
+            "priority": 2,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": {
+          "name": "app-protection-acl",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "priority": 1,
+              "name": "RateLimit-API",
+              "type": "rate-based",
+              "limit": 100,
+              "evaluation_window": 300,
+              "scope_down": {
+                "uri_path": {
+                  "starts_with": "/api/"
+                }
+              },
+              "action": "BLOCK"
+            },
+            {
+              "priority": 2,
+              "name": "CommonRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesCommonRuleSet",
+              "rule_action_overrides": [
+                {
+                  "name": "SizeRestrictions_QUERYSTRING",
+                  "action": "COUNT"
+                }
+              ]
+            },
+            {
+              "priority": 3,
+              "name": "SQLiRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesSQLiRuleSet",
+              "rule_action_overrides": [],
+              "sensitivity_level": "HIGH"
+            }
+          ]
+        }
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

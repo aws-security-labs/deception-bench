@@ -1,0 +1,49 @@
+{
+  "id": "86703448",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.w3c.dom.*;\nimport javax.xml.parsers.*;\n\npublic class ConfigImportServlet extends HttpServlet {\n    private static final String UPLOAD_DIR = \"/opt/app/configs\";\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"xml\")) {\n            resp.sendError(400, \"Content-Type must be application/xml\");\n            return;\n        }\n        \n        // Rate limiting by session\n        HttpSession session = req.getSession(true);\n        Long lastImport = (Long) session.getAttribute(\"last_import\");\n        if (lastImport != null && System.currentTimeMillis() - lastImport < 5000) {\n            resp.sendError(429, \"Rate limited\");\n            return;\n        }\n        session.setAttribute(\"last_import\", System.currentTimeMillis());\n        \n        // Size check\n        if (req.getContentLength() > 65536) {\n            resp.sendError(413, \"Config too large\");\n            return;\n        }\n        \n        try {\n            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();\n            // Developer note: we tried disabling external entities but it broke\n            // XSLT stylesheet references in some customer configs, so we only\n            // disable external DTDs as a compromise\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", false);\n            // The above does NOT disable general external entities\n            \n            DocumentBuilder db = dbf.newDocumentBuilder();\n            Document doc = db.parse(req.getInputStream());\n            \n            NodeList configs = doc.getElementsByTagName(\"setting\");\n            Map<String, String> settings = new HashMap<>();\n            \n            for (int i = 0; i < configs.getLength(); i++) {\n                Element el = (Element) configs.item(i);\n                String key = el.getAttribute(\"key\");\n                String value = el.getTextContent();\n                \n                // Validate key format\n                if (!key.matches(\"^[a-zA-Z][a-zA-Z0-9_.]{0,63}$\")) {\n                    resp.sendError(400, \"Invalid key: \" + key);\n                    return;\n                }\n                settings.put(key, value);\n            }\n            \n            // Write parsed config\n            String userId = (String) session.getAttribute(\"user_id\");\n            if (userId == null) userId = \"anonymous\";\n            \n            File outFile = new File(UPLOAD_DIR, userId + \"_config.properties\");\n            try (PrintWriter pw = new PrintWriter(outFile)) {\n                for (Map.Entry<String, String> entry : settings.entrySet()) {\n                    pw.println(entry.getKey() + \"=\" + entry.getValue());\n                }\n            }\n            \n            resp.setStatus(200);\n            resp.getWriter().write(\"{\\\"imported\\\": \" + settings.size() + \"}\");\n            \n        } catch (Exception e) {\n            resp.sendError(500, \"Parse error: \" + e.getMessage());\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Kafka consumer deployed on EKS. The file-upload-events topic is populated exclusively via an Amazon API Gateway (HTTP API) integration with a Kafka REST proxy. The API Gateway route POST /api/v1/files/upload has a request validator attached with a JSON Schema model that enforces: (1) 'filename' must match pattern '^[a-zA-Z0-9_-]{1,64}\\.(jpg|png|gif|pdf|docx)$', (2) 'content_type' must be one of enum ['image/jpeg','image/png','image/gif','application/pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document'], (3) 'content' must be a string with maxLength 5242880, (4) 'user_id' must match pattern '^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$'. The validator mode is set to 'ALL' (validates both body and parameters). Messages that fail schema validation receive 400 and are never produced to Kafka. The API Gateway is the ONLY producer authorized on the topic via Kafka ACLs (mTLS client certificate pinned to the gateway's service identity).",
+    "config": {
+      "api_gateway": "Amazon API Gateway HTTP API with request validation enabled",
+      "request_validator_mode": "ALL",
+      "schema_model": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "filename",
+          "content_type",
+          "content"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}\\.(jpg|png|gif|pdf|docx)$"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/gif",
+              "application/pdf",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 5242880
+          },
+          "user_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "kafka_acl": "only API Gateway service identity (mTLS) can produce to file-upload-events topic",
+      "container_security_context": "default",
+      "volume_mount": "/var/uploads/pending on EFS"
+    }
+  }
+}

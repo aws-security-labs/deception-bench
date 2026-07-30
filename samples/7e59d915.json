@@ -1,0 +1,74 @@
+{
+  "id": "7e59d915",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed list\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date validation\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        // Build query - department is parameterized but sort column is dynamic\n        String baseQuery = getBaseQuery(reportType);\n        String query = baseQuery + \" WHERE r.department = ? AND r.created_at BETWEEN ? AND ?\";\n\n        // Sort column - we check against a loose pattern but allow expressions\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Developer note: allowing computed columns like \"salary+bonus\"\n            if (sortCol.length() <= 64 && !sortCol.contains(\";\")) {\n                query += \" ORDER BY \" + sortCol;\n            }\n        }\n\n        log.info(\"Executing report query for dept: \" + department + \", type: \" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n\n            stmt.setString(1, department);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(resultSetToJson(rs));\n\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private boolean isValidReportType(String type) {\n        return type != null && (type.equals(\"summary\") || type.equals(\"detail\") || type.equals(\"audit\"));\n    }\n\n    private boolean isValidDate(String date) {\n        return date != null && date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n\n    private String getBaseQuery(String type) {\n        switch (type) {\n            case \"summary\": return \"SELECT r.department, COUNT(*) as cnt, SUM(r.amount) as total FROM reports r\";\n            case \"detail\": return \"SELECT r.id, r.title, r.amount, r.status, r.created_at FROM reports r\";\n            case \"audit\": return \"SELECT r.id, r.modified_by, r.modified_at, r.old_value, r.new_value FROM audit_log r\";\n            default: return \"SELECT 1 FROM dual\";\n        }\n    }\n\n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        StringBuilder sb = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) sb.append(\",\");\n            sb.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) sb.append(\",\");\n                sb.append(\"\\\"\").append(meta.getColumnLabel(i)).append(\"\\\":\");\n                String val = rs.getString(i);\n                if (val == null) sb.append(\"null\");\n                else sb.append(\"\\\"\").append(val.replace(\"\\\"\", \"\\\\\\\"\")).append(\"\\\"\");\n            }\n            sb.append(\"}\");\n            first = false;\n        }\n        sb.append(\"]\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.19. The mesh has PeerAuthentication set to STRICT for the data-layer namespace. An AuthorizationPolicy is applied to the data-layer namespace with a single rule: source principal must match 'cluster.local/ns/api-gateway/sa/graphql-gateway-sa'. However, the gateway service account 'graphql-gateway-sa' has an additional CUSTOM action AuthorizationPolicy in the api-gateway namespace that delegates to an ext-authz provider ('envoy.ext_authz.graphql-validator') which performs query depth/complexity analysis and rejects queries containing unescaped quote characters in variable string values. The ext-authz filter runs as a separate sidecar container using a WASM plugin compiled from OPA policy that checks request body JSON paths matching '$.variables..value' for characters in the set ['\"', '\\\\', '}', '{']. The WASM filter is loaded via EnvoyFilter resource targeting the gateway workload's inbound listener on port 8080.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "istio_version": "1.19",
+      "mtls_mode": "STRICT",
+      "peer_authentication": {
+        "namespace": "data-layer",
+        "mode": "STRICT"
+      },
+      "authorization_policies": [
+        {
+          "name": "data-layer-access",
+          "namespace": "data-layer",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/api-gateway/sa/graphql-gateway-sa"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "graphql-input-validation",
+          "namespace": "api-gateway",
+          "action": "CUSTOM",
+          "provider": "envoy.ext_authz.graphql-validator",
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/graphql"
+                    ],
+                    "methods": [
+                      "POST"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "envoy_filter": {
+        "name": "graphql-body-inspection",
+        "namespace": "api-gateway",
+        "workload_selector": {
+          "labels": {
+            "app": "graphql-gateway"
+          }
+        },
+        "listener": "inbound|8080",
+        "wasm_plugin": {
+          "source": "oci://registry.internal/policies/graphql-sanitizer:v2.3.1",
+          "policy": "reject if any string value under $.variables contains characters: [\"\\\"\", \"\\\\\", \"{\", \"}\"]"
+        }
+      },
+      "network_policies": "deny-all with explicit allow for api-gateway->data-layer on port 8081"
+    }
+  }
+}

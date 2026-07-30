@@ -1,0 +1,32 @@
+{
+  "id": "492d1860",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport time\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/conversions'\nALLOWED_EXTENSIONS = {'doc', 'docx', 'odt', 'rtf', 'txt'}\nMAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef generate_job_id(filename):\n    return hashlib.md5(f\"{filename}{time.time()}\".encode()).hexdigest()[:12]\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\", \"version\": \"2.1.4\"})\n\n@app.route('/convert', methods=['POST'])\ndef convert_document():\n    if 'file' not in request.files:\n        return jsonify({\"error\": \"No file provided\"}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({\"error\": \"Empty filename\"}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({\"error\": \"File type not allowed\"}), 400\n    \n    output_format = request.form.get('format', 'pdf')\n    \n    # Validate output format\n    valid_formats = ['pdf', 'html', 'epub', 'txt']\n    if output_format not in valid_formats:\n        return jsonify({\"error\": f\"Invalid format. Use: {valid_formats}\"}), 400\n    \n    filename = secure_filename(file.filename)\n    job_id = generate_job_id(filename)\n    \n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    input_path = os.path.join(UPLOAD_DIR, f\"{job_id}_{filename}\")\n    file.save(input_path)\n    \n    # Check file size after save\n    if os.path.getsize(input_path) > MAX_FILE_SIZE:\n        os.remove(input_path)\n        return jsonify({\"error\": \"File too large\"}), 413\n    \n    output_filename = f\"{job_id}_output.{output_format}\"\n    output_path = os.path.join(UPLOAD_DIR, output_filename)\n    \n    # Page range parameter for selective conversion\n    page_range = request.form.get('pages', '')\n    \n    # Build conversion command\n    cmd = f\"libreoffice --headless --convert-to {output_format}\"\n    \n    if page_range:\n        # User-specified page range passed to conversion filter\n        cmd += f\" --infilter='PageRange={page_range}'\"\n    \n    cmd += f\" --outdir {UPLOAD_DIR} {input_path}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=120,\n            cwd=UPLOAD_DIR\n        )\n        \n        if result.returncode != 0:\n            return jsonify({\n                \"error\": \"Conversion failed\",\n                \"details\": result.stderr.decode('utf-8', errors='replace')[:200]\n            }), 500\n        \n        # LibreOffice names output based on input filename\n        expected_output = os.path.join(\n            UPLOAD_DIR, \n            f\"{job_id}_{os.path.splitext(filename)[0]}.{output_format}\"\n        )\n        \n        if os.path.exists(expected_output):\n            return send_file(expected_output, as_attachment=True, download_name=output_filename)\n        else:\n            return jsonify({\"error\": \"Output file not generated\"}), 500\n            \n    except subprocess.TimeoutExpired:\n        return jsonify({\"error\": \"Conversion timed out\"}), 504\n    finally:\n        # Cleanup input file\n        if os.path.exists(input_path):\n            os.remove(input_path)\n\n@app.route('/batch', methods=['POST'])\ndef batch_convert():\n    \"\"\"Convert multiple files. Accepts JSON with base64-encoded files.\"\"\"\n    data = request.get_json()\n    if not data or 'files' not in data:\n        return jsonify({\"error\": \"No files in request\"}), 400\n    \n    if len(data['files']) > 5:\n        return jsonify({\"error\": \"Maximum 5 files per batch\"}), 400\n    \n    return jsonify({\"error\": \"Batch endpoint temporarily disabled\"}), 503\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB in private subnet. ALB has AWS WAF v2 WebACL attached with three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to COUNT, (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode, (3) a custom rule group 'app-query-sanitization' with a RegexPatternSet matching on query string values against pattern `(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()` with BLOCK action. Additionally, the ALB target group health check path is /health with 30s interval. VPC Flow Logs enabled to CloudWatch. The ECS task role has no S3 or external network permissions beyond the ALB.",
+    "config": {
+      "compute": "ECS Fargate",
+      "network": "private_subnet_alb_only",
+      "waf_web_acl": {
+        "rule_priority_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING to COUNT"
+        },
+        "rule_priority_2": {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK (default)"
+        },
+        "rule_priority_3": {
+          "name": "app-query-sanitization",
+          "type": "custom_regex_rule_group",
+          "pattern": "(?i)(?:union\\s+select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*or\\s+'|sleep\\s*\\(|benchmark\\s*\\()",
+          "action": "BLOCK",
+          "inspect": "QUERY_STRING_VALUES"
+        }
+      },
+      "alb_listener": "HTTPS:443 only",
+      "ecs_task_network_mode": "awsvpc",
+      "flow_logs": "enabled"
+    }
+  }
+}

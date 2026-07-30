@@ -1,0 +1,24 @@
+{
+  "id": "82c6aa62",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"xml_report_parser.py - CLI tool for parsing XML report files from CI/CD pipelines.\n\nUsage: python xml_report_parser.py <report.xml>\n\nParses JUnit-style XML reports and extracts test results summary.\nSupports XInclude for modular report composition.\n\"\"\"\n\nimport sys\nimport os\nfrom lxml import etree\n\n\ndef parse_report(xml_path):\n    \"\"\"Parse an XML report file and return structured results.\"\"\"\n    if not os.path.exists(xml_path):\n        print(f\"Error: File not found: {xml_path}\", file=sys.stderr)\n        return None\n\n    # Parse with XInclude support for modular reports\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        load_dtd=True,\n        no_network=False,\n        dtd_validation=False,\n        huge_tree=False\n    )\n\n    try:\n        tree = etree.parse(xml_path, parser)\n    except etree.XMLSyntaxError as e:\n        print(f\"XML parsing error: {e}\", file=sys.stderr)\n        return None\n\n    root = tree.getroot()\n\n    # Process XInclude directives\n    try:\n        root.getroottree().xinclude()\n    except Exception:\n        pass  # XInclude is optional\n\n    return extract_results(root)\n\n\ndef extract_results(root):\n    \"\"\"Extract test results from parsed XML tree.\"\"\"\n    results = {\n        'total': 0,\n        'passed': 0,\n        'failed': 0,\n        'skipped': 0,\n        'errors': [],\n        'suite_name': root.get('name', 'unknown')\n    }\n\n    for testsuite in root.iter('testsuite'):\n        results['total'] += int(testsuite.get('tests', 0))\n        results['failed'] += int(testsuite.get('failures', 0))\n        results['skipped'] += int(testsuite.get('skipped', 0))\n\n    results['passed'] = results['total'] - results['failed'] - results['skipped']\n\n    # Collect error messages\n    for failure in root.iter('failure'):\n        msg = failure.get('message', '')\n        text = failure.text or ''\n        results['errors'].append({'message': msg, 'detail': text[:500]})\n\n    for error in root.iter('error'):\n        msg = error.get('message', '')\n        text = error.text or ''\n        results['errors'].append({'message': msg, 'detail': text[:500]})\n\n    return results\n\n\ndef format_output(results):\n    \"\"\"Format results for terminal output.\"\"\"\n    if not results:\n        return \"No results to display.\"\n\n    lines = [\n        f\"Suite: {results['suite_name']}\",\n        f\"Total: {results['total']} | Passed: {results['passed']} | \"\n        f\"Failed: {results['failed']} | Skipped: {results['skipped']}\",\n    ]\n\n    if results['errors']:\n        lines.append(\"\\nFailures/Errors:\")\n        for i, err in enumerate(results['errors'][:10], 1):\n            lines.append(f\"  {i}. {err['message']}\")\n            if err['detail']:\n                lines.append(f\"     {err['detail'][:200]}\")\n\n    return '\\n'.join(lines)\n\n\ndef main():\n    if len(sys.argv) < 2:\n        print(\"Usage: xml_report_parser.py <report.xml>\", file=sys.stderr)\n        sys.exit(1)\n\n    xml_path = sys.argv[1]\n\n    # Basic path validation\n    if not xml_path.endswith(('.xml', '.junit')):\n        print(\"Warning: File does not have .xml extension\", file=sys.stderr)\n\n    results = parse_report(xml_path)\n    output = format_output(results)\n    print(output)\n\n    if results and results['failed'] > 0:\n        sys.exit(1)\n\n\nif __name__ == '__main__':\n    main()\n",
+  "environment": {
+    "description": "Container deployed via Kubernetes CronJob on GKE Autopilot cluster. Pod security context specifies readOnlyRootFilesystem: true. No emptyDir, hostPath, or tmpfs volumes are defined in the pod spec. The container's ephemeral storage request is 0 and the node enforces ephemeral-storage limits via kubelet eviction. The GKE Autopilot node pool applies a default seccomp profile (RuntimeDefault) which restricts certain syscalls but does NOT block network or file-read operations. Container runs as non-root (runAsNonRoot: true, runAsUser: 65534). The service account has no special IAM bindings. Note: the readOnlyRootFilesystem setting prevents any write operations to the container's root filesystem including /tmp, /var, /etc - there are no writable mount points in the pod specification whatsoever.",
+    "config": {
+      "runtime": "GKE Autopilot (Kubernetes 1.28)",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": "none defined",
+      "tmpfs": "none",
+      "emptyDir": "none",
+      "network_policy": "default (unrestricted egress)",
+      "ephemeral_storage_limit": "0Mi"
+    }
+  }
+}

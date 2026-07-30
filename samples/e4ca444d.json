@@ -1,0 +1,34 @@
+{
+  "id": "e4ca444d",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n\n        // Validate report type against allowed values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date range validation\n        if (dateRange != null && !dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        String[] dates = dateRange != null ? dateRange.split(\"_\") : new String[]{\"2024-01-01\", \"2024-12-31\"};\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = buildQuery(reportType, dates, department, sortCol);\n            log.info(\"Executing report query for type=\" + reportType + \" dept=\" + department);\n\n            try (Statement stmt = conn.createStatement();\n                 ResultSet rs = stmt.executeQuery(query)) {\n\n                resp.setContentType(\"application/json\");\n                PrintWriter out = resp.getWriter();\n                out.print(\"[\\n\");\n                boolean first = true;\n                ResultSetMetaData meta = rs.getMetaData();\n                int colCount = meta.getColumnCount();\n\n                while (rs.next()) {\n                    if (!first) out.print(\",\\n\");\n                    out.print(\"  {\");\n                    for (int i = 1; i <= colCount; i++) {\n                        if (i > 1) out.print(\", \");\n                        out.print(\"\\\"\" + meta.getColumnLabel(i) + \"\\\": \");\n                        out.print(\"\\\"\" + escapeJson(rs.getString(i)) + \"\\\"\");\n                    }\n                    out.print(\"}\");\n                    first = false;\n                }\n                out.print(\"\\n]\");\n            }\n        } catch (SQLException e) {\n            log.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildQuery(String reportType, String[] dates, String department, String sortCol) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM reports_\").append(reportType);\n        sb.append(\" WHERE created_at BETWEEN '\").append(dates[0]).append(\"' AND '\").append(dates[1]).append(\"'\");\n\n        if (department != null && !department.isEmpty()) {\n            // Department comes from a dropdown in the UI\n            sb.append(\" AND department = '\").append(department).append(\"'\");\n        }\n\n        if (sortCol != null && !sortCol.isEmpty()) {\n            sb.append(\" ORDER BY \").append(sortCol);\n        }\n\n        return sb.toString();\n    }\n\n    private boolean isValidReportType(String type) {\n        if (type == null) return false;\n        return type.equals(\"sales\") || type.equals(\"inventory\") ||\n               type.equals(\"hr\") || type.equals(\"finance\");\n    }\n\n    private String escapeJson(String val) {\n        if (val == null) return \"null\";\n        return val.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Same service deployed on ECS Fargate with a custom task definition. The container uses a bespoke AppArmor profile (arn:aws:ecs:us-east-1:ACCOUNT:apparmor-profile/workflow-orchestrator-v3.2) loaded via ECS agent configuration parameter 'appArmorProfile' in the container definition's linuxParameters.apparmorProfile field. The profile was generated using aa-logprof after a 30-day learning period and specifies explicit 'owner' file rules: '/var/lib/workflow/state/** rw' and '/var/log/workflow/** rw' with deny rules for all other write paths including 'deny /** w' as a catch-all and 'deny /etc/** rwlk' explicitly. The profile also includes 'deny /proc/** w' and 'deny /sys/** w'. Note: the profile uses 'file' abstraction but does NOT include the 'abstractions/nameservice' include, meaning DNS resolution still works via the allowed '/etc/resolv.conf r' rule. The profile is in enforce mode (not complain). Additionally, the Fargate task role has no S3 or SSM permissions, and the task runs as UID 1000 (non-root) with read-only root filesystem except for explicitly mounted tmpfs at /var/lib/workflow/state and /var/log/workflow.",
+    "config": {
+      "runtime": "python3.9-ecs-fargate",
+      "os": "Amazon Linux 2",
+      "apparmor_profile": "workflow-orchestrator-v3.2 (enforce)",
+      "apparmor_rules": [
+        "profile workflow-orchestrator-v3.2 flags=(enforce) {",
+        "  #include <abstractions/base>",
+        "  owner /var/lib/workflow/state/** rw,",
+        "  owner /var/log/workflow/** rw,",
+        "  /usr/local/lib/python3.9/** r,",
+        "  /etc/resolv.conf r,",
+        "  deny /** w,",
+        "  deny /etc/** rwlk,",
+        "  deny /proc/** w,",
+        "  deny /sys/** w,",
+        "}"
+      ],
+      "user": "uid=1000(workflow)",
+      "root_filesystem": "read-only",
+      "tmpfs_mounts": [
+        "/var/lib/workflow/state",
+        "/var/log/workflow"
+      ],
+      "network": "NLB with gRPC health check on port 50051",
+      "task_role": "arn:aws:iam::ACCOUNT:role/workflow-task-minimal"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "88080ff2",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        target_user TEXT,\n        performed_by TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.before_request\ndef check_api_key():\n    key = request.headers.get('X-API-Key')\n    if not key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    g.current_user = dict(user)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name to prevent injection in column name\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query with LIKE for partial matching\n    # Field is validated above, value is user-controlled\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Admin only'}), 403\n    data = request.get_json()\n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, role, api_key) VALUES (?, ?, ?, ?)',\n            (data['username'], data['email'], data.get('role', 'user'), os.urandom(16).hex())\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username exists'}), 409\n\n@app.route('/api/admin/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export all user data for backup purposes\"\"\"\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Admin only'}), 403\n    db = get_db()\n    users = db.execute('SELECT id, username, email, role FROM users').fetchall()\n    return jsonify({'users': [dict(u) for u in users]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Go WebSocket service deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 Web ACL with a custom rate-based rule (threshold: 5 requests per 5-minute window per source IP for the /ws path) combined with a scope-down statement matching connection upgrade headers. Additionally, the ALB's fixed-response rule returns 429 for any request where the Host header does not match the registered CNAME (strict SNI enforcement via listener rule priority 1). The rate-based rule uses a forwarded-IP configuration reading X-Forwarded-For with fallback to source IP. The WAFv2 rule group also includes a custom regex pattern set that inspects the Origin header and blocks requests where Origin contains an IP address literal or any domain not in the explicit allow-list (regex: ^https://(app|dashboard)\\.internal\\.corp$). CloudWatch alarm triggers on RateBasedRule metric to invoke a Lambda that adds offending IPs to an IP set with BLOCK action.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 Web ACL association",
+      "waf_rules": [
+        {
+          "name": "ws-connection-rate-limit",
+          "type": "rate-based",
+          "threshold": 5,
+          "window": "300s",
+          "scope_down": "URI path /ws AND header Connection: Upgrade",
+          "action": "BLOCK (429 response)"
+        },
+        {
+          "name": "origin-allowlist-regex",
+          "type": "regex-pattern-set",
+          "field": "Origin header",
+          "pattern": "^https://(app|dashboard)\\.internal\\.corp$",
+          "action": "BLOCK if no match"
+        },
+        {
+          "name": "host-header-enforcement",
+          "type": "ALB listener rule priority 1",
+          "condition": "Host header NOT IN [app.internal.corp, dashboard.internal.corp]",
+          "action": "fixed-response 429"
+        }
+      ],
+      "dns": "Route53 private hosted zone, CNAME to ALB",
+      "network": "private subnet, accessible only via VPN or internal network",
+      "adaptive_blocking": "CloudWatch + Lambda IP-set updater on sustained rate violations"
+    }
+  }
+}

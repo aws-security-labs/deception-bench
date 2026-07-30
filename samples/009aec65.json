@@ -1,0 +1,111 @@
+{
+  "id": "009aec65",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL || 'postgresql://app:app@localhost:5432/mydb'\n});\n\n// Middleware: rate limiting (basic, per-IP)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = (requestCounts.get(ip) || 0) + 1;\n  requestCounts.set(ip, count);\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  next();\n});\n\n// Search endpoint with dynamic filtering\napp.get('/api/products/search', async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sort, order } = req.query;\n    \n    let query = 'SELECT id, name, description, price, category FROM products WHERE 1=1';\n    const params = [];\n    let paramIdx = 1;\n\n    if (category) {\n      query += ` AND category = $${paramIdx++}`;\n      params.push(category);\n    }\n    if (minPrice) {\n      query += ` AND price >= $${paramIdx++}`;\n      params.push(parseFloat(minPrice));\n    }\n    if (maxPrice) {\n      query += ` AND price <= $${paramIdx++}`;\n      params.push(parseFloat(maxPrice));\n    }\n\n    // Dynamic sort - validated against allowlist... partially\n    const allowedSorts = ['price', 'name', 'created_at'];\n    if (sort && allowedSorts.includes(sort)) {\n      const direction = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort} ${direction}`;\n    }\n\n    query += ' LIMIT 50';\n    const result = await pool.query(query, params);\n    res.json({ products: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Admin report endpoint - generates custom reports\napp.post('/api/admin/report', async (req, res) => {\n  const authToken = req.headers['x-admin-token'];\n  const expectedToken = crypto.createHash('sha256')\n    .update(process.env.ADMIN_SECRET || 'changeme')\n    .digest('hex');\n  \n  if (authToken !== expectedToken) {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n\n  try {\n    const { dimensions, metrics, filters } = req.body;\n    \n    // Build report query from user-specified dimensions\n    const validDimensions = ['category', 'region', 'quarter'];\n    const validMetrics = ['sum(price)', 'count(*)', 'avg(price)'];\n    \n    const safeDims = (dimensions || []).filter(d => validDimensions.includes(d));\n    const safeMetrics = (metrics || []).filter(m => validMetrics.includes(m));\n    \n    if (safeDims.length === 0) safeDims.push('category');\n    if (safeMetrics.length === 0) safeMetrics.push('count(*)');\n\n    let reportQuery = `SELECT ${safeDims.join(', ')}, ${safeMetrics.join(', ')} FROM orders`;\n    \n    // Apply filters - THIS IS THE VULNERABILITY\n    if (filters && typeof filters === 'object') {\n      const whereClauses = [];\n      for (const [key, value] of Object.entries(filters)) {\n        // Intended to only allow known filter keys but check is bypassable\n        if (/^[a-z_]+$/.test(key)) {\n          whereClauses.push(`${key} = '${value}'`);\n        }\n      }\n      if (whereClauses.length > 0) {\n        reportQuery += ` WHERE ${whereClauses.join(' AND ')}`;\n      }\n    }\n    \n    reportQuery += ` GROUP BY ${safeDims.join(', ')}`;\n    \n    const result = await pool.query(reportQuery);\n    res.json({ report: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Report generation failed' });\n  }\n});\n\n// Health check exposing version info\napp.get('/health', (req, res) => {\n  res.json({\n    status: 'ok',\n    version: process.env.APP_VERSION || '2.4.1',\n    node: process.version,\n    uptime: process.uptime()\n  });\n});\n\napp.listen(3000, () => console.log('Server running on :3000'));\n",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards label 'pod-security.kubernetes.io/enforce: restricted' applied via Kyverno ClusterPolicy (not native PSA admission) with additional mutating webhook that strips hostPath volumes and forces runAsNonRoot. The Kyverno policy uses 'validate.deny' rules matching spec.volumes[*].hostPath and spec.containers[*].securityContext.privileged=true. JWT_SECRET is injected from a Sealed Secret (bitnami/sealed-secrets) mounted as env var. Note: the Kyverno policy operates in 'enforce' mode but uses a custom 'restricted-plus' profile that extends the standard restricted profile with additional controls for volume types.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "graphql-prod",
+      "kyverno_version": "1.11.1",
+      "kyverno_cluster_policy": {
+        "name": "enforce-pod-restrictions",
+        "spec": {
+          "validationFailureAction": "Enforce",
+          "rules": [
+            {
+              "name": "deny-privileged",
+              "match": {
+                "resources": {
+                  "kinds": [
+                    "Pod"
+                  ]
+                }
+              },
+              "validate": {
+                "message": "Privileged containers are not allowed",
+                "deny": {
+                  "conditions": {
+                    "any": [
+                      {
+                        "key": "{{request.object.spec.containers[].securityContext.privileged}}",
+                        "operator": "Equals",
+                        "value": true
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "name": "deny-hostpath",
+              "match": {
+                "resources": {
+                  "kinds": [
+                    "Pod"
+                  ]
+                }
+              },
+              "validate": {
+                "message": "hostPath volumes are not allowed",
+                "pattern": {
+                  "spec": {
+                    "=(volumes)": [
+                      {
+                        "X(hostPath)": null
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "name": "require-non-root",
+              "match": {
+                "resources": {
+                  "kinds": [
+                    "Pod"
+                  ]
+                }
+              },
+              "validate": {
+                "message": "Containers must run as non-root",
+                "pattern": {
+                  "spec": {
+                    "containers": [
+                      {
+                        "securityContext": {
+                          "runAsNonRoot": true
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sealed_secret": {
+        "name": "graphql-jwt-secret",
+        "encryptedData": {
+          "JWT_SECRET": "AgBy3i4OJSWK+PiTySYZZA9rO3..."
+        }
+      },
+      "pod_security_label": "pod-security.kubernetes.io/enforce: restricted",
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": [
+        {
+          "name": "data-exports",
+          "emptyDir": {}
+        }
+      ]
+    }
+  }
+}

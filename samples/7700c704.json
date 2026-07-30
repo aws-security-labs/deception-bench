@@ -1,0 +1,98 @@
+{
+  "id": "7700c704",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef render_report(template_path, output_path, params):\n    \"\"\"Render a report using wkhtmltopdf with user-supplied parameters.\"\"\"\n    # Build command with user-controlled header/footer\n    cmd = ['wkhtmltopdf', '--enable-local-file-access']\n    \n    if params.get('header'):\n        cmd.extend(['--header-html', params['header']])\n    if params.get('footer'):\n        cmd.extend(['--footer-html', params['footer']])\n    if params.get('margin_top'):\n        cmd.extend(['--margin-top', str(params['margin_top'])])\n    if params.get('orientation'):\n        cmd.extend(['--orientation', params['orientation']])\n    \n    cmd.extend([template_path, output_path])\n    \n    result = subprocess.run(cmd, capture_output=True, timeout=30)\n    return result.returncode == 0\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate PDF report from HTML template with user parameters.\"\"\"\n    if 'template' not in request.files:\n        return jsonify({'error': 'No template file'}), 400\n    \n    template_file = request.files['template']\n    filename = secure_filename(template_file.filename)\n    \n    if not filename.endswith('.html'):\n        return jsonify({'error': 'Only HTML templates allowed'}), 400\n    \n    # Parse rendering parameters\n    params = {}\n    if request.form.get('params'):\n        try:\n            params = yaml.safe_load(request.form['params'])\n        except yaml.YAMLError:\n            return jsonify({'error': 'Invalid params YAML'}), 400\n    \n    # Save template\n    template_path = os.path.join(UPLOAD_DIR, filename)\n    template_file.save(template_path)\n    \n    # Generate output path\n    output_filename = filename.rsplit('.', 1)[0] + '.pdf'\n    output_path = os.path.join(UPLOAD_DIR, output_filename)\n    \n    # Render the report\n    success = render_report(template_path, output_path, params)\n    \n    if success:\n        return jsonify({'status': 'ok', 'path': f'/reports/{output_filename}'})\n    else:\n        return jsonify({'error': 'Rendering failed'}), 500\n\n@app.route('/api/reports/batch', methods=['POST'])\ndef batch_generate():\n    \"\"\"Batch generate reports from a manifest file.\"\"\"\n    manifest = request.get_json()\n    if not manifest or 'jobs' not in manifest:\n        return jsonify({'error': 'Invalid manifest'}), 400\n    \n    results = []\n    for job in manifest['jobs']:\n        template_url = job.get('template_path', '')\n        # Validate path doesn't escape upload dir\n        full_path = os.path.realpath(os.path.join(UPLOAD_DIR, template_url))\n        if not full_path.startswith(os.path.realpath(UPLOAD_DIR)):\n            results.append({'error': 'path traversal blocked', 'job': job.get('id')})\n            continue\n        \n        output_path = full_path.rsplit('.', 1)[0] + '.pdf'\n        params = job.get('params', {})\n        success = render_report(full_path, output_path, params)\n        results.append({'job': job.get('id'), 'success': success})\n    \n    return jsonify({'results': results})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Kubernetes cluster on AWS EKS. Workers run in 'processing' namespace. A NetworkPolicy named 'worker-egress-restrict' is applied with spec.podSelector matching label app=celery-worker. The policy defines egress rules that allow DNS (UDP/TCP 53 to kube-dns), Redis (TCP 6379 to redis service CIDR), and HTTP/HTTPS to external IPs via an allow-list of CIDR blocks that explicitly excludes link-local (169.254.0.0/16) and RFC1918 ranges. The policy uses policyTypes: ['Egress'] which means all egress not explicitly allowed is denied. Note: the Calico CNI plugin is installed but the GlobalNetworkPolicy for metadata protection is NOT configured - only the namespace-scoped NetworkPolicy exists. IMDSv1 remains enabled on the underlying nodes. The validate_url function in the code does not check 169.254.x.x addresses.",
+    "config": {
+      "kubernetes_namespace": "processing",
+      "cni_plugin": "calico-3.26",
+      "network_policy_name": "worker-egress-restrict",
+      "network_policy_spec": {
+        "podSelector": {
+          "matchLabels": {
+            "app": "celery-worker"
+          }
+        },
+        "policyTypes": [
+          "Egress"
+        ],
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "UDP",
+                "port": 53
+              },
+              {
+                "protocol": "TCP",
+                "port": 53
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "redis"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 6379
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "169.254.0.0/16"
+                  ]
+                }
+              }
+            ],
+            "ports": [
+              {
+                "protocol": "TCP",
+                "port": 443
+              },
+              {
+                "protocol": "TCP",
+                "port": 80
+              }
+            ]
+          }
+        ]
+      },
+      "imds_version": "v1",
+      "global_network_policy": "not_configured",
+      "pod_labels": {
+        "app": "celery-worker"
+      }
+    }
+  }
+}

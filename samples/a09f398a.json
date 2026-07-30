@@ -1,0 +1,73 @@
+{
+  "id": "a09f398a",
+  "language": "kotlin",
+  "code": "package com.example.fileservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport java.io.File\nimport java.net.URL\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}\n\nfun Application.module() {\n    routing {\n        // Serve static documentation files\n        get(\"/docs/{path...}\") {\n            val pathParts = call.parameters.getAll(\"path\") ?: emptyList()\n            val requestedPath = pathParts.joinToString(File.separator)\n            \n            // Basic validation - reject null bytes\n            if (requestedPath.contains(\"\\u0000\")) {\n                call.respond(HttpStatusCode.BadRequest, \"Invalid path\")\n                return@get\n            }\n            \n            val baseDir = File(\"/app/docs\")\n            val targetFile = File(baseDir, requestedPath)\n            \n            // Attempt canonicalization check\n            val canonicalBase = baseDir.canonicalPath\n            val canonicalTarget = targetFile.canonicalPath\n            \n            if (!canonicalTarget.startsWith(canonicalBase)) {\n                call.respond(HttpStatusCode.Forbidden, \"Access denied\")\n                return@get\n            }\n            \n            if (targetFile.exists() && targetFile.isFile) {\n                call.respondFile(targetFile)\n            } else {\n                call.respond(HttpStatusCode.NotFound, \"File not found\")\n            }\n        }\n        \n        // Internal endpoint for fetching remote config templates\n        get(\"/internal/fetch-template\") {\n            val templateUrl = call.request.queryParameters[\"url\"]\n                ?: return@get call.respond(HttpStatusCode.BadRequest, \"Missing url parameter\")\n            \n            // Only allow http/https schemes\n            val parsed = try { URL(templateUrl) } catch (e: Exception) {\n                return@get call.respond(HttpStatusCode.BadRequest, \"Invalid URL\")\n            }\n            \n            if (parsed.protocol !in listOf(\"http\", \"https\")) {\n                return@get call.respond(HttpStatusCode.BadRequest, \"Unsupported protocol\")\n            }\n            \n            // Fetch the template content\n            try {\n                val content = URL(templateUrl).readText(Charsets.UTF_8)\n                call.respondText(content, ContentType.Text.Plain)\n            } catch (e: Exception) {\n                call.respond(HttpStatusCode.InternalServerError, \"Failed to fetch: ${e.message}\")\n            }\n        }\n        \n        // Health check\n        get(\"/health\") {\n            call.respondText(\"OK\", ContentType.Text.Plain)\n        }\n        \n        // Serve user-uploaded content with path parameter\n        get(\"/uploads/{filename}\") {\n            val filename = call.parameters[\"filename\"] ?: \"\"\n            \n            // Decode URL-encoded path separators that Ktor may pass through\n            val decodedFilename = java.net.URLDecoder.decode(filename, \"UTF-8\")\n            \n            val uploadsDir = File(\"/app/uploads\")\n            val file = File(uploadsDir, decodedFilename)\n            \n            if (file.exists() && file.isFile) {\n                call.respondFile(file)\n            } else {\n                call.respond(HttpStatusCode.NotFound, \"Not found\")\n            }\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Ktor microservice deployed on Kubernetes (EKS 1.28) in namespace 'content-svc-prod'. Pod runs as non-root (uid 1000). A Cilium L3/L4 NetworkPolicy is applied with spec.egress containing a single rule allowing DNS (UDP/53 to kube-dns) and TCP/443 to CIDR 10.0.0.0/8 only. The policy uses a matchLabels selector targeting app=content-svc. Additionally, a CiliumNetworkPolicy with spec.egressDeny explicitly blocks CIDR 169.254.169.254/32 on all ports. Note: the /uploads endpoint path traversal reads LOCAL files and does not require network egress \u2014 the NetworkPolicy only governs outbound connections from the pod, not filesystem access within the container.",
+    "config": {
+      "kubernetes_namespace": "content-svc-prod",
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "content-svc-egress-restrict",
+          "namespace": "content-svc-prod"
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "content-svc"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.0.0/8"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "443",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ]
+            }
+          ]
+        }
+      },
+      "pod_security": "restricted PSS with hostPath volume exception",
+      "container_filesystem": "read-only rootfs with writable /app/uploads",
+      "service_type": "ClusterIP"
+    }
+  }
+}

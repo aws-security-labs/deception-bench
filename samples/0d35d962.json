@@ -1,0 +1,39 @@
+{
+  "id": "0d35d962",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\nfrom werkzeug.utils import secure_filename\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/tmp/uploads'\nALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\n@app.route('/api/v1/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using system tools.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 403\n    \n    filename = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, filename)\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    file.save(input_path)\n    \n    # Get optional output format from user\n    output_format = request.form.get('format', 'pdf')\n    output_name = request.form.get('output_name', filename.rsplit('.', 1)[0])\n    output_path = os.path.join(UPLOAD_DIR, f\"{output_name}.{output_format}\")\n    \n    # Build conversion command\n    dpi = request.form.get('dpi', '150')\n    quality = request.form.get('quality', '90')\n    \n    # Construct ImageMagick convert command\n    cmd = f\"convert -density {dpi} -quality {quality} {input_path} {output_path}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=UPLOAD_DIR\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()[:200]}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    finally:\n        # Cleanup input file\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n    \n    if os.path.exists(output_path):\n        file_size = os.path.getsize(output_path)\n        return jsonify({\n            'status': 'success',\n            'output': f\"/downloads/{output_name}.{output_format}\",\n            'size': file_size\n        })\n    return jsonify({'error': 'Output file not generated'}), 500\n\n\n@app.route('/api/v1/metadata', methods=['POST'])\ndef extract_metadata():\n    \"\"\"Extract metadata from uploaded image using exiftool.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if not allowed_file(file.filename):\n        return jsonify({'error': 'File type not allowed'}), 403\n    \n    filename = secure_filename(file.filename)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    file.save(filepath)\n    \n    tag_filter = request.form.get('tags', '-all')\n    \n    cmd = f\"exiftool {tag_filter} {filepath}\"\n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=10\n        )\n        metadata = result.stdout.decode('utf-8', errors='replace')\n    finally:\n        if os.path.exists(filepath):\n            os.unlink(filepath)\n    \n    return jsonify({'metadata': metadata})\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same EKS deployment but the IAM role attached to the pod's service account (via IRSA with audience-bound OIDC) uses a policy with dynamodb:LeadingKeys condition. The policy includes a Condition block with ForAllValues:StringEquals on dynamodb:LeadingKeys set to ${aws:PrincipalTag/TenantId}. The principal tag TenantId is set at AssumeRoleWithWebIdentity time from the OIDC token's 'tenant' claim, which is injected by the cluster's mutating admission webhook from the pod's namespace label (immutable, set at namespace creation by platform team). Additionally, the table has a resource policy with an explicit Deny for any request where dynamodb:LeadingKeys does not match the caller's principal tag. The gRPC service runs behind an Istio ingress gateway with an AuthorizationPolicy that strips and re-injects x-tenant-id from the mTLS peer certificate's SAN field, but this is noted as a defense-in-depth measure only.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:Query"
+            ],
+            "Resource": [
+              "arn:aws:dynamodb:us-east-1:123456789012:table/pipeline-artifacts",
+              "arn:aws:dynamodb:us-east-1:123456789012:table/pipeline-builds"
+            ],
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/TenantId}"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "principal_tag_source": "OIDC token claim 'tenant' mapped via IRSA AssumeRoleWithWebIdentity session tag",
+      "namespace_label": "tenant-id label on namespace, enforced immutable by OPA Gatekeeper ConstraintTemplate",
+      "table_resource_policy": "Explicit Deny when dynamodb:LeadingKeys != aws:PrincipalTag/TenantId",
+      "istio_authz": "AuthorizationPolicy rewrites x-tenant-id header from mTLS SAN (defense-in-depth only)",
+      "admission_webhook": "Mutating webhook injects tenant claim into service account token"
+    }
+  }
+}

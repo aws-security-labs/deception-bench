@@ -1,0 +1,27 @@
+{
+  "id": "e9c1d0fc",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst _ = require('lodash');\n\n// Step Functions activity worker that processes state machine tasks\n// Reads configuration from S3, merges with task input, writes results back\n\nconst s3 = new AWS.S3({ region: process.env.AWS_REGION || 'us-east-1' });\nconst stepfunctions = new AWS.StepFunctions();\n\nconst CONFIG_BUCKET = process.env.CONFIG_BUCKET || 'workflow-configs-prod';\nconst RESULTS_BUCKET = process.env.RESULTS_BUCKET || 'workflow-results-prod';\n\nasync function loadBaseConfig(workflowId) {\n  const params = {\n    Bucket: CONFIG_BUCKET,\n    Key: `workflows/${workflowId}/base-config.json`\n  };\n  const data = await s3.getObject(params).promise();\n  return JSON.parse(data.Body.toString());\n}\n\nasync function mergeTaskInput(baseConfig, taskInput) {\n  // Deep merge task input overrides into base configuration\n  // This allows step function tasks to customize behavior per-execution\n  const merged = {};\n  _.merge(merged, baseConfig, taskInput.configOverrides || {});\n  return merged;\n}\n\nasync function writeResults(workflowId, executionId, results) {\n  const params = {\n    Bucket: RESULTS_BUCKET,\n    Key: `results/${workflowId}/${executionId}/output.json`,\n    Body: JSON.stringify(results),\n    ContentType: 'application/json'\n  };\n  await s3.putObject(params).promise();\n}\n\nasync function processTask(taskToken, input) {\n  try {\n    const { workflowId, executionId, configOverrides } = input;\n    \n    if (!workflowId || !executionId) {\n      throw new Error('Missing required fields: workflowId, executionId');\n    }\n\n    // Load base configuration from S3\n    const baseConfig = await loadBaseConfig(workflowId);\n    \n    // Merge overrides from step function input (VULNERABILITY: prototype pollution)\n    const effectiveConfig = await mergeTaskInput(baseConfig, input);\n    \n    // Process based on merged configuration\n    const results = {\n      workflowId,\n      executionId,\n      processedAt: new Date().toISOString(),\n      config: effectiveConfig,\n      status: 'completed'\n    };\n\n    // Check if admin mode was enabled (can be polluted via __proto__)\n    if (effectiveConfig.adminMode) {\n      results.sensitiveData = process.env;\n      results.status = 'admin-completed';\n    }\n\n    // Write results to S3\n    await writeResults(workflowId, executionId, results);\n\n    // Report success back to Step Functions\n    await stepfunctions.sendTaskSuccess({\n      taskToken,\n      output: JSON.stringify(results)\n    }).promise();\n\n  } catch (err) {\n    await stepfunctions.sendTaskFailure({\n      taskToken,\n      error: err.name,\n      cause: err.message\n    }).promise();\n  }\n}\n\nasync function pollForTasks() {\n  const activityArn = process.env.ACTIVITY_ARN;\n  \n  while (true) {\n    try {\n      const task = await stepfunctions.getActivityTask({\n        activityArn,\n        workerName: `worker-${process.pid}`\n      }).promise();\n\n      if (task.taskToken) {\n        const input = JSON.parse(task.input);\n        await processTask(task.taskToken, input);\n      }\n    } catch (err) {\n      console.error('Poll error:', err.message);\n      await new Promise(r => setTimeout(r, 5000));\n    }\n  }\n}\n\n// Start polling\npollForTasks().catch(console.error);\n\nmodule.exports = { processTask, mergeTaskInput, loadBaseConfig };",
+  "environment": {
+    "description": "AWS Lambda-backed Step Functions activity worker running in VPC subnet-0a1b2c3d with NAT gateway for internet access. S3 access via regional endpoint (not VPC endpoint). IAM role arn:aws:iam::111222333444:role/WorkflowWorkerRole has s3:GetObject on CONFIG_BUCKET and s3:PutObject on RESULTS_BUCKET. lodash@4.17.15 installed. Step Function input is user-controllable via StartExecution API with no input validation at the state machine level.",
+    "config": {
+      "runtime": "nodejs14.x",
+      "vpc": "vpc-0abc123",
+      "subnets": [
+        "subnet-0a1b2c3d"
+      ],
+      "nat_gateway": true,
+      "s3_access": "regional-endpoint",
+      "iam_role": "arn:aws:iam::111222333444:role/WorkflowWorkerRole",
+      "iam_permissions": [
+        "s3:GetObject on workflow-configs-prod/*",
+        "s3:PutObject on workflow-results-prod/*",
+        "states:SendTaskSuccess",
+        "states:SendTaskFailure",
+        "states:GetActivityTask"
+      ],
+      "lodash_version": "4.17.15",
+      "input_validation": "none"
+    }
+  }
+}

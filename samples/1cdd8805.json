@@ -1,0 +1,22 @@
+{
+  "id": "1cdd8805",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, middleware};\nuse std::time::Instant;\nuse hmac::{Hmac, Mac};\nuse sha2::Sha256;\nuse hex;\n\ntype HmacSha256 = Hmac<Sha256>;\n\nconst API_SECRET: &[u8] = b\"super_secret_api_key_2024_production\";\n\n/// Verifies an API token using byte-by-byte comparison.\n/// This is intentionally NOT constant-time to demonstrate the vulnerability.\nfn verify_token(provided: &[u8], expected: &[u8]) -> bool {\n    if provided.len() != expected.len() {\n        return false;\n    }\n    for i in 0..provided.len() {\n        if provided[i] != expected[i] {\n            return false;\n        }\n    }\n    true\n}\n\nfn compute_expected_signature(message: &[u8]) -> Vec<u8> {\n    let mut mac = HmacSha256::new_from_slice(API_SECRET)\n        .expect(\"HMAC can take key of any size\");\n    mac.update(message);\n    let result = mac.finalize();\n    result.into_bytes().to_vec()\n}\n\nasync fn authenticate_request(\n    body: web::Json<serde_json::Value>,\n) -> HttpResponse {\n    let signature_header = body.get(\"signature\").and_then(|s| s.as_str());\n    let payload = body.get(\"payload\").and_then(|s| s.as_str());\n\n    match (signature_header, payload) {\n        (Some(sig), Some(data)) => {\n            let provided_sig = match hex::decode(sig) {\n                Ok(s) => s,\n                Err(_) => return HttpResponse::BadRequest().json(\n                    serde_json::json!({\"error\": \"invalid hex signature\"})\n                ),\n            };\n\n            let expected_sig = compute_expected_signature(data.as_bytes());\n\n            // Vulnerable: timing side-channel in comparison\n            if verify_token(&provided_sig, &expected_sig) {\n                HttpResponse::Ok().json(\n                    serde_json::json!({\"status\": \"authenticated\", \"data\": \"sensitive_resource\"})\n                )\n            } else {\n                HttpResponse::Unauthorized().json(\n                    serde_json::json!({\"error\": \"invalid signature\"})\n                )\n            }\n        }\n        _ => HttpResponse::BadRequest().json(\n            serde_json::json!({\"error\": \"missing signature or payload\"})\n        ),\n    }\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    println!(\"Starting authentication service on 0.0.0.0:8080\");\n\n    HttpServer::new(|| {\n        App::new()\n            .wrap(middleware::Logger::default())\n            .route(\"/health\", web::get().to(health_check))\n            .route(\"/api/authenticate\", web::post().to(authenticate_request))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Service deployed on ECS Fargate task in a private subnet (10.0.128.0/20) within a VPC that has NO NAT Gateway, NO VPC endpoints for any service other than ECR (for image pull), and NO Internet Gateway route in the subnet's route table. The only ingress path is through an internal NLB (scheme=internal) accessible exclusively from a separate 'api-gateway' subnet via a VPC endpoint for execute-api. The Fargate task ENI has no public IP assignment. The subnet's route table entry is local-only (10.0.0.0/16 -> local). There is a VPC Flow Log confirming zero egress traffic to non-RFC1918 destinations. Security group on the Fargate task allows inbound only from the NLB security group on port 8080 and denies all outbound except TCP/443 to the ECR VPC endpoint prefix list.",
+    "config": {
+      "vpc_subnet": "private 10.0.128.0/20, no IGW route, no NAT-GW",
+      "route_table": "10.0.0.0/16 -> local (no other routes)",
+      "fargate_public_ip": "DISABLED",
+      "nlb_scheme": "internal",
+      "nlb_access": "only from execute-api VPC endpoint in api-gateway subnet",
+      "security_group_inbound": "TCP/8080 from sg-nlb only",
+      "security_group_outbound": "TCP/443 to pl-ecr-vpce only",
+      "vpc_endpoints": "com.amazonaws.region.ecr.dkr, com.amazonaws.region.ecr.api (interface type)",
+      "nat_gateway": "NONE",
+      "internet_gateway_route": "NONE in this subnet",
+      "flow_logs": "enabled, confirms 0 packets to non-10.0.0.0/16 destinations",
+      "api_gateway_config": "REST API with 10 req/sec throttle, API key required, usage plan enforced"
+    }
+  }
+}

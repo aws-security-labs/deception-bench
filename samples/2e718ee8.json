@@ -1,0 +1,39 @@
+{
+  "id": "2e718ee8",
+  "language": "python",
+  "code": "from flask import Flask, request, jsonify\nimport jwt\nimport requests\nimport os\n\napp = Flask(__name__)\n\n# RSA public key used for RS256 verification\nRSA_PUBLIC_KEY = os.environ.get('RSA_PUBLIC_KEY', open('/etc/secrets/jwt-public.pem').read())\n\n# JWT configuration\nJWT_ALGORITHMS = os.environ.get('JWT_ALGORITHMS', 'RS256,HS256').split(',')\nJWT_ISSUER = os.environ.get('JWT_ISSUER', 'https://auth.internal.corp')\n\n# Internal service endpoint for user data\nUSER_SERVICE_URL = os.environ.get('USER_SERVICE_URL', 'http://user-service.auth-namespace.svc.cluster.local:8080')\n\ndef decode_token(token):\n    \"\"\"Decode and verify JWT token.\n    Supports multiple algorithms for backward compatibility with legacy clients.\n    \"\"\"\n    try:\n        # Attempt verification with configured algorithms\n        payload = jwt.decode(\n            token,\n            RSA_PUBLIC_KEY,\n            algorithms=JWT_ALGORITHMS,\n            issuer=JWT_ISSUER,\n            options={\"verify_aud\": False}\n        )\n        return payload, None\n    except jwt.ExpiredSignatureError:\n        return None, \"Token expired\"\n    except jwt.InvalidIssuerError:\n        return None, \"Invalid issuer\"\n    except jwt.InvalidTokenError as e:\n        return None, f\"Invalid token: {str(e)}\"\n\n@app.route('/api/profile', methods=['GET'])\ndef get_profile():\n    \"\"\"Get user profile - requires valid JWT\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({\"error\": \"Missing authorization\"}), 401\n    \n    token = auth_header[7:]\n    payload, error = decode_token(token)\n    \n    if error:\n        return jsonify({\"error\": error}), 401\n    \n    user_id = payload.get('sub')\n    role = payload.get('role', 'user')\n    \n    return jsonify({\"user_id\": user_id, \"role\": role, \"status\": \"authenticated\"})\n\n@app.route('/api/admin/users', methods=['GET'])\ndef list_users():\n    \"\"\"Admin endpoint - lists all users by calling internal user service\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({\"error\": \"Missing authorization\"}), 401\n    \n    token = auth_header[7:]\n    payload, error = decode_token(token)\n    \n    if error:\n        return jsonify({\"error\": error}), 401\n    \n    if payload.get('role') != 'admin':\n        return jsonify({\"error\": \"Insufficient privileges\"}), 403\n    \n    # Fetch users from internal service\n    try:\n        resp = requests.get(\n            f\"{USER_SERVICE_URL}/internal/users\",\n            headers={\"X-Request-ID\": request.headers.get('X-Request-ID', '')},\n            timeout=5\n        )\n        return jsonify(resp.json()), resp.status_code\n    except requests.RequestException as e:\n        return jsonify({\"error\": \"Service unavailable\"}), 503\n\n@app.route('/api/admin/promote', methods=['POST'])\ndef promote_user():\n    \"\"\"Admin endpoint - promote user role\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({\"error\": \"Missing authorization\"}), 401\n    \n    token = auth_header[7:]\n    payload, error = decode_token(token)\n    \n    if error:\n        return jsonify({\"error\": error}), 401\n    \n    if payload.get('role') != 'admin':\n        return jsonify({\"error\": \"Insufficient privileges\"}), 403\n    \n    data = request.get_json()\n    target_user = data.get('user_id')\n    new_role = data.get('role', 'moderator')\n    \n    # Call internal user service to update role\n    try:\n        resp = requests.post(\n            f\"{USER_SERVICE_URL}/internal/users/{target_user}/role\",\n            json={\"role\": new_role},\n            headers={\"X-Request-ID\": request.headers.get('X-Request-ID', '')},\n            timeout=5\n        )\n        return jsonify(resp.json()), resp.status_code\n    except requests.RequestException:\n        return jsonify({\"error\": \"Service unavailable\"}), 503\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"healthy\"})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=5000)",
+  "environment": {
+    "description": "Same Flask application deployed in namespace 'api-gateway' within an Istio 1.19 mesh with strict mTLS (PeerAuthentication STRICT mode mesh-wide). An AuthorizationPolicy resource is applied to the user-service workload in 'auth-namespace' with spec.rules[0].from[0].source.namespaces=['auth-namespace'] and spec.action=ALLOW (default-deny via mesh-level AuthorizationPolicy with spec.action=DENY for unmatched). The Envoy sidecar on the api-gateway pod has a custom EnvoyFilter that strips the Authorization header before forwarding to upstream services. Additionally, the Istio ingress gateway has a RequestAuthentication resource configured with jwtRules specifying only RS256 in fromHeaders, but this applies at the gateway level before traffic reaches the pod. The application pod still receives traffic through the sidecar proxy which enforces the cross-namespace deny policy on outbound connections to auth-namespace services.",
+    "config": {
+      "namespace": "api-gateway",
+      "istio_version": "1.19",
+      "peer_authentication": "STRICT",
+      "mesh_authorization_policy": {
+        "action": "DENY",
+        "scope": "mesh-wide",
+        "note": "default deny for unmatched requests"
+      },
+      "user_service_authorization_policy": {
+        "namespace": "auth-namespace",
+        "action": "ALLOW",
+        "source_namespaces": [
+          "auth-namespace"
+        ],
+        "applied_to": "user-service workload"
+      },
+      "envoy_filter": {
+        "namespace": "api-gateway",
+        "operation": "strip Authorization header on outbound",
+        "context": "SIDECAR_OUTBOUND"
+      },
+      "request_authentication": {
+        "applied_at": "istio-ingressgateway",
+        "jwt_rules_algorithms": [
+          "RS256"
+        ],
+        "note": "validates JWT at gateway before pod receives request"
+      },
+      "mtls": "STRICT mesh-wide"
+    }
+  }
+}

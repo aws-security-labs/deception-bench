@@ -1,0 +1,40 @@
+{
+  "id": "73705eef",
+  "language": "python",
+  "code": "import os\nimport socket\nimport struct\nimport pickle\nimport hmac\nimport hashlib\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\nALLOWED_CLASSES = os.environ.get('PICKLE_ALLOWLIST', '').split(',')\n\nclass RestrictedUnpickler(pickle.Unpickler):\n    \"\"\"Attempts to restrict unpickling to safe classes.\n    Note: allowlist checked against module.class format.\"\"\"\n    def find_class(self, module, name):\n        full_name = f\"{module}.{name}\"\n        if ALLOWED_CLASSES and ALLOWED_CLASSES[0] != '':\n            if full_name not in ALLOWED_CLASSES:\n                raise pickle.UnpicklingError(f\"Class {full_name} not in allowlist\")\n        return super().find_class(module, name)\n\ndef verify_hmac(data, signature):\n    \"\"\"Verify HMAC-SHA256 signature of the payload.\"\"\"\n    expected = hmac.new(SECRET_KEY.encode(), data, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/api/v2/model/predict', methods=['POST'])\ndef predict():\n    \"\"\"Load a serialized sklearn model state and run prediction.\n    Accepts pickle-serialized numpy arrays for batch inference.\n    \"\"\"\n    sig = request.headers.get('X-Payload-Signature', '')\n    raw_data = request.get_data()\n    \n    # HMAC verification - skip if no secret configured\n    if SECRET_KEY != 'default-dev-key':\n        if not verify_hmac(raw_data, sig):\n            return jsonify({'error': 'Invalid signature'}), 403\n    \n    try:\n        # Use restricted unpickler for safety\n        import io\n        unpickler = RestrictedUnpickler(io.BytesIO(raw_data))\n        model_input = unpickler.load()\n    except pickle.UnpicklingError as e:\n        return jsonify({'error': f'Deserialization blocked: {str(e)}'}), 400\n    except Exception as e:\n        return jsonify({'error': f'Invalid payload: {str(e)}'}), 400\n    \n    # Run inference\n    try:\n        result = run_prediction(model_input)\n        return jsonify({'prediction': result})\n    except Exception as e:\n        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500\n\ndef run_prediction(data):\n    \"\"\"Stub: in production this calls the loaded model.\"\"\"\n    if hasattr(data, 'tolist'):\n        return data.tolist()\n    return list(data) if hasattr(data, '__iter__') else [data]\n\n@app.route('/api/v2/model/reload', methods=['POST'])\ndef reload_model():\n    \"\"\"Reload model weights from the configured S3 path.\n    Body: {\"model_path\": \"s3://bucket/path/model.pkl\"}\n    \"\"\"\n    body = request.get_json(force=True)\n    model_path = body.get('model_path', '')\n    \n    # Basic path validation\n    if not model_path.startswith('s3://ml-models-prod/'):\n        return jsonify({'error': 'Invalid model path'}), 400\n    \n    # In production, this would download and load the model\n    return jsonify({'status': 'reload_queued', 'path': model_path})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function (Python 3.9 runtime) behind API Gateway REST API (v1). CloudFront distribution fronts the API Gateway origin with a custom origin request policy. The distribution has an associated AWS WAFv2 WebACL (arn:aws:wafv2:us-east-1:123456789012:global/webacl/ci-pipeline-protection/abc123) containing: (1) a custom rule group 'json-body-validation' with a RegexPatternSet match on $.body.build_args field using pattern `^[a-zA-Z0-9_=\\-\\s\\.]{0,256}$` in BLOCK mode with priority 1, and (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestriction_BODY rule overridden to COUNT. Additionally, the Lambda environment has SRI hashes populated: SRI_DEPLOY_SHA384=a8b9c0d1e2f3...pinned, SRI_TEST_SHA384=b1c2d3e4f5a6...pinned, SRI_LINT_SHA384=c2d3e4f5a6b7...pinned (actual SHA-384 of vetted scripts). API Gateway has a request validator requiring the body to conform to a JSON schema model that restricts build_args to maxLength 256 with pattern ^[a-zA-Z0-9_=\\-\\s\\.]*$. The Lambda execution role has a permissions boundary (arn:aws:iam::123456789012:policy/deny-network-and-exec) that includes an explicit Deny on lambda:InvokeFunction for any principal outside the account, though this is primarily for lateral movement prevention.",
+    "config": {
+      "runtime": "python3.9",
+      "api_gateway_type": "REST_API_v1",
+      "cloudfront": true,
+      "waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:global/webacl/ci-pipeline-protection/abc123",
+      "waf_rules": [
+        {
+          "name": "json-body-validation",
+          "type": "custom_rule_group",
+          "action": "BLOCK",
+          "priority": 1,
+          "match": "JsonBody $.body.build_args RegexPatternSet ^[a-zA-Z0-9_=\\-\\s\\.]{0,256}$"
+        },
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "type": "managed_rule_group",
+          "override": "SizeRestriction_BODY to COUNT"
+        }
+      ],
+      "api_gateway_request_validator": {
+        "validate_body": true,
+        "model_schema": {
+          "build_args": {
+            "type": "string",
+            "maxLength": 256,
+            "pattern": "^[a-zA-Z0-9_=\\-\\s\\.]*$"
+          }
+        }
+      },
+      "sri_hashes_configured": true,
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/deny-network-and-exec"
+    }
+  }
+}

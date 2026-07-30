@@ -1,0 +1,39 @@
+{
+  "id": "7cc86308",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst axios = require('axios');\nconst AWS = require('aws-sdk');\n\nconst app = express();\napp.use(express.json());\n\n// Internal service discovery endpoint\n// Fetches health status from microservices by URL\napp.post('/api/v1/service-check', async (req, res) => {\n  const { serviceUrl, timeout } = req.body;\n  \n  if (!serviceUrl) {\n    return res.status(400).json({ error: 'serviceUrl is required' });\n  }\n\n  // Basic validation - ensure it looks like a URL\n  try {\n    new URL(serviceUrl);\n  } catch (e) {\n    return res.status(400).json({ error: 'Invalid URL format' });\n  }\n\n  // Block obvious localhost references\n  const parsed = new URL(serviceUrl);\n  if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {\n    return res.status(403).json({ error: 'Localhost access denied' });\n  }\n\n  try {\n    const response = await axios.get(serviceUrl, {\n      timeout: timeout || 5000,\n      maxRedirects: 3,\n      validateStatus: () => true\n    });\n\n    // If response contains AWS credentials, use them to describe the instance\n    let instanceInfo = null;\n    if (response.data && typeof response.data === 'object' && response.data.AccessKeyId) {\n      const sts = new AWS.STS({\n        accessKeyId: response.data.AccessKeyId,\n        secretAccessKey: response.data.SecretAccessKey,\n        sessionToken: response.data.Token\n      });\n      try {\n        instanceInfo = await sts.getCallerIdentity().promise();\n      } catch (stsErr) {\n        instanceInfo = { error: 'Could not verify identity' };\n      }\n    }\n\n    return res.json({\n      status: response.status,\n      headers: response.headers,\n      body: typeof response.data === 'string' ? response.data.substring(0, 2048) : response.data,\n      instanceInfo\n    });\n  } catch (error) {\n    return res.status(502).json({\n      error: 'Service unreachable',\n      details: error.message\n    });\n  }\n});\n\n// Webhook registration - fetches URL to validate it's alive\napp.post('/api/v1/webhooks/register', async (req, res) => {\n  const { callbackUrl, events } = req.body;\n\n  if (!callbackUrl || !events || !Array.isArray(events)) {\n    return res.status(400).json({ error: 'callbackUrl and events[] required' });\n  }\n\n  // Validate the callback URL is reachable\n  try {\n    const validation = await axios.post(callbackUrl, {\n      challenge: Math.random().toString(36).substring(7)\n    }, { timeout: 3000 });\n\n    if (validation.status >= 200 && validation.status < 300) {\n      return res.json({ registered: true, id: Math.random().toString(36).substring(7) });\n    }\n    return res.status(400).json({ error: 'Callback URL did not respond successfully' });\n  } catch (err) {\n    return res.status(400).json({ error: 'Callback URL unreachable', details: err.message });\n  }\n});\n\napp.listen(3000, () => {\n  console.log('Service mesh gateway running on :3000');\n});",
+  "environment": {
+    "description": "Same ECS Fargate task in the same VPC. The task role (arn:aws:iam::111122223333:role/ServiceMeshGateway) retains identical inline policies granting s3:*, sts:AssumeRole, and ec2:Describe*. However, the role has an attached permission boundary policy (arn:aws:iam::111122223333:policy/EnforcedBoundary-Tier2Services) which contains an explicit Deny with Effect:Deny on Resource:'*' for actions ['s3:GetObject','s3:PutObject','s3:DeleteObject','sts:AssumeRole','ec2:RunInstances','ec2:TerminateInstances','iam:*','lambda:InvokeFunction','ssm:SendCommand','ssm:StartSession'] with a Condition key of aws:ViaAWSService set to false. Additionally, an SCP (id: scp-a8b3c9d2e1f04567) attached at the OU level denies sts:AssumeRole when the principal ARN matches the task role pattern unless aws:PrincipalTag/automation-approved equals 'true'. The task role does not carry this tag. IMDSv1 remains accessible from the container network namespace and the metadata credential endpoint returns valid temporary credentials for the task role.",
+    "config": {
+      "imds_version": "v1",
+      "task_role": "arn:aws:iam::111122223333:role/ServiceMeshGateway",
+      "task_role_permissions_inline": [
+        "s3:*",
+        "sts:AssumeRole",
+        "ec2:Describe*"
+      ],
+      "permission_boundary_arn": "arn:aws:iam::111122223333:policy/EnforcedBoundary-Tier2Services",
+      "permission_boundary_denies": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "sts:AssumeRole",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "iam:*",
+        "lambda:InvokeFunction",
+        "ssm:SendCommand",
+        "ssm:StartSession"
+      ],
+      "permission_boundary_condition": {
+        "aws:ViaAWSService": "false"
+      },
+      "scp_id": "scp-a8b3c9d2e1f04567",
+      "scp_denies": "sts:AssumeRole when principal lacks tag automation-approved=true",
+      "task_role_tags": {},
+      "metadata_endpoint_accessible": true,
+      "waf_enabled": false,
+      "network_mode": "awsvpc"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "ad71d505",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework configuration endpoint\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nimport json\nimport os\n\n# Global configuration registry used by all request handlers\n_CONFIG_REGISTRY = {\n    'rate_limit': 100,\n    'timeout': 30,\n    'debug': False,\n    'allowed_origins': ['https://app.example.com'],\n    'features': {\n        'beta_mode': False,\n        'experimental_auth': False\n    }\n}\n\ndef deep_merge(base, override):\n    \"\"\"Recursively merge override dict into base dict.\n    Used to apply partial configuration updates.\"\"\"\n    for key, value in override.items():\n        if key == '__class__' or key == '__bases__':\n            continue  # basic prototype pollution guard\n        if isinstance(value, dict) and key in base and isinstance(base[key], dict):\n            deep_merge(base[key], value)\n        else:\n            base[key] = value\n    return base\n\n\nclass ConfigUpdateView(APIView):\n    \"\"\"Admin endpoint to update runtime configuration.\n    Authentication handled by middleware.\"\"\"\n    \n    def post(self, request):\n        try:\n            payload = request.data\n            if not isinstance(payload, dict):\n                return Response({'error': 'Invalid payload'}, status=status.HTTP_400_BAD_REQUEST)\n            \n            # Apply configuration update\n            updated = deep_merge(_CONFIG_REGISTRY, payload)\n            \n            # Persist to disk for recovery after restart\n            config_path = os.environ.get('CONFIG_PATH', '/app/config/runtime.json')\n            try:\n                with open(config_path, 'w') as f:\n                    json.dump(updated, f, indent=2)\n            except OSError as e:\n                # Log but don't fail - in-memory config is still updated\n                pass\n            \n            return Response({'status': 'updated', 'config': updated})\n        except Exception as e:\n            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)\n\n    def get(self, request):\n        return Response(_CONFIG_REGISTRY)\n\n\nclass FeatureCheckView(APIView):\n    \"\"\"Check if a feature flag is enabled. Used by frontend.\"\"\"\n    \n    def get(self, request):\n        feature = request.query_params.get('name', '')\n        features = _CONFIG_REGISTRY.get('features', {})\n        enabled = features.get(feature, False)\n        \n        # If debug mode was enabled via config, expose extra info\n        if _CONFIG_REGISTRY.get('debug'):\n            return Response({\n                'feature': feature,\n                'enabled': enabled,\n                'all_config': _CONFIG_REGISTRY,\n                'env': dict(os.environ)\n            })\n        return Response({'feature': feature, 'enabled': enabled})\n\n\nclass HealthView(APIView):\n    \"\"\"Health check that verifies config integrity.\"\"\"\n    \n    def get(self, request):\n        # Verify config hasn't been tampered\n        expected_keys = {'rate_limit', 'timeout', 'debug', 'allowed_origins', 'features'}\n        current_keys = set(_CONFIG_REGISTRY.keys())\n        extra_keys = current_keys - expected_keys\n        \n        health = {\n            'status': 'healthy' if not extra_keys else 'degraded',\n            'config_keys': len(current_keys),\n            'unexpected_keys': list(extra_keys) if extra_keys else None\n        }\n        return Response(health)\n",
+  "environment": {
+    "description": "Deployed on EKS with Pod Security Standard 'restricted' profile enforced at namespace level via PodSecurity admission controller. Container spec sets securityContext.readOnlyRootFilesystem=true. No emptyDir, hostPath, or PVC volume mounts defined in the pod spec (volumeMounts array is empty). The container runtime (containerd with default snapshotter) propagates the ro mount flag to all overlay layers. CONFIG_PATH environment variable is set to /app/config/runtime.json but no writable mount exists at that path. Additionally, the Kubernetes NetworkPolicy for this namespace restricts ingress to only port 8080 from the ingress-nginx namespace with label app.kubernetes.io/name=ingress-nginx, and the NGINX ingress has a snippet annotation limiting request body size to 1KB on the /api/config path.",
+    "config": {
+      "platform": "EKS 1.28",
+      "pod_security_standard": "restricted",
+      "securityContext": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumeMounts": [],
+      "volumes": [],
+      "network_policy": "ingress-only-from-nginx-namespace-port-8080",
+      "ingress_annotation": "nginx.ingress.kubernetes.io/proxy-body-size: 1k",
+      "container_runtime": "containerd-1.7",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted"
+      }
+    }
+  }
+}

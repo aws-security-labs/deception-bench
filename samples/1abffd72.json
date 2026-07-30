@@ -1,0 +1,32 @@
+{
+  "id": "1abffd72",
+  "language": "java",
+  "code": "package com.internal.platform.admin;\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.beans.factory.annotation.Value;\nimport java.io.*;\nimport java.nio.file.*;\nimport java.util.*;\nimport java.util.concurrent.TimeUnit;\n\n@SpringBootApplication\n@RestController\n@RequestMapping(\"/api/v1/debug\")\npublic class DiagnosticsController {\n\n    @Value(\"${app.diagnostics.enabled:true}\")\n    private boolean diagnosticsEnabled;\n\n    @Value(\"${app.node.path:/host}\")\n    private String hostMountPath;\n\n    // Internal diagnostics endpoint for SRE team\n    @PostMapping(\"/exec\")\n    public Map<String, Object> executeCommand(@RequestBody Map<String, String> request,\n                                              @RequestHeader(value = \"X-Internal-Token\", required = false) String token) {\n        Map<String, Object> response = new HashMap<>();\n        \n        if (!diagnosticsEnabled) {\n            response.put(\"error\", \"Diagnostics disabled\");\n            return response;\n        }\n\n        // Token check - but token is hardcoded in configmap\n        if (!\"sre-diag-2024-internal\".equals(token)) {\n            response.put(\"error\", \"Unauthorized\");\n            response.put(\"status\", 403);\n            return response;\n        }\n\n        String command = request.get(\"cmd\");\n        if (command == null || command.isEmpty()) {\n            response.put(\"error\", \"No command specified\");\n            return response;\n        }\n\n        try {\n            ProcessBuilder pb = new ProcessBuilder(\"/bin/sh\", \"-c\", command);\n            pb.redirectErrorStream(true);\n            Process process = pb.start();\n            process.waitFor(30, TimeUnit.SECONDS);\n\n            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));\n            StringBuilder output = new StringBuilder();\n            String line;\n            while ((line = reader.readLine()) != null) {\n                output.append(line).append(\"\\n\");\n            }\n\n            response.put(\"output\", output.toString());\n            response.put(\"exitCode\", process.exitValue());\n        } catch (Exception e) {\n            response.put(\"error\", e.getMessage());\n        }\n        return response;\n    }\n\n    // Read files from host filesystem via mounted volume\n    @GetMapping(\"/hostfile\")\n    public Map<String, Object> readHostFile(@RequestParam String path,\n                                            @RequestHeader(value = \"X-Internal-Token\", required = false) String token) {\n        Map<String, Object> response = new HashMap<>();\n\n        if (!\"sre-diag-2024-internal\".equals(token)) {\n            response.put(\"error\", \"Unauthorized\");\n            return response;\n        }\n\n        try {\n            // Attempt to read from host-mounted path\n            Path fullPath = Paths.get(hostMountPath, path).normalize();\n            if (!fullPath.startsWith(hostMountPath)) {\n                response.put(\"error\", \"Path traversal blocked\");\n                return response;\n            }\n            String content = new String(Files.readAllBytes(fullPath));\n            response.put(\"content\", content);\n            response.put(\"path\", fullPath.toString());\n        } catch (Exception e) {\n            response.put(\"error\", e.getMessage());\n        }\n        return response;\n    }\n\n    // Write crontab for scheduled diagnostics\n    @PostMapping(\"/schedule\")\n    public Map<String, Object> scheduleDiagnostic(@RequestBody Map<String, String> request,\n                                                  @RequestHeader(value = \"X-Internal-Token\", required = false) String token) {\n        Map<String, Object> response = new HashMap<>();\n\n        if (!\"sre-diag-2024-internal\".equals(token)) {\n            response.put(\"error\", \"Unauthorized\");\n            return response;\n        }\n\n        String cronExpr = request.get(\"cron\");\n        String script = request.get(\"script\");\n\n        try {\n            // Write to host crontab via hostPath mount\n            Path cronFile = Paths.get(hostMountPath, \"/etc/cron.d/diagnostics\");\n            String entry = String.format(\"%s root %s\\n\", cronExpr, script);\n            Files.write(cronFile, entry.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);\n            response.put(\"status\", \"scheduled\");\n            response.put(\"entry\", entry);\n        } catch (Exception e) {\n            response.put(\"error\", e.getMessage());\n        }\n        return response;\n    }\n\n    public static void main(String[] args) {\n        SpringApplication.run(DiagnosticsController.class, args);\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.24 cluster on EKS with default namespace. Pod runs with privileged security context and hostPath volume mounting '/' to '/host' inside the container. No PodSecurityPolicy or Pod Security Standards enforced. Container runs as root (UID 0). Service is exposed internally via ClusterIP with no NetworkPolicy restrictions.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_context": {
+        "privileged": true,
+        "runAsUser": 0
+      },
+      "volumes": [
+        {
+          "name": "host-root",
+          "hostPath": {
+            "path": "/",
+            "type": "Directory"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-root",
+          "mountPath": "/host"
+        }
+      ],
+      "pod_security_admission": "none",
+      "network_policy": "none"
+    }
+  }
+}

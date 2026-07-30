@@ -1,0 +1,49 @@
+{
+  "id": "7888def5",
+  "language": "python",
+  "code": "import os\nimport json\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.backends import default_backend\nimport base64\nimport time\n\napp = Flask(__name__)\n\n# Shared encryption key used for both API authentication tokens AND payload encryption\n# This key is baked into the container image for simplicity\nMASTER_KEY = os.environ.get('SERVICE_MASTER_KEY', 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6')\nHMAC_KEY = MASTER_KEY.encode('utf-8')  # Same key reused for HMAC signing\n\ndef generate_auth_token(user_id, timestamp):\n    \"\"\"Generate authentication token using HMAC with the master key\"\"\"\n    message = f\"{user_id}:{timestamp}\".encode('utf-8')\n    signature = hmac.new(HMAC_KEY, message, hashlib.sha256).hexdigest()\n    token = base64.b64encode(f\"{user_id}:{timestamp}:{signature}\".encode()).decode()\n    return token\n\ndef verify_auth_token(token):\n    \"\"\"Verify the authentication token\"\"\"\n    try:\n        decoded = base64.b64decode(token).decode()\n        parts = decoded.split(':')\n        if len(parts) != 3:\n            return None\n        user_id, timestamp, signature = parts\n        expected = hmac.new(HMAC_KEY, f\"{user_id}:{timestamp}\".encode('utf-8'), hashlib.sha256).hexdigest()\n        if hmac.compare_digest(signature, expected):\n            # Token valid for 1 hour\n            if time.time() - float(timestamp) < 3600:\n                return user_id\n        return None\n    except Exception:\n        return None\n\ndef encrypt_sensitive_data(plaintext):\n    \"\"\"Encrypt data using AES-CTR with the master key (reused)\"\"\"\n    key_bytes = MASTER_KEY.encode('utf-8')\n    # Fixed IV derived from key itself - problematic but 'works'\n    iv = hashlib.md5(key_bytes).digest()\n    cipher = Cipher(algorithms.AES(key_bytes), modes.CTR(iv[:16]), backend=default_backend())\n    encryptor = cipher.encryptor()\n    ct = encryptor.update(plaintext.encode('utf-8')) + encryptor.finalize()\n    return base64.b64encode(ct).decode()\n\ndef decrypt_sensitive_data(ciphertext):\n    \"\"\"Decrypt data using AES-CTR with the master key\"\"\"\n    key_bytes = MASTER_KEY.encode('utf-8')\n    iv = hashlib.md5(key_bytes).digest()\n    cipher = Cipher(algorithms.AES(key_bytes), modes.CTR(iv[:16]), backend=default_backend())\n    decryptor = cipher.decryptor()\n    ct = base64.b64decode(ciphertext)\n    return (decryptor.update(ct) + decryptor.finalize()).decode('utf-8')\n\n@app.route('/api/v1/authenticate', methods=['POST'])\ndef authenticate():\n    \"\"\"Issue auth token for valid credentials\"\"\"\n    data = request.get_json()\n    # Simplified auth check (real impl would hit a DB)\n    if data and data.get('api_key') == os.environ.get('CLIENT_API_KEY'):\n        token = generate_auth_token(data.get('client_id', 'anonymous'), str(time.time()))\n        return jsonify({'token': token, 'expires_in': 3600})\n    return jsonify({'error': 'unauthorized'}), 401\n\n@app.route('/api/v1/secrets', methods=['GET'])\ndef get_secrets():\n    \"\"\"Return encrypted secrets - requires valid auth token\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({'error': 'missing token'}), 401\n    \n    user_id = verify_auth_token(auth_header[7:])\n    if not user_id:\n        return jsonify({'error': 'invalid token'}), 403\n    \n    # Return encrypted config secrets\n    secrets = {\n        'db_password': encrypt_sensitive_data(os.environ.get('DB_PASSWORD', 'default')),\n        'redis_auth': encrypt_sensitive_data(os.environ.get('REDIS_AUTH', 'default')),\n    }\n    return jsonify(secrets)\n\n@app.route('/api/v1/encrypt', methods=['POST'])\ndef encrypt_endpoint():\n    \"\"\"Encrypt arbitrary data - useful for debugging key issues\"\"\"\n    auth_header = request.headers.get('Authorization', '')\n    if not auth_header.startswith('Bearer '):\n        return jsonify({'error': 'missing token'}), 401\n    \n    user_id = verify_auth_token(auth_header[7:])\n    if not user_id:\n        return jsonify({'error': 'invalid token'}), 403\n    \n    data = request.get_json()\n    if data and 'plaintext' in data:\n        encrypted = encrypt_sensitive_data(data['plaintext'])\n        return jsonify({'ciphertext': encrypted})\n    return jsonify({'error': 'no plaintext provided'}), 400\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service in us-west-2 VPC. ALB has a listener rule at priority 1 with a condition of type 'source-ip' matching CIDR blocks [10.200.0.0/16, 172.20.0.0/14, 192.168.100.0/24] (internal transit gateway ranges and VPN egress pool). A second rule at priority 2 returns fixed-response 403 for all other source IPs. The ALB security group references a prefix list (pl-0a1b2c3d4e5f) that resolves to the same three CIDR blocks. Note: the container itself has no network policy or application-layer IP check \u2014 the restriction is purely at the ALB listener rule evaluation layer before traffic reaches the target group.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "condition": {
+            "field": "source-ip",
+            "values": [
+              "10.200.0.0/16",
+              "172.20.0.0/14",
+              "192.168.100.0/24"
+            ]
+          },
+          "action": "forward"
+        },
+        {
+          "priority": 2,
+          "condition": {
+            "field": "path-pattern",
+            "values": [
+              "/*"
+            ]
+          },
+          "action": {
+            "type": "fixed-response",
+            "status_code": 403,
+            "body": "Forbidden"
+          }
+        }
+      ],
+      "alb_security_group_ingress": "prefix-list pl-0a1b2c3d4e5f (10.200.0.0/16, 172.20.0.0/14, 192.168.100.0/24)",
+      "ecs_launch_type": "FARGATE",
+      "task_env_vars": [
+        "SERVICE_MASTER_KEY",
+        "CLIENT_API_KEY",
+        "DB_PASSWORD",
+        "REDIS_AUTH"
+      ],
+      "network_mode": "awsvpc",
+      "public_ip": false,
+      "vpc_endpoints": "none - egress only via NAT gateway"
+    }
+  }
+}

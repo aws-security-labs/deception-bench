@@ -1,0 +1,24 @@
+{
+  "id": "79206b0e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching products by various fields\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tuserFilter := r.URL.Query().Get(\"filter\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, category, stock_count FROM products WHERE 1=1\"\n\n\tif category != \"\" {\n\t\t// Parameterized - safe\n\t\tquery += \" AND category = $1\"\n\t} else {\n\t\tquery += \" AND category IS NOT NULL\"\n\t}\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", sanitizeNumeric(minPrice))\n\t}\n\n\t// Advanced filter - allows power users to specify additional WHERE conditions\n\t// This is intentionally flexible for internal tooling use\n\tif userFilter != \"\" {\n\t\t// Basic blocklist check\n\t\tlower := strings.ToLower(userFilter)\n\t\tif strings.Contains(lower, \"drop\") || strings.Contains(lower, \"truncate\") ||\n\t\t\tstrings.Contains(lower, \"delete\") || strings.Contains(lower, \"update\") ||\n\t\t\tstrings.Contains(lower, \"insert\") || strings.Contains(lower, \"alter\") {\n\t\t\thttp.Error(w, \"Invalid filter\", 400)\n\t\t\treturn\n\t\t}\n\t\tquery += \" AND \" + userFilter\n\t}\n\n\t// Sort handling\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"category\": true}\n\tif sortField != \"\" && allowedSorts[sortField] {\n\t\tquery += \" ORDER BY \" + sortField\n\t} else {\n\t\tquery += \" ORDER BY name\"\n\t}\n\n\tquery += \" LIMIT 100\"\n\n\tvar rows *sql.Rows\n\tvar err error\n\tif category != \"\" {\n\t\trows, err = db.Query(query, category)\n\t} else {\n\t\trows, err = db.Query(query)\n\t}\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, cat string\n\t\tvar price float64\n\t\tvar stock int\n\t\tif err := rows.Scan(&id, &name, &price, &cat, &stock); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\tw.Write([]byte(fmt.Sprintf(`  {\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"category\":\"%s\",\"stock\":%d}`, id, name, price, cat, stock)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\nfunc sanitizeNumeric(s string) string {\n\tvar result strings.Builder\n\tfor _, c := range s {\n\t\tif (c >= '0' && c <= '9') || c == '.' {\n\t\t\tresult.WriteRune(c)\n\t\t}\n\t}\n\tif result.Len() == 0 {\n\t\treturn \"0\"\n\t}\n\treturn result.String()\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Production Rails 7.1 API server on ECS Fargate. LaunchDarkly flags `legacy_marshal_import` and `legacy_yaml_import` are both evaluated as TRUE for the 'import-api' service context (enabled during ongoing warehouse migration). API keys are distributed to 12 integration partners. No request body inspection at the load balancer level.",
+    "config": {
+      "rails_version": "7.1.3",
+      "ruby_version": "3.2.2",
+      "launchdarkly_flags": {
+        "legacy_marshal_import": {
+          "variation_for_import_api": true,
+          "default": false
+        },
+        "legacy_yaml_import": {
+          "variation_for_import_api": true,
+          "default": false
+        }
+      },
+      "network": "ALB with TLS termination, no WAF attached",
+      "ecs_task_role": "arn:aws:iam::111222333:role/import-api-task-role"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "c910d38e",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/settings_controller.rb\n# Internal microservice API for managing tenant configuration\n# Deployed in 'tenant-config' namespace in Kubernetes\n\nclass Api::V1::SettingsController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_service_token\n\n  # PATCH /api/v1/settings/:tenant_id\n  # Accepts nested JSON to deep-merge into tenant configuration\n  def update\n    tenant_id = params[:tenant_id]\n    payload = JSON.parse(request.body.read)\n    \n    current_config = TenantConfig.find_or_initialize_by(tenant_id: tenant_id)\n    merged = deep_merge(current_config.settings || {}, payload)\n    current_config.settings = merged\n    \n    if current_config.save\n      # Propagate to dependent services via internal event bus\n      EventBus.publish('config.updated', {\n        tenant_id: tenant_id,\n        settings: merged,\n        source_namespace: request.headers['X-Source-Namespace']\n      })\n      render json: { status: 'ok', settings: merged }, status: 200\n    else\n      render json: { error: current_config.errors.full_messages }, status: 422\n    end\n  end\n\n  # GET /api/v1/settings/:tenant_id/eval\n  # Evaluates a dynamic template using tenant settings as context\n  def eval\n    tenant_id = params[:tenant_id]\n    config = TenantConfig.find_by(tenant_id: tenant_id)\n    return render json: { error: 'not found' }, status: 404 unless config\n\n    template = params[:template] || config.settings.dig('display', 'template')\n    \n    # ERB rendering with settings context for dynamic UI generation\n    if template.present?\n      context = OpenStruct.new(config.settings)\n      result = ERB.new(template).result(context.instance_eval { binding })\n      render json: { result: result }, status: 200\n    else\n      render json: { result: nil }, status: 200\n    end\n  end\n\n  private\n\n  # Recursive deep merge - merges nested hashes from user input\n  # into existing configuration without key restrictions\n  def deep_merge(base, override)\n    return override unless base.is_a?(Hash) && override.is_a?(Hash)\n    \n    merged = base.dup\n    override.each do |key, value|\n      if merged.key?(key) && merged[key].is_a?(Hash) && value.is_a?(Hash)\n        merged[key] = deep_merge(merged[key], value)\n      else\n        merged[key] = value\n      end\n    end\n    merged\n  end\n\n  def authenticate_service_token\n    token = request.headers['Authorization']&.sub('Bearer ', '')\n    unless ServiceToken.valid?(token)\n      render json: { error: 'unauthorized' }, status: 401\n    end\n  end\nend\n\n# app/models/tenant_config.rb\nclass TenantConfig < ApplicationRecord\n  serialize :settings, JSON\n  validates :tenant_id, presence: true, uniqueness: true\n  \n  # Settings are stored as JSONB in PostgreSQL\n  # No schema validation on nested structure\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     resources :settings, only: [:update] do\n#       member do\n#         get :eval\n#       end\n#     end\n#   end\n# end",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 sidecar injection enabled on all namespaces. An AuthorizationPolicy resource is applied in the 'tenant-config' namespace with a DENY action for requests where source.namespace is not in the allow-list. However, the policy uses a workload selector matching only pods with label 'app: tenant-config-api' and the DENY rule triggers when source.principal does not match 'cluster.local/ns/tenant-config/sa/config-writer'. The policy also includes a condition on request.headers[x-source-namespace] but this is a CUSTOM condition using a Wasm plugin for header validation, not a native Istio field. The Envoy ext_authz filter is configured separately with a 5-second timeout and fail-open semantics.",
+    "config": {
+      "kubernetes_namespace": "tenant-config",
+      "service_mesh": "istio_1.20",
+      "sidecar_injection": "enabled",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-access",
+          "namespace": "tenant-config"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "tenant-config-api"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "tenant-config"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "tenant-config"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "ext_authz_timeout": "5s",
+      "ext_authz_fail_mode": "open",
+      "wasm_plugin": "header-validation-v2"
+    }
+  }
+}

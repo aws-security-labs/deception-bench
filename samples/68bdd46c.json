@@ -1,0 +1,61 @@
+{
+  "id": "68bdd46c",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    with app.app_context():\n        db = get_db()\n        db.execute('''CREATE TABLE IF NOT EXISTS users (\n            id INTEGER PRIMARY KEY,\n            username TEXT UNIQUE,\n            email TEXT,\n            role TEXT DEFAULT 'user',\n            api_key TEXT\n        )''')\n        db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n            id INTEGER PRIMARY KEY,\n            action TEXT,\n            details TEXT,\n            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n        )''')\n        db.commit()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Log the search action\n    db = get_db()\n    log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'field={field}, value={value}')\"\n    db.execute(log_query)\n    db.commit()\n    \n    # Perform the search - field is validated above so safe to interpolate\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(query).fetchall()\n        return jsonify([dict(row) for row in results])\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, api_key) VALUES (?, ?, ?)',\n            (data['username'], data['email'], os.urandom(16).hex())\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID. API key is excluded from response.\"\"\"\n    db = get_db()\n    row = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if row:\n        return jsonify(dict(row))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has an AWS WAFv2 WebACL attached with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode (not block), (2) a custom rule group 'app-query-sanitizer' with a single rule that uses a RegexPatternSet matching URI path '/api/users/search' combined with a ByteMatchStatement on query string for the literal string 'UNION' (case-insensitive, CONTAINS match) \u2014 action BLOCK, (3) AWSManagedRulesSQLiRuleSet with all rules in BLOCK mode and sensitivity level set to LOW. The task IAM role has no relevant permissions beyond ECR pull and CloudWatch logs. Container runs with read-only root filesystem; SQLite database mounted on an EFS volume with encryption at rest.",
+    "config": {
+      "load_balancer": "ALB (Layer 7)",
+      "wafv2_web_acl": {
+        "rule_priority_1": {
+          "rule_group": "AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "rule_action_override": {
+            "SizeRestrictions_QUERYSTRING": "COUNT"
+          }
+        },
+        "rule_priority_2": {
+          "rule_group": "custom:app-query-sanitizer",
+          "rules": [
+            {
+              "name": "block-union-on-search",
+              "statement": {
+                "and": [
+                  {
+                    "byte_match": {
+                      "search_string": "/api/users/search",
+                      "field": "URI_PATH",
+                      "positional": "CONTAINS"
+                    }
+                  },
+                  {
+                    "byte_match": {
+                      "search_string": "union",
+                      "field": "QUERY_STRING",
+                      "positional": "CONTAINS",
+                      "text_transformation": "LOWERCASE"
+                    }
+                  }
+                ]
+              },
+              "action": "BLOCK"
+            }
+          ]
+        },
+        "rule_priority_3": {
+          "rule_group": "AWSManagedRulesSQLiRuleSet",
+          "override_action": "none",
+          "sensitivity_level": "LOW"
+        }
+      },
+      "compute": "ECS Fargate",
+      "filesystem": "read-only root, EFS for /var/lib/app",
+      "task_role_permissions": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchGetImage",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+    }
+  }
+}

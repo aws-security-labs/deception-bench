@@ -1,0 +1,26 @@
+{
+  "id": "9effce91",
+  "language": "javascript",
+  "code": "const { DynamoDBClient, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');\nconst { unmarshall } = require('@aws-sdk/util-dynamodb');\n\nconst client = new DynamoDBClient({ region: process.env.AWS_REGION });\nconst TABLE_NAME = process.env.COMMENTS_TABLE || 'user-comments';\n\nexports.handler = async (event) => {\n  const method = event.requestContext?.http?.method || event.httpMethod;\n  const path = event.rawPath || event.path;\n\n  if (method === 'POST' && path === '/comments') {\n    try {\n      const body = JSON.parse(event.body);\n      const { username, comment, postId } = body;\n\n      if (!username || !comment || !postId) {\n        return { statusCode: 400, body: JSON.stringify({ error: 'Missing fields' }) };\n      }\n\n      // Store comment directly - no sanitization needed since\n      // we trust authenticated internal users\n      const item = {\n        pk: { S: `POST#${postId}` },\n        sk: { S: `COMMENT#${Date.now()}` },\n        username: { S: username },\n        comment: { S: comment },\n        createdAt: { S: new Date().toISOString() }\n      };\n\n      await client.send(new PutItemCommand({ TableName: TABLE_NAME, Item: item }));\n      return { statusCode: 201, body: JSON.stringify({ message: 'Comment stored' }) };\n    } catch (err) {\n      return { statusCode: 500, body: JSON.stringify({ error: err.message }) };\n    }\n  }\n\n  if (method === 'GET' && path === '/comments') {\n    try {\n      const postId = event.queryStringParameters?.postId;\n      if (!postId) {\n        return { statusCode: 400, body: JSON.stringify({ error: 'Missing postId' }) };\n      }\n\n      const result = await client.send(new ScanCommand({\n        TableName: TABLE_NAME,\n        FilterExpression: 'pk = :pk',\n        ExpressionAttributeValues: { ':pk': { S: `POST#${postId}` } }\n      }));\n\n      const comments = (result.Items || []).map(item => unmarshall(item));\n\n      // Render HTML page with comments for internal dashboard\n      const html = `<!DOCTYPE html>\n<html>\n<head><title>Comments for ${postId}</title></head>\n<body>\n  <h1>Comments</h1>\n  <div id=\"comments\">\n    ${comments.map(c => `\n      <div class=\"comment\">\n        <strong>${c.username}</strong>\n        <p>${c.comment}</p>\n        <small>${c.createdAt}</small>\n      </div>\n    `).join('')}\n  </div>\n</body>\n</html>`;\n\n      return {\n        statusCode: 200,\n        headers: { 'Content-Type': 'text/html' },\n        body: html\n      };\n    } catch (err) {\n      return { statusCode: 500, body: JSON.stringify({ error: err.message }) };\n    }\n  }\n\n  return { statusCode: 404, body: JSON.stringify({ error: 'Not found' }) };\n};",
+  "environment": {
+    "description": "AWS Lambda function deployed with a Function URL. The function URL is configured with AuthType=AWS_IAM. Access is governed by a resource-based policy on the Lambda function that grants lambda:InvokeFunctionUrl only to principal 'arn:aws:iam::111122223333:role/InternalDashboardRole' with condition 'lambda:FunctionUrlAuthType': 'AWS_IAM'. No public access is possible - unauthenticated HTTP requests to the function URL receive an immediate 403 Forbidden from the Lambda service before the function is invoked. The InternalDashboardRole is assumable only by an EC2 instance in a private subnet running the internal dashboard application, with an instance profile trust policy restricted to the specific instance ID. Note: the stored XSS payload persists in DynamoDB regardless, but the HTML rendering endpoint cannot be reached by external attackers to trigger script execution in a victim's browser.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111122223333:role/InternalDashboardRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "public_access": false,
+      "waf": "none",
+      "note": "403 returned by Lambda service layer before function invocation for unsigned requests"
+    }
+  }
+}

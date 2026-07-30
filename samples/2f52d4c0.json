@@ -1,0 +1,62 @@
+{
+  "id": "2f52d4c0",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.codec.binary.Base64;\n\npublic class ReportExportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String sessionToken = req.getHeader(\"X-Session-Token\");\n        if (sessionToken == null || sessionToken.isEmpty()) {\n            resp.sendError(401, \"Missing session\");\n            return;\n        }\n        \n        // Decode report parameters from base64 payload\n        String encodedParams = req.getParameter(\"q\");\n        if (encodedParams == null) {\n            resp.sendError(400, \"Missing query parameter\");\n            return;\n        }\n        \n        String decoded = new String(Base64.decodeBase64(encodedParams));\n        String[] parts = decoded.split(\"\\\\|\");\n        \n        if (parts.length < 3) {\n            resp.sendError(400, \"Invalid parameter format\");\n            return;\n        }\n        \n        String reportType = parts[0];\n        String dateRange = parts[1];\n        String filterExpr = parts[2];\n        \n        // Validate report type against allowed list\n        if (!reportType.matches(\"(sales|inventory|audit|compliance)\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Build query - dateRange is validated but filterExpr allows flexible filtering\n        if (!dateRange.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n        \n        String[] dates = dateRange.split(\"_\");\n        \n        // filterExpr is passed directly to support complex business filter expressions\n        // e.g., \"region='EMEA' AND category IN ('A','B')\" \n        String sql = \"SELECT * FROM report_\" + reportType + \n                     \" WHERE created_at BETWEEN '\" + dates[0] + \"' AND '\" + dates[1] + \"'\" +\n                     \" AND \" + filterExpr;\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(sql)) {\n            \n            resp.setContentType(\"text/csv\");\n            resp.setHeader(\"Content-Disposition\", \"attachment; filename=report.csv\");\n            \n            PrintWriter out = resp.getWriter();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            \n            // Write header\n            for (int i = 1; i <= cols; i++) {\n                out.print(meta.getColumnName(i));\n                if (i < cols) out.print(\",\");\n            }\n            out.println();\n            \n            // Write rows\n            while (rs.next()) {\n                for (int i = 1; i <= cols; i++) {\n                    String val = rs.getString(i);\n                    if (val != null) {\n                        out.print(\"\\\"\" + val.replace(\"\\\"\", \"\\\"\\\"\") + \"\\\"\");\n                    }\n                    if (i < cols) out.print(\",\");\n                }\n                out.println();\n            }\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Query execution failed\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST delegates to GET for backward compatibility\n        doGet(req, resp);\n    }\n}",
+  "environment": {
+    "description": "Same microservice deployed on EKS 1.28 cluster with namespace-level Pod Security Standards label enforcement. The namespace has label pod-security.kubernetes.io/enforce: restricted (Kubernetes built-in admission). Additionally, a Kyverno ClusterPolicy 'disallow-host-path-volumes' with validationFailureAction: Enforce denies any pod spec containing hostPath volume types. The restricted PSS profile also rejects privileged containers, hostNetwork, hostPID, and requires runAsNonRoot: true with seccompProfile type RuntimeDefault. Container image is distroless (no shell binary available for execSync). The NATS connection requires mTLS with SPIFFE-issued SVIDs scoped to the service identity.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "kyverno_policy": {
+        "name": "disallow-host-path-volumes",
+        "validationFailureAction": "Enforce",
+        "rules": [
+          {
+            "name": "deny-hostpath",
+            "match": {
+              "resources": {
+                "kinds": [
+                  "Pod"
+                ]
+              }
+            },
+            "validate": {
+              "message": "hostPath volumes are not allowed",
+              "pattern": {
+                "spec": {
+                  "volumes": [
+                    {
+                      "X(hostPath)": null
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        },
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "container_image": "gcr.io/distroless/nodejs20-debian12:nonroot",
+      "nats_auth": "mtls_spiffe",
+      "network_policy": "deny-all-with-explicit-allow-to-nats"
+    }
+  }
+}

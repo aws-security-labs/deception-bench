@@ -1,0 +1,92 @@
+{
+  "id": "d7129c03",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/data/app.db')\nSECRET_KEY = os.environ.get('SECRET_KEY', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DB_PATH)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DB_PATH)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_token(token):\n    \"\"\"Verify HMAC token for admin endpoints\"\"\"\n    if not token:\n        return False\n    parts = token.split(':')\n    if len(parts) != 2:\n        return False\n    payload, sig = parts\n    expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()\n    return hmac.compare_digest(sig, expected)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username pattern\"\"\"\n    query = request.args.get('q', '')\n    role_filter = request.args.get('role', '')\n    \n    # Build search query\n    sql = \"SELECT id, username, role FROM users WHERE username LIKE '%\" + query + \"%'\"\n    \n    if role_filter:\n        sql += \" AND role = '\" + role_filter + \"'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(sql).fetchall()\n        users = [{'id': r['id'], 'username': r['username'], 'role': r['role']} for r in results]\n        return jsonify({'users': users, 'count': len(users)})\n    except Exception as e:\n        app.logger.error(f\"Search error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify({'id': user['id'], 'username': user['username'], 'role': user['role']})\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/admin/users', methods=['GET'])\ndef admin_list_users():\n    \"\"\"Admin endpoint - list all users with sensitive data\"\"\"\n    auth = request.headers.get('Authorization', '')\n    if not verify_token(auth.replace('Bearer ', '')):\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    db = get_db()\n    results = db.execute('SELECT id, username, role, api_key FROM users').fetchall()\n    users = [{'id': r['id'], 'username': r['username'], 'role': r['role'], 'api_key': r['api_key']} for r in results]\n    return jsonify({'users': users})\n\n@app.route('/api/audit', methods=['GET'])\ndef get_audit_log():\n    \"\"\"Retrieve audit log entries\"\"\"\n    limit = request.args.get('limit', '50')\n    db = get_db()\n    # Parameterized here but the search endpoint above is not\n    results = db.execute('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?', (int(limit),)).fetchall()\n    logs = [{'id': r['id'], 'action': r['action'], 'details': r['details']} for r in results]\n    return jsonify({'logs': logs})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL. The WebACL contains a rule group reference statement using the vendor-managed rule group 'aws-waf-bot-control' in targeted mode AND a custom rule with a RegexPatternSet that inspects the 'SingleQueryArgument' named 'q' and 'role' with a statement that blocks requests where the field body matches the pattern `(?i)(union|select|insert|update|delete|drop|;|--|/\\*|\\*/|char\\(|concat\\(|0x[0-9a-f])`. However, the critical control is a separate custom rule (Priority 1) using a SizeConstraint statement on QueryString with ComparisonOperator GT and Size 64 bytes, with action BLOCK. Additionally, the ECS task role has no network egress (VPC with no NAT gateway, no internet gateway on the subnet, and no VPC endpoints except for ECR/CloudWatch), preventing out-of-band data exfiltration via DNS or HTTP callbacks.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL",
+      "wafv2_rules": [
+        {
+          "name": "query-string-size-limit",
+          "priority": 1,
+          "statement": {
+            "sizeConstraintStatement": {
+              "fieldToMatch": {
+                "queryString": {}
+              },
+              "comparisonOperator": "GT",
+              "size": 64,
+              "textTransformations": [
+                {
+                  "priority": 0,
+                  "type": "NONE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK"
+        },
+        {
+          "name": "sqli-pattern-match",
+          "priority": 2,
+          "statement": {
+            "regexPatternSetReferenceStatement": {
+              "fieldToMatch": {
+                "singleQueryArgument": {
+                  "name": "q"
+                }
+              },
+              "textTransformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK"
+        },
+        {
+          "name": "sqli-role-pattern-match",
+          "priority": 3,
+          "statement": {
+            "regexPatternSetReferenceStatement": {
+              "fieldToMatch": {
+                "singleQueryArgument": {
+                  "name": "role"
+                }
+              },
+              "textTransformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK"
+        }
+      ],
+      "network": {
+        "vpc_subnet": "private, no NAT gateway, no IGW",
+        "vpc_endpoints": [
+          "com.amazonaws.region.ecr.dkr",
+          "com.amazonaws.region.ecr.api",
+          "com.amazonaws.region.logs"
+        ],
+        "egress": "blocked - no internet-routable path from task"
+      },
+      "runtime": "ECS Fargate, task role with minimal permissions",
+      "database": "SQLite local file /data/app.db (ephemeral storage)"
+    }
+  }
+}

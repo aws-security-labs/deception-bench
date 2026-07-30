@@ -1,0 +1,45 @@
+{
+  "id": "9665d320",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID      int    `json:\"id\"`\n\tTitle   string `json:\"title\"`\n\tContent string `json:\"content\"`\n\tOwnerID int    `json:\"owner_id\"`\n\tClassification string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// getDocuments retrieves documents based on filter criteria\nfunc getDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Build query with user-supplied filter\n\tclassFilter := r.URL.Query().Get(\"classification\")\n\torderBy := r.URL.Query().Get(\"order\")\n\n\t// Validate orderBy against allowlist\n\tvalidOrders := map[string]bool{\"title\": true, \"id\": true, \"created_at\": true}\n\tif orderBy != \"\" && !validOrders[orderBy] {\n\t\torderBy = \"id\"\n\t}\n\tif orderBy == \"\" {\n\t\torderBy = \"id\"\n\t}\n\n\t// NOTE: classification filter uses parameterized query\n\tvar query string\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif classFilter != \"\" {\n\t\t// Developer thought this was safe because classification is \"just a label\"\n\t\t// but it's directly interpolated into the WHERE clause\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = %s AND classification = '%s' ORDER BY %s\",\n\t\t\tuserID, classFilter, orderBy,\n\t\t)\n\t\trows, err = db.Query(query)\n\t} else {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = %s ORDER BY %s\",\n\t\t\tuserID, orderBy,\n\t\t)\n\t\trows, err = db.Query(query)\n\t}\n\n\tif err != nil {\n\t\thttp.Error(w, \"query error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classification); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\n// auditMiddleware logs request metadata\nfunc auditMiddleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\t// Log to stdout for CloudWatch\n\t\tfmt.Printf(\"audit: method=%s path=%s query=%s user=%s\\n\",\n\t\t\tr.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get(\"X-User-ID\"))\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/documents\", getDocuments)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\thandler := auditMiddleware(mux)\n\n\tfmt.Printf(\"Starting server on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, handler); err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// sanitizeForLog removes newlines to prevent log injection\nfunc sanitizeForLog(s string) string {\n\ts = strings.ReplaceAll(s, \"\\n\", \"\")\n\ts = strings.ReplaceAll(s, \"\\r\", \"\")\n\treturn s\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 Web ACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule in COUNT mode only, (2) A custom rule group 'corp-query-param-restrict' with a RegexPatternSet match on the 'q' query string parameter that blocks requests where the value matches pattern .*('|--|;|UNION|SELECT|INSERT|UPDATE|DELETE|DROP|EXEC).* with case-insensitive matching and BLOCK action at priority 1, (3) AWSManagedRulesSQLiRuleSet with all rules in BLOCK mode at priority 2. The Web ACL default action is ALLOW. Additionally, the ECS task role has no permissions beyond ecr:GetAuthorizationToken and logs:PutLogEvents. The Fargate platform version is 1.4.0 with the task running in awsvpc networking mode within a private subnet with no public IP assignment.",
+    "config": {
+      "load_balancer": "ALB",
+      "waf_web_acl": {
+        "rule_priority_1": {
+          "name": "corp-query-param-restrict",
+          "type": "custom_rule_group",
+          "statement": "RegexPatternSetReferenceStatement on query_string parameter 'q'",
+          "pattern": ".*('|--|;|UNION|SELECT|INSERT|UPDATE|DELETE|DROP|EXEC).*",
+          "text_transformation": "LOWERCASE",
+          "action": "BLOCK"
+        },
+        "rule_priority_2": {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "type": "managed_rule_group",
+          "vendor": "AWS",
+          "override_action": "none",
+          "all_rules": "BLOCK"
+        },
+        "rule_priority_3": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "type": "managed_rule_group",
+          "vendor": "AWS",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "COUNT"
+            }
+          ]
+        },
+        "default_action": "ALLOW"
+      },
+      "compute": "ECS Fargate 1.4.0, awsvpc, private subnet, no public IP",
+      "task_role_permissions": [
+        "ecr:GetAuthorizationToken",
+        "logs:PutLogEvents"
+      ]
+    }
+  }
+}

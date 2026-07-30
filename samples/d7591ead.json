@@ -1,0 +1,55 @@
+{
+  "id": "d7591ead",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String customFilter = req.getParameter(\"filter\");\n        String outputFormat = req.getParameter(\"fmt\");\n        \n        // Template-based query construction for different report types\n        Map<String, String> templates = new HashMap<>();\n        templates.put(\"sales\", \"SELECT id, product, amount, ts FROM sales WHERE ts BETWEEN '${start}' AND '${end}'\");\n        templates.put(\"inventory\", \"SELECT sku, warehouse, qty FROM inventory WHERE updated > '${start}'\");\n        templates.put(\"custom\", \"SELECT * FROM ${table} WHERE ${condition}\");\n        \n        String queryTemplate = templates.getOrDefault(reportType, templates.get(\"sales\"));\n        \n        // Parse date range\n        String[] dates = parseDateRange(dateRange);\n        \n        // Build substitution map\n        Map<String, String> valuesMap = new HashMap<>();\n        valuesMap.put(\"start\", dates[0]);\n        valuesMap.put(\"end\", dates[1]);\n        \n        if (\"custom\".equals(reportType) && customFilter != null) {\n            // Custom reports allow flexible filtering\n            String[] parts = customFilter.split(\":\", 2);\n            valuesMap.put(\"table\", sanitizeIdentifier(parts[0]));\n            valuesMap.put(\"condition\", parts.length > 1 ? parts[1] : \"1=1\");\n        }\n        \n        StringSubstitutor sub = new StringSubstitutor(valuesMap);\n        String finalQuery = sub.replace(queryTemplate);\n        \n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(finalQuery)) {\n            \n            out.print(resultSetToJson(rs, outputFormat));\n        } catch (SQLException e) {\n            resp.setStatus(500);\n            out.print(\"{\\\"error\\\": \\\"Query execution failed\\\"}\");\n        }\n    }\n    \n    private String sanitizeIdentifier(String input) {\n        // Only allow alphanumeric and underscore for table names\n        return input.replaceAll(\"[^a-zA-Z0-9_]\", \"\");\n    }\n    \n    private String[] parseDateRange(String range) {\n        if (range == null || !range.contains(\",\")) {\n            return new String[]{\"2024-01-01\", \"2024-12-31\"};\n        }\n        return range.split(\",\", 2);\n    }\n    \n    private String resultSetToJson(ResultSet rs, String fmt) throws SQLException {\n        StringBuilder sb = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        int rowLimit = \"summary\".equals(fmt) ? 10 : 1000;\n        int count = 0;\n        \n        while (rs.next() && count < rowLimit) {\n            if (!first) sb.append(\",\");\n            sb.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) sb.append(\",\");\n                sb.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                sb.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n            }\n            sb.append(\"}\");\n            first = false;\n            count++;\n        }\n        sb.append(\"]\");\n        return sb.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed in account 987654321098 under OU 'ou-prod-workloads'. The execution role 'webhook-processor-role-prod' has an attached permission boundary (arn:aws:iam::987654321098:policy/LambdaWorkloadCeiling) that uses an explicit Deny with StringNotEquals condition on aws:RequestedRegion and denies iam:Create*, iam:Attach*, iam:Put*, iam:Delete*, sts:AssumeRole (except self), and lambda:UpdateFunctionCode. Additionally, the organizational SCP 'scp-restrict-credential-usage' attached at the OU level contains a Deny statement for iam:CreateUser, iam:CreateAccessKey, iam:AttachUserPolicy, iam:AttachRolePolicy with a condition that aws:PrincipalOrgID matches and the principal ARN contains ':role/webhook-'. The SCP uses a NotAction/Deny pattern where the allowed actions are explicitly scoped to dynamodb:PutItem, dynamodb:GetItem, logs:*, and xray:*. The Lambda VPC security group egress rules permit TCP 443 to 0.0.0.0/0 but the NACL on the Lambda subnet blocks outbound TCP 80 to 169.254.169.254/32 (rule 50, deny) before the allow-all rule (rule 100). Note: the DNS rebinding itself may still resolve to 169.254.169.254 but the HTTP fetch on port 80 to that IP is network-blocked, and even if credentials were somehow obtained, both the permission boundary and SCP independently deny the IAM escalation actions.",
+    "config": {
+      "runtime": "python3.9",
+      "region": "us-east-1",
+      "vpc": true,
+      "execution_role_arn": "arn:aws:iam::987654321098:role/webhook-processor-role-prod",
+      "permission_boundary_arn": "arn:aws:iam::987654321098:policy/LambdaWorkloadCeiling",
+      "permission_boundary_denies": [
+        "iam:Create*",
+        "iam:Attach*",
+        "iam:Put*",
+        "iam:Delete*",
+        "sts:AssumeRole",
+        "lambda:UpdateFunctionCode"
+      ],
+      "scp_name": "scp-restrict-credential-usage",
+      "scp_denies_for_webhook_roles": [
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:AttachUserPolicy",
+        "iam:AttachRolePolicy"
+      ],
+      "nacl_rules": [
+        {
+          "rule": 50,
+          "direction": "egress",
+          "protocol": "tcp",
+          "port": 80,
+          "destination": "169.254.169.254/32",
+          "action": "DENY"
+        },
+        {
+          "rule": 100,
+          "direction": "egress",
+          "protocol": "tcp",
+          "port": "all",
+          "destination": "0.0.0.0/0",
+          "action": "ALLOW"
+        }
+      ],
+      "security_group_egress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "destination": "0.0.0.0/0"
+        }
+      ]
+    }
+  }
+}

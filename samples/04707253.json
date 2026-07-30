@@ -1,0 +1,60 @@
+{
+  "id": "04707253",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Employee struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tEmail    string `json:\"email\"`\n\tSalary   string `json:\"salary,omitempty\"`\n\tSSN      string `json:\"ssn,omitempty\"`\n\tDeptCode string `json:\"dept_code\"`\n}\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n}\n\n// handleSearch allows searching employees by department\nfunc handleSearch(w http.ResponseWriter, r *http.Request) {\n\tdept := r.URL.Query().Get(\"dept\")\n\tif dept == \"\" {\n\t\thttp.Error(w, \"dept parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic length check\n\tif len(dept) > 64 {\n\t\thttp.Error(w, \"parameter too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - vulnerable to SQL injection\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, email, dept_code FROM hr.employees WHERE dept_code = '%s' AND active = true\",\n\t\tdept,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Employee\n\tfor rows.Next() {\n\t\tvar emp Employee\n\t\tif err := rows.Scan(&emp.ID, &emp.Name, &emp.Email, &emp.DeptCode); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, emp)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// handleProfile returns current user profile from JWT claims\nfunc handleProfile(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\") // Set by auth proxy\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tvar emp Employee\n\terr := db.QueryRow(\n\t\t\"SELECT id, name, email, salary, dept_code FROM hr.employees WHERE id = $1\",\n\t\tuserID,\n\t).Scan(&emp.ID, &emp.Name, &emp.Email, &emp.Salary, &emp.DeptCode)\n\tif err != nil {\n\t\thttp.Error(w, \"not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(emp)\n}\n\n// handleHealthCheck for ALB target group health checks\nfunc handleHealthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\n// handleMetrics exposes internal metrics - restricted by middleware\nfunc handleMetrics(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Metrics-Token\")\n\texpected := os.Getenv(\"METRICS_TOKEN\")\n\tif !strings.EqualFold(token, expected) {\n\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\treturn\n\t}\n\tstats := db.Stats()\n\tjson.NewEncoder(w).Encode(stats)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", handleSearch)\n\thttp.HandleFunc(\"/api/profile\", handleProfile)\n\thttp.HandleFunc(\"/health\", handleHealthCheck)\n\thttp.HandleFunc(\"/internal/metrics\", handleMetrics)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same container on ECS Fargate. ALB has an associated AWS WAFv2 Web ACL (arn:aws:wafv2:us-east-1:111122223333:regional/webacl/prod-api-acl/a1b2c3d4) with three rule groups evaluated in order: (1) Priority 0 - AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to Count, (2) Priority 1 - AWS managed rule group AWSManagedRulesSQLiRuleSet with NO action overrides (all rules in BLOCK mode including SQLi_QUERYARGUMENTS, SQLi_BODY, SQLi_COOKIE, SQLi_URIPATH), (3) Priority 2 - custom rate-based rule 2000 req/5min per source IP. The Web ACL default action is ALLOW. Additionally, the ALB has a listener rule that routes /api/keys/* to a separate target group requiring mTLS client certificate validation via the ALB's trust store (arn:aws:elasticloadbalancing:us-east-1:111122223333:truststore/internal-ca-store/ts-0abc123def456). The container's security group only allows inbound from the ALB security group.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "condition": "path-pattern=/api/keys/*",
+          "action": "forward",
+          "target_group": "keys-tg",
+          "mutual_tls": "verify"
+        },
+        {
+          "priority": 99,
+          "action": "forward",
+          "target_group": "app-tg"
+        }
+      ],
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:111122223333:regional/webacl/prod-api-acl/a1b2c3d4",
+      "waf_rules": [
+        {
+          "priority": 0,
+          "name": "AWSManagedRulesCommonRuleSet",
+          "overrides": [
+            {
+              "rule": "SizeRestrictions_QUERYSTRING",
+              "action": "count"
+            }
+          ]
+        },
+        {
+          "priority": 1,
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "overrides": []
+        },
+        {
+          "priority": 2,
+          "name": "rate-limit-rule",
+          "type": "rate-based",
+          "limit": 2000
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 8080,
+          "source": "sg-alb-0123456"
+        }
+      ],
+      "container_env": {
+        "INTERNAL_SECRET": "s3cr3t-key-2024"
+      },
+      "network": "private_subnet"
+    }
+  }
+}

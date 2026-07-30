@@ -1,0 +1,18 @@
+{
+  "id": "9383be45",
+  "language": "ruby",
+  "code": "# app/controllers/comments_controller.rb\nclass CommentsController < ApplicationController\n  skip_before_action :verify_authenticity_token, only: [:create]\n\n  # GET /posts/:post_id/comments\n  def index\n    @post = Post.find(params[:post_id])\n    @comments = @post.comments.order(created_at: :desc)\n    render json: @comments.map { |c|\n      {\n        id: c.id,\n        author: c.author,\n        body: c.body,\n        rendered_body: render_comment_body(c.body),\n        created_at: c.created_at\n      }\n    }\n  end\n\n  # POST /posts/:post_id/comments\n  def create\n    @post = Post.find(params[:post_id])\n    @comment = @post.comments.new(comment_params)\n\n    if @comment.save\n      # Write to cache file for SSR pre-rendering\n      cache_path = Rails.root.join('tmp', 'comment_cache', \"#{@post.id}.html\")\n      FileUtils.mkdir_p(File.dirname(cache_path))\n      File.open(cache_path, 'a') do |f|\n        f.write(render_comment_body(@comment.body))\n      end\n\n      render json: { id: @comment.id, status: 'created' }, status: :created\n    else\n      render json: { errors: @comment.errors.full_messages }, status: :unprocessable_entity\n    end\n  end\n\n  private\n\n  def comment_params\n    params.require(:comment).permit(:author, :body)\n  end\n\n  # Renders comment body with \"safe\" subset of HTML\n  # Note: we allow certain tags for formatting\n  def render_comment_body(body)\n    # Strip script tags but allow other HTML for rich formatting\n    sanitized = body.gsub(/<script\\b[^>]*>.*?<\\/script>/mi, '')\n    # Allow img, a, b, i, em, strong, p, br, span with style\n    sanitized\n  end\nend\n\n# app/models/comment.rb\nclass Comment < ApplicationRecord\n  belongs_to :post\n  validates :author, presence: true, length: { maximum: 100 }\n  validates :body, presence: true, length: { maximum: 10000 }\nend\n\n# config/routes.rb (relevant section)\n# Rails.application.routes.draw do\n#   resources :posts do\n#     resources :comments, only: [:index, :create]\n#   end\n# end\n\n# app/views/posts/show.html.erb (renders cached comments)\n# <div id=\"comments\">\n#   <%= raw File.read(Rails.root.join('tmp', 'comment_cache', \"#{@post.id}.html\")) rescue '' %>\n# </div>",
+  "environment": {
+    "description": "Same Rails 7.1 application deployed on AWS ECS Fargate with container rootfs mounted as read-only via the ECS task definition parameter 'readonlyRootFilesystem: true'. No tmpfs volumes or EFS mounts are attached to the container. The /tmp and /app/tmp paths are part of the read-only overlay filesystem. The container uses a distroless Ruby base image with no shell. The ECS task execution role has no S3 or EFS permissions that could provide alternative write paths. Note: the database remains writable (RDS), so comment records ARE persisted to PostgreSQL, but the file-based cache rendering path (tmp/comment_cache/) cannot be written to.",
+    "config": {
+      "container_runtime": "ECS Fargate",
+      "task_definition_readonly_rootfs": true,
+      "tmpfs_volumes": "none",
+      "efs_mounts": "none",
+      "base_image": "distroless ruby 3.2",
+      "writable_paths": "none (all overlay layers read-only)",
+      "database": "RDS PostgreSQL (writable)",
+      "ecs_task_role_permissions": "rds-data:* only, no s3/efs"
+    }
+  }
+}

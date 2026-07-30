@@ -1,0 +1,44 @@
+{
+  "id": "1c24d9cd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/aws/aws-sdk-go/aws\"\n\t\"github.com/aws/aws-sdk-go/aws/session\"\n\t\"github.com/aws/aws-sdk-go/service/s3\"\n)\n\nvar configStore = map[string]interface{}{\n\t\"defaults\": map[string]interface{}{\n\t\t\"timeout\":    30,\n\t\t\"retries\":    3,\n\t\t\"log_level\":  \"info\",\n\t\t\"admin_role\": false,\n\t},\n}\n\nfunc deepMerge(dst map[string]interface{}, src map[string]interface{}) {\n\tfor key, srcVal := range src {\n\t\tif dstVal, exists := dst[key]; exists {\n\t\t\tif dstMap, ok := dstVal.(map[string]interface{}); ok {\n\t\t\t\tif srcMap, ok := srcVal.(map[string]interface{}); ok {\n\t\t\t\t\tdeepMerge(dstMap, srcMap)\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\tdst[key] = srcVal\n\t}\n}\n\nfunc updateConfigHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"Bad request\", 400)\n\t\treturn\n\t}\n\n\tvar userInput map[string]interface{}\n\tif err := json.Unmarshal(body, &userInput); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", 400)\n\t\treturn\n\t}\n\n\t// Merge user-provided config into global store\n\t// This allows nested key updates like {\"defaults\": {\"timeout\": 60}}\n\tdeepMerge(configStore, userInput)\n\n\t// Persist updated config to S3 for cross-instance sync\n\tgo persistToS3(configStore)\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(map[string]string{\"status\": \"updated\"})\n}\n\nfunc persistToS3(config map[string]interface{}) {\n\tbucket := os.Getenv(\"CONFIG_BUCKET\")\n\tif bucket == \"\" {\n\t\tbucket = \"app-config-store-prod\"\n\t}\n\n\tdata, _ := json.Marshal(config)\n\n\tsess := session.Must(session.NewSession(&aws.Config{\n\t\tRegion: aws.String(os.Getenv(\"AWS_REGION\")),\n\t}))\n\tsvc := s3.New(sess)\n\n\t_, err := svc.PutObject(&s3.PutObjectInput{\n\t\tBucket: aws.String(bucket),\n\t\tKey:    aws.String(\"live/config.json\"),\n\t\tBody:   aws.ReadSeekCloser(strings.NewReader(string(data))),\n\t})\n\tif err != nil {\n\t\tfmt.Printf(\"S3 persist error: %v\\n\", err)\n\t}\n}\n\nfunc getConfigHandler(w http.ResponseWriter, r *http.Request) {\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(configStore)\n}\n\nfunc isAdmin(r *http.Request) bool {\n\tdefaults, ok := configStore[\"defaults\"].(map[string]interface{})\n\tif !ok {\n\t\treturn false\n\t}\n\tadminRole, ok := defaults[\"admin_role\"].(bool)\n\tif !ok {\n\t\treturn false\n\t}\n\treturn adminRole\n}\n\nfunc adminHandler(w http.ResponseWriter, r *http.Request) {\n\tif !isAdmin(r) {\n\t\thttp.Error(w, \"Forbidden\", 403)\n\t\treturn\n\t}\n\t// Admin-only: trigger config reload from S3\n\tw.Write([]byte(\"Admin action executed\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/config\", getConfigHandler)\n\thttp.HandleFunc(\"/config/update\", updateConfigHandler)\n\thttp.HandleFunc(\"/admin/reload\", adminHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tfmt.Printf(\"Starting server on :%s\\n\", port)\n\thttp.ListenAndServe(\":\"+port, nil)\n}",
+  "environment": {
+    "description": "Go microservice running on ECS Fargate in a VPC with an S3 Gateway VPC Endpoint (vpce-0x9f8e7d6c5b4a). The endpoint policy restricts PutObject operations with a condition requiring aws:PrincipalTag/team equals 'platform-eng' AND a StringEquals condition on s3:prefix limiting writes to 'live/' prefix only when the request originates from the specific task role ARN arn:aws:iam::111222333444:role/config-writer-prod. The route table (rtb-0abc123) associated with the Fargate subnets directs all S3 traffic (prefix list pl-63a5400a) through the VPC endpoint exclusively \u2014 no NAT fallback path exists for S3. The task role attached to this service is arn:aws:iam::111222333444:role/config-reader-readonly which has ONLY s3:GetObject permission and lacks the PrincipalTag 'team=platform-eng'. The VPC endpoint policy explicitly denies s3:PutObject for any principal not matching the condition set.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "vpc": "vpc-0a1b2c3d with S3 Gateway VPC Endpoint vpce-0x9f8e7d6c5b4a",
+      "s3_access": "exclusively via VPC endpoint (no NAT path for S3 prefix list)",
+      "route_table": "rtb-0abc123 routes pl-63a5400a -> vpce-0x9f8e7d6c5b4a",
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Sid": "AllowGetForAll",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::app-config-store-prod/*"
+          },
+          {
+            "Sid": "RestrictPutToWriter",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::app-config-store-prod/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalArn": "arn:aws:iam::111222333444:role/config-writer-prod",
+                "aws:PrincipalTag/team": "platform-eng"
+              }
+            }
+          }
+        ]
+      },
+      "task_role": "arn:aws:iam::111222333444:role/config-reader-readonly",
+      "task_role_permissions": "s3:GetObject only on arn:aws:s3:::app-config-store-prod/*",
+      "task_role_tags": {
+        "team": "app-services"
+      },
+      "input_validation": "none"
+    }
+  }
+}

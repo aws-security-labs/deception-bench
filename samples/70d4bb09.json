@@ -1,0 +1,74 @@
+{
+  "id": "70d4bb09",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.Pattern;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Allow alphanumeric, spaces, hyphens, and common punctuation\n    private static final Pattern DISPLAY_SANITIZER = Pattern.compile(\"[<>\\\"'&]\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate date format\n        if (!startDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\") || \n            !endDate.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\")) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Validate sort column against whitelist\n        String[] allowedSorts = {\"created_at\", \"amount\", \"customer_name\", \"status\"};\n        String validatedSort = \"created_at\";\n        if (sortCol != null) {\n            for (String allowed : allowedSorts) {\n                if (allowed.equals(sortCol)) {\n                    validatedSort = sortCol;\n                    break;\n                }\n            }\n        }\n        \n        String query = buildQuery(reportType, startDate, endDate, validatedSort, customFilter);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"text/html; charset=UTF-8\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"<html><body><table>\");\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            out.println(\"<tr>\");\n            for (int i = 1; i <= cols; i++) {\n                out.println(\"<th>\" + sanitizeDisplay(meta.getColumnName(i)) + \"</th>\");\n            }\n            out.println(\"</tr>\");\n            \n            while (rs.next()) {\n                out.println(\"<tr>\");\n                for (int i = 1; i <= cols; i++) {\n                    out.println(\"<td>\" + sanitizeDisplay(rs.getString(i)) + \"</td>\");\n                }\n                out.println(\"</tr>\");\n            }\n            out.println(\"</table></body></html>\");\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private String buildQuery(String reportType, String start, String end, \n                              String sort, String customFilter) {\n        StringBuilder sb = new StringBuilder();\n        \n        switch (reportType) {\n            case \"sales\":\n                sb.append(\"SELECT id, customer_name, amount, status, created_at FROM orders\");\n                break;\n            case \"inventory\":\n                sb.append(\"SELECT sku, product_name, quantity, warehouse FROM inventory\");\n                break;\n            default:\n                sb.append(\"SELECT id, description, created_at FROM audit_log\");\n        }\n        \n        sb.append(\" WHERE created_at BETWEEN '\" + start + \"' AND '\" + end + \"'\");\n        \n        // Custom filter - appended directly for flexible reporting\n        if (customFilter != null && !customFilter.isEmpty()) {\n            sb.append(\" AND \" + customFilter);\n        }\n        \n        sb.append(\" ORDER BY \" + sort + \" DESC LIMIT 1000\");\n        \n        return sb.toString();\n    }\n    \n    private String sanitizeDisplay(String input) {\n        if (input == null) return \"\";\n        return DISPLAY_SANITIZER.matcher(input).replaceAll(\"\");\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.28 cluster with namespace-level Pod Security Standards configured via label `pod-security.kubernetes.io/enforce: baseline` on the migrations namespace. Additionally, a ValidatingAdmissionPolicy (v1beta1, CEL-based) is bound to the namespace with expression `!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))` rejecting any pod spec containing hostPath volumes. The cluster also enforces a Kyverno ClusterPolicy in audit+enforce mode with rule `validate-host-path` matching on kind Pod/Job/CronJob that denies any container with `securityContext.privileged: true` OR any volume of type hostPath. Container image is pulled from a registry with Notary v2 signatures verified by the admission controller. The migration pod runs with `securityContext.runAsNonRoot: true, runAsUser: 65534, readOnlyRootFilesystem: true` with an emptyDir volume for the working directory. Note: the baseline Pod Security Standard does NOT explicitly block all path traversal scenarios - it focuses on preventing host namespace sharing and privileged escalation vectors. The zip slip vulnerability in the code still exists and files can be written outside the intended extraction directory within the container's writable emptyDir mount, but the traversal cannot escape to the host filesystem since no hostPath volume exists and the container has no privileged access to mount or access host paths.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "validating_admission_policy": {
+        "name": "deny-hostpath-volumes",
+        "cel_expression": "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))",
+        "action": "Deny"
+      },
+      "kyverno_cluster_policy": {
+        "name": "restrict-host-access",
+        "rules": [
+          {
+            "name": "validate-host-path",
+            "match": {
+              "resources": {
+                "kinds": [
+                  "Pod",
+                  "Job",
+                  "CronJob"
+                ]
+              }
+            },
+            "validate": {
+              "message": "hostPath volumes and privileged containers are not allowed",
+              "deny": {
+                "conditions": "any hostPath volume OR privileged securityContext"
+              }
+            }
+          }
+        ],
+        "enforcement": "enforce"
+      },
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "work-dir",
+          "emptyDir": {
+            "sizeLimit": "256Mi"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "work-dir",
+          "mountPath": "/var/lib/migrations"
+        }
+      ],
+      "env": {
+        "MIGRATION_DIR": "/var/lib/migrations"
+      }
+    }
+  }
+}

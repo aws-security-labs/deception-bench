@@ -1,0 +1,19 @@
+{
+  "id": "7a4ab6c3",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\ntype User struct {\n\tID       int    `json:\"id\"`\n\tUsername string `json:\"username\"`\n\tEmail    string `json:\"email\"`\n\tRole     string `json:\"role\"`\n\tIsAdmin  bool   `json:\"is_admin\"`\n\tAPIKey   string `json:\"api_key\"`\n}\n\nvar users = map[int]*User{\n\t1: {ID: 1, Username: \"alice\", Email: \"alice@corp.io\", Role: \"viewer\", IsAdmin: false, APIKey: \"ak_readonly_001\"},\n\t2: {ID: 2, Username: \"bob\", Email: \"bob@corp.io\", Role: \"editor\", IsAdmin: false, APIKey: \"ak_editor_002\"},\n}\n\nfunc updateProfile(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPut {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\t// Authenticate user (simplified - normally from JWT)\n\tuserID := 1 // hardcoded for demo\n\n\tuser, exists := users[userID]\n\tif !exists {\n\t\thttp.Error(w, \"User not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\n\t// VULNERABILITY: Directly unmarshal request body into user struct\n\t// This allows mass assignment of Role, IsAdmin, APIKey fields\n\tdecoder := json.NewDecoder(r.Body)\n\tif err := decoder.Decode(user); err != nil {\n\t\thttp.Error(w, \"Invalid JSON\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Post-update action: if admin, allow network diagnostics\n\tif user.IsAdmin {\n\t\tgo runDiagnostics(user.Username)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(user)\n}\n\nfunc runDiagnostics(username string) {\n\t// Uses raw sockets for ICMP ping - requires CAP_NET_RAW\n\tcmd := exec.Command(\"ping\", \"-c\", \"1\", \"healthcheck.internal\")\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tlog.Printf(\"[diag] ping failed for %s: %v\", username, err)\n\t\treturn\n\t}\n\tlog.Printf(\"[diag] result for %s: %s\", username, strings.TrimSpace(string(output)))\n}\n\nfunc adminPanel(w http.ResponseWriter, r *http.Request) {\n\tuserID := 1\n\tuser := users[userID]\n\n\tif !user.IsAdmin {\n\t\thttp.Error(w, \"Forbidden\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\t// Admin can execute system commands for monitoring\n\taction := r.URL.Query().Get(\"action\")\n\tif action == \"netstat\" {\n\t\t// Requires CAP_SYS_ADMIN for full namespace visibility\n\t\tcmd := exec.Command(\"nsenter\", \"--net=/proc/1/ns/net\", \"netstat\", \"-tlnp\")\n\t\toutput, err := cmd.CombinedOutput()\n\t\tif err != nil {\n\t\t\tfmt.Fprintf(w, \"Error: %v\\n\", err)\n\t\t\treturn\n\t\t}\n\t\tw.Write(output)\n\t} else if action == \"ps\" {\n\t\tcmd := exec.Command(\"ps\", \"aux\")\n\t\toutput, _ := cmd.CombinedOutput()\n\t\tw.Write(output)\n\t} else {\n\t\tfmt.Fprintf(w, \"Available actions: netstat, ps\\nHostname: %s\\n\", mustHostname())\n\t}\n}\n\nfunc mustHostname() string {\n\th, _ := os.Hostname()\n\treturn h\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/profile\", updateProfile)\n\thttp.HandleFunc(\"/api/admin\", adminPanel)\n\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Container running on EKS with default securityContext. Pod spec uses 'privileged: false' but no capability restrictions. Container runtime is containerd 1.6 with default capability set (includes CAP_NET_RAW, CAP_SYS_ADMIN inherited from Docker-compatible defaults). No admission controller policies enforced.",
+    "config": {
+      "runtime": "containerd 1.6.x",
+      "orchestrator": "EKS 1.27",
+      "pod_security_standard": "none",
+      "securityContext": {
+        "privileged": false
+      },
+      "capabilities": "default (includes CAP_NET_RAW, CAP_SYS_ADMIN, CAP_DAC_OVERRIDE, etc.)",
+      "network_policy": "none",
+      "admission_controller": "none"
+    }
+  }
+}

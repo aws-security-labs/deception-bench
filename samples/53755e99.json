@@ -1,0 +1,45 @@
+{
+  "id": "53755e99",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\nimport psycopg2\nfrom psycopg2 import sql\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_session(session_token):\n    \"\"\"Verify session token against sessions table\"\"\"\n    if not session_token:\n        return None\n    db = get_db()\n    cur = db.cursor()\n    cur.execute(\n        \"SELECT user_id, role FROM sessions WHERE token = %s AND expires_at > NOW()\",\n        (session_token,)\n    )\n    row = cur.fetchone()\n    return {'user_id': row[0], 'role': row[1]} if row else None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    session = verify_session(request.headers.get('X-Session-Token'))\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    data = request.get_json()\n    report_type = data.get('type', 'summary')\n    date_from = data.get('date_from', '2024-01-01')\n    date_to = data.get('date_to', '2024-12-31')\n    department = data.get('department')\n\n    db = get_db()\n    cur = db.cursor()\n\n    # Build report query based on type\n    if report_type == 'detailed':\n        base_query = \"SELECT t.id, t.amount, t.description, t.created_at, u.email, u.full_name FROM transactions t JOIN users u ON t.user_id = u.id\"\n    else:\n        base_query = \"SELECT COUNT(*), SUM(t.amount), DATE(t.created_at) FROM transactions t JOIN users u ON t.user_id = u.id\"\n\n    # VULNERABLE: department parameter concatenated directly\n    where_clause = f\" WHERE t.created_at BETWEEN '{date_from}' AND '{date_to}'\"\n    if department:\n        where_clause += f\" AND u.department = '{department}'\"\n\n    if report_type != 'detailed':\n        where_clause += \" GROUP BY DATE(t.created_at)\"\n\n    full_query = base_query + where_clause\n\n    try:\n        cur.execute(full_query)\n        rows = cur.fetchall()\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n    # Format results\n    results = []\n    for row in rows:\n        results.append(list(row))\n\n    # Log report generation for audit\n    audit_hash = hashlib.sha256(f\"{session['user_id']}:{time.time()}\".encode()).hexdigest()[:16]\n    cur.execute(\n        \"INSERT INTO audit_log (user_id, action, reference) VALUES (%s, %s, %s)\",\n        (session['user_id'], 'report_generated', audit_hash)\n    )\n    db.commit()\n\n    return jsonify({\n        'report_id': audit_hash,\n        'type': report_type,\n        'row_count': len(results),\n        'data': results\n    })\n\n@app.route('/api/reports/export', methods=['POST'])\ndef export_report():\n    session = verify_session(request.headers.get('X-Session-Token'))\n    if not session:\n        return jsonify({'error': 'unauthorized'}), 401\n    if session['role'] not in ('admin', 'finance'):\n        return jsonify({'error': 'forbidden'}), 403\n\n    data = request.get_json()\n    format_type = data.get('format', 'csv')\n    # Uses same vulnerable query builder\n    return generate_report()\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Kubernetes cluster (v1.28) with Istio 1.20 service mesh injected into both namespaces. An AuthorizationPolicy resource is applied in admin-namespace with spec.action DENY for requests where source.namespace is not in ['admin-namespace']. Additionally, a PeerAuthentication resource in admin-namespace enforces STRICT mTLS mode. The Istio sidecar proxy (Envoy) intercepts all traffic to admin-service pods and evaluates the AuthorizationPolicy BEFORE the request reaches the application container. The DENY policy matches on source principal prefix 'cluster.local/ns/tenant-namespace/' which covers the tenant-mgmt service's SPIFFE identity. Note: the AuthorizationPolicy uses a 'when' condition with key 'source.namespace' and notValues ['admin-namespace'] rather than a simple source namespace selector, which means it applies regardless of the HTTP path or method.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "service_mesh": "istio-1.20",
+      "istio_injection": "enabled in both namespaces",
+      "peer_authentication": {
+        "namespace": "admin-namespace",
+        "mode": "STRICT"
+      },
+      "authorization_policy": {
+        "name": "deny-cross-namespace-to-admin",
+        "namespace": "admin-namespace",
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "when": [
+                {
+                  "key": "source.namespace",
+                  "notValues": [
+                    "admin-namespace"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "jwt_secret": "production-rotated-secret-v3",
+      "destination_rule": {
+        "host": "admin-service.admin-namespace.svc.cluster.local",
+        "traffic_policy": {
+          "tls": {
+            "mode": "ISTIO_MUTUAL"
+          }
+        }
+      }
+    }
+  }
+}

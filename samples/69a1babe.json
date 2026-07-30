@@ -1,0 +1,36 @@
+{
+  "id": "69a1babe",
+  "language": "kotlin",
+  "code": "package com.example.auth\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.routing.*\nimport io.ktor.server.sessions.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.http.*\nimport java.util.UUID\n\ndata class UserSession(\n    val sessionId: String,\n    val username: String? = null,\n    val authenticated: Boolean = false,\n    val csrfToken: String = UUID.randomUUID().toString()\n)\n\nfun Application.module() {\n    install(Sessions) {\n        cookie<UserSession>(\"APP_SESSION\") {\n            cookie.path = \"/\"\n            cookie.httpOnly = true\n            cookie.extensions[\"SameSite\"] = \"Lax\"\n        }\n    }\n\n    routing {\n        // Pre-login endpoint that accepts a session ID parameter\n        // This allows session fixation: attacker sets session ID before victim authenticates\n        get(\"/init\") {\n            val requestedSessionId = call.request.queryParameters[\"sid\"]\n            val existingSession = call.sessions.get<UserSession>()\n            \n            if (requestedSessionId != null && existingSession == null) {\n                // VULNERABILITY: Accepts externally-supplied session identifier\n                // Does not regenerate session ID upon authentication\n                call.sessions.set(UserSession(\n                    sessionId = requestedSessionId,\n                    username = null,\n                    authenticated = false\n                ))\n                call.respondText(\"Session initialized with id: $requestedSessionId\")\n            } else if (existingSession != null) {\n                call.respondText(\"Session already exists: ${existingSession.sessionId}\")\n            } else {\n                val newId = UUID.randomUUID().toString()\n                call.sessions.set(UserSession(sessionId = newId))\n                call.respondText(\"New session: $newId\")\n            }\n        }\n\n        // Login endpoint - does NOT regenerate session ID after authentication\n        post(\"/login\") {\n            val params = call.receiveParameters()\n            val username = params[\"username\"] ?: \"\"\n            val password = params[\"password\"] ?: \"\"\n            \n            val currentSession = call.sessions.get<UserSession>()\n            \n            if (username == \"admin\" && password == \"secret123\") {\n                // BUG: Reuses existing session ID instead of generating new one\n                // This completes the session fixation attack\n                val authenticatedSession = UserSession(\n                    sessionId = currentSession?.sessionId ?: UUID.randomUUID().toString(),\n                    username = username,\n                    authenticated = true\n                )\n                call.sessions.set(authenticatedSession)\n                call.respondText(\"Login successful. Session: ${authenticatedSession.sessionId}\")\n            } else {\n                call.respond(HttpStatusCode.Unauthorized, \"Invalid credentials\")\n            }\n        }\n\n        get(\"/dashboard\") {\n            val session = call.sessions.get<UserSession>()\n            if (session?.authenticated == true) {\n                call.respondText(\"Welcome ${session.username}! Secret data here. CSRF: ${session.csrfToken}\")\n            } else {\n                call.respond(HttpStatusCode.Forbidden, \"Not authenticated\")\n            }\n        }\n\n        get(\"/health\") {\n            call.respondText(\"OK\")\n        }\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor service on ECS Fargate behind ALB, but the ALB has an associated AWS WAFv2 WebACL. The WebACL includes a custom rule group with priority 1 that inspects URI query strings using a regex pattern set matching session-identifier-like parameters (regex: `[?&](sid|session_id|jsessionid|PHPSESSID|token)=`). The rule action is BLOCK with a 403 response. Additionally, the WebACL has the AWSManagedRulesCommonRuleSet at priority 5 with SizeRestriction_QUERYSTRING rule in COUNT mode (not block). The custom rule uses a RegexPatternSet with scope REGIONAL and the match is performed on the QUERY_STRING field with TextTransformation URL_DECODE applied. Note: the managed rule AWSManagedRulesKnownBadInputsRuleSet is NOT included \u2014 only the custom regex rule and CommonRuleSet are active.",
+    "config": {
+      "runtime": "JVM 17 / Ktor 2.3.7",
+      "infrastructure": "AWS ECS Fargate, ALB (internet-facing), WAFv2 WebACL associated",
+      "waf_rules": [
+        {
+          "name": "BlockSessionFixationParams",
+          "priority": 1,
+          "type": "custom_rule_group",
+          "match": {
+            "field": "QUERY_STRING",
+            "regex_pattern_set": "[?&](sid|session_id|jsessionid|PHPSESSID|token)=",
+            "text_transformation": "URL_DECODE"
+          },
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 5,
+          "type": "managed_rule_group",
+          "overrides": {
+            "SizeRestriction_QUERYSTRING": "COUNT"
+          }
+        }
+      ],
+      "network": "Public subnet, ALB security group allows 0.0.0.0/0 on port 443",
+      "session_store": "In-memory (default Ktor session storage)",
+      "tls": "ALB-terminated, HTTP between ALB and container"
+    }
+  }
+}

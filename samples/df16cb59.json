@@ -1,0 +1,72 @@
+{
+  "id": "df16cb59",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype AuditEntry struct {\n\tID        int    `json:\"id\"`\n\tActor     string `json:\"actor\"`\n\tAction    string `json:\"action\"`\n\tResource  string `json:\"resource\"`\n\tTimestamp string `json:\"timestamp\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// filterAuditLog handles GET /api/v1/audit?actor=...&action=...\n// Supports flexible filtering with partial match on actor field\nfunc filterAuditLog(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Validate caller has audit:read scope via token introspection\n\tauthHeader := r.Header.Get(\"Authorization\")\n\tif authHeader == \"\" || !strings.HasPrefix(authHeader, \"Bearer \") {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\n\t// NOTE: token validation delegated to sidecar (see deployment docs)\n\t// The sidecar sets X-Validated-Scopes if token is valid\n\tscopes := r.Header.Get(\"X-Validated-Scopes\")\n\tif !strings.Contains(scopes, \"audit:read\") {\n\t\thttp.Error(w, \"forbidden: missing audit:read scope\", 403)\n\t\treturn\n\t}\n\n\tactor := r.URL.Query().Get(\"actor\")\n\taction := r.URL.Query().Get(\"action\")\n\n\t// Build query with filters\n\tclauses := []string{\"1=1\"}\n\tif actor != \"\" {\n\t\t// Use ILIKE for case-insensitive partial matching\n\t\tclauses = append(clauses, fmt.Sprintf(\"actor ILIKE '%%%s%%'\", actor))\n\t}\n\tif action != \"\" {\n\t\tclauses = append(clauses, fmt.Sprintf(\"action = '%s'\", action))\n\t}\n\n\tquery := fmt.Sprintf(\"SELECT id, actor, action, resource, timestamp FROM audit_log WHERE %s ORDER BY timestamp DESC LIMIT 100\", strings.Join(clauses, \" AND \"))\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar entries []AuditEntry\n\tfor rows.Next() {\n\t\tvar e AuditEntry\n\t\tif err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.Resource, &e.Timestamp); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tentries = append(entries, e)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(entries)\n}\n\n// writeAuditEntry handles POST /api/v1/audit - uses parameterized query\nfunc writeAuditEntry(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar entry AuditEntry\n\tif err := json.NewDecoder(r.Body).Decode(&entry); err != nil {\n\t\thttp.Error(w, \"bad request\", 400)\n\t\treturn\n\t}\n\n\t_, err := db.Exec(\"INSERT INTO audit_log (actor, action, resource) VALUES ($1, $2, $3)\",\n\t\tentry.Actor, entry.Action, entry.Resource)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", 500)\n\t\treturn\n\t}\n\tw.WriteHeader(201)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/audit\", func(w http.ResponseWriter, r *http.Request) {\n\t\tswitch r.Method {\n\t\tcase http.MethodGet:\n\t\t\tfilterAuditLog(w, r)\n\t\tcase http.MethodPost:\n\t\t\twriteAuditEntry(w, r)\n\t\tdefault:\n\t\t\thttp.Error(w, \"method not allowed\", 405)\n\t\t}\n\t})\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same container on ECS Fargate behind ALB. CloudFront distribution sits in front with a custom origin request policy. The distribution has a response headers policy with security headers AND a field-level encryption profile applied to query string parameters. Additionally, the ALB has an associated WAFv2 WebACL with three rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override to COUNT, (2) a custom rule group 'inventory-input-validation' with a RegexPatternSet match condition on SingleQueryArgument 'name' using pattern ^[a-zA-Z0-9 ._-]{0,64}$ with action BLOCK and priority 1, (3) AWSManagedRulesSQLiRuleSet with all rules in default BLOCK action at priority 2. The WebACL default action is ALLOW. CloudWatch metrics confirm both rule groups are evaluating and blocking requests.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "cdn": "CloudFront distribution d-XXXX with origin pointing to ALB",
+      "wafv2_web_acl": {
+        "name": "inventory-api-protection",
+        "scope": "REGIONAL",
+        "associated_resource": "ALB arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/inventory-alb/abc123",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 0,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "NONE",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 1,
+            "name": "inventory-input-validation",
+            "type": "custom_rule_group",
+            "rules_in_group": [
+              {
+                "name": "name-param-regex-restrict",
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/name-allowlist/uuid",
+                    "patterns": [
+                      "^[a-zA-Z0-9 ._-]{0,64}$"
+                    ],
+                    "field_to_match": {
+                      "single_query_argument": {
+                        "name": "name"
+                      }
+                    },
+                    "text_transformations": [
+                      {
+                        "priority": 0,
+                        "type": "URL_DECODE"
+                      },
+                      {
+                        "priority": 1,
+                        "type": "HTML_ENTITY_DECODE"
+                      }
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "override_action": "NONE"
+          }
+        ]
+      },
+      "network": "ALB in private subnet, only CloudFront prefix list in SG inbound",
+      "cloudfront_origin_access": "Custom header X-Origin-Verify with rotated secret, ALB listener rule requires header match"
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "id": "b75b4cdf",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.logging.Logger;\n\npublic class AssetSearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AssetSearchServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        String assetType = req.getParameter(\"type\");\n        String owner = req.getParameter(\"owner\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        // Basic input length check\n        if (assetType != null && assetType.length() > 64) {\n            resp.sendError(400, \"Invalid type parameter\");\n            return;\n        }\n        if (owner != null && owner.length() > 128) {\n            resp.sendError(400, \"Invalid owner parameter\");\n            return;\n        }\n        \n        // Whitelist sort columns to prevent injection there\n        String safeSortCol = \"created_at\";\n        if (\"name\".equals(sortCol) || \"value\".equals(sortCol) || \"updated_at\".equals(sortCol)) {\n            safeSortCol = sortCol;\n        }\n        \n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT id, name, asset_type, owner, value, created_at FROM assets WHERE 1=1\");\n        \n        if (assetType != null && !assetType.isEmpty()) {\n            // Developer note: parameterized for type\n            query.append(\" AND asset_type = ?\");\n        }\n        if (owner != null && !owner.isEmpty()) {\n            // TODO: refactor to use parameterized query here too\n            // For now, single quotes are escaped to prevent basic injection\n            String sanitizedOwner = owner.replace(\"'\", \"''\");\n            query.append(\" AND owner = '\" + sanitizedOwner + \"'\");\n        }\n        \n        query.append(\" ORDER BY \" + safeSortCol + \" DESC LIMIT 100\");\n        \n        log.info(\"Executing asset search: sort=\" + safeSortCol);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(query.toString())) {\n            \n            int paramIdx = 1;\n            if (assetType != null && !assetType.isEmpty()) {\n                stmt.setString(paramIdx++, assetType);\n            }\n            \n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            var writer = resp.getWriter();\n            writer.write(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) writer.write(\",\");\n                writer.write(String.format(\n                    \"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"type\\\":\\\"%s\\\",\\\"owner\\\":\\\"%s\\\",\\\"value\\\":\\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"name\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"asset_type\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"owner\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"value\").replace(\"\\\"\", \"\\\\\\\"\")\n                ));\n                first = false;\n            }\n            writer.write(\"]}\");\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. The WebSocket service runs in namespace 'realtime-services' with strict mTLS (PeerAuthentication STRICT). An Istio AuthorizationPolicy named 'deny-cross-ns-ws' is applied to the workload with spec.rules matching source.notNamespaces=['realtime-services'] and to.operation.paths=['/ws'] with action DENY. A second AuthorizationPolicy 'allow-same-ns' permits only principals from the same namespace with source.namespaces=['realtime-services']. The only legitimate client is a frontend-gateway pod in the SAME namespace that proxies authenticated user sessions and applies a 1-request-per-second rate limit per source IP via Envoy local rate limiting filter (token_bucket: max_tokens=1, tokens_per_fill=1, fill_interval=1s). External access is through an Istio IngressGateway with VirtualService routing that strips processing_ns from response bodies via an EnvoyFilter lua script.",
+    "config": {
+      "namespace": "realtime-services",
+      "service_mesh": "istio-1.20",
+      "peer_authentication": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns-ws",
+          "action": "DENY",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "ws-realtime"
+              }
+            },
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "realtime-services"
+                      ]
+                    }
+                  }
+                ],
+                "to": [
+                  {
+                    "operation": {
+                      "paths": [
+                        "/ws"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "allow-same-ns",
+          "action": "ALLOW",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "ws-realtime"
+              }
+            },
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "realtime-services"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "envoy_local_rate_limit": {
+        "stat_prefix": "ws_rate_limit",
+        "token_bucket": {
+          "max_tokens": 1,
+          "tokens_per_fill": 1,
+          "fill_interval": "1s"
+        }
+      },
+      "envoy_filter_lua": {
+        "inline_code": "function envoy_on_response(response_handle) local body = response_handle:body() if body then local s = body:getBytes(0, body:length()) s = string.gsub(s, '\"processing_ns\":%d+,?', '') response_handle:body():setBytes(s) end end"
+      }
+    }
+  }
+}

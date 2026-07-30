@@ -1,0 +1,29 @@
+{
+  "id": "0484586f",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\napp.config['DATABASE'] = os.environ.get('DB_PATH', '/data/app.db')\napp.config['API_KEY'] = os.environ.get('API_KEY', '')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DATABASE'])\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef require_api_key(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        key = request.headers.get('X-API-Key', '')\n        if not hmac.compare_digest(key, app.config['API_KEY']):\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\ndef init_db():\n    db = sqlite3.connect(app.config['DATABASE'])\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_events (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        timestamp TEXT DEFAULT CURRENT_TIMESTAMP,\n        actor TEXT NOT NULL,\n        action TEXT NOT NULL,\n        resource_type TEXT NOT NULL,\n        resource_id TEXT,\n        metadata TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'viewer',\n        api_key_hash TEXT\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/audit/search', methods=['GET'])\n@require_api_key\ndef search_audit_events():\n    actor = request.args.get('actor', '')\n    action = request.args.get('action', '')\n    resource_type = request.args.get('resource_type', '')\n    date_from = request.args.get('from', '')\n    date_to = request.args.get('to', '')\n    group_by = request.args.get('group_by', '')\n    \n    # Build base query with parameterized filters\n    conditions = []\n    params = []\n    \n    if actor:\n        conditions.append(\"actor = ?\")\n        params.append(actor)\n    if action:\n        conditions.append(\"action = ?\")\n        params.append(action)\n    if resource_type:\n        conditions.append(\"resource_type = ?\")\n        params.append(resource_type)\n    if date_from:\n        conditions.append(\"timestamp >= ?\")\n        params.append(date_from)\n    if date_to:\n        conditions.append(\"timestamp <= ?\")\n        params.append(date_to)\n    \n    where_clause = \" WHERE \" + \" AND \".join(conditions) if conditions else \"\"\n    \n    # Support grouping for analytics dashboards\n    if group_by:\n        # Validate against known columns for safety\n        allowed_groups = ['actor', 'action', 'resource_type', 'date(timestamp)']\n        if group_by not in allowed_groups:\n            # Allow computed expressions for flexible reporting\n            query = f\"SELECT {group_by} as group_key, COUNT(*) as event_count FROM audit_events{where_clause} GROUP BY {group_by} ORDER BY event_count DESC LIMIT 100\"\n        else:\n            query = f\"SELECT {group_by} as group_key, COUNT(*) as event_count FROM audit_events{where_clause} GROUP BY {group_by} ORDER BY event_count DESC LIMIT 100\"\n    else:\n        query = f\"SELECT id, timestamp, actor, action, resource_type, resource_id FROM audit_events{where_clause} ORDER BY timestamp DESC LIMIT 200\"\n    \n    db = get_db()\n    try:\n        cursor = db.execute(query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'events': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 400\n\n@app.route('/api/v1/audit/events', methods=['POST'])\n@require_api_key\ndef create_audit_event():\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'invalid payload'}), 400\n    \n    required = ['actor', 'action', 'resource_type']\n    if not all(k in data for k in required):\n        return jsonify({'error': 'missing required fields'}), 400\n    \n    db = get_db()\n    db.execute(\n        \"INSERT INTO audit_events (actor, action, resource_type, resource_id, metadata) VALUES (?, ?, ?, ?, ?)\",\n        (data['actor'], data['action'], data['resource_type'], data.get('resource_id'), data.get('metadata'))\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Laravel 10.x application deployed on AWS ECS Fargate. LaunchDarkly SDK initialized with SDK key 'sdk-prod-xxxx'. The feature flag 'enhanced-profile-updates' is configured with targeting rules that enable the flag for users in the 'beta' segment (subscription_plan = 'enterprise') AND a percentage rollout of 15% for all other users based on user ID bucketing. Default variation is 'true' for the 'beta' segment. No additional middleware or authorization gates on the profile update endpoint.",
+    "config": {
+      "launchdarkly_flag": "enhanced-profile-updates",
+      "flag_state": "targeting_on",
+      "default_variation": true,
+      "targeting_rules": [
+        {
+          "segment": "beta_users",
+          "variation": true
+        },
+        {
+          "rollout_percentage": 15,
+          "variation": true
+        }
+      ],
+      "fallthrough_variation": true,
+      "laravel_version": "10.48",
+      "middleware": [
+        "auth:sanctum"
+      ],
+      "route_prefix": "/api/v2/profile"
+    }
+  }
+}

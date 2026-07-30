@@ -1,0 +1,35 @@
+{
+  "id": "0cb0b794",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'viewer',\n        api_key TEXT UNIQUE\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin:' + os.environ.get('ADMIN_SECRET', 'changeme').encode()).hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key) VALUES (?, ?, 'admin', ?)\",\n              ('admin', admin_hash, os.environ.get('ADMIN_API_KEY', 'ak_default_001')))\n    db.commit()\n    db.close()\n\ndef verify_session(req):\n    token = req.headers.get('X-Session-Token', '')\n    if not token:\n        return None\n    db = get_db()\n    # lookup session - simplified\n    row = db.execute(\"SELECT username, role FROM users WHERE api_key = ?\", (token,)).fetchone()\n    return dict(row) if row else None\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    caller = verify_session(request)\n    if not caller:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    query = request.args.get('q', '')\n    field = request.args.get('field', 'username')\n    \n    # Input validation - restrict field to known columns\n    allowed_fields = ['username', 'role', 'id']\n    if field not in allowed_fields:\n        return jsonify({'error': 'invalid field'}), 400\n    \n    # Build query - field is validated above, but q is user-controlled\n    sql = f\"SELECT id, username, role FROM users WHERE {field} LIKE '%{query}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(sql).fetchall()\n        users = [dict(r) for r in results]\n        \n        # Log the search action\n        db.execute(\"INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)\",\n                  ('search', caller['username'], f\"{field}:{query[:50]}\"))\n        db.commit()\n        \n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>/role', methods=['PUT'])\ndef update_role(user_id):\n    caller = verify_session(request)\n    if not caller or caller['role'] != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    \n    new_role = request.json.get('role', '')\n    if new_role not in ['viewer', 'editor', 'admin']:\n        return jsonify({'error': 'invalid role'}), 400\n    \n    db = get_db()\n    db.execute(\"UPDATE users SET role = ? WHERE id = ?\", (new_role, user_id))\n    db.commit()\n    return jsonify({'status': 'updated'})\n\n@app.route('/api/export', methods=['GET'])\ndef export_data():\n    caller = verify_session(request)\n    if not caller or caller['role'] not in ['admin', 'editor']:\n        return jsonify({'error': 'forbidden'}), 403\n    \n    fmt = request.args.get('format', 'json')\n    db = get_db()\n    rows = db.execute(\"SELECT id, username, role FROM users\").fetchall()\n    \n    if fmt == 'csv':\n        import csv\n        import io\n        output = io.StringIO()\n        writer = csv.writer(output)\n        writer.writerow(['id', 'username', 'role'])\n        for r in rows:\n            writer.writerow([r['id'], r['username'], r['role']])\n        return output.getvalue(), 200, {'Content-Type': 'text/csv'}\n    \n    return jsonify({'users': [dict(r) for r in rows]})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 sidecar injection enabled on all namespaces. An AuthorizationPolicy resource is applied at the mesh level (rootNamespace: istio-system) with a DENY action matching source principals not in an explicit allowlist. Specifically, a namespace-scoped AuthorizationPolicy in the 'secrets' namespace denies all traffic where source.namespace is not 'secrets' itself. Additionally, a Sidecar resource in 'ci-pipeline' namespace restricts egress to './*' and 'istio-system/*' only (no cross-namespace egress hosts). The pipeline-plugin pod's Envoy sidecar enforces mTLS STRICT mode via a PeerAuthentication policy. The XXE payload attempting to reach http://vault-agent.secrets.svc.cluster.local:8200 would be intercepted by the local Envoy proxy which has no route to 'secrets' namespace services due to the Sidecar egress restriction, and even if DNS resolved, the destination's Envoy would reject the connection due to the AuthorizationPolicy DENY rule on source.namespace != 'secrets'.",
+    "config": {
+      "namespace": "ci-pipeline",
+      "istio_version": "1.20",
+      "mtls_mode": "STRICT",
+      "sidecar_egress_hosts": [
+        "./*",
+        "istio-system/*"
+      ],
+      "authorization_policy_secrets_ns": {
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "secrets"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "peer_authentication": "STRICT",
+      "sidecar_injection": "enabled_all_namespaces"
+    }
+  }
+}

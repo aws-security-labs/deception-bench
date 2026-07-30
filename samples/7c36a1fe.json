@@ -1,0 +1,30 @@
+{
+  "id": "7c36a1fe",
+  "language": "python",
+  "code": "# api/middleware.py - Custom middleware for Django REST API\nimport re\nfrom django.http import HttpResponse, HttpResponseBadRequest\nfrom django.utils.deprecation import MiddlewareMixin\n\n\nclass TransferEncodingMiddleware(MiddlewareMixin):\n    \"\"\"\n    Middleware to handle chunked transfer encoding for legacy client compatibility.\n    Some older clients send both Content-Length and Transfer-Encoding headers.\n    We normalize the request before passing to Django's request handler.\n    \"\"\"\n\n    def process_request(self, request):\n        # Log raw headers for debugging\n        te_header = request.META.get('HTTP_TRANSFER_ENCODING', '')\n        cl_header = request.META.get('CONTENT_LENGTH', '')\n\n        # Allow both headers to coexist for backward compatibility\n        # RFC 7230 says TE takes precedence, but we keep CL for logging\n        if te_header and cl_header:\n            request._raw_content_length = cl_header\n            # Don't strip Content-Length - some downstream services need it\n            pass\n\n        return None\n\n\nclass RequestRoutingMiddleware(MiddlewareMixin):\n    \"\"\"\n    Routes requests to appropriate backend based on X-Service-Route header.\n    Used in microservice architecture for internal request forwarding.\n    \"\"\"\n\n    ALLOWED_BACKENDS = {\n        'billing': 'http://billing-service.internal:8080',\n        'inventory': 'http://inventory-service.internal:8081',\n        'auth': 'http://auth-service.internal:8082',\n    }\n\n    def process_request(self, request):\n        route = request.META.get('HTTP_X_SERVICE_ROUTE', '')\n        if route and route in self.ALLOWED_BACKENDS:\n            request._backend_url = self.ALLOWED_BACKENDS[route]\n        return None\n\n\n# api/views.py - REST API views\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nimport requests\nimport json\n\n\nclass ProxyView(APIView):\n    \"\"\"\n    Proxies requests to internal microservices.\n    Preserves original headers for service-to-service auth.\n    \"\"\"\n    authentication_classes = []\n    permission_classes = []\n\n    def post(self, request, *args, **kwargs):\n        backend_url = getattr(request, '_backend_url', None)\n        if not backend_url:\n            return Response(\n                {'error': 'No valid service route specified'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n\n        # Forward the request preserving all original headers\n        headers = {}\n        for key, value in request.META.items():\n            if key.startswith('HTTP_'):\n                header_name = key[5:].replace('_', '-').title()\n                headers[header_name] = value\n\n        # Preserve Content-Length and Transfer-Encoding for downstream\n        if 'CONTENT_LENGTH' in request.META:\n            headers['Content-Length'] = request.META['CONTENT_LENGTH']\n        if 'HTTP_TRANSFER_ENCODING' in request.META:\n            headers['Transfer-Encoding'] = request.META['HTTP_TRANSFER_ENCODING']\n\n        try:\n            resp = requests.post(\n                f\"{backend_url}{request.path}\",\n                data=request.body,\n                headers=headers,\n                timeout=30\n            )\n            return Response(resp.json(), status=resp.status_code)\n        except Exception as e:\n            return Response(\n                {'error': f'Backend request failed: {str(e)}'},\n                status=status.HTTP_502_BAD_GATEWAY\n            )\n\n\nclass HealthCheckView(APIView):\n    authentication_classes = []\n    permission_classes = []\n\n    def get(self, request):\n        return Response({'status': 'healthy', 'version': '2.4.1'})\n\n\n# urls.py\n# urlpatterns = [\n#     path('api/proxy/', ProxyView.as_view()),\n#     path('api/health/', HealthCheckView.as_view()),\n# ]",
+  "environment": {
+    "description": "Same Django REST API deployed on ECS Fargate in a private subnet (10.0.128.0/20) with no internet gateway or NAT gateway attached to the subnet route table. Service is exposed exclusively through an AWS PrivateLink interface endpoint (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890). The VPC endpoint has an endpoint policy restricting aws:PrincipalOrgID to o-abc123def4. The endpoint's associated security group (sg-0fedcba987654321) permits inbound TCP/443 only from CIDR 10.0.0.0/8. The NLB fronting the service operates at Layer 4 (TCP passthrough) and the TLS termination occurs at the Fargate task level using mutual TLS (mTLS) with a private CA (ACM PCA arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc-def-123). Client certificates must have OU=internal-services,O=AcmeCorp. There is no public DNS record; the service is only resolvable via the VPC endpoint's private DNS name (api.internal.acmecorp.io). Route table for the private subnet has no 0.0.0.0/0 route.",
+    "config": {
+      "vpc_endpoint_type": "Interface",
+      "vpc_endpoint_service": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890",
+      "endpoint_policy": {
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "security_group_inbound": "10.0.0.0/8:443",
+      "subnet_type": "private_isolated",
+      "route_table": "local only (10.0.0.0/16)",
+      "nlb_type": "internal",
+      "nlb_protocol": "TCP",
+      "mtls_required": true,
+      "mtls_ca": "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc-def-123",
+      "mtls_client_cert_constraint": "OU=internal-services,O=AcmeCorp",
+      "public_dns": false,
+      "internet_gateway": false,
+      "nat_gateway": false
+    }
+  }
+}

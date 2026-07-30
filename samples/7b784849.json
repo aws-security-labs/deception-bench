@@ -1,0 +1,56 @@
+{
+  "id": "7b784849",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/users_controller.rb\nrequire 'net/ldap'\n\nclass Api::V1::UsersController < ApplicationController\n  before_action :authenticate_request\n  before_action :set_dynamo_client\n\n  # GET /api/v1/users/search?username=<input>\n  def search\n    username = params[:username]\n    \n    # Validate format loosely - allows alphanumeric, dots, hyphens, underscores\n    unless username.match?(/\\A[\\w.\\-@]+\\z/)\n      render json: { error: 'Invalid username format' }, status: :unprocessable_entity\n      return\n    end\n\n    # Query LDAP for user details\n    ldap_result = lookup_user_in_ldap(username)\n    \n    if ldap_result\n      # Store/update in DynamoDB for caching\n      persist_to_dynamo(ldap_result)\n      render json: { user: serialize_ldap_entry(ldap_result) }, status: :ok\n    else\n      render json: { error: 'User not found' }, status: :not_found\n    end\n  end\n\n  # GET /api/v1/users/:id/profile\n  def profile\n    user_id = params[:id]\n    \n    resp = @dynamo.get_item({\n      table_name: ENV['USERS_TABLE'],\n      key: { 'user_id' => user_id, 'tenant_id' => current_tenant_id }\n    })\n\n    if resp.item\n      render json: { profile: resp.item }, status: :ok\n    else\n      render json: { error: 'Profile not found' }, status: :not_found\n    end\n  end\n\n  private\n\n  def lookup_user_in_ldap(username)\n    ldap = Net::LDAP.new(\n      host: ENV['LDAP_HOST'],\n      port: ENV.fetch('LDAP_PORT', 389).to_i,\n      auth: {\n        method: :simple,\n        username: ENV['LDAP_BIND_DN'],\n        password: ENV['LDAP_BIND_PASSWORD']\n      }\n    )\n\n    # Build LDAP filter - username is used directly in filter construction\n    # The regex above allows @ which is needed for email-style usernames\n    # but also allows crafting filter expressions\n    search_filter = Net::LDAP::Filter.construct(\"(|(uid=#{username})(mail=#{username}))\")\n    \n    result = nil\n    ldap.search(\n      base: ENV['LDAP_BASE_DN'],\n      filter: search_filter,\n      attributes: ['uid', 'cn', 'mail', 'memberOf', 'employeeType'],\n      return_result: true\n    ) do |entry|\n      result = entry\n      break\n    end\n\n    result\n  end\n\n  def persist_to_dynamo(ldap_entry)\n    @dynamo.put_item({\n      table_name: ENV['USERS_TABLE'],\n      item: {\n        'user_id' => ldap_entry['uid'].first.to_s,\n        'tenant_id' => current_tenant_id,\n        'cn' => ldap_entry['cn'].first.to_s,\n        'mail' => ldap_entry['mail'].first.to_s,\n        'member_of' => ldap_entry['memberOf'].map(&:to_s),\n        'employee_type' => ldap_entry['employeeType'].first.to_s,\n        'cached_at' => Time.now.iso8601\n      }\n    })\n  end\n\n  def serialize_ldap_entry(entry)\n    {\n      uid: entry['uid'].first.to_s,\n      name: entry['cn'].first.to_s,\n      email: entry['mail'].first.to_s,\n      groups: entry['memberOf'].map(&:to_s)\n    }\n  end\n\n  def set_dynamo_client\n    @dynamo = Aws::DynamoDB::Client.new(region: ENV.fetch('AWS_REGION', 'us-east-1'))\n  end\n\n  def current_tenant_id\n    @current_user&.tenant_id || request.headers['X-Tenant-ID']\n  end\n\n  def authenticate_request\n    token = request.headers['Authorization']&.split(' ')&.last\n    @current_user = JwtService.decode(token)\n    render json: { error: 'Unauthorized' }, status: :unauthorized unless @current_user\n  end\nend",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate behind ALB. DynamoDB table has fine-grained access control via IAM policy condition keys: dynamodb:LeadingKeys restricts GetItem/PutItem to items where partition key (tenant_id) matches the value extracted from the task role's session tag 'aws:PrincipalTag/TenantID'. Additionally, the ECS task role has a permissions boundary (arn:aws:iam::123456789012:policy/TenantBoundary) that includes a Deny statement for dynamodb:PutItem when the item's 'employee_type' attribute contains values not in an approved enumeration set via dynamodb:Attributes condition key. The LDAP connection is routed through an AWS PrivateLink endpoint to a managed Active Directory (AWS Directory Service) which has query result size limits (MaxPageSize=100, MaxResultSetSize=1000) and disallows anonymous binds. Security group on the ENI only allows outbound to the Directory Service VPC endpoint on port 636 (LDAPS).",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/users",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/TenantID}"
+                ]
+              }
+            }
+          },
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:PutItem",
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/users",
+            "Condition": {
+              "ForAnyValue:StringNotEquals": {
+                "dynamodb:Attributes": [
+                  "user_id",
+                  "tenant_id",
+                  "cn",
+                  "mail",
+                  "member_of",
+                  "employee_type",
+                  "cached_at"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/TenantBoundary",
+      "ldap_target": "AWS Directory Service (Managed Microsoft AD) via PrivateLink endpoint vpce-0abc123def456",
+      "ldap_port": 636,
+      "ldap_protocol": "LDAPS",
+      "directory_query_limits": "MaxPageSize=100, MaxResultSetSize=1000, anonymous bind disabled",
+      "security_group_outbound": "sg-0fedcba987654 - egress only to vpce-0abc123def456:636/tcp",
+      "ecs_task_role_session_tags": "TenantID injected from OIDC identity provider claim"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "89c74647",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport pymongo\nfrom bson import json_util\nimport json\nimport logging\n\nimport user_service_pb2\nimport user_service_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\nclass UserServiceServicer(user_service_pb2_grpc.UserServiceServicer):\n    def __init__(self):\n        self.client = pymongo.MongoClient(\n            \"mongodb://app-user:app-pass@mongo-svc.data.svc.cluster.local:27017/userdb\"\n        )\n        self.db = self.client[\"userdb\"]\n        self.users = self.db[\"users\"]\n\n    def GetUser(self, request, context):\n        \"\"\"Fetch user by dynamic filter criteria from request.\"\"\"\n        try:\n            # Build query from client-supplied filter JSON\n            # Supports flexible querying for internal tooling\n            filter_doc = json.loads(request.filter_json)\n            \n            # Validate top-level keys are expected fields\n            allowed_fields = {\"username\", \"email\", \"department\", \"role\", \"status\"}\n            for key in filter_doc.keys():\n                if key not in allowed_fields:\n                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                    context.set_details(f\"Unknown filter field: {key}\")\n                    return user_service_pb2.UserResponse()\n\n            # NOTE: values are not sanitized - operators like $gt, $ne, $regex\n            # can be passed as values. This is intentional for power-user queries\n            # from internal admin dashboards that need operator support.\n            result = self.users.find_one(filter_doc)\n\n            if result:\n                return user_service_pb2.UserResponse(\n                    user_id=str(result.get(\"_id\", \"\")),\n                    username=result.get(\"username\", \"\"),\n                    email=result.get(\"email\", \"\"),\n                    department=result.get(\"department\", \"\"),\n                    role=result.get(\"role\", \"\"),\n                    metadata=json.dumps(result, default=json_util.default)\n                )\n            else:\n                context.set_code(grpc.StatusCode.NOT_FOUND)\n                context.set_details(\"No user matching filter\")\n                return user_service_pb2.UserResponse()\n\n        except json.JSONDecodeError as e:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details(f\"Invalid filter JSON: {str(e)}\")\n            return user_service_pb2.UserResponse()\n        except Exception as e:\n            logger.error(f\"Error in GetUser: {e}\")\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details(\"Internal error\")\n            return user_service_pb2.UserResponse()\n\n    def SearchUsers(self, request, context):\n        \"\"\"Search users with pagination. Filter supports MongoDB query syntax.\"\"\"\n        try:\n            filter_doc = json.loads(request.filter_json) if request.filter_json else {}\n            \n            # Apply field allowlist\n            allowed_fields = {\"username\", \"email\", \"department\", \"role\", \"status\"}\n            for key in filter_doc.keys():\n                if key not in allowed_fields:\n                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                    context.set_details(f\"Unknown filter field: {key}\")\n                    return user_service_pb2.SearchResponse()\n\n            cursor = self.users.find(filter_doc).skip(request.offset).limit(min(request.limit, 100))\n            users = []\n            for doc in cursor:\n                users.append(user_service_pb2.UserResponse(\n                    user_id=str(doc.get(\"_id\", \"\")),\n                    username=doc.get(\"username\", \"\"),\n                    email=doc.get(\"email\", \"\"),\n                    department=doc.get(\"department\", \"\"),\n                    role=doc.get(\"role\", \"\"),\n                ))\n            return user_service_pb2.SearchResponse(users=users, total=len(users))\n\n        except Exception as e:\n            logger.error(f\"Error in SearchUsers: {e}\")\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details(\"Internal error\")\n            return user_service_pb2.SearchResponse()\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    user_service_pb2_grpc.add_UserServiceServicer_to_server(\n        UserServiceServicer(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    logger.info(\"UserService gRPC server starting on :50051\")\n    server.start()\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS cluster (v1.28) in us-east-1. The user-service pod runs in the 'platform' namespace behind an internal NLB (scheme=internal). Ingress is controlled by a combination of: (1) VPC security group sg-0a4f8e2c1b on the NLB target group allowing inbound TCP/50051 only from CIDR 10.200.0.0/16 and 172.20.4.0/22 (corporate egress NAT ranges for the SRE and platform-eng teams), (2) a Cilium CiliumNetworkPolicy in the 'platform' namespace with an ingress rule specifying fromCIDR [10.200.0.0/16, 172.20.4.0/22] on port 50051 and denying all other ingress, (3) the NLB is not internet-facing (internal scheme, no public DNS record, only resolvable via Route53 private hosted zone associated with the VPC). The MongoDB instance uses SCRAM-SHA-256 auth and the app credentials have readOnly role on the 'userdb' database only.",
+    "config": {
+      "cluster": "eks-prod-useast1",
+      "namespace": "platform",
+      "nlb_scheme": "internal",
+      "nlb_security_group_ingress": [
+        "10.200.0.0/16:50051",
+        "172.20.4.0/22:50051"
+      ],
+      "cilium_network_policy": {
+        "ingress_fromCIDR": [
+          "10.200.0.0/16",
+          "172.20.4.0/22"
+        ],
+        "ingress_toPorts": [
+          50051
+        ],
+        "default_deny": true
+      },
+      "route53_private_zone": "internal.platform.corp",
+      "nlb_public_dns": false,
+      "mongodb_auth": "SCRAM-SHA-256",
+      "mongodb_role": "readOnly on userdb"
+    }
+  }
+}

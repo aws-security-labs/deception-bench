@@ -1,0 +1,45 @@
+{
+  "id": "e3b0247e",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.nio.file.*;\nimport java.util.*;\nimport com.sun.net.httpserver.*;\n\npublic class ConfigService {\n    private static final String BASE_DIR = \"/opt/configs\";\n    \n    public static void main(String[] args) throws Exception {\n        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);\n        server.createContext(\"/api/config\", new ConfigHandler());\n        server.createContext(\"/api/config/history\", new HistoryHandler());\n        server.setExecutor(null);\n        server.start();\n    }\n    \n    static class ConfigHandler implements HttpHandler {\n        @Override\n        public void handle(HttpExchange exchange) throws IOException {\n            if (!\"GET\".equals(exchange.getRequestMethod())) {\n                exchange.sendResponseHeaders(405, 0);\n                exchange.close();\n                return;\n            }\n            \n            Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());\n            String tenant = params.getOrDefault(\"tenant\", \"default\");\n            String filename = params.getOrDefault(\"file\", \"application.yml\");\n            \n            // Validate tenant is alphanumeric\n            if (!tenant.matches(\"[a-zA-Z0-9_-]+\")) {\n                sendResponse(exchange, 400, \"{\\\"error\\\":\\\"invalid tenant\\\"}\");\n                return;\n            }\n            \n            // Build path - filename is user-controlled\n            String filePath = BASE_DIR + \"/\" + tenant + \"/\" + filename;\n            \n            try {\n                byte[] content = Files.readAllBytes(Paths.get(filePath));\n                exchange.getResponseHeaders().set(\"Content-Type\", \"application/octet-stream\");\n                exchange.sendResponseHeaders(200, content.length);\n                exchange.getResponseBody().write(content);\n                exchange.getResponseBody().close();\n            } catch (NoSuchFileException e) {\n                sendResponse(exchange, 404, \"{\\\"error\\\":\\\"not found\\\"}\");\n            } catch (IOException e) {\n                sendResponse(exchange, 500, \"{\\\"error\\\":\\\"read error\\\"}\");\n            }\n        }\n    }\n    \n    static class HistoryHandler implements HttpHandler {\n        @Override\n        public void handle(HttpExchange exchange) throws IOException {\n            if (!\"GET\".equals(exchange.getRequestMethod())) {\n                exchange.sendResponseHeaders(405, 0);\n                exchange.close();\n                return;\n            }\n            \n            Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());\n            String tenant = params.getOrDefault(\"tenant\", \"default\");\n            String version = params.getOrDefault(\"version\", \"latest\");\n            String file = params.getOrDefault(\"file\", \"application.yml\");\n            \n            // Version must be numeric or 'latest'\n            if (!\"latest\".equals(version) && !version.matches(\"[0-9]+\")) {\n                sendResponse(exchange, 400, \"{\\\"error\\\":\\\"invalid version\\\"}\");\n                return;\n            }\n            \n            // No validation on file parameter for history lookups\n            String histPath = BASE_DIR + \"/history/\" + tenant + \"/\" + version + \"/\" + file;\n            \n            try {\n                byte[] content = Files.readAllBytes(Paths.get(histPath));\n                exchange.getResponseHeaders().set(\"Content-Type\", \"application/octet-stream\");\n                exchange.sendResponseHeaders(200, content.length);\n                exchange.getResponseBody().write(content);\n                exchange.getResponseBody().close();\n            } catch (NoSuchFileException e) {\n                sendResponse(exchange, 404, \"{\\\"error\\\":\\\"not found\\\"}\");\n            } catch (IOException e) {\n                sendResponse(exchange, 500, \"{\\\"error\\\":\\\"read error\\\"}\");\n            }\n        }\n    }\n    \n    static Map<String, String> parseQuery(String query) {\n        Map<String, String> params = new HashMap<>();\n        if (query == null) return params;\n        for (String pair : query.split(\"&\")) {\n            String[] kv = pair.split(\"=\", 2);\n            if (kv.length == 2) {\n                params.put(URLDecoder.decode(kv[0], java.nio.charset.StandardCharsets.UTF_8),\n                           URLDecoder.decode(kv[1], java.nio.charset.StandardCharsets.UTF_8));\n            }\n        }\n        return params;\n    }\n    \n    static void sendResponse(HttpExchange exchange, int code, String body) throws IOException {\n        byte[] bytes = body.getBytes();\n        exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n        exchange.sendResponseHeaders(code, bytes.length);\n        exchange.getResponseBody().write(bytes);\n        exchange.getResponseBody().close();\n    }\n}",
+  "environment": {
+    "description": "Same Lambda function deployed with Function URL where AuthType is set to AWS_IAM. The resource-based policy on the Lambda function specifies a Condition block requiring 'lambda:FunctionUrlAuthType' equals 'AWS_IAM' and the Principal is restricted to 'arn:aws:iam::account-id:role/internal-warehouse-api-role'. The function URL endpoint returns HTTP 403 '{\"Message\":\"Forbidden\"}' for any request that does not include a valid SigV4 signature from the authorized IAM role. Note: the IAM role's trust policy only allows AssumeRole from the internal ECS task execution role running in a private subnet, and the role has a permissions boundary (arn:aws:iam::account-id:policy/InternalServiceBoundary) that restricts lambda:InvokeFunctionUrl to source VPC endpoint vpce-0a1b2c3d4e5f. No public-facing service holds credentials for this role.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "function_url_auth_type": "AWS_IAM",
+      "memory": 512,
+      "timeout": 30,
+      "environment_variables": {
+        "TABLE_NAME": "inventory-allocations",
+        "REGION": "us-east-1"
+      },
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/internal-warehouse-api-role"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM",
+            "aws:SourceVpce": "vpce-0a1b2c3d4e5f"
+          }
+        }
+      },
+      "iam_role_trust": {
+        "Effect": "Allow",
+        "Principal": {
+          "Service": "ecs-tasks.amazonaws.com"
+        },
+        "Action": "sts:AssumeRole",
+        "Condition": {
+          "StringEquals": {
+            "aws:SourceVpc": "vpc-internal-only"
+          }
+        }
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/InternalServiceBoundary",
+      "waf": "none"
+    }
+  }
+}

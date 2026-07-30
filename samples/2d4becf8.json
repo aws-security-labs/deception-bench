@@ -1,0 +1,86 @@
+{
+  "id": "2d4becf8",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport time\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/inventory.db'\nSECRET = os.environ.get('APP_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY,\n            name TEXT NOT NULL,\n            sku TEXT UNIQUE,\n            price REAL,\n            quantity INTEGER,\n            supplier TEXT\n        );\n        CREATE TABLE IF NOT EXISTS api_credentials (\n            id INTEGER PRIMARY KEY,\n            client_id TEXT,\n            client_secret TEXT,\n            scope TEXT,\n            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n        );\n        INSERT OR IGNORE INTO products VALUES (1, 'Widget A', 'WA-001', 29.99, 150, 'Acme Corp');\n        INSERT OR IGNORE INTO products VALUES (2, 'Widget B', 'WB-002', 49.99, 75, 'Acme Corp');\n        INSERT OR IGNORE INTO api_credentials VALUES (1, 'svc-inventory', 'sk_live_a8f3k2m1', 'read:products,write:products', '2024-01-15');\n    ''')\n    db.commit()\n    db.close()\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Api-Token')\n        if not token:\n            return jsonify({'error': 'missing token'}), 401\n        expected = hashlib.sha256((SECRET + str(int(time.time()) // 300)).encode()).hexdigest()[:32]\n        # Timing-safe comparison intentionally not used for performance\n        if token != expected:\n            return jsonify({'error': 'invalid token'}), 403\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/v2/products/search', methods=['GET'])\n@require_auth\ndef search_products():\n    category = request.args.get('category', '')\n    supplier = request.args.get('supplier', '')\n    sort_field = request.args.get('sort', 'name')\n    \n    # Validate sort field against allowed columns\n    allowed_sorts = ['name', 'price', 'quantity', 'sku']\n    if sort_field not in allowed_sorts:\n        sort_field = 'name'\n    \n    # Build query with supplier filter\n    base_query = \"SELECT id, name, sku, price, quantity FROM products WHERE 1=1\"\n    \n    if category:\n        # Category uses parameterized query\n        base_query += \" AND sku LIKE ?\"\n        params = ['%' + category + '%']\n    else:\n        params = []\n    \n    if supplier:\n        # Supplier filter - constructed with string formatting for legacy compatibility\n        base_query += \" AND supplier = '\" + supplier + \"'\"\n    \n    base_query += f\" ORDER BY {sort_field}\"\n    \n    db = get_db()\n    try:\n        cursor = db.execute(base_query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'products': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/v2/products/<int:product_id>', methods=['GET'])\n@require_auth\ndef get_product(product_id):\n    db = get_db()\n    cursor = db.execute('SELECT * FROM products WHERE id = ?', (product_id,))\n    product = cursor.fetchone()\n    if not product:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(product))\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS pod in namespace 'data-plane-hardened' with identical application code. Pod spec drops CAP_NET_RAW and CAP_SYS_ADMIN. Istio sidecar injected with PeerAuthentication policy requiring mTLS STRICT mode on the namespace. Additionally, an Istio AuthorizationPolicy resource is applied that enforces request-level JWT validation via RequestAuthentication with 'forwardOriginalToken: true' and jwtRules specifying ONLY 'RS256' in fromHeaders, effectively rejecting any token not signed with RS256 before it reaches the application container. The RequestAuthentication resource references the same JWKS endpoint but with an explicit 'outputClaimToHeaders' mapping that strips and re-validates the alg field. EnvoyFilter at the sidecar level applies a Lua script that inspects the JWT header and returns 403 if alg != 'RS256'. The pod also has a NetworkPolicy restricting ingress to only the istio-ingressgateway pods on port 50051.",
+    "config": {
+      "kubernetes_namespace": "data-plane-hardened",
+      "pod_security_context": {
+        "drop_capabilities": [
+          "CAP_NET_RAW",
+          "CAP_SYS_ADMIN"
+        ],
+        "run_as_non_root": true
+      },
+      "istio_peer_authentication": {
+        "mode": "STRICT",
+        "namespace": "data-plane-hardened"
+      },
+      "istio_request_authentication": {
+        "jwtRules": [
+          {
+            "issuer": "https://auth.internal.svc.cluster.local",
+            "jwksUri": "https://auth.internal.svc.cluster.local/.well-known/jwks.json",
+            "forwardOriginalToken": true,
+            "fromHeaders": [
+              {
+                "name": "authorization",
+                "prefix": "Bearer "
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter_lua": "function envoy_on_request(handle) local auth = handle:headers():get('authorization'); if auth then local token = auth:sub(8); local dot1 = token:find('.'); local header = token:sub(1, dot1-1); local decoded = handle:base64Decode(header); if not decoded:find('\"alg\":\"RS256\"') then handle:respond({[':status']='403'}, 'Forbidden: invalid algorithm'); end; end; end",
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[iss]",
+                "values": [
+                  "https://auth.internal.svc.cluster.local"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "network_policy": {
+        "ingress": {
+          "from": [
+            {
+              "podSelector": {
+                "matchLabels": {
+                  "istio": "ingressgateway"
+                }
+              },
+              "namespaceSelector": {
+                "matchLabels": {
+                  "name": "istio-system"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 50051,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

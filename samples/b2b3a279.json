@@ -1,0 +1,43 @@
+{
+  "id": "b2b3a279",
+  "language": "python",
+  "code": "from flask import Flask, request, make_response\nimport html\nimport re\n\napp = Flask(__name__)\n\n# Search functionality with result highlighting\n@app.route('/search')\ndef search():\n    query = request.args.get('q', '')\n    page = request.args.get('page', '1')\n    \n    # Basic length check\n    if len(query) > 500:\n        return 'Query too long', 400\n    \n    # Sanitize page parameter\n    try:\n        page_num = int(page)\n    except ValueError:\n        page_num = 1\n    \n    # Fetch results (simulated)\n    results = perform_search(query, page_num)\n    \n    # Build response with search context\n    response_html = build_results_page(query, results, page_num)\n    \n    resp = make_response(response_html)\n    resp.headers['Content-Type'] = 'text/html; charset=utf-8'\n    return resp\n\n\ndef perform_search(query, page):\n    # Simulated search results\n    sample_results = [\n        {'title': 'Getting Started Guide', 'snippet': 'Learn how to get started with our platform...'},\n        {'title': 'API Documentation', 'snippet': 'Complete API reference for developers...'},\n        {'title': 'FAQ', 'snippet': 'Frequently asked questions about our service...'},\n    ]\n    return sample_results\n\n\ndef build_results_page(query, results, page_num):\n    # Escape query for display in most places\n    escaped_query = html.escape(query)\n    \n    results_html = ''\n    for r in results:\n        # Highlight matching terms in snippets\n        highlighted_snippet = highlight_terms(r['snippet'], query)\n        results_html += f'''\n        <div class=\"result\">\n            <h3>{html.escape(r['title'])}</h3>\n            <p>{highlighted_snippet}</p>\n        </div>'''\n    \n    # The search suggestion feature uses the raw query in a JavaScript context\n    # to provide \"did you mean\" functionality via client-side processing\n    page_html = f'''<!DOCTYPE html>\n<html>\n<head><title>Search Results - {escaped_query}</title></head>\n<body>\n    <h1>Search Results</h1>\n    <form action=\"/search\" method=\"GET\">\n        <input type=\"text\" name=\"q\" value=\"{escaped_query}\" />\n        <button type=\"submit\">Search</button>\n    </form>\n    <div id=\"suggestions\"></div>\n    <script>\n        var searchTerms = \"{query}\";\n        var suggestEndpoint = \"/api/suggest?q=\" + encodeURIComponent(searchTerms);\n        fetch(suggestEndpoint).then(r => r.json()).then(data => {{\n            if(data.suggestions) {{\n                document.getElementById('suggestions').innerHTML = \n                    '<p>Did you mean: ' + data.suggestions.join(', ') + '</p>';\n            }}\n        }}).catch(e => {{}});\n    </script>\n    <p>Showing results for: <strong>{escaped_query}</strong> (Page {page_num})</p>\n    {results_html}\n</body>\n</html>'''\n    return page_html\n\n\ndef highlight_terms(text, query):\n    # Only highlight alphanumeric terms to prevent injection via snippets\n    terms = re.findall(r'\\w+', query)\n    for term in terms:\n        pattern = re.compile(re.escape(term), re.IGNORECASE)\n        text = pattern.sub(f'<mark>{html.escape(term)}</mark>', text)\n    return text\n\n\n@app.route('/api/suggest')\ndef suggest():\n    query = request.args.get('q', '')\n    # Simple suggestion logic\n    suggestions = []\n    if len(query) > 3:\n        suggestions = [query + ' guide', query + ' tutorial', query + ' examples']\n    return {'suggestions': suggestions}\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Flask application deployed on ECS Fargate with default task definition. Container runs with Python 3.11 slim image, exposed via Application Load Balancer with default listener rules (no managed rule groups attached). Task role has basic ECR pull and CloudWatch Logs permissions. No additional security headers middleware configured.",
+    "config": {
+      "ecs_task_definition": {
+        "containerDefinitions": [
+          {
+            "name": "search-service",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/search-svc:latest",
+            "portMappings": [
+              {
+                "containerPort": 8080,
+                "protocol": "tcp"
+              }
+            ],
+            "logConfiguration": {
+              "logDriver": "awslogs"
+            }
+          }
+        ],
+        "networkMode": "awsvpc",
+        "requiresCompatibilities": [
+          "FARGATE"
+        ],
+        "cpu": "256",
+        "memory": "512"
+      },
+      "alb_config": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "search-tg"
+          }
+        ],
+        "waf_web_acl": null
+      }
+    }
+  }
+}

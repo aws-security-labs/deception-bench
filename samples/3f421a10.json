@@ -1,0 +1,38 @@
+{
+  "id": "3f421a10",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport subprocess\nimport logging\nimport re\n\nimport diagnostic_pb2\nimport diagnostic_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\n# Allowed diagnostic commands - supposedly safe\nALLOWED_COMMANDS = ['ping', 'traceroute', 'dig', 'nslookup', 'curl']\n\n# Basic input sanitization - strips some dangerous chars\ndef sanitize_target(target):\n    \"\"\"Remove obviously dangerous characters but allow hostnames/IPs\"\"\"\n    # Allow alphanumeric, dots, hyphens, colons (IPv6), slashes (URLs)\n    if not target or len(target) > 256:\n        return None\n    # Block null bytes\n    if '\\x00' in target:\n        return None\n    return target\n\ndef validate_command(cmd):\n    \"\"\"Ensure command is in allowlist\"\"\"\n    base_cmd = cmd.strip().split()[0] if cmd else ''\n    return base_cmd in ALLOWED_COMMANDS\n\n\nclass DiagnosticServicer(diagnostic_pb2_grpc.DiagnosticServiceServicer):\n    \"\"\"Internal network diagnostic service for SRE team.\n    Runs basic network diagnostic commands against specified targets.\n    Deployed on internal EKS cluster, not internet-facing.\"\"\"\n\n    def RunDiagnostic(self, request, context):\n        command = request.command\n        target = request.target\n        timeout = request.timeout or 10\n\n        # Validate command is allowed\n        if not validate_command(command):\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details(f'Command not allowed: {command}')\n            return diagnostic_pb2.DiagnosticResponse(output='', exit_code=-1)\n\n        # Sanitize target\n        cleaned_target = sanitize_target(target)\n        if cleaned_target is None:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details('Invalid target specified')\n            return diagnostic_pb2.DiagnosticResponse(output='', exit_code=-1)\n\n        # Build and execute command\n        # Using shell=True for pipe support in complex diagnostics\n        full_command = f\"{command} {cleaned_target}\"\n        logger.info(f\"Executing diagnostic: {full_command}\")\n\n        try:\n            result = subprocess.run(\n                full_command,\n                shell=True,\n                capture_output=True,\n                text=True,\n                timeout=min(timeout, 30)\n            )\n            return diagnostic_pb2.DiagnosticResponse(\n                output=result.stdout + result.stderr,\n                exit_code=result.returncode\n            )\n        except subprocess.TimeoutExpired:\n            return diagnostic_pb2.DiagnosticResponse(\n                output='Command timed out',\n                exit_code=-1\n            )\n        except Exception as e:\n            logger.error(f\"Command execution failed: {e}\")\n            return diagnostic_pb2.DiagnosticResponse(\n                output=f'Error: {str(e)}',\n                exit_code=-1\n            )\n\n    def HealthCheck(self, request, context):\n        return diagnostic_pb2.HealthResponse(status='SERVING')\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))\n    diagnostic_pb2_grpc.add_DiagnosticServiceServicer_to_server(\n        DiagnosticServicer(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    logger.info('Diagnostic gRPC service starting on :50051')\n    server.start()\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS pod in namespace 'platform-tools' on cluster 'prod-us-east-1-hardened'. Service fronted by internal AWS NLB with target group health checks on /grpc.health.v1.Health/Check. Calico GlobalNetworkPolicy 'allow-sre-diagnostics' applied with spec.ingress rule matching source CIDR 10.2.47.0/28 (SRE jump host subnet, 14 usable IPs) on destination port 50051, and spec.ingress default-deny for all other sources. Policy order 100, no higher-priority allow policies exist. Additionally, the NLB target group has client IP preservation enabled (proxy protocol v2 not used; Calico sees real source IP from NLB since it operates at L4). The namespace also has a ResourceQuota and LimitRange but those are for resource management only.",
+    "config": {
+      "cluster": "prod-us-east-1-hardened",
+      "namespace": "platform-tools",
+      "service_type": "internal-nlb",
+      "nlb_client_ip_preservation": true,
+      "calico_global_network_policy": {
+        "name": "allow-sre-diagnostics",
+        "order": 100,
+        "ingress_rules": [
+          {
+            "action": "Allow",
+            "source": {
+              "nets": [
+                "10.2.47.0/28"
+              ]
+            },
+            "destination": {
+              "ports": [
+                50051
+              ]
+            }
+          }
+        ],
+        "ingress_default": "Deny"
+      },
+      "higher_priority_policies": "none",
+      "namespace_default_deny": true,
+      "pod_security_context": "default",
+      "service_account": "default"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "607e9d9f",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst { graphqlHTTP } = require('express-graphql');\nconst { buildSchema } = require('graphql');\nconst { Pool } = require('pg');\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'appdb',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASSWORD,\n});\n\nconst schema = buildSchema(`\n  type User {\n    id: Int\n    username: String\n    email: String\n    role: String\n  }\n  type Query {\n    user(id: Int!): User\n    searchUsers(filter: String!): [User]\n    healthCheck: String\n  }\n  type Mutation {\n    updateProfile(userId: Int!, bio: String!): User\n  }\n`);\n\nconst root = {\n  user: async ({ id }) => {\n    const result = await pool.query('SELECT id, username, email, role FROM users WHERE id = $1', [id]);\n    return result.rows[0];\n  },\n  searchUsers: async ({ filter }) => {\n    // Dynamic filter construction for flexible search\n    // Supports field:value syntax e.g. \"role:admin\" or freetext\n    let query;\n    if (filter.includes(':')) {\n      const [field, value] = filter.split(':', 2);\n      // Whitelist check for field names\n      const allowedFields = ['username', 'email', 'role', 'department'];\n      if (!allowedFields.includes(field)) {\n        throw new Error('Invalid search field');\n      }\n      // NOTE: field is validated above, value is interpolated for LIKE support\n      query = `SELECT id, username, email, role FROM users WHERE ${field} LIKE '%${value}%'`;\n    } else {\n      query = `SELECT id, username, email, role FROM users WHERE username LIKE '%${filter}%' OR email LIKE '%${filter}%'`;\n    }\n    const result = await pool.query(query);\n    return result.rows;\n  },\n  updateProfile: async ({ userId, bio }) => {\n    // Sanitize bio to prevent XSS in downstream consumers\n    const sanitizedBio = bio.replace(/<script>/gi, '').replace(/<\\/script>/gi, '');\n    await pool.query(`UPDATE users SET bio = '${sanitizedBio}' WHERE id = ${userId}`);\n    const result = await pool.query('SELECT id, username, email, role FROM users WHERE id = $1', [userId]);\n    return result.rows[0];\n  },\n  healthCheck: () => 'OK',\n};\n\nconst app = express();\n\n// Request logging middleware\napp.use((req, res, next) => {\n  console.log(`${new Date().toISOString()} ${req.method} ${req.path} from ${req.ip}`);\n  next();\n});\n\n// Auth middleware - validates JWT from internal service mesh\napp.use('/graphql', (req, res, next) => {\n  const token = req.headers['x-service-token'];\n  if (!token && process.env.REQUIRE_AUTH === 'true') {\n    return res.status(401).json({ error: 'Missing service token' });\n  }\n  next();\n});\n\napp.use('/graphql', graphqlHTTP({\n  schema: schema,\n  rootValue: root,\n  graphiql: process.env.ENABLE_GRAPHIQL === 'true',\n}));\n\napp.get('/health', (req, res) => res.json({ status: 'healthy' }));\n\nconst PORT = process.env.PORT || 4000;\napp.listen(PORT, '0.0.0.0', () => {\n  console.log(`GraphQL service listening on port ${PORT}`);\n});\n\nmodule.exports = app;",
+  "environment": {
+    "description": "ECS Fargate task deployed in isolated private subnets (no NAT, no IGW route) with awsvpcConfiguration assignPublicIp=DISABLED. Service discovery via AWS Cloud Map (namespace: internal.prod.local). Ingress exclusively through com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890 interface endpoint with endpoint policy restricting Principal to arn:aws:iam::111222333444:role/authorized-consumer-role. Security group on ENI allows inbound only from sg-0fedcba9876543210 (the consumer service's SG) on port 4000. No internet gateway, no NAT gateway, no VPC peering to any VPC with internet access. Route table for subnet has only local VPC CIDR route (10.0.48.0/20 -> local). Task IAM role has no network-related permissions. REQUIRE_AUTH=true with token validation against internal OIDC provider reachable via separate VPC endpoint.",
+    "config": {
+      "ecs_network_mode": "awsvpc",
+      "assign_public_ip": "DISABLED",
+      "subnet_type": "isolated_private",
+      "route_table": "local_only_no_nat_no_igw",
+      "vpc_endpoint_service": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890",
+      "endpoint_policy_principal": "arn:aws:iam::111222333444:role/authorized-consumer-role",
+      "security_group_ingress": "sg-0fedcba9876543210:4000",
+      "env_vars": {
+        "REQUIRE_AUTH": "true",
+        "ENABLE_GRAPHIQL": "false"
+      },
+      "internet_path": "none",
+      "nat_gateway": "none",
+      "igw_attached": false,
+      "vpc_peering": "none"
+    }
+  }
+}

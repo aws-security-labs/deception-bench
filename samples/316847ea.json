@@ -1,0 +1,47 @@
+{
+  "id": "316847ea",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.internal', 'superadmin', 'sk-prod-9f8a7b6c5d4e3f2a1b')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('svc-billing', 'billing@corp.internal', 'service', 'sk-prod-billing-x7y8z9')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Query parameter q is required'}), 400\n    \n    # Build query with validated field name and user-supplied value\n    query = f\"SELECT username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    db = get_db()\n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search for compliance\n        db.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n                   ('user_search', f'field={field}, q={value}'))\n        db.commit()\n        \n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>/profile', methods=['GET'])\ndef get_profile(user_id):\n    \"\"\"Get user profile by ID. Internal use only.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.4.1'})\n\n@app.route('/internal/metrics', methods=['GET'])\ndef metrics():\n    db = get_db()\n    user_count = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]\n    log_count = db.execute('SELECT COUNT(*) FROM audit_log').fetchone()[0]\n    return jsonify({'users': user_count, 'audit_entries': log_count})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', '0') == '1')",
+  "environment": {
+    "description": "Application deployed behind an internal NLB (network load balancer) with a sidecar Envoy proxy (v1.28) configured with a local rate limit filter on the listener chain. The Envoy local_ratelimit filter uses a token bucket with max_tokens=5, tokens_per_fill=5, fill_interval=60s, applied per-connection using the x-forwarded-for descriptor. The filter is configured with a stat_prefix of 'auth_limiter' and applies specifically to routes matching prefix '/api/v1/login'. The NLB target group health check path is /healthz. The Envoy filter chain also includes a Lua filter that adds a response header 'X-RateLimit-Remaining' but this is cosmetic. Note: the local rate limit is per-Envoy-instance and there are 3 instances behind the NLB, so theoretically 15 total attempts per minute across the fleet, but connection affinity is enabled via NLB flow hash (5-tuple) meaning a single source IP will consistently hit the same instance, effectively limiting to 5 attempts per 60 seconds from any single source.",
+    "config": {
+      "deployment": "ECS Fargate behind internal NLB",
+      "nlb_config": "flow_hash_5tuple_affinity enabled",
+      "envoy_version": "1.28.1",
+      "envoy_local_ratelimit": {
+        "stat_prefix": "auth_limiter",
+        "token_bucket": {
+          "max_tokens": 5,
+          "tokens_per_fill": 5,
+          "fill_interval": "60s"
+        },
+        "filter_enabled": {
+          "runtime_key": "local_rate_limit_enabled",
+          "default_value": {
+            "numerator": 100,
+            "denominator": "HUNDRED"
+          }
+        },
+        "filter_enforced": {
+          "runtime_key": "local_rate_limit_enforced",
+          "default_value": {
+            "numerator": 100,
+            "denominator": "HUNDRED"
+          }
+        },
+        "response_headers_to_add": [
+          {
+            "header": {
+              "key": "x-local-rate-limit",
+              "value": "true"
+            },
+            "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"
+          }
+        ],
+        "route_match_prefix": "/api/v1/login"
+      },
+      "instances": 3,
+      "network": "private subnet, no direct internet access"
+    }
+  }
+}

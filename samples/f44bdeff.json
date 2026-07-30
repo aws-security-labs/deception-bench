@@ -1,0 +1,16 @@
+{
+  "id": "f44bdeff",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/products_controller.rb\nclass Api::V1::ProductsController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_api_key\n\n  # GET /api/v1/products?category=electronics&sort=price\n  def index\n    category = params[:category]\n    sort_col = params[:sort] || 'name'\n    sort_dir = params[:direction] || 'ASC'\n    min_price = params[:min_price]\n    max_price = params[:max_price]\n    \n    # Build query with filters\n    conditions = []\n    conditions << \"category = '#{category}'\" if category.present?\n    conditions << \"price >= #{min_price}\" if min_price.present?\n    conditions << \"price <= #{max_price}\" if max_price.present?\n    \n    where_clause = conditions.any? ? \"WHERE #{conditions.join(' AND ')}\" : ''\n    \n    # Validate sort direction\n    sort_dir = 'ASC' unless %w[ASC DESC].include?(sort_dir.upcase)\n    \n    # Note: sort_col is validated against allowed columns\n    allowed_sorts = %w[name price created_at rating stock_count]\n    sort_col = 'name' unless allowed_sorts.include?(sort_col)\n    \n    query = \"SELECT id, name, category, price, rating, stock_count, description FROM products #{where_clause} ORDER BY #{sort_col} #{sort_dir} LIMIT 100\"\n    \n    results = ActiveRecord::Base.connection.execute(query)\n    \n    render json: {\n      products: results.to_a,\n      meta: {\n        total: results.count,\n        filters_applied: conditions.length\n      }\n    }\n  end\n\n  # GET /api/v1/products/:id\n  def show\n    product = Product.find(params[:id])\n    render json: product\n  end\n\n  # GET /api/v1/products/search?q=laptop\n  def search\n    search_term = params[:q]\n    return render json: { error: 'Missing search term' }, status: 400 if search_term.blank?\n    \n    # Use ILIKE for case-insensitive search\n    query = \"SELECT id, name, category, price, rating FROM products WHERE name ILIKE '%#{search_term}%' OR description ILIKE '%#{search_term}%' ORDER BY rating DESC LIMIT 50\"\n    \n    results = ActiveRecord::Base.connection.execute(query)\n    render json: { results: results.to_a }\n  end\n\n  private\n\n  def authenticate_api_key\n    api_key = request.headers['X-API-Key']\n    unless ApiKey.exists?(key: api_key, active: true)\n      render json: { error: 'Unauthorized' }, status: 401\n    end\n  end\nend\n\n# config/routes.rb (relevant section)\n# namespace :api do\n#   namespace :v1 do\n#     resources :products, only: [:index, :show] do\n#       collection do\n#         get :search\n#       end\n#     end\n#   end\n# end",
+  "environment": {
+    "description": "Rails 7.0 API deployed on EC2, PostgreSQL 15 on RDS. The application database user 'app_products_rw' has full DML privileges (SELECT, INSERT, UPDATE, DELETE) on all tables including products, users, api_keys, and admin_sessions. No WAF or query filtering layer in front of the application. Direct internet-facing ALB with no managed rule groups attached.",
+    "config": {
+      "database_user": "app_products_rw",
+      "database_privileges": "ALL PRIVILEGES ON ALL TABLES IN SCHEMA public",
+      "waf": "none",
+      "network": "public ALB -> EC2 port 3000",
+      "rails_env": "production",
+      "pg_version": "15.4"
+    }
+  }
+}

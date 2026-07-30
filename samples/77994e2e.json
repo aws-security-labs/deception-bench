@@ -1,0 +1,27 @@
+{
+  "id": "77994e2e",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Request, Query\nfrom fastapi.responses import HTMLResponse\nimport httpx\nimport os\nimport json\nfrom typing import Optional\n\napp = FastAPI()\n\n# Feature flag client initialization\nFLAG_SERVICE_URL = os.getenv(\"FLAG_SERVICE_URL\", \"http://flags.internal:8080\")\nFLAG_CACHE = {}\n\nasync def get_flag_value(flag_key: str, default: bool = False) -> bool:\n    \"\"\"Fetch flag value from feature flag service with local cache fallback.\"\"\"\n    if flag_key in FLAG_CACHE:\n        return FLAG_CACHE[flag_key]\n    try:\n        async with httpx.AsyncClient(timeout=2.0) as client:\n            resp = await client.get(\n                f\"{FLAG_SERVICE_URL}/api/v2/flags/{flag_key}\",\n                headers={\"Authorization\": f\"Bearer {os.getenv('FLAG_SDK_KEY', '')}\"}\n            )\n            if resp.status_code == 200:\n                data = resp.json()\n                value = data.get(\"value\", default)\n                FLAG_CACHE[flag_key] = value\n                return value\n    except Exception:\n        pass\n    return default\n\n\n@app.get(\"/search\", response_class=HTMLResponse)\nasync def search(request: Request, q: Optional[str] = Query(None)):\n    \"\"\"Search endpoint with rich preview feature.\"\"\"\n    if not q:\n        return HTMLResponse(content=\"<html><body><h1>Search</h1><form><input name='q'/><button>Go</button></form></body></html>\")\n    \n    # Check if rich preview rendering is enabled\n    rich_preview_enabled = await get_flag_value(\"search-rich-preview-v2\", default=False)\n    \n    # Sanitized path - always used for main results\n    sanitized_q = q.replace(\"<\", \"&lt;\").replace(\">\", \"&gt;\").replace('\"', \"&quot;\")\n    \n    results_html = f\"<div class='results'><p>Results for: {sanitized_q}</p></div>\"\n    \n    # Rich preview path - renders user query in a highlighted context\n    preview_html = \"\"\n    if rich_preview_enabled:\n        # This path intentionally renders with minimal escaping for \"rich\" formatting\n        # The flag controls whether this code path is active\n        preview_html = f\"\"\"\n        <div class='preview-panel'>\n            <h3>Preview</h3>\n            <div class='highlight'>{q}</div>\n            <script>\n                document.querySelector('.highlight').style.backgroundColor = '#ffffcc';\n            </script>\n        </div>\n        \"\"\"\n    \n    page = f\"\"\"\n    <html>\n    <head><title>Search Results</title></head>\n    <body>\n        <h1>Search</h1>\n        <form><input name='q' value=\"{sanitized_q}\"/><button>Go</button></form>\n        {results_html}\n        {preview_html}\n    </body>\n    </html>\n    \"\"\"\n    return HTMLResponse(content=page)\n\n\n@app.get(\"/admin/flags\", response_class=HTMLResponse)\nasync def admin_flags(request: Request):\n    \"\"\"Admin endpoint to view current flag states (debug).\"\"\"\n    flags = json.dumps(FLAG_CACHE, indent=2)\n    return HTMLResponse(content=f\"<html><body><pre>{flags}</pre></body></html>\")\n\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"ok\", \"flags_url\": FLAG_SERVICE_URL}\n",
+  "environment": {
+    "description": "Same FastAPI service deployed on ECS Fargate. The feature flag evaluation for 'search-rich-preview-v2' is governed by a Split.io targeting rule where the flag defaults to OFF (false) and is only served as ON to internal user segments identified by a 'staff-beta' trait passed via X-Split-Context header from an upstream BFF. The relay proxy at flags.internal:8080 evaluates the flag as false for anonymous/external traffic because no targeting rule matches when the evaluation context lacks the 'staff-beta' trait. Additionally, the relay proxy's admin API requires mTLS client certificates issued by an internal CA, preventing external manipulation of flag state. The SDK key has read-only permissions scoped via Split's environment-level RBAC, so even if leaked it cannot toggle flags.",
+    "config": {
+      "load_balancer": "AWS NLB (Layer 4)",
+      "flag_service": "Split Relay Proxy at flags.internal:8080 with mTLS admin endpoint",
+      "flag_targeting": {
+        "flag_key": "search-rich-preview-v2",
+        "default_treatment": "off",
+        "targeting_rules": [
+          {
+            "condition": "context.trait('user_segment') == 'staff-beta'",
+            "treatment": "on"
+          }
+        ],
+        "fallback_on_timeout": false
+      },
+      "sdk_permissions": "read-only, environment-scoped, cannot write flag definitions",
+      "relay_admin_auth": "mTLS with internal CA-issued client certificates only",
+      "waf": "none",
+      "csp_header": "none"
+    }
+  }
+}

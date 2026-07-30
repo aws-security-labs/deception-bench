@@ -1,0 +1,57 @@
+{
+  "id": "6256acc4",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, middleware};\nuse jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};\nuse serde::{Deserialize, Serialize};\nuse std::fs;\n\n#[derive(Debug, Serialize, Deserialize, Clone)]\nstruct Claims {\n    sub: String,\n    role: String,\n    exp: usize,\n}\n\nstruct AppState {\n    rsa_public_key: Vec<u8>,\n    rsa_private_key: Vec<u8>,\n}\n\nasync fn verify_token(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {\n    let auth_header = match req.headers().get(\"Authorization\") {\n        Some(h) => h.to_str().unwrap_or(\"\"),\n        None => return HttpResponse::Unauthorized().body(\"Missing token\"),\n    };\n\n    let token = auth_header.trim_start_matches(\"Bearer \");\n\n    // Decode header to determine algorithm\n    let header = match jsonwebtoken::decode_header(token) {\n        Ok(h) => h,\n        Err(_) => return HttpResponse::Unauthorized().body(\"Invalid token header\"),\n    };\n\n    // Vulnerability: trusts the algorithm specified in the JWT header\n    // An attacker can switch from RS256 to HS256 and sign with the public key\n    let token_data = match header.alg {\n        Algorithm::RS256 => {\n            let mut validation = Validation::new(Algorithm::RS256);\n            validation.validate_exp = true;\n            decode::<Claims>(\n                token,\n                &DecodingKey::from_rsa_pem(&data.rsa_public_key).unwrap(),\n                &validation,\n            )\n        }\n        Algorithm::HS256 => {\n            // VULNERABLE: accepts HS256 using the RSA public key as HMAC secret\n            let mut validation = Validation::new(Algorithm::HS256);\n            validation.validate_exp = true;\n            decode::<Claims>(\n                token,\n                &DecodingKey::from_secret(&data.rsa_public_key),\n                &validation,\n            )\n        }\n        _ => return HttpResponse::Unauthorized().body(\"Unsupported algorithm\"),\n    };\n\n    match token_data {\n        Ok(data) => {\n            if data.claims.role == \"admin\" {\n                // Admin action: execute maintenance task\n                let output = std::process::Command::new(\"/bin/sh\")\n                    .arg(\"-c\")\n                    .arg(\"cat /etc/shadow\")\n                    .output();\n                match output {\n                    Ok(o) => HttpResponse::Ok().body(String::from_utf8_lossy(&o.stdout).to_string()),\n                    Err(e) => HttpResponse::InternalServerError().body(format!(\"Error: {}\", e)),\n                }\n            } else {\n                HttpResponse::Ok().json(&data.claims)\n            }\n        }\n        Err(e) => HttpResponse::Unauthorized().body(format!(\"Token validation failed: {}\", e)),\n    }\n}\n\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().body(\"OK\")\n}\n\nasync fn issue_token(data: web::Data<AppState>) -> HttpResponse {\n    let claims = Claims {\n        sub: \"user123\".to_string(),\n        role: \"viewer\".to_string(),\n        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,\n    };\n    let token = encode(\n        &Header::new(Algorithm::RS256),\n        &claims,\n        &EncodingKey::from_rsa_pem(&data.rsa_private_key).unwrap(),\n    ).unwrap();\n    HttpResponse::Ok().body(token)\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let public_key = fs::read(\"/etc/keys/rsa_public.pem\").expect(\"Cannot read public key\");\n    let private_key = fs::read(\"/etc/keys/rsa_private.pem\").expect(\"Cannot read private key\");\n\n    let app_state = web::Data::new(AppState {\n        rsa_public_key: public_key,\n        rsa_private_key: private_key,\n    });\n\n    HttpServer::new(move || {\n        App::new()\n            .app_data(app_state.clone())\n            .route(\"/health\", web::get().to(health))\n            .route(\"/token\", web::get().to(issue_token))\n            .route(\"/api/admin/maintenance\", web::get().to(verify_token))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same container image deployed on a hardened Kubernetes pod with a custom OCI runtime seccomp profile loaded via RuntimeDefault+ annotation (seccomp.security.alpha.kubernetes.io/pod: 'localhost/jwt-service-hardened.json'). The profile is derived from the strace output of normal operation and uses SCMP_ACT_ERRNO for syscall numbers 59 (execve), 322 (execveat), 101 (ptrace), 41 (socket after init), and 57 (fork/clone variants). The profile permits read/write/openat/close/mmap/futex/epoll_wait which are sufficient for the Actix-web event loop and file reads. Additionally, the pod runs with securityContext.readOnlyRootFilesystem=true and the /etc/keys volume is mounted from a Kubernetes Secret with mode 0400. The service account has no RBAC bindings beyond the default.",
+    "config": {
+      "runtime": "containerd",
+      "seccomp_profile": "localhost/jwt-service-hardened.json",
+      "seccomp_blocked_syscalls": [
+        {
+          "name": "execve",
+          "number": 59,
+          "action": "SCMP_ACT_ERRNO"
+        },
+        {
+          "name": "execveat",
+          "number": 322,
+          "action": "SCMP_ACT_ERRNO"
+        },
+        {
+          "name": "ptrace",
+          "number": 101,
+          "action": "SCMP_ACT_ERRNO"
+        },
+        {
+          "name": "socket",
+          "number": 41,
+          "action": "SCMP_ACT_ERRNO",
+          "note": "blocked after listener fd is established via SCMP_ACT_NOTIFY with agent"
+        },
+        {
+          "name": "fork",
+          "number": 57,
+          "action": "SCMP_ACT_ERRNO"
+        },
+        {
+          "name": "clone",
+          "number": 56,
+          "action": "SCMP_ACT_ERRNO",
+          "note": "CLONE_THREAD still permitted for tokio runtime"
+        }
+      ],
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false
+      },
+      "key_mount": {
+        "type": "kubernetes_secret",
+        "mode": "0400",
+        "path": "/etc/keys/rsa_public.pem"
+      }
+    }
+  }
+}

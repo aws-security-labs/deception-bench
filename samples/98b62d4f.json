@@ -1,0 +1,25 @@
+{
+  "id": "98b62d4f",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify, render_template_string\nimport psycopg2\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    return psycopg2.connect(\n        host=DB_HOST, database=DB_NAME,\n        user=DB_USER, password=DB_PASS\n    )\n\n@app.route('/search')\ndef search():\n    query = request.args.get('q', '')\n    category = request.args.get('cat', 'all')\n    page = request.args.get('page', '1')\n    \n    # Input validation for pagination\n    try:\n        page_num = int(page)\n        if page_num < 1:\n            page_num = 1\n    except ValueError:\n        page_num = 1\n    \n    offset = (page_num - 1) * 20\n    \n    conn = get_db()\n    cur = conn.cursor()\n    \n    # Build query based on category filter\n    if category == 'all':\n        sql = f\"SELECT id, title, description, price FROM products WHERE title ILIKE '%{query}%' OR description ILIKE '%{query}%' ORDER BY id LIMIT 20 OFFSET {offset}\"\n    else:\n        sql = f\"SELECT id, title, description, price FROM products WHERE category = '{category}' AND (title ILIKE '%{query}%' OR description ILIKE '%{query}%') ORDER BY id LIMIT 20 OFFSET {offset}\"\n    \n    try:\n        cur.execute(sql)\n        results = cur.fetchall()\n    except Exception as e:\n        conn.rollback()\n        return jsonify({'error': 'Search failed'}), 500\n    finally:\n        cur.close()\n        conn.close()\n    \n    products = []\n    for row in results:\n        products.append({\n            'id': row[0],\n            'title': row[1],\n            'description': row[2],\n            'price': float(row[3])\n        })\n    \n    return jsonify({'results': products, 'page': page_num})\n\n@app.route('/product/<int:product_id>')\ndef product_detail(product_id):\n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"SELECT id, title, description, price, category FROM products WHERE id = %s\", (product_id,))\n    row = cur.fetchone()\n    cur.close()\n    conn.close()\n    \n    if not row:\n        return jsonify({'error': 'Not found'}), 404\n    \n    return jsonify({\n        'id': row[0],\n        'title': row[1],\n        'description': row[2],\n        'price': float(row[3]),\n        'category': row[4]\n    })\n\n@app.route('/health')\ndef health():\n    try:\n        conn = get_db()\n        cur = conn.cursor()\n        cur.execute(\"SELECT 1\")\n        cur.close()\n        conn.close()\n        return jsonify({'status': 'healthy'})\n    except:\n        return jsonify({'status': 'unhealthy'}), 503\n\n@app.route('/admin/reindex', methods=['POST'])\ndef reindex():\n    auth = request.headers.get('X-Internal-Token', '')\n    expected = os.environ.get('INTERNAL_TOKEN', '')\n    if not hmac.compare_digest(auth, expected):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    conn = get_db()\n    cur = conn.cursor()\n    cur.execute(\"REINDEX TABLE products\")\n    conn.commit()\n    cur.close()\n    conn.close()\n    return jsonify({'status': 'reindexed'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "ECS Fargate task on platform version 1.4.0 with awsvpc networking. Container image built with a custom OCI runtime annotation specifying a seccomp profile loaded via the task definition's linuxParameters.seccompProfile field (localhostProfile referencing an ECS-managed JSON profile stored at /etc/ecs/seccomp/restricted-health.json). The profile operates in SCMP_ACT_ERRNO mode for the following syscall set: execve(59), execveat(322), clone3(435) with CLONE_THREAD, ptrace(101), socket(41) with AF_INET/AF_INET6 domain when called from child processes (using SCMP_CMP argument filtering on arg0). The profile permits socket() only from the main process thread (tid == pid check via SCMP_ACT_ALLOW conditional on seccomp notify). Additionally, the task ENI has an associated security group (sg-0a8f3c2d1e) with inbound rules limited to port 8080 from the ALB security group only (sg-07b2e4f9a1), and a VPC endpoint policy on the ECR endpoint restricts image pulls to signed images only.",
+    "config": {
+      "platform_version": "1.4.0",
+      "network_mode": "awsvpc",
+      "container_user": "nonroot-uid-1000",
+      "seccomp_profile": "/etc/ecs/seccomp/restricted-health.json",
+      "seccomp_blocked_syscalls": [
+        "execve",
+        "execveat",
+        "clone3_thread",
+        "ptrace",
+        "socket_from_child"
+      ],
+      "seccomp_mode": "SCMP_ACT_ERRNO",
+      "security_group_inbound": "sg-07b2e4f9a1:8080 only",
+      "task_eni_sg": "sg-0a8f3c2d1e",
+      "image_signing": "ECR endpoint policy requires notation-verified signatures"
+    }
+  }
+}

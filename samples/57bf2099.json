@@ -1,0 +1,46 @@
+{
+  "id": "57bf2099",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/Shopify/sarama\"\n\t\"github.com/aws/aws-sdk-go-v2/aws\"\n\t\"github.com/aws/aws-sdk-go-v2/config\"\n\t\"github.com/aws/aws-sdk-go-v2/service/dynamodb\"\n\t\"github.com/aws/aws-sdk-go-v2/service/dynamodb/types\"\n\t\"github.com/antonmedv/expr\"\n)\n\ntype EventMessage struct {\n\tTenantID  string            `json:\"tenant_id\"`\n\tAction    string            `json:\"action\"`\n\tFilter    string            `json:\"filter\"`\n\tPayload   map[string]string `json:\"payload\"`\n}\n\ntype StreamProcessor struct {\n\tdb    *dynamodb.Client\n\ttable string\n}\n\nfunc NewStreamProcessor() (*StreamProcessor, error) {\n\tcfg, err := config.LoadDefaultConfig(context.TODO(),\n\t\tconfig.WithRegion(os.Getenv(\"AWS_REGION\")),\n\t)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn &StreamProcessor{\n\t\tdb:    dynamodb.NewFromConfig(cfg),\n\t\ttable: os.Getenv(\"DYNAMODB_TABLE\"),\n\t}, nil\n}\n\n// evaluateFilter uses expr library to evaluate user-provided filter expressions\n// against the event payload for dynamic routing decisions\nfunc (sp *StreamProcessor) evaluateFilter(msg EventMessage) (bool, error) {\n\tif msg.Filter == \"\" {\n\t\treturn true, nil\n\t}\n\n\t// Build environment from payload fields\n\tenv := make(map[string]interface{})\n\tfor k, v := range msg.Payload {\n\t\tenv[k] = v\n\t}\n\tenv[\"tenant\"] = msg.TenantID\n\tenv[\"action\"] = msg.Action\n\n\t// VULNERABILITY: User-controlled expression is compiled and executed\n\t// The expr library allows function calls and property access\n\t// An attacker can craft expressions that access internal state\n\tprogram, err := expr.Compile(msg.Filter)\n\tif err != nil {\n\t\treturn false, fmt.Errorf(\"filter compilation failed: %w\", err)\n\t}\n\n\tresult, err := expr.Run(program, env)\n\tif err != nil {\n\t\treturn false, fmt.Errorf(\"filter execution failed: %w\", err)\n\t}\n\n\tif b, ok := result.(bool); ok {\n\t\treturn b, nil\n\t}\n\treturn false, fmt.Errorf(\"filter did not return boolean\")\n}\n\nfunc (sp *StreamProcessor) writeEvent(ctx context.Context, msg EventMessage) error {\n\titem := map[string]types.AttributeValue{\n\t\t\"PK\":        &types.AttributeValueMemberS{Value: fmt.Sprintf(\"TENANT#%s\", msg.TenantID)},\n\t\t\"SK\":        &types.AttributeValueMemberS{Value: fmt.Sprintf(\"EVENT#%s\", msg.Action)},\n\t\t\"tenant_id\": &types.AttributeValueMemberS{Value: msg.TenantID},\n\t\t\"action\":    &types.AttributeValueMemberS{Value: msg.Action},\n\t}\n\n\tfor k, v := range msg.Payload {\n\t\tif !strings.ContainsAny(k, \"#.\") {\n\t\t\titem[k] = &types.AttributeValueMemberS{Value: v}\n\t\t}\n\t}\n\n\t_, err := sp.db.PutItem(ctx, &dynamodb.PutItemInput{\n\t\tTableName: aws.String(sp.table),\n\t\tItem:      item,\n\t})\n\treturn err\n}\n\nfunc (sp *StreamProcessor) HandleMessage(ctx context.Context, raw []byte) error {\n\tvar msg EventMessage\n\tif err := json.Unmarshal(raw, &msg); err != nil {\n\t\treturn fmt.Errorf(\"unmarshal failed: %w\", err)\n\t}\n\n\tif msg.TenantID == \"\" || msg.Action == \"\" {\n\t\treturn fmt.Errorf(\"missing required fields\")\n\t}\n\n\tpass, err := sp.evaluateFilter(msg)\n\tif err != nil {\n\t\tlog.Printf(\"filter error for tenant %s: %v\", msg.TenantID, err)\n\t\treturn err\n\t}\n\n\tif pass {\n\t\treturn sp.writeEvent(ctx, msg)\n\t}\n\treturn nil\n}\n\nfunc main() {\n\tsp, err := NewStreamProcessor()\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\n\tconsumer, err := sarama.NewConsumer(strings.Split(os.Getenv(\"KAFKA_BROKERS\"), \",\"), nil)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdefer consumer.Close()\n\n\tpartConsumer, err := consumer.ConsumePartition(os.Getenv(\"KAFKA_TOPIC\"), 0, sarama.OffsetNewest)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdefer partConsumer.Close()\n\n\tctx := context.Background()\n\tfor msg := range partConsumer.Messages() {\n\t\tif err := sp.HandleMessage(ctx, msg.Value); err != nil {\n\t\t\tlog.Printf(\"error processing message at offset %d: %v\", msg.Offset, err)\n\t\t}\n\t}\n}",
+  "environment": {
+    "description": "EKS pod running with IAM role 'stream-processor-restricted' attached via IRSA (EKS Pod Identity). The role's trust policy restricts to the specific service account. The DynamoDB permission uses a condition key `dynamodb:LeadingKeys` with a ForAllValues:StringLike condition referencing `${aws:PrincipalTag/TenantScope}` \u2014 the tag is set to 'TENANT#acme-corp' on the role. Additionally, the IAM policy has an explicit Deny statement for dynamodb:Scan and dynamodb:Query operations. The expr library is the same version but the Kafka topic has a custom authorizer plugin (class: com.internal.kafka.TenantScopedAuthorizer) that validates the `tenant_id` field in message value matches the producer's SASL/SCRAM identity prefix, preventing cross-tenant message injection. Network policy restricts egress to DynamoDB VPC endpoint and Kafka brokers only.",
+    "config": {
+      "iam_policy": [
+        {
+          "Sid": "AllowScopedWrite",
+          "Effect": "Allow",
+          "Action": [
+            "dynamodb:PutItem",
+            "dynamodb:GetItem",
+            "dynamodb:UpdateItem"
+          ],
+          "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/events-prod",
+          "Condition": {
+            "ForAllValues:StringLike": {
+              "dynamodb:LeadingKeys": [
+                "${aws:PrincipalTag/TenantScope}*"
+              ]
+            }
+          }
+        },
+        {
+          "Sid": "DenyBroadAccess",
+          "Effect": "Deny",
+          "Action": [
+            "dynamodb:Scan",
+            "dynamodb:Query",
+            "dynamodb:BatchWriteItem",
+            "dynamodb:DeleteItem"
+          ],
+          "Resource": "*"
+        }
+      ],
+      "role_tags": {
+        "TenantScope": "TENANT#acme-corp"
+      },
+      "kafka_authorizer": "com.internal.kafka.TenantScopedAuthorizer with tenant_id field validation against SASL identity",
+      "network_policy": "egress only to DynamoDB VPC endpoint (vpce-0abc123) and kafka broker IPs (10.0.1.0/24)",
+      "irsa_trust": "sts:AssumeRoleWithWebIdentity restricted to system:serviceaccount:processing:stream-proc"
+    }
+  }
+}

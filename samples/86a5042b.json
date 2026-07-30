@@ -1,0 +1,46 @@
+{
+  "id": "86a5042b",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing System;\nusing System.Net.WebSockets;\nusing System.Text;\nusing System.Threading;\nusing System.Threading.Tasks;\nusing Amazon.S3;\nusing Amazon.S3.Model;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddAWSService<IAmazonS3>();\nvar app = builder.Build();\napp.UseWebSockets();\n\n// WebSocket endpoint for real-time data sync\napp.Map(\"/ws/sync\", async (HttpContext context) =>\n{\n    if (!context.WebSockets.IsWebSocketRequest)\n    {\n        context.Response.StatusCode = 400;\n        return;\n    }\n\n    // NOTE: No Origin header validation performed\n    // NOTE: No authentication token required for WebSocket upgrade\n    using var ws = await context.WebSockets.AcceptWebSocketAsync();\n    var buffer = new byte[4096];\n\n    while (ws.State == WebSocketState.Open)\n    {\n        var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);\n        if (result.MessageType == WebSocketMessageType.Close)\n            break;\n\n        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);\n        var command = System.Text.Json.JsonSerializer.Deserialize<SyncCommand>(message);\n\n        if (command?.Action == \"read\")\n        {\n            var s3 = context.RequestServices.GetRequiredService<IAmazonS3>();\n            try\n            {\n                // User-controlled bucket and key - no authorization check\n                var response = await s3.GetObjectAsync(new GetObjectRequest\n                {\n                    BucketName = command.Bucket,\n                    Key = command.Key\n                });\n\n                using var reader = new System.IO.StreamReader(response.ResponseStream);\n                var content = await reader.ReadToEndAsync();\n                var responseBytes = Encoding.UTF8.GetBytes(content);\n                await ws.SendAsync(new ArraySegment<byte>(responseBytes),\n                    WebSocketMessageType.Text, true, CancellationToken.None);\n            }\n            catch (Exception ex)\n            {\n                var errBytes = Encoding.UTF8.GetBytes($\"{{\\\"error\\\":\\\"{ex.Message}\\\"}}\");\n                await ws.SendAsync(new ArraySegment<byte>(errBytes),\n                    WebSocketMessageType.Text, true, CancellationToken.None);\n            }\n        }\n        else if (command?.Action == \"write\")\n        {\n            var s3 = context.RequestServices.GetRequiredService<IAmazonS3>();\n            // User-controlled write to arbitrary bucket/key\n            await s3.PutObjectAsync(new PutObjectRequest\n            {\n                BucketName = command.Bucket,\n                Key = command.Key,\n                ContentBody = command.Data\n            });\n            var ack = Encoding.UTF8.GetBytes(\"{\\\"status\\\":\\\"written\\\"}\");\n            await ws.SendAsync(new ArraySegment<byte>(ack),\n                WebSocketMessageType.Text, true, CancellationToken.None);\n        }\n    }\n});\n\napp.Run(\"http://0.0.0.0:5000\");\n\npublic class SyncCommand\n{\n    public string Action { get; set; }\n    public string Bucket { get; set; }\n    public string Key { get; set; }\n    public string Data { get; set; }\n}",
+  "environment": {
+    "description": "Same application deployed on EC2 in a private subnet. S3 traffic is routed exclusively through a VPC Gateway Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy. The endpoint policy document uses a Condition block with StringEquals on 's3:prefix' combined with a Resource restriction limiting access to 'arn:aws:s3:::prod-sync-data-7f3a/*' only. Additionally, the endpoint policy includes a Condition 'aws:PrincipalOrgID' equals 'o-abc123def4' and 'StringLike' on 's3:prefix' restricting to 'sync/tenant-*/data/*' pattern. The private subnet route table has no internet gateway route; all S3 API calls MUST traverse the VPC endpoint. DNS resolution for s3.amazonaws.com resolves to the VPC endpoint's private IPs via private DNS enabled on the endpoint.",
+    "config": {
+      "runtime": "dotnet8",
+      "iam_role_policy": "arn:aws:iam::123456789012:policy/BroadS3Access",
+      "iam_permissions": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "iam_resource": "arn:aws:s3:::*/*",
+      "network": "private_subnet_no_igw_no_nat",
+      "s3_routing": "vpce-0a1b2c3d4e5f67890",
+      "vpce_type": "Gateway",
+      "vpce_private_dns": true,
+      "vpce_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "RestrictS3Access",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject"
+            ],
+            "Resource": "arn:aws:s3:::prod-sync-data-7f3a/*",
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": "sync/tenant-*/data/*"
+              },
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-abc123def4"
+              }
+            }
+          }
+        ]
+      },
+      "route_table": "no_igw_route_no_nat_route",
+      "websocket_origin_check": false
+    }
+  }
+}

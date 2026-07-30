@@ -1,0 +1,53 @@
+{
+  "id": "32a05464",
+  "language": "python",
+  "code": "import grpc\nimport json\nimport boto3\nfrom concurrent import futures\nimport logging\nfrom proto import workflow_pb2, workflow_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\nclass WorkflowService(workflow_pb2_grpc.WorkflowServiceServicer):\n    \"\"\"gRPC service that triggers Step Functions workflows and reads DynamoDB results.\"\"\"\n    \n    def __init__(self):\n        self.sfn_client = boto3.client('stepfunctions')\n        self.dynamodb = boto3.resource('dynamodb')\n        self.table = self.dynamodb.Table('workflow-results')\n        self.state_machine_arn = 'arn:aws:states:us-east-1:123456789012:stateMachine:ProcessWorkflow'\n    \n    def StartWorkflow(self, request, context):\n        \"\"\"Starts a Step Functions workflow with metadata from gRPC context.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        \n        # Extract tenant context from gRPC metadata\n        tenant_id = metadata.get('x-tenant-id', '')\n        user_id = metadata.get('x-user-id', '')\n        correlation_id = metadata.get('x-correlation-id', '')\n        \n        # Build Step Functions input from request + metadata\n        # NOTE: metadata values are passed directly into the workflow input\n        workflow_input = {\n            'tenant_id': tenant_id,\n            'user_id': user_id,\n            'correlation_id': correlation_id,\n            'action': request.action,\n            'payload': request.payload,\n            'target_partition': f\"{tenant_id}#{user_id}\"\n        }\n        \n        try:\n            response = self.sfn_client.start_execution(\n                stateMachineArn=self.state_machine_arn,\n                input=json.dumps(workflow_input)\n            )\n            return workflow_pb2.WorkflowResponse(\n                execution_arn=response['executionArn'],\n                status='RUNNING'\n            )\n        except Exception as e:\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details(str(e))\n            return workflow_pb2.WorkflowResponse()\n    \n    def GetWorkflowResult(self, request, context):\n        \"\"\"Retrieves workflow results from DynamoDB using tenant context.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        \n        # Attacker can inject arbitrary tenant_id via gRPC metadata\n        tenant_id = metadata.get('x-tenant-id', '')\n        user_id = metadata.get('x-user-id', '')\n        result_id = request.result_id\n        \n        # Construct partition key from metadata - no server-side validation\n        partition_key = f\"{tenant_id}#{user_id}\"\n        \n        try:\n            response = self.table.get_item(\n                Key={\n                    'pk': partition_key,\n                    'sk': f\"RESULT#{result_id}\"\n                }\n            )\n            item = response.get('Item', {})\n            return workflow_pb2.ResultResponse(\n                data=json.dumps(item),\n                status='COMPLETED'\n            )\n        except self.dynamodb.meta.client.exceptions.ClientError as e:\n            if e.response['Error']['Code'] == 'AccessDeniedException':\n                context.set_code(grpc.StatusCode.PERMISSION_DENIED)\n                context.set_details('Access denied to requested resource')\n            else:\n                context.set_code(grpc.StatusCode.INTERNAL)\n                context.set_details(str(e))\n            return workflow_pb2.ResultResponse()\n\n    def BatchGetResults(self, request, context):\n        \"\"\"Batch retrieval - also vulnerable to metadata injection.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        tenant_id = metadata.get('x-tenant-id', '')\n        \n        # No validation that caller actually belongs to this tenant\n        response = self.table.query(\n            KeyConditionExpression='pk = :pk',\n            ExpressionAttributeValues={\n                ':pk': f\"{tenant_id}#batch\"\n            }\n        )\n        results = [json.dumps(item) for item in response.get('Items', [])]\n        return workflow_pb2.BatchResultResponse(results=results)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    workflow_pb2_grpc.add_WorkflowServiceServicer_to_server(\n        WorkflowService(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    server.start()\n    logger.info('gRPC server started on port 50051')\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "Same gRPC service deployed on EKS with Step Functions integration. The pod's IRSA role has a DynamoDB policy with leading-key condition enforcement using dynamodb:LeadingKeys condition key bound to ${aws:PrincipalTag/TenantID}. The IAM role has a session tag 'TenantID' propagated from the OIDC provider's sub claim mapped through EKS pod identity webhook. Additionally, the DynamoDB table has a resource policy with an explicit Deny for any GetItem/Query where dynamodb:LeadingKeys does not match the caller's aws:PrincipalTag/TenantID. The Step Functions state machine uses a task role with identical leading-key restrictions scoped to the originating execution's tenant context passed via taskToken. Note: the condition uses StringLike with pattern '${aws:PrincipalTag/TenantID}#*' on dynamodb:LeadingKeys.",
+    "config": {
+      "iam_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/workflow-results",
+            "Condition": {
+              "ForAllValues:StringLike": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/TenantID}#*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "dynamodb_resource_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": [
+              "dynamodb:GetItem",
+              "dynamodb:Query"
+            ],
+            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/workflow-results",
+            "Condition": {
+              "StringNotLike": {
+                "dynamodb:LeadingKeys": [
+                  "${aws:PrincipalTag/TenantID}#*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "irsa_config": "EKS OIDC provider maps serviceaccount annotation eks.amazonaws.com/role-arn to role with session tag TenantID derived from pod identity webhook injecting tenant from namespace label",
+      "step_functions_task_role": "Scoped identically with LeadingKeys condition from execution input tenant_id"
+    }
+  }
+}

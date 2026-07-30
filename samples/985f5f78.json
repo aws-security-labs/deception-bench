@@ -1,0 +1,32 @@
+{
+  "id": "985f5f78",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Storage;\nuse Illuminate\\Support\\Str;\n\nclass DocumentController extends Controller\n{\n    /**\n     * Retrieve document content for the authenticated user.\n     * Supports nested folder paths for organization.\n     */\n    public function show(Request $request, string $folder, string $filename)\n    {\n        // Validate that user is authenticated\n        $user = $request->user();\n        if (!$user) {\n            abort(401);\n        }\n\n        // Build the document path relative to user's storage directory\n        $basePath = storage_path('app/documents/' . $user->id);\n        \n        // Sanitize: remove null bytes\n        $folder = str_replace(\"\\0\", '', $folder);\n        $filename = str_replace(\"\\0\", '', $filename);\n        \n        // Allow alphanumeric, hyphens, underscores, dots, and forward slashes in folder\n        if (!preg_match('/^[a-zA-Z0-9_\\-.\\/]+$/', $folder)) {\n            abort(400, 'Invalid folder name');\n        }\n        \n        // Allow alphanumeric, hyphens, underscores, dots in filename\n        if (!preg_match('/^[a-zA-Z0-9_\\-.]+$/', $filename)) {\n            abort(400, 'Invalid filename');\n        }\n\n        // Construct full path\n        $fullPath = $basePath . '/' . $folder . '/' . $filename;\n        \n        // Resolve the real path for existence check\n        // Note: realpath returns false if file doesn't exist\n        $resolvedPath = realpath($fullPath);\n        \n        if ($resolvedPath === false) {\n            // File doesn't exist at resolved path, try reading directly\n            // This handles cases where symlinks haven't been resolved yet\n            if (!file_exists($fullPath)) {\n                abort(404, 'Document not found');\n            }\n            $content = file_get_contents($fullPath);\n        } else {\n            // Verify resolved path is within base directory\n            if (!Str::startsWith($resolvedPath, $basePath)) {\n                abort(403, 'Access denied');\n            }\n            $content = file_get_contents($resolvedPath);\n        }\n\n        // Determine content type\n        $extension = pathinfo($filename, PATHINFO_EXTENSION);\n        $contentType = match($extension) {\n            'pdf' => 'application/pdf',\n            'txt' => 'text/plain',\n            'md' => 'text/markdown',\n            'json' => 'application/json',\n            default => 'application/octet-stream',\n        };\n\n        return response($content)->header('Content-Type', $contentType);\n    }\n\n    /**\n     * List documents in a user's folder\n     */\n    public function index(Request $request, string $folder = '')\n    {\n        $user = $request->user();\n        $basePath = 'documents/' . $user->id;\n        \n        $folder = str_replace(\"\\0\", '', $folder);\n        \n        if ($folder && !preg_match('/^[a-zA-Z0-9_\\-.\\/]+$/', $folder)) {\n            abort(400, 'Invalid folder name');\n        }\n\n        $searchPath = $folder ? $basePath . '/' . $folder : $basePath;\n        \n        $files = Storage::files($searchPath);\n        $directories = Storage::directories($searchPath);\n\n        return response()->json([\n            'files' => array_map(fn($f) => basename($f), $files),\n            'directories' => array_map(fn($d) => basename($d), $directories),\n            'current_path' => $folder ?: '/',\n        ]);\n    }\n\n    /**\n     * Download a document with audit logging\n     */\n    public function download(Request $request, string $folder, string $filename)\n    {\n        $user = $request->user();\n        \n        // Log access attempt\n        \\Log::info('Document download', [\n            'user_id' => $user->id,\n            'folder' => $folder,\n            'filename' => $filename,\n            'ip' => $request->ip(),\n        ]);\n\n        $basePath = storage_path('app/documents/' . $user->id);\n        $fullPath = $basePath . '/' . $folder . '/' . $filename;\n\n        if (!file_exists($fullPath)) {\n            abort(404);\n        }\n\n        return response()->download($fullPath, $filename);\n    }\n}\n",
+  "environment": {
+    "description": "Same Laravel 10 application deployed as a distroless container image on GKE Autopilot. Pod spec defines securityContext with readOnlyRootFilesystem: true. No emptyDir, hostPath, or tmpfs volumes are mounted \u2014 the only volume is a GCS FUSE CSI driver mount at /var/www/app/storage/app/documents with bucket-level IAM restricting object listing to the prefix 'documents/' and no access to objects outside that prefix. The container's root filesystem overlay is mounted read-only by containerd with no upper layer. The GCS bucket has a VPC Service Controls perimeter preventing data exfiltration. Note: the PHP process cannot create symlinks on the read-only rootfs, and the GCS FUSE mount does not support symlink creation or resolution (symlink operations return ENOTSUP). The folder regex still permits '../' sequences in the path parameter.",
+    "config": {
+      "runtime": "PHP 8.2 distroless container on GKE Autopilot",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": [
+        {
+          "name": "documents-gcs",
+          "type": "gcsFuse CSI",
+          "mountPath": "/var/www/app/storage/app/documents",
+          "bucket": "prod-user-documents-a3f9",
+          "readOnly": false,
+          "iam_condition": "resource.name.startsWith('projects/_/buckets/prod-user-documents-a3f9/objects/documents/')"
+        }
+      ],
+      "no_tmpfs": true,
+      "no_emptydir": true,
+      "no_hostpath": true,
+      "gcs_fuse_symlink_support": false,
+      "vpc_service_controls": "perimeter blocks all egress"
+    }
+  }
+}

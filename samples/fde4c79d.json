@@ -1,0 +1,19 @@
+{
+  "id": "fde4c79d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"google.golang.org/grpc\"\n\t\"google.golang.org/grpc/metadata\"\n)\n\nconst grpcBackend = \"localhost:9090\"\n\n// ProxyRequest forwards requests to the gRPC backend service\n// It passes along client-provided metadata for tracing purposes\nfunc ProxyRequest(c *gin.Context) {\n\t// Extract trace headers from the incoming HTTP request\n\ttraceID := c.GetHeader(\"X-Trace-ID\")\n\tclientMeta := c.GetHeader(\"X-Client-Metadata\")\n\tuserRole := c.GetHeader(\"X-User-Role\")\n\n\t// Build gRPC metadata from client headers\n\tmd := metadata.New(map[string]string{\n\t\t\"trace-id\": traceID,\n\t})\n\n\t// Parse and forward additional client metadata key-value pairs\n\t// Format: \"key1=value1;key2=value2\"\n\tif clientMeta != \"\" {\n\t\tpairs := strings.Split(clientMeta, \";\")\n\t\tfor _, pair := range pairs {\n\t\t\tparts := strings.SplitN(pair, \"=\", 2)\n\t\t\tif len(parts) == 2 {\n\t\t\t\t// Directly inject user-controlled key-value into gRPC metadata\n\t\t\t\tmd.Set(parts[0], parts[1])\n\t\t\t}\n\t\t}\n\t}\n\n\tif userRole != \"\" {\n\t\tmd.Set(\"x-user-role\", userRole)\n\t}\n\n\tctx := metadata.NewOutgoingContext(context.Background(), md)\n\n\t// Connect to gRPC backend\n\tconn, err := grpc.Dial(grpcBackend, grpc.WithInsecure())\n\tif err != nil {\n\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": \"backend unavailable\"})\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\t// The gRPC backend reads file paths from metadata for config loading\n\t// This is used by the internal config-reload RPC\n\tfilePath := \"\"\n\tif vals := md.Get(\"config-path\"); len(vals) > 0 {\n\t\tfilePath = vals[0]\n\t}\n\n\tif filePath != \"\" {\n\t\t// Backend reads config file specified in metadata\n\t\tdata, err := ioutil.ReadFile(filePath)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": fmt.Sprintf(\"config read failed: %v\", err)})\n\t\t\treturn\n\t\t}\n\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\"status\": \"config reloaded\",\n\t\t\t\"config\": string(data),\n\t\t})\n\t\treturn\n\t}\n\n\tc.JSON(http.StatusOK, gin.H{\n\t\t\"status\":   \"forwarded\",\n\t\t\"trace_id\": traceID,\n\t\t\"metadata_keys\": md.Len(),\n\t})\n}\n\n// HealthCheck endpoint\nfunc HealthCheck(c *gin.Context) {\n\tc.JSON(http.StatusOK, gin.H{\"status\": \"healthy\"})\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Rate limiting middleware\n\tr.Use(func(c *gin.Context) {\n\t\t// Basic rate limiting by IP\n\t\tc.Next()\n\t})\n\n\tr.GET(\"/health\", HealthCheck)\n\tr.POST(\"/api/v1/proxy\", ProxyRequest)\n\tr.POST(\"/api/v1/config/reload\", ProxyRequest)\n\n\tlog.Println(\"Starting gateway on :8080\")\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Kubernetes pod running the Go Gin gateway as root user with default security context. No AppArmor or SELinux profile applied. Pod spec uses `securityContext: {}` with no restrictions. The container filesystem has read access to /etc/shadow, /etc/passwd, and mounted secrets at /var/run/secrets/. The gRPC backend is a mock service on localhost:9090 that trusts all metadata.",
+    "config": {
+      "kubernetes_security_context": "unconfined",
+      "apparmor_profile": "unconfined",
+      "selinux_context": "unconfined_t",
+      "run_as_user": 0,
+      "read_only_root_filesystem": false,
+      "mounted_volumes": [
+        "/etc/",
+        "/var/run/secrets/kubernetes.io/serviceaccount/"
+      ]
+    }
+  }
+}

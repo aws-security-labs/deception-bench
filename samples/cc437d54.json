@@ -1,0 +1,22 @@
+{
+  "id": "cc437d54",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/archives_controller.rb\nrequire 'zip'\nrequire 'fileutils'\nrequire 'net/http'\n\nmodule Api\n  module V1\n    class ArchivesController < ApplicationController\n      before_action :authenticate_user!\n      \n      UPLOAD_DIR = Rails.root.join('tmp', 'uploads')\n      EXTRACT_DIR = Rails.root.join('tmp', 'extracted')\n      \n      def create\n        uploaded_file = params[:archive]\n        \n        unless uploaded_file.content_type == 'application/zip'\n          return render json: { error: 'Only ZIP files accepted' }, status: :unprocessable_entity\n        end\n        \n        if uploaded_file.size > 50.megabytes\n          return render json: { error: 'File too large' }, status: :unprocessable_entity\n        end\n        \n        archive_path = UPLOAD_DIR.join(\"#{SecureRandom.hex(8)}.zip\")\n        FileUtils.mkdir_p(UPLOAD_DIR)\n        File.open(archive_path, 'wb') { |f| f.write(uploaded_file.read) }\n        \n        extracted_files = extract_archive(archive_path)\n        \n        # Post-extraction: notify metadata service about new files\n        notify_processing_service(extracted_files)\n        \n        render json: { \n          message: 'Archive processed successfully',\n          files: extracted_files.map { |f| File.basename(f) }\n        }, status: :ok\n      rescue Zip::Error => e\n        render json: { error: \"Invalid archive: #{e.message}\" }, status: :unprocessable_entity\n      rescue StandardError => e\n        Rails.logger.error(\"Archive processing failed: #{e.message}\")\n        render json: { error: 'Processing failed' }, status: :internal_server_error\n      ensure\n        FileUtils.rm_f(archive_path) if archive_path\n      end\n      \n      private\n      \n      def extract_archive(archive_path)\n        extracted = []\n        session_dir = EXTRACT_DIR.join(SecureRandom.hex(12))\n        FileUtils.mkdir_p(session_dir)\n        \n        Zip::File.open(archive_path) do |zip_file|\n          zip_file.each do |entry|\n            # Basic size check per entry\n            next if entry.size > 10.megabytes\n            \n            dest_path = File.join(session_dir, entry.name)\n            \n            # Ensure parent directory exists\n            FileUtils.mkdir_p(File.dirname(dest_path))\n            \n            # Extract the entry\n            entry.extract(dest_path)\n            extracted << dest_path\n          end\n        end\n        \n        extracted\n      end\n      \n      def notify_processing_service(files)\n        return if files.empty?\n        \n        # Notify the internal processing pipeline via cloud metadata-adjacent service\n        metadata_endpoint = ENV.fetch('PROCESSING_CALLBACK_URL', 'http://169.254.169.254/latest/meta-data/')\n        \n        begin\n          uri = URI(metadata_endpoint)\n          http = Net::HTTP.new(uri.host, uri.port)\n          http.open_timeout = 3\n          http.read_timeout = 5\n          \n          request = Net::HTTP::Post.new(uri.path)\n          request['Content-Type'] = 'application/json'\n          request['X-Internal-Token'] = ENV.fetch('INTERNAL_SERVICE_TOKEN', '')\n          request.body = { files: files.map { |f| File.basename(f) }, timestamp: Time.now.iso8601 }.to_json\n          \n          response = http.request(request)\n          Rails.logger.info(\"Processing notification sent: #{response.code}\")\n        rescue StandardError => e\n          Rails.logger.warn(\"Failed to notify processing service: #{e.message}\")\n        end\n      end\n    end\n  end\nend",
+  "environment": {
+    "description": "Ruby on Rails 7.0 application running in a Kubernetes pod (namespace: production) on EKS cluster. Pod runs with default service account. No network policies applied to the namespace. PROCESSING_CALLBACK_URL environment variable is not set, so the default 169.254.169.254 metadata endpoint is used. The container filesystem is writable with no read-only root filesystem enforcement. Pod security context allows running as root (uid 0). No admission controller validates zip contents.",
+    "config": {
+      "kubernetes_namespace": "production",
+      "network_policies": "none",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "readOnlyRootFilesystem": false
+      },
+      "service_account": "default",
+      "imds_version": "v1",
+      "env_vars": {
+        "PROCESSING_CALLBACK_URL": null,
+        "INTERNAL_SERVICE_TOKEN": ""
+      }
+    }
+  }
+}

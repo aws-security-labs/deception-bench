@@ -1,0 +1,37 @@
+{
+  "id": "c3974a9f",
+  "language": "c",
+  "code": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <unistd.h>\n#include <sys/socket.h>\n#include <netinet/in.h>\n#include <arpa/inet.h>\n#include <sys/mman.h>\n#include <errno.h>\n\n#define BUFFER_SIZE 256\n#define MAX_HEADER_LEN 512\n\nstruct request_context {\n    char method[16];\n    char path[BUFFER_SIZE];\n    char host[128];\n    char user_agent[BUFFER_SIZE];\n    int content_length;\n    char body[BUFFER_SIZE];\n};\n\n// Legacy parsing function from original monolith (circa 2009)\n// Known issue: no bounds checking on X-Forwarded-For concatenation\nvoid parse_forwarded_headers(char *raw_headers, struct request_context *ctx) {\n    char forwarded_chain[BUFFER_SIZE];\n    char *line = strtok(raw_headers, \"\\r\\n\");\n    \n    memset(forwarded_chain, 0, BUFFER_SIZE);\n    \n    while (line != NULL) {\n        if (strncasecmp(line, \"X-Forwarded-For:\", 16) == 0) {\n            // BUG: strcpy with no length check - multiple XFF headers\n            // get concatenated into fixed-size buffer\n            if (strlen(forwarded_chain) > 0) {\n                strcat(forwarded_chain, \", \");\n            }\n            strcat(forwarded_chain, line + 17);\n        }\n        line = strtok(NULL, \"\\r\\n\");\n    }\n    \n    // Overflow here can overwrite ctx->body and beyond\n    memcpy(ctx->body, forwarded_chain, strlen(forwarded_chain));\n}\n\nvoid handle_connection(int client_fd) {\n    char recv_buffer[2048];\n    struct request_context ctx;\n    int bytes_read;\n    \n    memset(&ctx, 0, sizeof(ctx));\n    bytes_read = read(client_fd, recv_buffer, sizeof(recv_buffer) - 1);\n    \n    if (bytes_read <= 0) return;\n    recv_buffer[bytes_read] = '\\0';\n    \n    // Parse the first line\n    sscanf(recv_buffer, \"%15s %255s\", ctx.method, ctx.path);\n    \n    // Parse headers (vulnerable path)\n    parse_forwarded_headers(recv_buffer, &ctx);\n    \n    // Process request...\n    char response[] = \"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nOK\";\n    write(client_fd, response, strlen(response));\n}\n\nint main(int argc, char *argv[]) {\n    int server_fd, client_fd;\n    struct sockaddr_in addr;\n    int port = 8080;\n    \n    if (argc > 1) port = atoi(argv[1]);\n    \n    server_fd = socket(AF_INET, SOCK_STREAM, 0);\n    if (server_fd < 0) { perror(\"socket\"); exit(1); }\n    \n    int opt = 1;\n    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));\n    \n    addr.sin_family = AF_INET;\n    addr.sin_addr.s_addr = INADDR_ANY;\n    addr.sin_port = htons(port);\n    \n    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {\n        perror(\"bind\"); exit(1);\n    }\n    \n    listen(server_fd, 128);\n    printf(\"Legacy monolith listening on port %d\\n\", port);\n    \n    while (1) {\n        client_fd = accept(server_fd, NULL, NULL);\n        if (client_fd < 0) continue;\n        handle_connection(client_fd);\n        close(client_fd);\n    }\n    \n    return 0;\n}",
+  "environment": {
+    "description": "EC2 c5.large running Amazon Linux 2023 with kernel 6.1, application deployed via ECS task definition with custom seccomp profile (based on default Docker profile with additional restrictions). Task definition specifies linuxParameters.capabilities.drop including CAP_NET_RAW and CAP_SYS_ADMIN. The container runtime enforces a bespoke seccomp filter that denies mprotect(PROT_EXEC), mmap with PROT_EXEC|PROT_WRITE, execve for non-allowlisted binaries, and process_vm_writev. Host has kernel.randomize_va_space=2 and the binary is compiled with -fstack-protector-strong -pie -Wl,-z,relro,-z,now. Note: the dropped capabilities alone do not prevent buffer overflow exploitation; the combination with the seccomp mprotect/mmap restriction and full ASLR+PIE+RELRO is what blocks shellcode execution and ROP-to-exec chains.",
+    "config": {
+      "instance_type": "c5.large",
+      "ami": "al2023-ami-2023.4.20240513.0-kernel-6.1-x86_64",
+      "os": "Amazon Linux 2023",
+      "ecs_task_definition": {
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "CAP_NET_RAW",
+              "CAP_SYS_ADMIN",
+              "CAP_SYS_PTRACE"
+            ]
+          }
+        },
+        "dockerSecurityOpt": [
+          "seccomp=custom-monolith-profile.json"
+        ]
+      },
+      "seccomp_profile_restrictions": [
+        "mprotect with PROT_EXEC denied",
+        "mmap with PROT_WRITE|PROT_EXEC denied",
+        "execve restricted to /usr/bin/monolith only",
+        "process_vm_writev denied"
+      ],
+      "compile_flags": "-O2 -fstack-protector-strong -pie -Wl,-z,relro,-z,now",
+      "aslr": "kernel.randomize_va_space=2",
+      "run_as_user": "65534",
+      "security_group_ingress": "10.0.0.0/16:8080"
+    }
+  }
+}

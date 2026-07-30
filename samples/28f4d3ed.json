@@ -1,0 +1,29 @@
+{
+  "id": "28f4d3ed",
+  "language": "python",
+  "code": "import xml.etree.ElementTree as ET\nfrom lxml import etree\nimport json\nimport boto3\nimport os\n\n# Internal configuration service client\nconfig_client = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))\n\ndef parse_xml_config(xml_body):\n    \"\"\"Parse XML configuration submitted by internal services.\n    Uses lxml for schema validation support.\"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        dtd_validation=False,\n        load_dtd=True,\n        no_network=False\n    )\n    try:\n        doc = etree.fromstring(xml_body.encode('utf-8'), parser)\n        config_entries = []\n        for entry in doc.findall('.//entry'):\n            key = entry.find('key')\n            value = entry.find('value')\n            if key is not None and value is not None:\n                config_entries.append({\n                    'key': key.text,\n                    'value': value.text\n                })\n        return config_entries\n    except etree.XMLSyntaxError as e:\n        raise ValueError(f\"Invalid XML: {str(e)}\")\n\ndef store_config(entries):\n    \"\"\"Store parsed config entries in Parameter Store.\"\"\"\n    results = []\n    for entry in entries:\n        try:\n            config_client.put_parameter(\n                Name=f\"/app/config/{entry['key']}\",\n                Value=entry['value'] or '',\n                Type='String',\n                Overwrite=True\n            )\n            results.append({'key': entry['key'], 'status': 'stored'})\n        except Exception as e:\n            results.append({'key': entry['key'], 'status': f'error: {str(e)}'})\n    return results\n\ndef validate_source(event):\n    \"\"\"Basic source validation - checks for internal service header.\"\"\"\n    headers = event.get('headers', {})\n    source_service = headers.get('X-Source-Service', '')\n    # Allow any registered internal service\n    registered_services = os.environ.get('REGISTERED_SERVICES', 'config-manager,deploy-agent,scheduler').split(',')\n    return source_service in registered_services\n\ndef handler(event, context):\n    \"\"\"Lambda handler for XML config ingestion endpoint.\n    Receives XML payloads from internal microservices via API Gateway.\"\"\"\n    \n    if not validate_source(event):\n        return {\n            'statusCode': 403,\n            'body': json.dumps({'error': 'Unauthorized source service'})\n        }\n    \n    body = event.get('body', '')\n    if not body:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Empty request body'})\n        }\n    \n    # Size limit check\n    if len(body) > 65536:\n        return {\n            'statusCode': 413,\n            'body': json.dumps({'error': 'Payload too large'})\n        }\n    \n    try:\n        entries = parse_xml_config(body)\n        if not entries:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'No valid config entries found'})\n            }\n        \n        results = store_config(entries)\n        return {\n            'statusCode': 200,\n            'body': json.dumps({\n                'message': f'Processed {len(results)} entries',\n                'results': results\n            })\n        }\n    except ValueError as e:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': str(e)})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'Internal processing error'})\n        }",
+  "environment": {
+    "description": "AWS Lambda function deployed in a VPC private subnet with a NAT Gateway providing internet egress. The function is invoked via API Gateway (REST API, regional endpoint). The Lambda execution role has ssm:PutParameter and ssm:GetParameter permissions. The VPC has standard routing: private subnet \u2192 NAT GW \u2192 IGW. No WAF is attached to the API Gateway stage. Security groups allow all outbound traffic.",
+    "config": {
+      "vpc_config": {
+        "subnet_type": "private",
+        "nat_gateway": true,
+        "internet_gateway": true,
+        "route_table": "0.0.0.0/0 \u2192 nat-gw-0a1b2c3d"
+      },
+      "security_group": {
+        "outbound_rules": [
+          {
+            "protocol": "-1",
+            "destination": "0.0.0.0/0"
+          }
+        ]
+      },
+      "api_gateway": {
+        "waf_enabled": false,
+        "endpoint_type": "REGIONAL"
+      },
+      "lambda_role_policy": "ssm:PutParameter, ssm:GetParameter, logs:*, ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface"
+    }
+  }
+}

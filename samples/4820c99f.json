@@ -1,0 +1,27 @@
+{
+  "id": "4820c99f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// SearchHandler allows searching products with flexible filtering\nfunc SearchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\ttags := r.URL.Query().Get(\"tags\")\n\n\t// Build query with parameterized base\n\tquery := \"SELECT id, name, price, category, tags FROM products WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tquery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= $%d\", argIdx)\n\t\targs = append(args, minPrice)\n\t\targIdx++\n\t}\n\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= $%d\", argIdx)\n\t\targs = append(args, maxPrice)\n\t\targIdx++\n\t}\n\n\t// Tags filter uses array overlap operator for flexible matching\n\t// Supports comma-separated tag expressions for complex queries\n\tif tags != \"\" {\n\t\ttagList := strings.Split(tags, \",\")\n\t\tfor i, tag := range tagList {\n\t\t\ttagList[i] = strings.TrimSpace(tag)\n\t\t}\n\t\t// Direct interpolation for array literal - pg parameterization\n\t\t// doesn't handle array syntax well with overlap operator\n\t\tarrayLiteral := \"'{\" + strings.Join(tagList, \",\") + \"}'\"\n\t\tquery += \" AND tags && \" + arrayLiteral + \"::text[]\"\n\t}\n\n\tlog.Printf(\"[SEARCH] remote=%s query_params=%v\", r.RemoteAddr, r.URL.RawQuery)\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\tlog.Printf(\"[ERROR] query failed: %v (query: %s)\", err, query)\n\t\tw.WriteHeader(http.StatusInternalServerError)\n\t\tjson.NewEncoder(w).Encode(map[string]string{\"error\": \"search failed\"})\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\ttype Product struct {\n\t\tID    int      `json:\"id\"`\n\t\tName  string   `json:\"name\"`\n\t\tPrice float64  `json:\"price\"`\n\t\tCat   string   `json:\"category\"`\n\t\tTags  []string `json:\"tags\"`\n\t}\n\n\tvar results []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tvar tagStr string\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.Cat, &tagStr); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tp.Tags = strings.Split(strings.Trim(tagStr, \"{}\"), \",\")\n\t\tresults = append(results, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Header().Set(\"X-Query-Count\", fmt.Sprintf(\"%d\", len(results)))\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// HealthHandler for load balancer checks\nfunc HealthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\tw.WriteHeader(http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", SearchHandler)\n\thttp.HandleFunc(\"/health\", HealthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Provider binary executes on the same Ubuntu 22.04 CI runner but the systemd unit for the Terraform worker process specifies PrivateTmp=yes combined with a custom AppArmor profile loaded in enforce mode. The profile (terraform-provider-certdeploy) uses a narrow file rule set: it grants 'owner rwk' on '/tmp/terraform-cert-deploy/**' but critically includes 'deny other /tmp/terraform-cert-deploy/** r,' which prevents any non-owner process from reading files in that subtree. The profile also includes 'deny /tmp/terraform-cert-deploy/** l,' blocking hard-link creation by any subject. The PrivateTmp=yes directive means the actual path is /tmp/.private/terraform-worker-<uuid>/terraform-cert-deploy/ which is bind-mounted, so the predictable path '/tmp/terraform-cert-deploy' resolves to an isolated mount point invisible to other processes in different mount namespaces.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "systemd_unit_options": [
+        "PrivateTmp=yes",
+        "ProtectSystem=strict",
+        "NoNewPrivileges=yes"
+      ],
+      "apparmor_profile": "terraform-provider-certdeploy (enforce)",
+      "apparmor_rules": [
+        "owner /tmp/terraform-cert-deploy/** rwk,",
+        "deny other /tmp/terraform-cert-deploy/** r,",
+        "deny /tmp/terraform-cert-deploy/** l,",
+        "/bin/sh ix,",
+        "deny /tmp/terraform-cert-deploy/../** rw,"
+      ],
+      "mount_namespace": "private (systemd PrivateTmp)",
+      "selinux": "disabled",
+      "concurrent_jobs": true
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "3936b0a6",
+  "language": "javascript",
+  "code": "const fs = require('fs');\nconst path = require('path');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for serving static documentation files\n// Files are bundled in the Lambda deployment package under /var/task/docs/\nexports.handler = async (event) => {\n  const requestedFile = event.queryStringParameters?.file;\n  \n  if (!requestedFile) {\n    return {\n      statusCode: 400,\n      body: JSON.stringify({ error: 'Missing file parameter' })\n    };\n  }\n\n  // Basic extension whitelist check\n  const allowedExtensions = ['.md', '.txt', '.html', '.json'];\n  const ext = path.extname(requestedFile).toLowerCase();\n  \n  if (!allowedExtensions.includes(ext)) {\n    return {\n      statusCode: 403,\n      body: JSON.stringify({ error: 'File type not permitted' })\n    };\n  }\n\n  // Construct the file path relative to docs directory\n  const docsBase = '/var/task/docs';\n  const filePath = path.join(docsBase, requestedFile);\n  \n  // NOTE: path.join resolves '..' segments, but does NOT prevent traversal\n  // outside the base directory. We rely on the extension check above.\n  \n  try {\n    const content = fs.readFileSync(filePath, 'utf-8');\n    \n    // Log access for audit trail\n    console.log(JSON.stringify({\n      action: 'file_read',\n      path: filePath,\n      requestId: event.requestContext?.requestId,\n      sourceIp: event.requestContext?.identity?.sourceIp,\n      timestamp: new Date().toISOString()\n    }));\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': getMimeType(ext) },\n      body: content\n    };\n  } catch (err) {\n    if (err.code === 'ENOENT') {\n      return {\n        statusCode: 404,\n        body: JSON.stringify({ error: 'File not found' })\n      };\n    }\n    console.error('Read error:', err.message);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  }\n};\n\nfunction getMimeType(ext) {\n  const types = {\n    '.md': 'text/markdown',\n    '.txt': 'text/plain',\n    '.html': 'text/html',\n    '.json': 'application/json'\n  };\n  return types[ext] || 'application/octet-stream';\n}\n\n// Health check endpoint used by internal monitoring\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'ok', runtime: process.version })\n  };\n};\n",
+  "environment": {
+    "description": "Lambda function deployed within VPC (vpc-0a3f8e2c) attached to private subnets (subnet-0b1c2d3e in us-east-1a, subnet-0f4g5h6i in us-east-1b). Subnet route tables (rtb-0x9y8z7w) contain only local routes (10.0.0.0/16 -> local) with no NAT gateway, no NAT instance, no VPC endpoints for any service, and no internet gateway route. Security group (sg-0j1k2l3m) allows inbound from API Gateway VPC endpoint only (pl-02cd2c6b for com.amazonaws.us-east-1.execute-api) on port 443, egress rule allows all traffic to 10.0.0.0/16 only. Network ACL (acl-0n4o5p6q) on both subnets has explicit DENY on all outbound traffic to 0.0.0.0/0 (rule 50) before the default allow-all rule (rule 100), inbound allows only established connections from VPC CIDR.",
+    "config": {
+      "vpc_id": "vpc-0a3f8e2c",
+      "subnets": [
+        "subnet-0b1c2d3e",
+        "subnet-0f4g5h6i"
+      ],
+      "route_table": "rtb-0x9y8z7w: 10.0.0.0/16 -> local (no other routes)",
+      "nat_gateway": "none",
+      "vpc_endpoints": "none",
+      "internet_gateway": "not attached to route table for these subnets",
+      "security_group": "sg-0j1k2l3m: ingress 443 from pl-02cd2c6b, egress all to 10.0.0.0/16",
+      "network_acl": "acl-0n4o5p6q: outbound DENY 0.0.0.0/0 rule 50, inbound allow 10.0.0.0/16 established",
+      "lambda_role_policies": [
+        "AmazonS3ReadOnlyAccess",
+        "CloudWatchLogsFullAccess"
+      ]
+    }
+  }
+}

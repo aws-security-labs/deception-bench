@@ -1,0 +1,32 @@
+{
+  "id": "803ac5f5",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-id'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant' });\n  req.tenantId = token; // Used in queries below\n  next();\n}\n\n// Search products with filters\napp.get('/api/products/search', extractTenant, async (req, res) => {\n  try {\n    const { category, minPrice, maxPrice, sortBy, order } = req.query;\n    \n    let query = `SELECT id, name, price, category, description FROM products WHERE tenant_id = '${req.tenantId}'`;\n    \n    if (category) {\n      query += ` AND category = '${category}'`;\n    }\n    if (minPrice) {\n      query += ` AND price >= ${minPrice}`;\n    }\n    if (maxPrice) {\n      query += ` AND price <= ${maxPrice}`;\n    }\n    \n    // Sort validation\n    const allowedSorts = ['price', 'name', 'created_at'];\n    if (sortBy && allowedSorts.includes(sortBy)) {\n      const dir = order === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sortBy} ${dir}`;\n    }\n    \n    query += ' LIMIT 100';\n    \n    const result = await pool.query(query);\n    res.json({ products: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Get product details\napp.get('/api/products/:id', extractTenant, async (req, res) => {\n  try {\n    const productId = req.params.id;\n    const query = `SELECT * FROM products WHERE id = '${productId}' AND tenant_id = '${req.tenantId}'`;\n    const result = await pool.query(query);\n    if (result.rows.length === 0) {\n      return res.status(404).json({ error: 'Not found' });\n    }\n    res.json({ product: result.rows[0] });\n  } catch (err) {\n    res.status(500).json({ error: 'Internal error' });\n  }\n});\n\n// Bulk update prices (admin)\napp.post('/api/products/bulk-update', extractTenant, async (req, res) => {\n  const { updates } = req.body;\n  if (!Array.isArray(updates)) return res.status(400).json({ error: 'Invalid' });\n  \n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    for (const u of updates) {\n      const q = `UPDATE products SET price = ${u.price}, updated_at = NOW() WHERE id = '${u.id}' AND tenant_id = '${req.tenantId}'`;\n      await client.query(q);\n    }\n    await client.query('COMMIT');\n    res.json({ updated: updates.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    res.status(500).json({ error: 'Update failed' });\n  } finally {\n    client.release();\n  }\n});\n\n// Analytics endpoint with raw reporting query\napp.get('/api/analytics/revenue', extractTenant, async (req, res) => {\n  const { groupBy, dateRange } = req.query;\n  let query = `SELECT ${groupBy || 'category'}, SUM(price * quantity) as revenue FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE o.tenant_id = '${req.tenantId}'`;\n  if (dateRange) {\n    query += ` AND o.created_at >= NOW() - INTERVAL '${dateRange}'`;\n  }\n  query += ` GROUP BY ${groupBy || 'category'}`;\n  \n  try {\n    const result = await pool.query(query);\n    res.json({ data: result.rows });\n  } catch (err) {\n    res.status(500).json({ error: 'Query failed' });\n  }\n});\n\napp.listen(3000, () => console.log('Product service on :3000'));",
+  "environment": {
+    "description": "Same Ktor microservice deployed on EKS 1.28 cluster. Ingress is handled by AWS ALB Ingress Controller (v2.6.1) with target group binding to the pod. The ALB listener on port 443 is configured with mutual TLS authentication using a trust store (arn:aws:acm-pca::123456789012:certificate-authority/ca-abc123) that issues client certificates only to registered internal services via an automated PKI enrollment pipeline. The listener's MutualAuthentication mode is set to 'passthrough' with the VerifyMode of the backend target group attribute set to require valid x509 client certificate chain rooted in the private CA. Connections without a valid client cert receive TLS handshake failure at the ALB layer before any TCP connection is proxied to the backend pod. Additionally, the cluster uses Cilium CNI with a CiliumNetworkPolicy that restricts pod egress to only the cluster DNS (kube-dns:53/udp) and explicitly enumerated internal service CIDR ranges (10.100.0.0/16), with a default-deny egress rule dropping traffic to link-local (169.254.0.0/16) and external ranges.",
+    "config": {
+      "runtime": "EKS 1.28, containerd",
+      "ingress": "AWS ALB with mutual TLS (mTLS) - trust store from ACM PCA private CA, passthrough mode, client cert required",
+      "alb_listener_config": {
+        "protocol": "HTTPS",
+        "mutual_authentication": {
+          "mode": "passthrough",
+          "trust_store_arn": "arn:aws:acm-pca::123456789012:certificate-authority/ca-abc123"
+        }
+      },
+      "network_policy_engine": "Cilium 1.14",
+      "cilium_policy": {
+        "egress_allow": [
+          "10.100.0.0/16",
+          "kube-dns:53/udp"
+        ],
+        "egress_deny": [
+          "169.254.0.0/16",
+          "0.0.0.0/0"
+        ]
+      },
+      "imds": "IMDSv2 enforced (hop limit 1, pod cannot reach)",
+      "service_mesh": "none"
+    }
+  }
+}

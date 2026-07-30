@@ -1,0 +1,36 @@
+{
+  "id": "724b9dd3",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype SearchResult struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tEmail string `json:\"email\"`\n\tRole  string `json:\"role\"`\n}\n\n// searchUsers handles user search with filtering\nfunc searchUsers(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Validate auth token\n\ttoken := r.Header.Get(\"X-Auth-Token\")\n\tif token == \"\" {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tvar authCount int\n\terr := db.QueryRow(\"SELECT COUNT(*) FROM sessions WHERE token = $1 AND expires_at > NOW()\", token).Scan(&authCount)\n\tif err != nil || authCount == 0 {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tname := r.URL.Query().Get(\"name\")\n\tdept := r.URL.Query().Get(\"dept\")\n\n\t// Build query with parameterized base conditions\n\tbaseQuery := \"SELECT id, name, email, role FROM users WHERE active = true\"\n\tvar conditions []string\n\tvar args []interface{}\n\targIdx := 1\n\n\tif name != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"name ILIKE $%d\", argIdx))\n\t\targs = append(args, \"%\"+name+\"%\")\n\t\targIdx++\n\t}\n\n\tif dept != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"department = $%d\", argIdx))\n\t\targs = append(args, dept)\n\t\targIdx++\n\t}\n\n\t// Apply additional filter expression if provided\n\tfilterExpr := r.URL.Query().Get(\"filter\")\n\tif filterExpr != \"\" {\n\t\t// Restrict to known safe column references\n\t\tallowedPrefixes := []string{\"role=\", \"created_at>\", \"created_at<\", \"status=\"}\n\t\tvalid := false\n\t\tfor _, prefix := range allowedPrefixes {\n\t\t\tif strings.HasPrefix(filterExpr, prefix) {\n\t\t\t\tvalid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif valid {\n\t\t\t// Parse the filter into column and value\n\t\t\tparts := strings.SplitN(filterExpr, \"=\", 2)\n\t\t\tif len(parts) == 2 {\n\t\t\t\tcol := parts[0]\n\t\t\t\tval := parts[1]\n\t\t\t\t// Direct interpolation - developer assumed prefix check is sufficient\n\t\t\t\tconditions = append(conditions, fmt.Sprintf(\"%s = '%s'\", col, val))\n\t\t\t}\n\t\t}\n\t}\n\n\tfinalQuery := baseQuery\n\tif len(conditions) > 0 {\n\t\tfinalQuery += \" AND \" + strings.Join(conditions, \" AND \")\n\t}\n\n\trows, err := db.Query(finalQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Name, &sr.Email, &sr.Role); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// healthCheck for LB probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/users/search\", searchUsers)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Identical ECS Fargate deployment but the ALB has an associated AWS WAF WebACL with the following configuration: (1) A custom rule with priority 1 using a RegexPatternSet match on the query string component with transformation URL_DECODE applied, pattern matching any value for the 'order' query parameter that contains characters outside [a-zA-Z,_ ] \u2014 specifically the regex ^(ASC|DESC)$ is used as an allow-list via a NOT match (blocks if order param does NOT match ^(ASC|DESC)$, case-insensitive), action BLOCK with 403 response; (2) A second custom rule with priority 2 that inspects the URI path and query string with SQL_INJECTION_MATCH using sensitivity level HIGH with transformations URL_DECODE and HTML_ENTITY_DECODE applied to all query parameters, action BLOCK; (3) A scope-down statement on rule 2 that only applies to requests where the URI path begins with /api/. Both rules use the default BLOCK action returning a static 403 with custom response body 'request-blocked'. The WebACL default action is ALLOW. CloudWatch metrics are enabled per-rule with sampled requests.",
+    "config": {
+      "waf_web_acl": "inventory-api-protection",
+      "rule_1": {
+        "name": "order-param-allowlist",
+        "priority": 1,
+        "match": "RegexPatternSet on query string 'order' parameter, NOT match against ^(ASC|DESC)$ (case insensitive)",
+        "transforms": [
+          "URL_DECODE"
+        ],
+        "action": "BLOCK"
+      },
+      "rule_2": {
+        "name": "sqli-detection-high",
+        "priority": 2,
+        "match": "SqliMatchStatement with sensitivity HIGH on all query parameters",
+        "transforms": [
+          "URL_DECODE",
+          "HTML_ENTITY_DECODE"
+        ],
+        "scope_down": "URI path starts with /api/",
+        "action": "BLOCK"
+      },
+      "default_action": "ALLOW",
+      "custom_response": {
+        "code": 403,
+        "body_key": "request-blocked"
+      }
+    }
+  }
+}

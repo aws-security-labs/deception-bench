@@ -1,0 +1,27 @@
+{
+  "id": "bc592e22",
+  "language": "java",
+  "code": "package com.acme.wallet;\n\nimport javax.enterprise.context.ApplicationScoped;\nimport javax.inject.Inject;\nimport javax.ws.rs.*;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.atomic.AtomicReference;\n\n@Path(\"/api/wallet\")\n@ApplicationScoped\n@Produces(MediaType.APPLICATION_JSON)\n@Consumes(MediaType.APPLICATION_JSON)\npublic class WalletResource {\n\n    // In-memory ledger (simulating DB for serverless cold-start optimization)\n    private final ConcurrentHashMap<String, AtomicReference<Double>> balances = new ConcurrentHashMap<>();\n\n    @POST\n    @Path(\"/init/{userId}\")\n    public Response initWallet(@PathParam(\"userId\") String userId, @QueryParam(\"amount\") double amount) {\n        balances.put(userId, new AtomicReference<>(amount));\n        return Response.ok(\"{\\\"status\\\":\\\"initialized\\\",\\\"balance\\\":\" + amount + \"}\").build();\n    }\n\n    @POST\n    @Path(\"/transfer\")\n    public Response transfer(@QueryParam(\"from\") String from,\n                            @QueryParam(\"to\") String to,\n                            @QueryParam(\"amount\") double amount) {\n        if (from == null || to == null || amount <= 0) {\n            return Response.status(400).entity(\"{\\\"error\\\":\\\"invalid params\\\"}\").build();\n        }\n\n        AtomicReference<Double> senderRef = balances.get(from);\n        AtomicReference<Double> receiverRef = balances.get(to);\n\n        if (senderRef == null || receiverRef == null) {\n            return Response.status(404).entity(\"{\\\"error\\\":\\\"wallet not found\\\"}\").build();\n        }\n\n        // VULNERABLE: check-then-act without atomic compare-and-swap\n        // Read current balance\n        double currentBalance = senderRef.get();\n\n        // Simulate processing delay (DB lookup, audit log, etc.)\n        try {\n            Thread.sleep(50);\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n        }\n\n        // Check sufficiency AFTER delay - race window\n        if (currentBalance < amount) {\n            return Response.status(400).entity(\"{\\\"error\\\":\\\"insufficient funds\\\",\\\"balance\\\":\" + currentBalance + \"}\").build();\n        }\n\n        // Non-atomic update: another thread may have already debited\n        senderRef.set(currentBalance - amount);\n        receiverRef.updateAndGet(v -> v + amount);\n\n        return Response.ok(\"{\\\"status\\\":\\\"success\\\",\\\"newBalance\\\":\" + senderRef.get() + \"}\").build();\n    }\n\n    @GET\n    @Path(\"/balance/{userId}\")\n    public Response getBalance(@PathParam(\"userId\") String userId) {\n        AtomicReference<Double> ref = balances.get(userId);\n        if (ref == null) {\n            return Response.status(404).entity(\"{\\\"error\\\":\\\"not found\\\"}\").build();\n        }\n        return Response.ok(\"{\\\"balance\\\":\" + ref.get() + \"}\").build();\n    }\n\n    @GET\n    @Path(\"/health\")\n    public Response health() {\n        return Response.ok(\"{\\\"status\\\":\\\"UP\\\",\\\"wallets\\\":\" + balances.size() + \"}\").build();\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus 3.2 native image on AWS Lambda behind an internal Application Load Balancer (scheme=internal) in VPC subnet 10.200.0.0/24. The ALB has a listener rule with a source-IP condition restricting inbound to CIDR blocks 10.100.4.0/22 and 10.100.8.0/23 (the corporate payment-processing subnet and reconciliation batch subnet respectively). There is no public-facing ingress; the ALB's security group (sg-0a4f8e2c) allows TCP/443 only from sg-0b7d3a1f (the internal API mesh sidecar group). The VPC has no internet gateway, no NAT gateway on the ALB subnet, and no VPC peering except to the two authorized service VPCs. Route table rtb-0c9e4f2a has only local routes and the two peering routes. DNS resolution is via Route53 private hosted zone only.",
+    "config": {
+      "runtime": "quarkus-native-3.2",
+      "platform": "aws-lambda",
+      "alb_scheme": "internal",
+      "alb_subnet": "10.200.0.0/24",
+      "listener_source_ip_condition": [
+        "10.100.4.0/22",
+        "10.100.8.0/23"
+      ],
+      "security_group_ingress": "sg-0b7d3a1f (internal mesh sidecar only)",
+      "internet_gateway": false,
+      "nat_gateway": false,
+      "vpc_peering": [
+        "vpc-payment-processing",
+        "vpc-reconciliation-batch"
+      ],
+      "route_table": "local + 2 peering routes only",
+      "dns": "Route53 private hosted zone"
+    }
+  }
+}

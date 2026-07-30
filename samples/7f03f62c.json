@@ -1,0 +1,27 @@
+{
+  "id": "7f03f62c",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"time\"\n\n\t\"github.com/aws/aws-lambda-go/events\"\n\t\"github.com/aws/aws-lambda-go/lambda\"\n)\n\n// MetadataClient fetches configuration from a user-specified endpoint\n// Used by our Terraform provider to validate external webhook configurations\ntype MetadataClient struct {\n\tEndpoint string\n\tTimeout  time.Duration\n}\n\nfunc NewMetadataClient(endpoint string) *MetadataClient {\n\treturn &MetadataClient{\n\t\tEndpoint: endpoint,\n\t\tTimeout:  10 * time.Second,\n\t}\n}\n\n// FetchConfig retrieves webhook configuration from the provided URL\n// The URL is resolved at request time, making it susceptible to DNS rebinding\n// if the DNS TTL expires between validation and fetch\nfunc (m *MetadataClient) FetchConfig(ctx context.Context) (map[string]interface{}, error) {\n\tclient := &http.Client{\n\t\tTimeout: m.Timeout,\n\t}\n\n\t// First request: validate the endpoint is reachable (DNS resolves to public IP)\n\tresp, err := client.Get(m.Endpoint + \"/health\")\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"health check failed: %w\", err)\n\t}\n\tresp.Body.Close()\n\n\tif resp.StatusCode != 200 {\n\t\treturn nil, fmt.Errorf(\"endpoint unhealthy: status %d\", resp.StatusCode)\n\t}\n\n\t// Sleep to allow provider state reconciliation\n\t// This window allows DNS TTL to expire and rebind to 169.254.169.254\n\ttime.Sleep(2 * time.Second)\n\n\t// Second request: fetch actual config (DNS may now resolve to IMDS)\n\tresp2, err := client.Get(m.Endpoint + \"/latest/meta-data/iam/security-credentials/\")\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"config fetch failed: %w\", err)\n\t}\n\tdefer resp2.Body.Close()\n\n\tbody, err := ioutil.ReadAll(resp2.Body)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"read body failed: %w\", err)\n\t}\n\n\tvar config map[string]interface{}\n\tif err := json.Unmarshal(body, &config); err != nil {\n\t\t// If not JSON, wrap raw response\n\t\tconfig = map[string]interface{}{\"raw\": string(body)}\n\t}\n\n\treturn config, nil\n}\n\n// HandleRequest processes incoming Lambda function URL requests\nfunc HandleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {\n\twebhookURL := request.QueryStringParameters[\"webhook_url\"]\n\tif webhookURL == \"\" {\n\t\treturn events.LambdaFunctionURLResponse{\n\t\t\tStatusCode: 400,\n\t\t\tBody:       `{\"error\": \"webhook_url parameter required\"}`,\n\t\t}, nil\n\t}\n\n\t// No validation that webhook_url doesn't resolve to internal IPs\n\tclient := NewMetadataClient(webhookURL)\n\tconfig, err := client.FetchConfig(ctx)\n\tif err != nil {\n\t\treturn events.LambdaFunctionURLResponse{\n\t\t\tStatusCode: 502,\n\t\t\tBody:       fmt.Sprintf(`{\"error\": \"%s\"}`, err.Error()),\n\t\t}, nil\n\t}\n\n\tresultJSON, _ := json.Marshal(config)\n\treturn events.LambdaFunctionURLResponse{\n\t\tStatusCode: 200,\n\t\tBody:       string(resultJSON),\n\t\tHeaders:    map[string]string{\"Content-Type\": \"application/json\"},\n\t}, nil\n}\n\nfunc main() {\n\tif os.Getenv(\"AWS_LAMBDA_FUNCTION_NAME\") != \"\" {\n\t\tlambda.Start(HandleRequest)\n\t} else {\n\t\t// Local development mode\n\t\thttp.HandleFunc(\"/validate\", func(w http.ResponseWriter, r *http.Request) {\n\t\t\twebhookURL := r.URL.Query().Get(\"webhook_url\")\n\t\t\tclient := NewMetadataClient(webhookURL)\n\t\t\tconfig, err := client.FetchConfig(r.Context())\n\t\t\tif err != nil {\n\t\t\t\thttp.Error(w, err.Error(), 502)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tjson.NewEncoder(w).Encode(config)\n\t\t})\n\t\tfmt.Println(\"Starting local server on :8080\")\n\t\thttp.ListenAndServe(\":8080\", nil)\n\t}\n}",
+  "environment": {
+    "description": "Lambda function deployed with function URL configured with auth_type=AWS_IAM. The resource-based policy on the function URL specifies a principal condition (aws:PrincipalOrgID) restricting invocation to identities within the organization. No public invoke permission is granted. Callers without valid SigV4 signatures matching an authorized IAM principal receive HTTP 403 from the Lambda service endpoint before the function code executes. Note: the code itself has no authentication logic \u2014 the gate is entirely at the Lambda service layer for function URL invocation authorization.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          }
+        }
+      },
+      "public_access": "blocked by auth_type=AWS_IAM",
+      "function_url_cors": {
+        "allow_origins": [
+          "https://internal.example.com"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "id": "11981a07",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { Pool } = require('pg');\nconst AWS = require('aws-sdk');\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: 5432,\n  database: 'appdb',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  max: 20\n});\n\nconst s3 = new AWS.S3({ region: 'us-east-1' });\n\nconst typeDefs = gql`\n  type AuditLog {\n    id: Int\n    action: String\n    username: String\n    timestamp: String\n    details: String\n  }\n\n  type ExportResult {\n    bucket: String\n    key: String\n    recordCount: Int\n  }\n\n  type Query {\n    searchAuditLogs(username: String!, startDate: String, endDate: String): [AuditLog]\n    exportAuditLogs(username: String!, format: String): ExportResult\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    searchAuditLogs: async (_, { username, startDate, endDate }) => {\n      // Build query with date filtering\n      let query = `SELECT id, action, username, timestamp, details FROM audit_logs WHERE username = '${username}'`;\n      \n      if (startDate) {\n        query += ` AND timestamp >= '${startDate}'`;\n      }\n      if (endDate) {\n        query += ` AND timestamp <= '${endDate}'`;\n      }\n      \n      query += ' ORDER BY timestamp DESC LIMIT 500';\n      \n      const result = await pool.query(query);\n      return result.rows;\n    },\n\n    exportAuditLogs: async (_, { username, format }) => {\n      // Query logs for export\n      const query = `SELECT id, action, username, timestamp, details FROM audit_logs WHERE username = '${username}' ORDER BY timestamp DESC`;\n      const result = await pool.query(query);\n      \n      const exportKey = `exports/${username}/${Date.now()}.${format || 'json'}`;\n      const exportBucket = process.env.EXPORT_BUCKET || 'audit-exports-prod';\n      \n      // Format and upload to S3\n      let body;\n      if (format === 'csv') {\n        const header = 'id,action,username,timestamp,details\\n';\n        body = header + result.rows.map(r => `${r.id},${r.action},${r.username},${r.timestamp},\"${r.details}\"`).join('\\n');\n      } else {\n        body = JSON.stringify(result.rows, null, 2);\n      }\n\n      await s3.putObject({\n        Bucket: exportBucket,\n        Key: exportKey,\n        Body: body,\n        ContentType: format === 'csv' ? 'text/csv' : 'application/json',\n        ServerSideEncryption: 'AES256'\n      }).promise();\n\n      return { bucket: exportBucket, key: exportKey, recordCount: result.rows.length };\n    }\n  }\n};\n\nconst app = express();\n\n// Health check endpoint\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n  playground: false,\n  formatError: (err) => {\n    // Don't leak internal errors\n    if (err.extensions?.code === 'INTERNAL_SERVER_ERROR') {\n      return { message: 'Internal error', code: 'INTERNAL_ERROR' };\n    }\n    return err;\n  }\n});\n\nserver.applyMiddleware({ app, path: '/graphql' });\n\napp.listen(4000, () => {\n  console.log('GraphQL server running on port 4000');\n});",
+  "environment": {
+    "description": "ECS Fargate service in private subnet with connectivity to RDS through a dedicated data subnet. S3 access is routed exclusively through a VPC endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that restricts PutObject to keys matching the condition aws:ResourceTag/classification=public AND requires the request to originate from the specific task role ARN. The VPC has no NAT gateway or internet gateway for the app subnet, so all S3 traffic MUST traverse the VPC endpoint. The endpoint policy additionally includes a Deny statement for any PutObject where the object key contains characters outside [a-zA-Z0-9/_.-] using StringNotLike on s3:prefix. RDS is accessed through a separate VPC endpoint for RDS (interface type). The RDS instance has a pg_hba.conf entry restricting connections to the app subnet CIDR only, and the database role used by the application is configured with a row-level security policy: SELECT on audit_logs is restricted via RLS policy 'tenant_isolation' that enforces current_setting('app.current_tenant') = username column, set per-connection via SET LOCAL before queries. However, the application code does not call SET LOCAL app.current_tenant before executing queries.",
+    "config": {
+      "runtime": "Node.js 18 on ECS Fargate",
+      "database": "RDS PostgreSQL 14 with RLS policy on audit_logs (policy: tenant_isolation, USING (username = current_setting('app.current_tenant')))",
+      "network": "Private subnet, no NAT/IGW, S3 Gateway VPC Endpoint vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowRestrictedPut",
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::111122223333:role/audit-app-task-role"
+            },
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::audit-exports-prod/*",
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": [
+                  "exports/[a-zA-Z0-9_.-]*/[0-9]*.[a-z]*"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyMalformedKeys",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::audit-exports-prod/*",
+            "Condition": {
+              "StringNotLike": {
+                "s3:prefix": [
+                  "exports/*/[0-9]*.*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "rds_config": "RLS enabled, policy tenant_isolation active, app.current_tenant defaults to empty string when not set",
+      "iam_role": "arn:aws:iam::111122223333:role/audit-app-task-role",
+      "security_groups": "App SG -> RDS SG on 5432 only"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "10ae8975",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom \"sanitizer\" that only blocks obvious attacks\n    private String sanitizeInput(String input) {\n        if (input == null) return null;\n        // Remove comments and semicolons\n        input = input.replaceAll(\"--\", \"\");\n        input = input.replaceAll(\";\", \"\");\n        input = input.replaceAll(\"/\\\\*.*?\\\\*/\", \"\");\n        return input.trim();\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String department = req.getParameter(\"dept\");\n        \n        // Validate report type against whitelist\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Date validation\n        if (!isValidDate(dateFrom) || !isValidDate(dateTo)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Apply our sanitizer to user inputs\n        sortCol = sanitizeInput(sortCol);\n        department = sanitizeInput(department);\n        \n        String query = buildQuery(reportType, dateFrom, dateTo, sortCol, department);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private String buildQuery(String type, String from, String to, \n                              String sort, String dept) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM reports_\").append(type);\n        sb.append(\" WHERE created_at BETWEEN '\").append(from);\n        sb.append(\"' AND '\").append(to).append(\"'\");\n        \n        if (dept != null && !dept.isEmpty()) {\n            sb.append(\" AND department = '\").append(dept).append(\"'\");\n        }\n        \n        if (sort != null && !sort.isEmpty()) {\n            sb.append(\" ORDER BY \").append(sort);\n        }\n        \n        return sb.toString();\n    }\n    \n    private boolean isValidReportType(String type) {\n        return type != null && type.matches(\"^(sales|inventory|hr|finance)$\");\n    }\n    \n    private boolean isValidDate(String date) {\n        return date != null && date.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\");\n    }\n}",
+  "environment": {
+    "description": "EKS pod in isolated subnet with com.amazonaws.us-east-1.s3 Gateway VPC Endpoint. The endpoint policy uses a condition-based restriction: aws:ResourceAccount must equal the owning account AND s3:prefix must begin with 'processed/' via StringLike condition. The pod's IRSA role has s3:PutObject scoped to arn:aws:s3:::prod-events-sink/processed/* but the VPC endpoint policy additionally enforces that ANY S3 API call transiting the endpoint must target bucket 'prod-events-sink' specifically (Resource: arn:aws:s3:::prod-events-sink/*) with a StringEquals condition on s3:x-amz-acl set to bucket-owner-full-control. Kafka topic has schema registry enforcement with Avro schema validation requiring 'metadata' field to be a flat map of string->string (no nested objects allowed).",
+    "config": {
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::prod-events-sink/processed/*",
+        "Condition": {
+          "StringEquals": {
+            "aws:ResourceAccount": "111222333444",
+            "s3:x-amz-acl": "bucket-owner-full-control"
+          },
+          "StringLike": {
+            "s3:prefix": "processed/*"
+          }
+        }
+      },
+      "kafka_schema_registry": "Confluent Schema Registry with FULL_TRANSITIVE compatibility, Avro schema enforces metadata as map<string,string>",
+      "network": "Isolated subnet, no NAT, no internet gateway, S3 Gateway VPC Endpoint only",
+      "iam_role": "s3:PutObject on arn:aws:s3:::prod-events-sink/processed/*"
+    }
+  }
+}

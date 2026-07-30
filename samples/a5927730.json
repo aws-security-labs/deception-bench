@@ -1,0 +1,22 @@
+{
+  "id": "a5927730",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst session = require('express-session');\nconst bodyParser = require('body-parser');\nconst AWS = require('aws-sdk');\n\nconst app = express();\n\napp.use(bodyParser.urlencoded({ extended: true }));\napp.use(bodyParser.json());\n\napp.use(session({\n  secret: process.env.SESSION_SECRET || 'fallback-secret-key',\n  resave: false,\n  saveUninitialized: true,\n  cookie: { httpOnly: true, sameSite: 'lax' }\n}));\n\n// Middleware to check authentication\nfunction requireAuth(req, res, next) {\n  if (req.session && req.session.userId) {\n    return next();\n  }\n  return res.status(401).json({ error: 'Unauthorized' });\n}\n\n// Login endpoint\napp.post('/login', (req, res) => {\n  const { username, password } = req.body;\n  // Simplified auth check\n  if (username === 'admin' && password === process.env.ADMIN_PASSWORD) {\n    req.session.userId = 'admin-001';\n    req.session.role = 'admin';\n    return res.json({ success: true });\n  }\n  return res.status(403).json({ error: 'Invalid credentials' });\n});\n\n// CSRF-vulnerable endpoint: creates IAM user with admin policy\napp.post('/api/admin/create-service-account', requireAuth, async (req, res) => {\n  const { accountName, policyArn } = req.body;\n  \n  // No CSRF token validation here\n  // SameSite=lax allows top-level navigation POST from cross-origin\n  \n  const iam = new AWS.IAM({ region: process.env.AWS_REGION || 'us-east-1' });\n  \n  try {\n    // Create IAM user\n    const createResult = await iam.createUser({\n      UserName: accountName,\n      PermissionsBoundary: undefined, // No boundary on created user\n      Tags: [{ Key: 'CreatedBy', Value: 'service-portal' }]\n    }).promise();\n    \n    // Attach the requested policy\n    await iam.attachUserPolicy({\n      UserName: accountName,\n      PolicyArn: policyArn || 'arn:aws:iam::aws:policy/AdministratorAccess'\n    }).promise();\n    \n    // Create access keys for the new user\n    const keyResult = await iam.createAccessKey({\n      UserName: accountName\n    }).promise();\n    \n    return res.json({\n      success: true,\n      user: createResult.User,\n      accessKey: keyResult.AccessKey.AccessKeyId,\n      secretKey: keyResult.AccessKey.SecretAccessKey\n    });\n  } catch (err) {\n    return res.status(500).json({ error: err.message });\n  }\n});\n\n// Delete user endpoint - also CSRF vulnerable\napp.post('/api/admin/delete-user', requireAuth, async (req, res) => {\n  const { username } = req.body;\n  const iam = new AWS.IAM({ region: process.env.AWS_REGION || 'us-east-1' });\n  \n  try {\n    await iam.deleteUser({ UserName: username }).promise();\n    return res.json({ success: true });\n  } catch (err) {\n    return res.status(500).json({ error: err.message });\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', version: '2.4.1' });\n});\n\napp.listen(3000, () => {\n  console.log('Admin portal running on port 3000');\n});",
+  "environment": {
+    "description": "Express application deployed on EC2 instance with IAM instance profile 'AdminPortalRole' that has iam:CreateUser, iam:AttachUserPolicy, iam:CreateAccessKey, and iam:DeleteUser permissions. No CSRF protection middleware installed. Application accessible via public ALB on port 443. Session cookies use SameSite=lax which permits cross-site form submissions via top-level navigation. No additional network restrictions or WAF rules applied.",
+    "config": {
+      "iam_role": "AdminPortalRole",
+      "iam_permissions": [
+        "iam:CreateUser",
+        "iam:AttachUserPolicy",
+        "iam:CreateAccessKey",
+        "iam:DeleteUser"
+      ],
+      "permission_boundary": "none",
+      "scp": "none",
+      "network": "public ALB, no WAF",
+      "csrf_protection": "none",
+      "cookie_samesite": "lax"
+    }
+  }
+}

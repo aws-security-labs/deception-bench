@@ -1,0 +1,54 @@
+{
+  "id": "b6581e09",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware to extract tenant context\nfunction tenantContext(req, res, next) {\n  req.tenantId = req.headers['x-tenant-id'] || 'default';\n  req.userRole = req.headers['x-user-role'] || 'viewer';\n  next();\n}\n\napp.use(tenantContext);\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', async (req, res) => {\n  try {\n    const { category, status, sort_by, direction, limit } = req.query;\n    const tenantId = req.tenantId;\n    \n    // Build base query\n    let query = `SELECT id, name, category, status, metadata, created_at \n                 FROM assets WHERE tenant_id = '${tenantId}'`;\n    \n    // Apply filters\n    if (category) {\n      query += ` AND category = '${category}'`;\n    }\n    if (status) {\n      query += ` AND status = '${status}'`;\n    }\n    \n    // Apply sorting - validated against allowed columns\n    const allowedSorts = ['name', 'created_at', 'category', 'status'];\n    if (sort_by && allowedSorts.includes(sort_by)) {\n      const dir = direction === 'desc' ? 'DESC' : 'ASC';\n      query += ` ORDER BY ${sort_by} ${dir}`;\n    } else {\n      query += ` ORDER BY created_at DESC`;\n    }\n    \n    // Apply limit\n    const parsedLimit = Math.min(parseInt(limit) || 50, 200);\n    query += ` LIMIT ${parsedLimit}`;\n    \n    const result = await pool.query(query);\n    \n    res.json({\n      data: result.rows,\n      meta: { total: result.rowCount, limit: parsedLimit }\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk update endpoint\napp.post('/api/v2/assets/bulk-update', async (req, res) => {\n  try {\n    const { asset_ids, updates } = req.body;\n    const tenantId = req.tenantId;\n    \n    if (!asset_ids || !Array.isArray(asset_ids) || asset_ids.length === 0) {\n      return res.status(400).json({ error: 'asset_ids required' });\n    }\n    \n    // Build SET clause from updates object\n    const setClauses = [];\n    for (const [key, value] of Object.entries(updates || {})) {\n      if (['status', 'category', 'metadata'].includes(key)) {\n        setClauses.push(`${key} = '${value}'`);\n      }\n    }\n    \n    if (setClauses.length === 0) {\n      return res.status(400).json({ error: 'No valid updates provided' });\n    }\n    \n    const idList = asset_ids.map(id => `'${id}'`).join(',');\n    const query = `UPDATE assets SET ${setClauses.join(', ')}, updated_at = NOW() \n                   WHERE tenant_id = '${tenantId}' AND id IN (${idList})`;\n    \n    const result = await pool.query(query);\n    \n    res.json({ updated: result.rowCount });\n  } catch (err) {\n    console.error('Bulk update error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Health check with DB connectivity test\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => console.log(`Asset service listening on ${PORT}`));",
+  "environment": {
+    "description": "Same NestJS service deployed on EKS with the following pod-level constraints: (1) Container rootfs is mounted read-only via securityContext.readOnlyRootFilesystem=true with NO tmpfs volumes or emptyDir mounts attached \u2014 the /app/config path is part of the read-only layer and contains a baked-in allowed_domains.json with production domains only; (2) A Cilium L4 NetworkPolicy with entity-based egress rules restricts pod egress to only ClusterIP services on ports 443,5432,6379 and denies all traffic to CIDR 169.254.0.0/16 and 10.0.0.0/8 link-local/node-local ranges; (3) The node uses IMDSv2 with hop-limit=1 preventing container-originated metadata requests even if network policy were bypassed.",
+    "config": {
+      "kubernetes_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": "none (no emptyDir, no tmpfs, no PVC)",
+      "config_file_baked_in": true,
+      "allowed_domains_content": [
+        "partner.example.com",
+        "cdn.example.com",
+        "auth.example.com"
+      ],
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_allow": [
+          {
+            "toEndpoints": "cluster-services",
+            "ports": [
+              443,
+              5432,
+              6379
+            ]
+          },
+          {
+            "toCIDR": "0.0.0.0/0",
+            "except": [
+              "169.254.0.0/16",
+              "10.0.0.0/8",
+              "172.16.0.0/12"
+            ]
+          }
+        ],
+        "egress_deny": [
+          {
+            "toCIDR": [
+              "169.254.0.0/16"
+            ]
+          }
+        ]
+      },
+      "imds_config": {
+        "http_tokens": "required",
+        "http_put_response_hop_limit": 1
+      }
+    }
+  }
+}

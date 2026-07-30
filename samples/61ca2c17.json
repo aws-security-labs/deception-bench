@@ -1,0 +1,41 @@
+{
+  "id": "61ca2c17",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { readFileSync } from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware: rate limiting (basic, in-memory)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 500) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  next();\n});\nsetInterval(() => requestCounts.clear(), 60000);\n\n// Auth middleware\nfunction authenticate(req, res, next) {\n  const token = req.headers['authorization']?.replace('Bearer ', '');\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  // Token validation via HMAC - note: timing-safe comparison\n  const [payload, sig] = token.split('.');\n  if (!payload || !sig) return res.status(401).json({ error: 'malformed token' });\n  const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || 'dev-secret')\n    .update(payload).digest('hex');\n  if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) {\n    return res.status(401).json({ error: 'invalid signature' });\n  }\n  req.user = JSON.parse(Buffer.from(payload, 'base64url').toString());\n  next();\n}\n\n// Product catalog search - supports full-text and filtered queries\napp.get('/api/v2/products/search', authenticate, async (req, res) => {\n  try {\n    const { category, sort_by, direction, min_price, max_price } = req.query;\n    \n    // Validate sort direction\n    const dir = direction === 'desc' ? 'DESC' : 'ASC';\n    \n    // Validate sort_by against allowlist\n    const allowedSorts = ['name', 'price', 'created_at', 'rating'];\n    const sortField = allowedSorts.includes(sort_by) ? sort_by : 'name';\n    \n    // Build query with parameterized values for price range\n    let query = `SELECT id, name, category, price, rating, description FROM products WHERE 1=1`;\n    const params = [];\n    let paramIdx = 1;\n    \n    if (min_price) {\n      params.push(parseFloat(min_price));\n      query += ` AND price >= $${paramIdx++}`;\n    }\n    if (max_price) {\n      params.push(parseFloat(max_price));\n      query += ` AND price <= $${paramIdx++}`;\n    }\n    \n    // Category filter - uses ILIKE for flexible matching\n    if (category) {\n      query += ` AND category ILIKE '%${category}%'`;\n    }\n    \n    query += ` ORDER BY ${sortField} ${dir} LIMIT 100`;\n    \n    const result = await pool.query(query, params);\n    res.json({ products: result.rows, total: result.rowCount });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Product detail - parameterized (safe)\napp.get('/api/v2/products/:id', authenticate, async (req, res) => {\n  const { id } = req.params;\n  const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);\n  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n  res.json(result.rows[0]);\n});\n\n// Admin endpoint - looks dangerous but is actually safe (parameterized)\napp.post('/api/v2/admin/users', authenticate, async (req, res) => {\n  if (req.user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });\n  const { username, email, role } = req.body;\n  const hash = crypto.createHash('sha256').update(crypto.randomBytes(32)).digest('hex');\n  const result = await pool.query(\n    'INSERT INTO users (username, email, role, api_key) VALUES ($1, $2, $3, $4) RETURNING id',\n    [username, email, role, hash]\n  );\n  res.json({ id: result.rows[0].id });\n});\n\n// Health check - no auth required\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(3000, () => console.log('Product API listening on :3000'));",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with condition path-pattern /api/* that has an associated WAFv2 WebACL. The WebACL contains a single custom rule group with a RegexPatternSet-based rule that inspects QUERY_STRING with pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)` in BLOCK action with priority 1, plus a rate-based rule at 100 requests per 5 minutes per source IP at priority 2. (3) Priority 99: default action forward to target group. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc ENI security group which allows outbound only to pl-63a5400a (com.amazonaws.us-east-1.logs prefix list) on port 443.",
+    "config": {
+      "compute": "ECS Fargate, task CPU 512, memory 1024, platform version 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "sql-pattern-block",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "field_to_match": "QUERY_STRING",
+                "regex_pattern": "(?i)('|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|xp_)"
+              }
+            }
+          },
+          {
+            "name": "rate-limit",
+            "priority": 2,
+            "action": "BLOCK",
+            "statement": {
+              "rate_based": {
+                "limit": 100,
+                "aggregate_key_type": "IP"
+              }
+            }
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "security_group_egress": "outbound 443 to pl-63a5400a only (CloudWatch Logs VPC endpoint)",
+      "vpc": "private subnets, no internet gateway, no NAT gateway"
+    }
+  }
+}

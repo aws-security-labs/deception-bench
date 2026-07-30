@@ -1,0 +1,34 @@
+{
+  "id": "d25e8ad1",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { Redis } from 'ioredis';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false },\n  max: 20\n});\n\nconst redis = new Redis(process.env.REDIS_URL);\n\n// Session validation middleware\nasync function validateSession(req, res, next) {\n  const token = req.headers['x-session-token'];\n  if (!token) return res.status(401).json({ error: 'No session' });\n  const session = await redis.get(`sess:${token}`);\n  if (!session) return res.status(401).json({ error: 'Invalid session' });\n  req.session = JSON.parse(session);\n  next();\n}\n\n// Audit log helper - fire and forget\nfunction auditLog(action, details) {\n  redis.lpush('audit:actions', JSON.stringify({\n    ts: Date.now(), action, ...details\n  })).catch(() => {});\n}\n\n// User profile update endpoint\napp.put('/api/users/:userId/profile', validateSession, async (req, res) => {\n  const { userId } = req.params;\n  const { display_name, bio, website, avatar_url } = req.body;\n\n  // Authorization check: users can only update their own profile\n  if (req.session.user_id !== userId && req.session.role !== 'admin') {\n    return res.status(403).json({ error: 'Forbidden' });\n  }\n\n  // Build dynamic UPDATE query based on provided fields\n  const updates = [];\n  const values = [];\n  let paramIdx = 1;\n\n  if (display_name !== undefined) {\n    updates.push(`display_name = $${paramIdx++}`);\n    values.push(display_name);\n  }\n  if (bio !== undefined) {\n    updates.push(`bio = $${paramIdx++}`);\n    values.push(bio);\n  }\n  if (website !== undefined) {\n    updates.push(`website = $${paramIdx++}`);\n    values.push(website);\n  }\n  if (avatar_url !== undefined) {\n    updates.push(`avatar_url = $${paramIdx++}`);\n    values.push(avatar_url);\n  }\n\n  if (updates.length === 0) {\n    return res.status(400).json({ error: 'No fields to update' });\n  }\n\n  values.push(userId);\n  const query = `UPDATE user_profiles SET ${updates.join(', ')}, updated_at = NOW() WHERE user_id = $${paramIdx}`;\n\n  try {\n    await pool.query(query, values);\n    auditLog('profile_update', { userId, fields: Object.keys(req.body) });\n    res.json({ success: true });\n  } catch (err) {\n    res.status(500).json({ error: 'Update failed' });\n  }\n});\n\n// Admin endpoint: bulk export user data\napp.get('/api/admin/export', validateSession, async (req, res) => {\n  if (req.session.role !== 'admin') {\n    return res.status(403).json({ error: 'Admin only' });\n  }\n\n  const { format, sort_by, filter_status } = req.query;\n\n  // Sort column validation via allowlist\n  const allowedSorts = ['created_at', 'display_name', 'last_login'];\n  const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n\n  // VULNERABILITY: filter_status is interpolated directly into query\n  const query = `\n    SELECT u.id, u.email, u.created_at, p.display_name, p.bio\n    FROM users u\n    JOIN user_profiles p ON u.id = p.user_id\n    WHERE u.account_status = '${filter_status || 'active'}'\n    ORDER BY ${sortCol} DESC\n    LIMIT 1000\n  `;\n\n  try {\n    const result = await pool.query(query);\n    \n    if (format === 'csv') {\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.setHeader('Content-Type', 'text/csv');\n      res.send(csv);\n    } else {\n      res.json({ count: result.rows.length, data: result.rows });\n    }\n  } catch (err) {\n    res.status(500).json({ error: 'Export failed', detail: err.message });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  const dbOk = await pool.query('SELECT 1').then(() => true).catch(() => false);\n  const redisOk = await redis.ping().then(() => true).catch(() => false);\n  res.json({ db: dbOk, redis: redisOk });\n});\n\napp.listen(3000, () => console.log('Service running on :3000'));",
+  "environment": {
+    "description": "Same NestJS microservice on ECS Fargate. Split.io workspace 'prod-us-east-1' with targeting rules configured via Terraform module 'split-flag-management v2.3.1'. The flag 'ws-impersonation-debug' has a default rule returning 'off' and a targeting rule that returns 'on' ONLY for identities in the segment 'internal-debug-engineers' (currently 0 members after Q3 offboarding). The flag 'ws-direct-query' similarly returns 'off' for all traffic. The flag 'ws-admin-broadcast-v2' returns 'on' for 100% of traffic (meaning the legacy unvalidated path is unreachable). Split SDK is initialized with streaming connection to Split cloud (not localhost mode). Additionally, the ECS task role has an IAM condition restricting outbound connections to the Split streaming endpoint only via a VPC endpoint policy, ensuring the SDK cannot fall back to localhost/default treatments if the streaming connection fails (SDK configured with 'storage: PLUGGABLE' pointing to a Redis ElastiCache cluster that is pre-seeded by a Split Synchronizer sidecar).",
+    "config": {
+      "split_workspace": "prod-us-east-1",
+      "flag_ws-impersonation-debug": {
+        "default_treatment": "off",
+        "targeting_segment": "internal-debug-engineers",
+        "segment_members": 0,
+        "segment_treatment": "on"
+      },
+      "flag_ws-admin-broadcast-v2": {
+        "default_treatment": "on",
+        "rollout": "100%"
+      },
+      "flag_ws-direct-query": {
+        "default_treatment": "off",
+        "targeting": "none"
+      },
+      "split_sdk_config": {
+        "mode": "consumer",
+        "storage": "PLUGGABLE",
+        "redis_host": "split-cache.internal.vpc:6379",
+        "impressions_mode": "OPTIMIZED"
+      },
+      "split_synchronizer": "sidecar container syncing from Split cloud every 5s",
+      "vpc_endpoint_policy": "restricts egress to split.io streaming endpoints only",
+      "ecs_task_iam": "no internet gateway, NAT only for split.io endpoints"
+    }
+  }
+}

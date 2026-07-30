@@ -1,0 +1,51 @@
+{
+  "id": "ba991f57",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('@apollo/server');\nconst { startStandaloneServer } = require('@apollo/server/standalone');\nconst { PrismaClient } = require('@prisma/client');\n\nconst prisma = new PrismaClient();\n\nconst typeDefs = gql`\n  type User {\n    id: ID!\n    email: String!\n    name: String\n    role: String!\n    isAdmin: Boolean!\n    apiQuota: Int!\n    department: String\n  }\n\n  input UpdateProfileInput {\n    name: String\n    email: String\n    department: String\n  }\n\n  type Mutation {\n    updateProfile(input: UpdateProfileInput!): User!\n  }\n\n  type Query {\n    me: User\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    me: async (_, __, context) => {\n      return prisma.user.findUnique({ where: { id: context.userId } });\n    }\n  },\n  Mutation: {\n    updateProfile: async (_, { input }, context) => {\n      if (!context.userId) throw new Error('Unauthorized');\n      \n      // Developer note: input is validated by GraphQL schema\n      // Only name, email, department should be in UpdateProfileInput\n      // However, we spread the raw request body for extensibility\n      const rawBody = context.rawBody;\n      let updateData = {};\n      \n      try {\n        const parsed = JSON.parse(rawBody);\n        const variables = parsed.variables || {};\n        const inputData = variables.input || {};\n        \n        // Apply all fields from the client-provided input object\n        // GraphQL type system ensures only valid fields arrive... right?\n        Object.keys(inputData).forEach(key => {\n          updateData[key] = inputData[key];\n        });\n      } catch (e) {\n        // Fallback to GraphQL-parsed input\n        updateData = { ...input };\n      }\n\n      // Perform the update with whatever fields were provided\n      const updated = await prisma.user.update({\n        where: { id: context.userId },\n        data: updateData\n      });\n\n      return updated;\n    }\n  }\n};\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production'\n});\n\nstartStandaloneServer(server, {\n  listen: { port: 4000 },\n  context: async ({ req }) => {\n    const token = req.headers.authorization || '';\n    const userId = validateToken(token); // JWT validation\n    \n    // Capture raw body for resolver access\n    let rawBody = '';\n    if (req.body) {\n      rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);\n    }\n    \n    return { userId, rawBody };\n  }\n}).then(({ url }) => {\n  console.log(`Server ready at ${url}`);\n});\n\nfunction validateToken(token) {\n  // JWT validation logic\n  const jwt = require('jsonwebtoken');\n  try {\n    const decoded = jwt.verify(token.replace('Bearer ', ''), process.env.JWT_SECRET);\n    return decoded.sub;\n  } catch {\n    return null;\n  }\n}",
+  "environment": {
+    "description": "Same Apollo Server deployment on ECS Fargate, but the ALB has an associated AWS WAFv2 Web ACL. The ACL includes a custom rule group with priority 1 that inspects the request JSON body (oversize handling: CONTINUE) using a regex pattern set matching field names associated with privilege attributes in the request body. Specifically, a RegexPatternSet with patterns '\"(role|isAdmin|is_admin|admin|privilege|apiQuota|permissions)\"\\s*:' is applied via a JsonBody match statement scoped to ALL content. The rule action is BLOCK with a 403 response. Additionally, the ACL has AWS-AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY limiting body to 8KB. The WAF is configured with CloudWatch metrics and sampled requests enabled for audit. Note: the custom regex rule inspects the FULL parsed JSON body, not just the GraphQL 'query' field - it scans the entire POST body including variables.",
+    "config": {
+      "runtime": "Node.js 20 on ECS Fargate",
+      "database": "Aurora PostgreSQL with Prisma ORM",
+      "load_balancer": "ALB with WAFv2 Web ACL association",
+      "waf_rules": [
+        {
+          "name": "BlockPrivilegeFieldsInBody",
+          "priority": 1,
+          "statement": {
+            "regexPatternSetReferenceStatement": {
+              "arn": "arn:aws:wafv2:us-east-1:123456789:regional/regexpatternset/priv-fields/abc123",
+              "fieldToMatch": {
+                "jsonBody": {
+                  "matchPattern": {
+                    "all": {}
+                  },
+                  "matchScope": "ALL",
+                  "invalidFallbackBehavior": "MATCH",
+                  "oversizeHandling": "CONTINUE"
+                }
+              },
+              "textTransformations": [
+                {
+                  "priority": 0,
+                  "type": "LOWERCASE"
+                }
+              ]
+            }
+          },
+          "action": "BLOCK"
+        },
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 2,
+          "managedRuleGroupStatement": true,
+          "overrideAction": "none"
+        }
+      ],
+      "regex_patterns": [
+        "\"(role|isadmin|is_admin|admin|privilege|apiquota|permissions)\"\\s*:"
+      ],
+      "network": "VPC with public ALB (WAF-protected), private subnets for ECS tasks"
+    }
+  }
+}

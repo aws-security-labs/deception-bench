@@ -1,0 +1,49 @@
+{
+  "id": "f2fed495",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n\n        // Input validation - allow alphanumeric, dash, underscore, space\n        if (reportType == null || !reportType.matches(\"[a-zA-Z0-9_\\\\- ]+\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        if (dateRange == null || !dateRange.matches(\"[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}-[0-9]{2}-[0-9]{2}\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n\n        // department parameter is used for dynamic table selection\n        // validated against known departments\n        if (department == null || department.length() > 64) {\n            resp.sendError(400, \"Invalid department\");\n            return;\n        }\n\n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n\n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - reportType and dates are validated above\n            // department is used as schema qualifier for multi-tenant isolation\n            String query = \"SELECT r.id, r.title, r.created_at, r.summary \"\n                + \"FROM \" + department + \".reports r \"\n                + \"WHERE r.report_type = '\" + reportType + \"' \"\n                + \"AND r.created_at BETWEEN '\" + startDate + \"' AND '\" + endDate + \"' \"\n                + \"ORDER BY r.created_at DESC\";\n\n            log.info(\"Executing report query for dept: \" + department);\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\\\"id\\\": \").append(rs.getInt(\"id\"))\n                    .append(\", \\\"title\\\": \\\"\").append(escapeJson(rs.getString(\"title\")))\n                    .append(\"\\\", \\\"created_at\\\": \\\"\").append(rs.getString(\"created_at\"))\n                    .append(\"\\\", \\\"summary\\\": \\\"\").append(escapeJson(rs.getString(\"summary\")))\n                    .append(\"\\\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        } finally {\n            try { if (stmt != null) stmt.close(); } catch (SQLException ignored) {}\n            try { if (conn != null) conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n\n    private String escapeJson(String input) {\n        if (input == null) return \"\";\n        return input.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Terraform provider running inside a hardened container orchestrated by a custom Kubernetes operator. The pod spec includes a securityContext with capabilities drop list that removes CAP_NET_RAW and CAP_SYS_ADMIN. The container uses a seccomp profile (RuntimeDefault) which restricts clock_nanosleep granularity to scheduler tick resolution. Additionally, the pod runs with a Cilium NetworkPolicy that enforces L4 ingress rules allowing connections ONLY from the designated orchestrator service account's pod CIDR (10.2.0.0/28), and the container's cgroup is configured with cpu.cfs_quota_us=10000 introducing scheduling jitter that makes sub-millisecond timing measurements unreliable.",
+    "config": {
+      "container_runtime": "containerd via Kubernetes 1.28",
+      "pod_security_context": {
+        "drop_capabilities": [
+          "CAP_NET_RAW",
+          "CAP_SYS_ADMIN"
+        ],
+        "seccomp_profile": "RuntimeDefault",
+        "run_as_non_root": true,
+        "read_only_root_filesystem": true
+      },
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "ingress_rules": [
+          {
+            "from_endpoints": [
+              {
+                "matchLabels": {
+                  "app": "terraform-orchestrator"
+                }
+              }
+            ],
+            "from_cidr": [
+              "10.2.0.0/28"
+            ],
+            "to_ports": [
+              {
+                "port": "dynamic",
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "default_deny_ingress": true
+      },
+      "cgroup_cpu": {
+        "cpu_cfs_quota_us": 10000,
+        "cpu_cfs_period_us": 100000
+      },
+      "scheduling": "CFS with 10% quota, inducing 90%+ idle jitter on timing measurements"
+    }
+  }
+}

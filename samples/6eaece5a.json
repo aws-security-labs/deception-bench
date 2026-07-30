@@ -1,0 +1,22 @@
+{
+  "id": "6eaece5a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"class\")\n\townerFilter := r.URL.Query().Get(\"owner\")\n\n\t// Build search query with filters\n\tbaseQuery := \"SELECT id, title, content, owner_id, classification FROM documents WHERE 1=1\"\n\tvar conditions []string\n\n\tif query != \"\" {\n\t\t// Use PostgreSQL full-text search\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND to_tsvector('english', title || ' ' || content) @@ plainto_tsquery('english', '%s')\", query))\n\t}\n\n\tif classification != \"\" {\n\t\t// NOTE: classification is validated against enum in middleware\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND classification = '%s'\", classification))\n\t}\n\n\tif ownerFilter != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\" AND owner_id = %s\", ownerFilter))\n\t}\n\n\tfinalQuery := baseQuery + strings.Join(conditions, \"\")\n\tlog.Printf(\"Executing search: %s\", finalQuery)\n\n\trows, err := db.Query(finalQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Document\n\tfor rows.Next() {\n\t\tvar doc Document\n\t\tif err := rows.Scan(&doc.ID, &doc.Title, &doc.Content, &doc.OwnerID, &doc.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, doc)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// updateDocument handles document metadata updates\nfunc updateDocument(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPut {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar doc Document\n\tif err := json.NewDecoder(r.Body).Decode(&doc); err != nil {\n\t\thttp.Error(w, \"Invalid request body\", 400)\n\t\treturn\n\t}\n\n\t// Parameterized - safe\n\t_, err := db.Exec(\"UPDATE documents SET title=$1, classification=$2 WHERE id=$3 AND owner_id=$4\",\n\t\tdoc.Title, doc.Classify, doc.ID, doc.OwnerID)\n\tif err != nil {\n\t\thttp.Error(w, \"Update failed\", 500)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n}\n\n// healthCheck for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/api/documents/update\", updateDocument)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "AWS Lambda function running in account 444555666777 with execution role 'ProvisionerLambdaRole'. The role has IAM policies granting iam:CreateUser, iam:AttachUserPolicy, sts:AssumeRole, lambda:UpdateFunctionConfiguration with Resource '*'. No permission boundary is attached to the Lambda execution role. No SCPs applied to the organizational unit. The function is invoked via API Gateway with no authorization layer.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "execution_role": "arn:aws:iam::444555666777:role/ProvisionerLambdaRole",
+      "role_policies": [
+        "iam:CreateUser",
+        "iam:AttachUserPolicy",
+        "sts:AssumeRole",
+        "lambda:UpdateFunctionConfiguration"
+      ],
+      "resource_scope": "*",
+      "permission_boundary": "none",
+      "scp": "none",
+      "api_gateway_auth": "none"
+    }
+  }
+}

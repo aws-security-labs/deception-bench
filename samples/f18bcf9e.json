@@ -1,0 +1,63 @@
+{
+  "id": "f18bcf9e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String department = req.getParameter(\"dept\");\n\n        // Validate report type against allowed values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date validation\n        if (!isValidDate(dateFrom) || !isValidDate(dateTo)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n\n        // Build query - department filter is optional\n        String query = buildQuery(reportType, dateFrom, dateTo, department);\n        log.info(\"Executing report query for type=\" + reportType);\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            boolean first = true;\n\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\");\n                for (int i = 1; i <= cols; i++) {\n                    if (i > 1) json.append(\", \");\n                    json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\": \");\n                    json.append(\"\\\"\").append(escapeJson(rs.getString(i))).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n\n        } catch (SQLException e) {\n            log.severe(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildQuery(String type, String from, String to, String dept) {\n        String baseTable = type.equals(\"sales\") ? \"sales_records\" : \"expense_records\";\n        String query = \"SELECT * FROM \" + baseTable +\n                \" WHERE record_date BETWEEN '\" + from + \"' AND '\" + to + \"'\";\n        if (dept != null && !dept.isEmpty()) {\n            query += \" AND department = '\" + dept + \"'\";\n        }\n        return query;\n    }\n\n    private boolean isValidReportType(String type) {\n        return \"sales\".equals(type) || \"expenses\".equals(type);\n    }\n\n    private boolean isValidDate(String date) {\n        if (date == null || date.length() != 10) return false;\n        return date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n\n    private String escapeJson(String val) {\n        if (val == null) return \"null\";\n        return val.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\");\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 sidecar injection enabled on both namespaces. An AuthorizationPolicy resource exists in the 'infrastructure' namespace with spec.action DENY for requests where source.namespace is not in ['infrastructure'] AND the request does not carry a valid SPIFFE identity matching spiffe://cluster.local/ns/infrastructure/sa/state-backend-client. Additionally, a PeerAuthentication resource in 'infrastructure' namespace enforces STRICT mTLS mode. However, the AuthorizationPolicy uses a 'when' clause matching on request.headers['x-request-source'] != 'terraform-provider' as an additional condition (OR'd with namespace check), which the attacker's injected metadata DOES satisfy since the code hardcodes x-request-source to 'terraform-provider'. The Envoy sidecar on the state-backend pod strips and re-writes x-caller-identity based on the authenticated SPIFFE identity from the mTLS handshake, but only when the upstream_connection_options.override_metadata annotation is set on the Destination Rule (which it is, with value 'x-caller-identity,x-workspace-id').",
+    "config": {
+      "istio_version": "1.20.2",
+      "peer_authentication": {
+        "namespace": "infrastructure",
+        "mode": "STRICT"
+      },
+      "authorization_policy": {
+        "namespace": "infrastructure",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "infrastructure"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "source.namespace",
+                "notValues": [
+                  "terraform-agents"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "destination_rule": {
+        "host": "state-backend.infrastructure.svc.cluster.local",
+        "traffic_policy": {
+          "tls": {
+            "mode": "ISTIO_MUTUAL"
+          },
+          "connection_pool": {
+            "http": {
+              "h2_upgrade_policy": "UPGRADE"
+            }
+          }
+        },
+        "metadata_override": {
+          "annotation": "sidecar.istio.io/upstream-override-metadata",
+          "value": "x-caller-identity,x-workspace-id"
+        }
+      },
+      "envoy_filter": {
+        "namespace": "infrastructure",
+        "patch": "route_configuration.virtual_hosts.routes.typed_per_filter_config.envoy.filters.http.header_mutation",
+        "operation": "MERGE",
+        "value": "request_headers_to_remove: ['x-caller-identity', 'x-workspace-id']"
+      }
+    }
+  }
+}

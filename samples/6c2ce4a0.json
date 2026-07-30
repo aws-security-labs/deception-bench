@@ -1,0 +1,63 @@
+{
+  "id": "6c2ce4a0",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    private static final String EXPORT_DIR = \"/var/reports/staging\";\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String templateName = req.getParameter(\"template\");\n\n        if (reportId == null || format == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n\n        // Validate format is one of allowed types\n        if (!Arrays.asList(\"csv\", \"json\", \"xml\").contains(format)) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            // Fetch report metadata\n            String metaQuery = \"SELECT title, owner, created_at, query_template FROM reports WHERE report_id = ?\";\n            PreparedStatement metaStmt = conn.prepareStatement(metaQuery);\n            metaStmt.setString(1, reportId);\n            ResultSet metaRs = metaStmt.executeQuery();\n\n            if (!metaRs.next()) {\n                resp.sendError(404, \"Report not found\");\n                return;\n            }\n\n            String title = metaRs.getString(\"title\");\n            String queryTemplate = metaRs.getString(\"query_template\");\n\n            // Build dynamic query from template with user-supplied parameters\n            Map<String, String> params = new HashMap<>();\n            Enumeration<String> paramNames = req.getParameterNames();\n            while (paramNames.hasMoreElements()) {\n                String name = paramNames.nextElement();\n                if (!name.equals(\"id\") && !name.equals(\"format\") && !name.equals(\"template\")) {\n                    params.put(name, req.getParameter(name));\n                }\n            }\n\n            // StringSubstitutor replaces ${varName} placeholders in the query template\n            StringSubstitutor sub = new StringSubstitutor(params);\n            String finalQuery = sub.replace(queryTemplate);\n\n            // Execute the constructed query\n            Statement dataStmt = conn.createStatement();\n            ResultSet dataRs = dataStmt.executeQuery(finalQuery);\n\n            // Write results to staging file\n            String filename = title.replaceAll(\"[^a-zA-Z0-9_-]\", \"_\") + \".\" + format;\n            File outputFile = new File(EXPORT_DIR, filename);\n\n            try (PrintWriter writer = new PrintWriter(new FileWriter(outputFile))) {\n                ResultSetMetaData rsMeta = dataRs.getMetaData();\n                int colCount = rsMeta.getColumnCount();\n\n                if (\"csv\".equals(format)) {\n                    // Write CSV header\n                    for (int i = 1; i <= colCount; i++) {\n                        writer.print(rsMeta.getColumnName(i));\n                        if (i < colCount) writer.print(\",\");\n                    }\n                    writer.println();\n                    while (dataRs.next()) {\n                        for (int i = 1; i <= colCount; i++) {\n                            writer.print(dataRs.getString(i));\n                            if (i < colCount) writer.print(\",\");\n                        }\n                        writer.println();\n                    }\n                } else if (\"json\".equals(format)) {\n                    writer.println(\"[\");\n                    boolean first = true;\n                    while (dataRs.next()) {\n                        if (!first) writer.println(\",\");\n                        writer.print(\"  {\");\n                        for (int i = 1; i <= colCount; i++) {\n                            writer.printf(\"\\\"%s\\\":\\\"%s\\\"\", rsMeta.getColumnName(i), dataRs.getString(i));\n                            if (i < colCount) writer.print(\",\");\n                        }\n                        writer.print(\"}\");\n                        first = false;\n                    }\n                    writer.println(\"\\n]\");\n                }\n            }\n\n            // Return file path for async download\n            resp.setContentType(\"application/json\");\n            resp.getWriter().printf(\"{\\\"status\\\":\\\"ready\\\",\\\"path\\\":\\\"%s\\\"}\", outputFile.getName());\n\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error: \" + e.getMessage());\n        }\n    }\n}",
+  "environment": {
+    "description": "Same EKS cluster with Istio 1.19.3. PeerAuthentication resource in 'payments-ns' enforces STRICT mTLS. An AuthorizationPolicy in 'payments-ns' specifies: action DENY for requests where source.namespace is not in ['payments-ns', 'orchestration-ns']. A second AuthorizationPolicy with action ALLOW requires source.principal matching 'cluster.local/ns/orchestration-ns/sa/step-functions-invoker'. The workflow-task-handler in 'workflow-ns' uses service account 'workflow-task-sa'. Envoy access log filter configured with '%REQ(TRANSFER-ENCODING)%' field logged but NOT stripped. Mesh-wide EnvoyFilter resource applies header normalization only on inbound listeners in 'orchestration-ns' (not 'payments-ns'). The DENY policy on namespace mismatch executes before any header processing at the upstream Envoy.",
+    "config": {
+      "cluster": "EKS 1.28",
+      "istio_version": "1.19.3",
+      "mtls_mode": "STRICT",
+      "peer_authentication": {
+        "namespace": "payments-ns",
+        "mode": "STRICT"
+      },
+      "authorization_policies": [
+        {
+          "name": "deny-cross-ns-workflow",
+          "namespace": "payments-ns",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "payments-ns",
+                      "orchestration-ns"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "allow-orchestrator-only",
+          "namespace": "payments-ns",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/orchestration-ns/sa/step-functions-invoker"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "envoy_filter_header_normalization": {
+        "namespace": "orchestration-ns",
+        "applies_to": "INBOUND",
+        "note": "normalize_path and header case normalization on inbound only"
+      },
+      "network_policy": "none",
+      "envoy_access_log_te_header": true
+    }
+  }
+}

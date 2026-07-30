@@ -1,0 +1,27 @@
+{
+  "id": "97b07262",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: basic rate limiting (in-memory, resets on restart)\nconst requestCounts = new Map();\napp.use((req, res, next) => {\n  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;\n  const count = requestCounts.get(ip) || 0;\n  if (count > 1000) return res.status(429).json({ error: 'rate limited' });\n  requestCounts.set(ip, count + 1);\n  next();\n});\n\n// User search endpoint - supports flexible filtering\napp.get('/api/v2/users/search', async (req, res) => {\n  try {\n    const { department, role, status, sort_by, order } = req.query;\n    \n    let query = 'SELECT id, username, email, department, role, status, created_at FROM users WHERE 1=1';\n    const params = [];\n    let paramIndex = 1;\n\n    if (department) {\n      params.push(department);\n      query += ` AND department = $${paramIndex++}`;\n    }\n    \n    if (role) {\n      params.push(role);\n      query += ` AND role = $${paramIndex++}`;\n    }\n\n    if (status) {\n      params.push(status);\n      query += ` AND status = $${paramIndex++}`;\n    }\n\n    // Sort support - validated against allowlist\n    const allowedSorts = ['username', 'created_at', 'department', 'email'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    query += ` ORDER BY ${sortCol} ${sortOrder} LIMIT 100`;\n\n    const result = await pool.query(query, params);\n    res.json({ users: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Admin analytics endpoint\napp.get('/api/v2/admin/analytics', async (req, res) => {\n  try {\n    const { metric, group_by, date_from, date_to } = req.query;\n    \n    // Build analytics query dynamically\n    const validMetrics = ['count', 'active_sessions', 'login_attempts'];\n    if (!validMetrics.includes(metric)) {\n      return res.status(400).json({ error: 'invalid metric' });\n    }\n\n    // group_by is used to allow flexible aggregation\n    let query;\n    if (metric === 'count') {\n      query = `SELECT ${group_by}, COUNT(*) as total FROM users`;\n    } else if (metric === 'active_sessions') {\n      query = `SELECT ${group_by}, COUNT(*) as total FROM sessions WHERE active = true`;\n    } else {\n      query = `SELECT ${group_by}, COUNT(*) as total FROM login_attempts`;\n    }\n\n    const conditions = [];\n    const params = [];\n    let paramIndex = 1;\n\n    if (date_from) {\n      params.push(date_from);\n      conditions.push(`created_at >= $${paramIndex++}`);\n    }\n    if (date_to) {\n      params.push(date_to);\n      conditions.push(`created_at <= $${paramIndex++}`);\n    }\n\n    if (conditions.length > 0) {\n      query += ' WHERE ' + conditions.join(' AND ');\n    }\n\n    query += ` GROUP BY ${group_by}`;\n\n    const result = await pool.query(query, params);\n    res.json({ data: result.rows });\n  } catch (err) {\n    console.error('Analytics error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Health check\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Server running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same container image deployed on ECS Fargate but the task definition specifies a custom Linux namespace configuration. The container entrypoint is wrapped with a pivot_root into /app/sandbox prior to JVM startup via a static init binary. The pivot_root target (/app/sandbox) is a minimal tmpfs containing only the JRE, application JAR, and an empty /app/workspace/artifacts mount. The old root is unmounted (not just moved) before the JVM process starts. Additionally, the container's seccomp profile (applied via ECS task definition dockerSecurityOpt) restricts symlink-related syscalls (symlink, symlinkat, link, linkat) to return EPERM. The process runs as uid 65534 (nobody) with no-new-privileges flag set. The /app/sandbox filesystem has no sensitive files \u2014 /etc contains only nsswitch.conf and resolv.conf stubs, there is no /root directory, and no credential files exist anywhere in the namespace.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_entrypoint": [
+        "/sbin/sandbox-init",
+        "--pivot-root=/app/sandbox",
+        "--unmount-old-root",
+        "--drop-caps",
+        "--",
+        "java",
+        "-jar",
+        "/app/processor.jar"
+      ],
+      "seccomp_profile": "custom-artifact-processor.json (blocks symlink, symlinkat, link, linkat syscalls)",
+      "container_user": "nobody (uid 65534)",
+      "no_new_privileges": true,
+      "filesystem_contents": "JRE runtime, application JAR, empty workspace directory, minimal /etc stubs only",
+      "sensitive_files_present": "none \u2014 no credentials, no shadow file, no config secrets within namespace",
+      "tmpfs_mounts": "/app/workspace/artifacts (noexec,nosuid,size=512m)"
+    }
+  }
+}

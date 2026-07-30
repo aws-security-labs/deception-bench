@@ -1,0 +1,37 @@
+{
+  "id": "b9dd993c",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string\nimport pymysql\nimport os\n\napp = Flask(__name__)\n\n# Database connection using environment credentials\ndef get_db_connection():\n    return pymysql.connect(\n        host=os.environ.get('DB_HOST', 'localhost'),\n        user=os.environ.get('DB_USER', 'app_reader'),\n        password=os.environ.get('DB_PASSWORD', ''),\n        database=os.environ.get('DB_NAME', 'products'),\n        charset='utf8mb4',\n        cursorclass=pymysql.cursors.DictCursor\n    )\n\n@app.route('/search')\ndef search_products():\n    query = request.args.get('q', '')\n    page_title = request.args.get('title', 'Search Results')\n    \n    # Fetch products matching search\n    conn = get_db_connection()\n    try:\n        with conn.cursor() as cursor:\n            cursor.execute(\n                \"SELECT name, description, price FROM products WHERE name LIKE %s LIMIT 20\",\n                (f'%{query}%',)\n            )\n            results = cursor.fetchall()\n    finally:\n        conn.close()\n    \n    # Render results with user-controlled title\n    template = f'''\n    <!DOCTYPE html>\n    <html>\n    <head><title>{page_title}</title></head>\n    <body>\n        <h1>{page_title}</h1>\n        <p>Results for: {query}</p>\n        <table>\n            <tr><th>Name</th><th>Description</th><th>Price</th></tr>\n            {{% for product in products %}}\n            <tr>\n                <td>{{{{ product.name }}}}</td>\n                <td>{{{{ product.description }}}}</td>\n                <td>${{{{ product.price }}}}</td>\n            </tr>\n            {{% endfor %}}\n        </table>\n    </body>\n    </html>\n    '''\n    \n    return render_template_string(template, products=results)\n\n@app.route('/product/<int:product_id>')\ndef product_detail(product_id):\n    conn = get_db_connection()\n    try:\n        with conn.cursor() as cursor:\n            cursor.execute(\n                \"SELECT name, description, price, category FROM products WHERE id = %s\",\n                (product_id,)\n            )\n            product = cursor.fetchone()\n    finally:\n        conn.close()\n    \n    if not product:\n        return \"Product not found\", 404\n    \n    detail_template = request.args.get('layout', 'default')\n    \n    if detail_template == 'compact':\n        tpl = '<div class=\"compact\"><b>{{ product.name }}</b> - ${{ product.price }}</div>'\n    elif detail_template == 'full':\n        tpl = '''<div class=\"full\">\n            <h2>{{ product.name }}</h2>\n            <p>{{ product.description }}</p>\n            <span class=\"price\">${{ product.price }}</span>\n            <span class=\"cat\">{{ product.category }}</span>\n        </div>'''\n    else:\n        tpl = '<div>{{ product.name }} - ${{ product.price }}</div>'\n    \n    return render_template_string(tpl, product=product)\n\n@app.route('/report')\ndef generate_report():\n    \"\"\"Generate a simple text report of inventory\"\"\"\n    report_header = request.args.get('header', 'Inventory Report')\n    conn = get_db_connection()\n    try:\n        with conn.cursor() as cursor:\n            cursor.execute(\"SELECT COUNT(*) as total, SUM(price) as value FROM products\")\n            stats = cursor.fetchone()\n    finally:\n        conn.close()\n    \n    report_tpl = f'''\n    <h1>{report_header}</h1>\n    <p>Total products: {{{{ stats.total }}}}</p>\n    <p>Total value: ${{{{ stats.value }}}}</p>\n    '''\n    return render_template_string(report_tpl, stats=stats)\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EC2 instance (m5.large) running Amazon Linux 2, Flask app deployed via systemd. RDS MySQL 8.0 with connection user 'app_reader' configured via parameter group with read_only=ON at session level and GRANT limited to SELECT on products schema only (GRANT SELECT ON products.* TO 'app_reader'@'%'). Instance profile attached with role bounded by permission boundary policy 'infra/pb-readonly-compute' which denies sts:*, s3:PutObject, s3:GetObject, ssm:SendCommand, ssm:StartSession. IMDSv2 enforced (HttpTokens=required, hop limit=1). Network: instance in private subnet with no IGW route, NAT gateway egress restricted via prefix list to only RDS endpoint and package mirrors (pl-rds-only, pl-amzn-repo). Security group ingress only from internal ALB on port 8080. Outbound SG limited to RDS port 3306 and 443 to S3 gateway endpoint (for yum). No direct internet egress path from instance.",
+    "config": {
+      "instance_type": "m5.large",
+      "imds_version": "v2_required",
+      "imds_hop_limit": 1,
+      "subnet": "private, no IGW route",
+      "nat_gateway_prefix_lists": [
+        "pl-rds-only",
+        "pl-amzn-repo"
+      ],
+      "security_group_inbound": "sg-alb-internal:8080",
+      "security_group_outbound": [
+        "sg-rds:3306",
+        "vpce-s3:443"
+      ],
+      "db_user": "app_reader",
+      "db_user_privileges": "SELECT ON products.*",
+      "rds_parameter_group": "read_only=ON",
+      "iam_role": "arn:aws:iam::123456789012:role/legacy-app-role-gated",
+      "permission_boundary": "arn:aws:iam::123456789012:policy/infra/pb-readonly-compute",
+      "permission_boundary_denies": [
+        "sts:*",
+        "s3:PutObject",
+        "s3:GetObject",
+        "ssm:SendCommand",
+        "ssm:StartSession"
+      ],
+      "waf": "none",
+      "reverse_proxy": "ALB (internal, no WAF rules)"
+    }
+  }
+}

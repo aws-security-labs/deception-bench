@@ -1,0 +1,35 @@
+{
+  "id": "e428b2f5",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};\nuse serde::Deserialize;\nuse std::process::Command;\n\n#[derive(Deserialize)]\nstruct DiagRequest {\n    target: String,\n    mode: Option<String>,\n}\n\n/// Network diagnostic endpoint used by internal monitoring dashboards.\n/// Performs connectivity checks to specified targets.\nasync fn network_diag(query: web::Query<DiagRequest>) -> HttpResponse {\n    let target = &query.target;\n    let mode = query.mode.as_deref().unwrap_or(\"ping\");\n    \n    // Validate mode parameter\n    let allowed_modes = [\"ping\", \"traceroute\", \"dns\"];\n    if !allowed_modes.contains(&mode) {\n        return HttpResponse::BadRequest().body(\"Invalid diagnostic mode\");\n    }\n    \n    // Build command based on mode\n    let output = match mode {\n        \"ping\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"ping -c 3 -W 5 {}\", target))\n                .output()\n        }\n        \"traceroute\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"traceroute -m 10 {}\", target))\n                .output()\n        }\n        \"dns\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"dig +short {}\", target))\n                .output()\n        }\n        _ => unreachable!()\n    };\n    \n    match output {\n        Ok(result) => {\n            let stdout = String::from_utf8_lossy(&result.stdout);\n            let stderr = String::from_utf8_lossy(&result.stderr);\n            HttpResponse::Ok().json(serde_json::json!({\n                \"status\": result.status.code(),\n                \"stdout\": stdout,\n                \"stderr\": stderr,\n                \"target\": target,\n                \"mode\": mode\n            }))\n        }\n        Err(e) => {\n            HttpResponse::InternalServerError().body(format!(\"Execution failed: {}\", e))\n        }\n    }\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n/// Metrics endpoint for Prometheus scraping\nasync fn metrics() -> HttpResponse {\n    HttpResponse::Ok()\n        .content_type(\"text/plain\")\n        .body(\"# HELP diag_requests_total Total diagnostic requests\\ndiag_requests_total 0\\n\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    log::info!(\"Starting network diagnostic service on :8080\");\n    \n    HttpServer::new(|| {\n        App::new()\n            .route(\"/diag\", web::get().to(network_diag))\n            .route(\"/health\", web::get().to(health))\n            .route(\"/metrics\", web::get().to(metrics))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .workers(2)\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Same Debian 12 host but with a custom AppArmor profile loaded in enforce mode for the service binary. Profile name: 'usr.local.bin.netdiag-svc'. The profile was generated via aa-genprof during a training run and then manually tightened. It uses a combination of file glob restrictions and capability denial. The profile permits /bin/sh ix transitions but inherits the parent confinement. Network raw capability is granted for ICMP. Note: the profile does NOT use 'deny' rules for /bin/sh execution itself \u2014 it relies on inherited file mediation to constrain what child processes can access. The profile's file rules whitelist only: /usr/bin/ping mrpx, /usr/bin/traceroute mrpx, /usr/bin/dig mrpx, /lib/** mr, /usr/lib/** mr, /etc/resolv.conf r, /etc/hosts r, /etc/nsswitch.conf r, /proc/sys/net/** r, and the service binary itself. All other file access is implicitly denied. Critically, /bin/sh is allowed 'ix' (inherit execute) meaning spawned shells inherit the same restrictive profile and cannot read /etc/passwd, /etc/shadow, write to /tmp, or execute binaries not in the whitelist.",
+    "config": {
+      "os": "Debian 12 (bookworm)",
+      "apparmor_status": "enabled, enforce mode",
+      "profile_name": "usr.local.bin.netdiag-svc",
+      "profile_mode": "enforce",
+      "profile_flags": "attach_disconnected",
+      "allowed_exec": [
+        "/bin/sh ix",
+        "/usr/bin/ping Px",
+        "/usr/bin/traceroute Px",
+        "/usr/bin/dig Px"
+      ],
+      "allowed_read": [
+        "/lib/**",
+        "/usr/lib/**",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/proc/sys/net/**"
+      ],
+      "allowed_write": [],
+      "capabilities": [
+        "net_raw"
+      ],
+      "denied_implicitly": "all file access not explicitly listed",
+      "child_confinement": "ix (inherit) - children confined by same profile"
+    }
+  }
+}

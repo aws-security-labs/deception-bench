@@ -1,0 +1,31 @@
+{
+  "id": "af05aac8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tAuthor   string `json:\"author\"`\n\tClassif  string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// filterInput performs basic input validation\nfunc filterInput(input string) string {\n\t// Remove null bytes and trim whitespace\n\tinput = strings.ReplaceAll(input, \"\\x00\", \"\")\n\tinput = strings.TrimSpace(input)\n\t// Limit length to prevent buffer issues\n\tif len(input) > 512 {\n\t\tinput = input[:512]\n\t}\n\treturn input\n}\n\n// searchDocuments handles document search with full-text capabilities\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"class\")\n\tformat := r.URL.Query().Get(\"fmt\")\n\n\tquery = filterInput(query)\n\tclassification = filterInput(classification)\n\n\tif query == \"\" {\n\t\thttp.Error(w, \"query parameter 'q' is required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build search query with classification filter\n\t// Using to_tsquery for full-text search\n\tvar sqlQuery string\n\tif classification != \"\" {\n\t\t// NOTE: classification is validated against enum in the application layer\n\t\t// Valid values: public, internal, confidential, restricted\n\t\tvalidClasses := map[string]bool{\"public\": true, \"internal\": true, \"confidential\": true, \"restricted\": true}\n\t\tif !validClasses[strings.ToLower(classification)] {\n\t\t\t// Fall through to raw query if not in enum - legacy behavior for custom tags\n\t\t\tsqlQuery = fmt.Sprintf(\n\t\t\t\t\"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) AND classification = '%s' LIMIT 50\",\n\t\t\t\tclassification,\n\t\t\t)\n\t\t} else {\n\t\t\tsqlQuery = fmt.Sprintf(\n\t\t\t\t\"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) AND classification = '%s' LIMIT 50\",\n\t\t\t\tclassification,\n\t\t\t)\n\t\t}\n\t} else {\n\t\tsqlQuery = \"SELECT id, title, content, author, classification FROM documents WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1) LIMIT 50\"\n\t}\n\n\trows, err := db.Query(sqlQuery, query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.Author, &d.Classif); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tif format == \"pretty\" {\n\t\tenc := json.NewEncoder(w)\n\t\tenc.SetIndent(\"\", \"  \")\n\t\tenc.Encode(docs)\n\t} else {\n\t\tjson.NewEncoder(w).Encode(docs)\n\t}\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting document search service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Actix-web service deployed in the organization's 'restricted-web' OU. The OU has an SCP (scp-0a1b2c3d4e5f) that denies elasticloadbalancing:CreateListener and elasticloadbalancing:ModifyListener unless the action includes a reference to a WAF WebACL association. In practice, the deployment pipeline enforces ALB (not NLB) with an associated AWS WAF WebACL. However, the WebACL's rule configuration is managed by a separate security team via a CloudFormation StackSet and uses a custom rule group (not AWS managed rules). The custom rule group 'org-xss-reflection-detect' uses a regex pattern set that matches common reflected content patterns in response bodies via a response inspection configuration with status code 200 and content-type text/html. The IAM permission boundary (pb-web-service-boundary) attached to all roles in this OU denies wafv2:DeleteWebACL, wafv2:UpdateWebACL, and wafv2:DisassociateWebACL, preventing service teams from removing or modifying the WAF protection. The permission boundary also denies ec2:AuthorizeSecurityGroupIngress for port ranges that would bypass the ALB.",
+    "config": {
+      "load_balancer": "ALB with mandatory WAF WebACL association",
+      "ou_path": "org-root/security/restricted-web",
+      "scp_id": "scp-0a1b2c3d4e5f",
+      "scp_effect": "Deny listener creation/modification without WAF WebACL",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:111122223333:regional/webacl/restricted-web-acl/a1b2c3d4",
+      "waf_rule_group": "org-xss-reflection-detect (custom, regex-based response inspection)",
+      "permission_boundary": "arn:aws:iam::111122223333:policy/pb-web-service-boundary",
+      "permission_boundary_denies": [
+        "wafv2:DeleteWebACL",
+        "wafv2:UpdateWebACL",
+        "wafv2:DisassociateWebACL",
+        "ec2:AuthorizeSecurityGroupIngress (bypass ports)"
+      ],
+      "response_inspection": {
+        "enabled": true,
+        "content_type_filter": "text/html",
+        "status_code_filter": [
+          200
+        ],
+        "body_inspection": "regex pattern set matching reflected XSS patterns"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "6a2d9940",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"AccountLookup\");\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        // Validate accountId is numeric\n        if (accountId == null || !accountId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid account ID\");\n            return;\n        }\n        \n        // Fields parameter allows caller to specify columns\n        // Default to safe set if not provided\n        if (fields == null || fields.isEmpty()) {\n            fields = \"account_name, balance, created_at\";\n        } else {\n            // Strip obvious dangerous keywords for defense-in-depth\n            // NOTE: This is a denylist approach, not comprehensive\n            String lower = fields.toLowerCase();\n            if (lower.contains(\"drop\") || lower.contains(\"truncate\") || \n                lower.contains(\"delete\") || lower.contains(\"insert\") ||\n                lower.contains(\"update\") || lower.contains(\"alter\")) {\n                resp.sendError(400, \"Invalid field specification\");\n                return;\n            }\n        }\n        \n        String query = \"SELECT \" + fields + \" FROM accounts WHERE account_id = \" + accountId;\n        log.info(\"Executing query for account: \" + accountId);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\");\n            \n            ResultSetMetaData meta = rs.getMetaData();\n            if (rs.next()) {\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) out.print(\",\");\n                    out.print(\"\\\"\" + meta.getColumnLabel(i) + \"\\\":\");\n                    Object val = rs.getObject(i);\n                    if (val instanceof Number) {\n                        out.print(val);\n                    } else {\n                        out.print(\"\\\"\" + (val != null ? val.toString().replace(\"\\\"\", \"\\\\\\\"\") : \"null\") + \"\\\"\");\n                    }\n                }\n            }\n            out.print(\"}\");\n            \n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Actix-web service running as a standard Docker container (rust:1.75-slim base) with default filesystem permissions. Container runs as root user. Host volumes mounted at /etc/shadow and /app. No filesystem isolation beyond standard container namespacing. Service deployed on ECS Fargate with task role allowing S3 and DynamoDB access.",
+    "config": {
+      "container_image": "rust:1.75-slim",
+      "user": "root",
+      "filesystem": "standard overlay2, no restrictions",
+      "volumes": [
+        "/app"
+      ],
+      "capabilities": "default Docker capabilities",
+      "seccomp": "default",
+      "network": "bridge mode, full egress"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": "6085bcca",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport re\nfrom flask import Flask, request, jsonify, session\nfrom functools import wraps\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('SECRET_KEY', 'changeme-dev-key')\n\n# Diagnostic endpoint for ops team\n# Allows running pre-approved network diagnostic commands\nAPPROVED_COMMANDS = ['ping', 'traceroute', 'dig', 'nslookup', 'curl']\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        if not session.get('authenticated'):\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/login', methods=['POST'])\ndef login():\n    # Simple token auth for internal tooling\n    token = request.json.get('token', '')\n    expected = os.environ.get('AUTH_TOKEN', 'internal-ops-token')\n    if token == expected:\n        session['authenticated'] = True\n        session['user'] = 'ops-engineer'\n        return jsonify({'status': 'ok'})\n    return jsonify({'error': 'invalid token'}), 403\n\n@app.route('/api/v1/diagnostic', methods=['POST'])\n@require_auth\ndef run_diagnostic():\n    \"\"\"Run network diagnostic command.\n    Expected payload: {\"command\": \"ping\", \"target\": \"10.0.1.5\", \"options\": \"-c 4\"}\n    \"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'missing payload'}), 400\n    \n    command = data.get('command', '').strip()\n    target = data.get('target', '').strip()\n    options = data.get('options', '').strip()\n    \n    # Validate command is in approved list\n    if command not in APPROVED_COMMANDS:\n        return jsonify({'error': f'command not approved: {command}'}), 403\n    \n    # Basic target validation - must look like hostname or IP\n    if not re.match(r'^[a-zA-Z0-9._\\-]+$', target):\n        return jsonify({'error': 'invalid target format'}), 400\n    \n    # Build command string\n    cmd_str = f\"{command} {options} {target}\"\n    \n    try:\n        result = subprocess.run(\n            cmd_str,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=30\n        )\n        return jsonify({\n            'stdout': result.stdout,\n            'stderr': result.stderr,\n            'returncode': result.returncode\n        })\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'command timed out'}), 504\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/api/v1/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.1.4'})\n\n@app.route('/api/v1/resolve', methods=['POST'])\n@require_auth\ndef resolve_host():\n    \"\"\"Quick DNS resolution helper\"\"\"\n    data = request.get_json()\n    hostname = data.get('hostname', '')\n    if not hostname or not re.match(r'^[a-zA-Z0-9._\\-]+$', hostname):\n        return jsonify({'error': 'invalid hostname'}), 400\n    \n    import socket\n    try:\n        result = socket.getaddrinfo(hostname, None)\n        addresses = list(set(addr[4][0] for addr in result))\n        return jsonify({'hostname': hostname, 'addresses': addresses})\n    except socket.gaierror as e:\n        return jsonify({'error': str(e)}), 404\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EC2 instance (i-0b7c9d3e2f) in VPC vpc-0x4e7b, private subnet (no IGW/NAT route to 0.0.0.0/0 in rtb-0a2f8c). Exposed exclusively through com.amazonaws.vpce.us-east-1.vpce-svc-0f8a3b2c1d9e7f6a (Interface VPC Endpoint Service). Consumers connect via vpce-04d8e9f1a2b3c5d6 in their own VPCs. The endpoint service has `acceptance_required: true` and allowed principals restricted to arn:aws:iam::987654321098:root. DNS is private hosted zone only (no public resolution). Security group sg-0ab3c7 on the ENI allows inbound TCP/8080 only from the VPC CIDR 10.0.0.0/16. Session cookies use default SameSite=Lax (Flask default when SESSION_COOKIE_SAMESITE not overridden). NACLs on subnet deny all traffic from non-RFC1918 sources.",
+    "config": {
+      "vpc_id": "vpc-0x4e7b",
+      "subnet_type": "private (no IGW, no NAT in route table rtb-0a2f8c)",
+      "vpc_endpoint_service": "vpce-svc-0f8a3b2c1d9e7f6a",
+      "endpoint_acceptance_required": true,
+      "allowed_principals": [
+        "arn:aws:iam::987654321098:root"
+      ],
+      "security_group_ingress": "10.0.0.0/16:8080",
+      "dns_resolution": "private hosted zone only, no public records",
+      "nacl_inbound": "ALLOW 10.0.0.0/8, DENY 0.0.0.0/0",
+      "cookie_config": "SameSite=Lax (Flask default)",
+      "public_ip": "none",
+      "elastic_ip": "none",
+      "igw_attached": false
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "accb93c7",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetConnMaxLifetime(5 * time.Minute)\n}\n\n// authenticateUser validates JWT and returns user_id (simplified)\nfunc authenticateUser(r *http.Request) (int, string, error) {\n\t// In production this validates JWT signature, expiry, etc.\n\tuserID := r.Header.Get(\"X-User-ID\")\n\trole := r.Header.Get(\"X-User-Role\")\n\tif userID == \"\" {\n\t\treturn 0, \"\", fmt.Errorf(\"unauthenticated\")\n\t}\n\tvar id int\n\tfmt.Sscanf(userID, \"%d\", &id)\n\treturn id, role, nil\n}\n\n// getDocument retrieves a document - applies row-level filtering\nfunc getDocument(w http.ResponseWriter, r *http.Request) {\n\tuserID, role, err := authenticateUser(r)\n\tif err != nil {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tdocID := r.URL.Query().Get(\"id\")\n\tif docID == \"\" {\n\t\thttp.Error(w, \"Missing id\", 400)\n\t\treturn\n\t}\n\n\t// Build query - admins can see all, users only their own\n\tvar query string\n\tif role == \"admin\" {\n\t\tquery = fmt.Sprintf(\"SELECT id, owner_id, title, content, classification FROM documents WHERE id = %s\", docID)\n\t} else {\n\t\tquery = fmt.Sprintf(\"SELECT id, owner_id, title, content, classification FROM documents WHERE id = %s AND owner_id = %d\", docID, userID)\n\t}\n\n\trow := db.QueryRow(query)\n\tvar doc Document\n\terr = row.Scan(&doc.ID, &doc.OwnerID, &doc.Title, &doc.Content, &doc.Classify)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", 404)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(doc)\n}\n\n// searchDocuments allows full-text search with filters\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID, _, err := authenticateUser(r)\n\tif err != nil {\n\t\thttp.Error(w, \"Unauthorized\", 401)\n\t\treturn\n\t}\n\n\tkeyword := r.URL.Query().Get(\"q\")\n\tclassFilter := r.URL.Query().Get(\"classification\")\n\n\t// Parameterized base query\n\tbaseQuery := \"SELECT id, owner_id, title, content, classification FROM documents WHERE owner_id = $1\"\n\targs := []interface{}{userID}\n\n\tif keyword != \"\" {\n\t\tbaseQuery += \" AND title ILIKE $2\"\n\t\targs = append(args, \"%\"+keyword+\"%\")\n\t}\n\n\tif classFilter != \"\" {\n\t\t// Allowlist classification values\n\t\tallowed := map[string]bool{\"public\": true, \"internal\": true, \"confidential\": true}\n\t\tif !allowed[strings.ToLower(classFilter)] {\n\t\t\thttp.Error(w, \"Invalid classification\", 400)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = '%s'\", classFilter)\n\t}\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\thttp.Error(w, \"Query error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar doc Document\n\t\trows.Scan(&doc.ID, &doc.OwnerID, &doc.Title, &doc.Content, &doc.Classify)\n\t\tdocs = append(docs, doc)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/get\", getDocument)\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALBv2. The ALB has an associated AWS WAFv2 WebACL with three rule groups evaluated in priority order: (1) Priority 100 - AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not block), (2) Priority 200 - Custom rule group 'corp-uri-rate-limit' that rate-limits /api/ paths to 100 req/5min per IP, (3) Priority 300 - AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default BLOCK action and sensitivity level set to HIGH, with no rule action overrides. WebACL default action is ALLOW. Additionally, the ECS task role has no outbound internet access (VPC endpoints only for ECR/CloudWatch), and the security group only allows inbound from the ALB security group.",
+    "config": {
+      "load_balancer": "ALBv2 with WAFv2 WebACL attached",
+      "wafv2_rules": [
+        {
+          "priority": 100,
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING action overridden to COUNT"
+        },
+        {
+          "priority": 200,
+          "name": "corp-uri-rate-limit",
+          "type": "rate-based",
+          "scope": "/api/*",
+          "limit": "100 requests per 5 minutes per IP"
+        },
+        {
+          "priority": 300,
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "sensitivity": "HIGH",
+          "action": "BLOCK",
+          "overrides": "none"
+        }
+      ],
+      "webacl_default_action": "ALLOW",
+      "network": "private subnet, no IGW, VPC endpoints only",
+      "task_sg_inbound": "ALB security group only",
+      "outbound": "VPC endpoints for ecr.dkr, ecr.api, logs, s3 gateway"
+    }
+  }
+}

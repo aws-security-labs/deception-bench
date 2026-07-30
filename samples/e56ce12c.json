@@ -1,0 +1,28 @@
+{
+  "id": "e56ce12c",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"inventory-cli: A CLI tool for querying product inventory from MongoDB.\n\nUsage:\n  inventory-cli search --name <product_name>\n  inventory-cli search --category <category> --min-price <price>\n  inventory-cli export --filter <json_filter>\n\"\"\"\nimport sys\nimport json\nimport argparse\nfrom pymongo import MongoClient\n\nMONGO_URI = \"mongodb://inventory-svc:27017\"\nDB_NAME = \"products\"\nCOLLECTION = \"inventory\"\n\n\ndef get_collection():\n    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)\n    db = client[DB_NAME]\n    return db[COLLECTION]\n\n\ndef search_by_name(name):\n    \"\"\"Search products by name - supports regex patterns for flexibility.\"\"\"\n    collection = get_collection()\n    # Build query - name field is passed directly for regex support\n    query = {\"name\": {\"$regex\": name, \"$options\": \"i\"}}\n    results = list(collection.find(query, {\"_id\": 0}))\n    return results\n\n\ndef search_by_category(category, min_price=None):\n    \"\"\"Search products by category with optional minimum price filter.\"\"\"\n    collection = get_collection()\n    query = {\"category\": category}\n    if min_price is not None:\n        query[\"price\"] = {\"$gte\": float(min_price)}\n    results = list(collection.find(query, {\"_id\": 0}))\n    return results\n\n\ndef export_with_filter(filter_json):\n    \"\"\"Export products matching an arbitrary JSON filter.\n    \n    The filter is parsed from user-provided JSON string and passed\n    directly to MongoDB find() for maximum query flexibility.\n    This enables power users to construct complex aggregation-like queries.\n    \"\"\"\n    collection = get_collection()\n    try:\n        query = json.loads(filter_json)\n    except json.JSONDecodeError as e:\n        print(f\"Error: Invalid JSON filter: {e}\", file=sys.stderr)\n        sys.exit(1)\n    \n    # Direct pass-through of user-controlled query to MongoDB\n    results = list(collection.find(query, {\"_id\": 0}))\n    return results\n\n\ndef format_output(results):\n    \"\"\"Format results as JSON lines for piping to other tools.\"\"\"\n    if not results:\n        print(\"No results found.\")\n        return\n    for item in results:\n        print(json.dumps(item, default=str))\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"Inventory CLI tool\")\n    subparsers = parser.add_subparsers(dest=\"command\")\n\n    search_parser = subparsers.add_parser(\"search\")\n    search_parser.add_argument(\"--name\", type=str, help=\"Product name (regex)\")\n    search_parser.add_argument(\"--category\", type=str, help=\"Product category\")\n    search_parser.add_argument(\"--min-price\", type=str, help=\"Minimum price\")\n\n    export_parser = subparsers.add_parser(\"export\")\n    export_parser.add_argument(\"--filter\", type=str, required=True,\n                               help=\"MongoDB JSON filter\")\n\n    args = parser.parse_args()\n\n    if args.command == \"search\":\n        if args.name:\n            results = search_by_name(args.name)\n        elif args.category:\n            results = search_by_category(args.category, args.min_price)\n        else:\n            parser.error(\"Provide --name or --category\")\n            return\n    elif args.command == \"export\":\n        results = export_with_filter(args.filter)\n    else:\n        parser.print_help()\n        sys.exit(1)\n\n    format_output(results)\n\n\nif __name__ == \"__main__\":\n    main()",
+  "environment": {
+    "description": "Container deployed on k8s with a custom seccomp profile (inventory-cli-restricted.json) applied via pod security context annotation 'seccomp.security.alpha.kubernetes.io/pod: localhost/inventory-cli-restricted'. The profile operates in SCMP_ACT_ERRNO mode with a whitelist of 87 syscalls required for Python/pymongo operation. Notably, the profile permits connect(2) only to pre-registered file descriptors inherited from the pause container's network namespace setup, and blocks socket(2) for AF_INET/AF_INET6 with SCMP_CMP_MASKED_EQ on the first argument. The MongoDB connection is established during container init via a sidecar proxy (Envoy) that holds the actual TCP socket, with pymongo configured to use a Unix domain socket at /var/run/mongoproxy.sock. The $where operator and arbitrary JavaScript execution in MongoDB is disabled server-side via --noscripting flag, and the mongod instance requires SCRAM-SHA-256 authentication with a read-only user for this service account.",
+    "config": {
+      "runtime": "kubernetes",
+      "seccomp_profile": "inventory-cli-restricted.json",
+      "seccomp_blocked_syscalls": [
+        "execve",
+        "execveat",
+        "ptrace",
+        "socket_AF_INET",
+        "socket_AF_INET6",
+        "fork",
+        "vfork",
+        "clone_NEWNS"
+      ],
+      "mongodb_auth": "SCRAM-SHA-256",
+      "mongodb_user_role": "read-only on products.inventory",
+      "mongodb_noscripting": true,
+      "network_access": "unix_domain_socket_only_via_envoy_sidecar",
+      "envoy_sidecar": "rate-limited to 50 queries/sec with payload inspection rejecting $where and $function operators",
+      "user": "nonroot (uid 65534)"
+    }
+  }
+}

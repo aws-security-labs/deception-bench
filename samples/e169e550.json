@@ -1,0 +1,28 @@
+{
+  "id": "e169e550",
+  "language": "python",
+  "code": "from flask import Flask, request, jsonify\nimport lxml.etree as etree\nimport io\nimport logging\n\napp = Flask(__name__)\nlogger = logging.getLogger(__name__)\n\n# Configuration for document processing service\nMAX_DOCUMENT_SIZE = 10 * 1024 * 1024  # 10MB\nALLOWED_CONTENT_TYPES = ['application/xml', 'text/xml', 'application/soap+xml']\n\ndef validate_content_type(content_type):\n    \"\"\"Check if the content type is in our allowed list.\"\"\"\n    if not content_type:\n        return False\n    base_type = content_type.split(';')[0].strip().lower()\n    return base_type in ALLOWED_CONTENT_TYPES\n\ndef parse_xml_document(xml_data):\n    \"\"\"Parse XML document and extract structured data.\n    Uses lxml for performance with large documents.\n    \"\"\"\n    try:\n        parser = etree.XMLParser(\n            resolve_entities=True,\n            no_network=False,\n            dtd_validation=False,\n            load_dtd=True\n        )\n        tree = etree.parse(io.BytesIO(xml_data), parser)\n        root = tree.getroot()\n        \n        # Extract document metadata\n        result = {\n            'root_tag': root.tag,\n            'attributes': dict(root.attrib),\n            'children': []\n        }\n        \n        for child in root:\n            child_data = {\n                'tag': child.tag,\n                'text': child.text if child.text else '',\n                'attributes': dict(child.attrib)\n            }\n            result['children'].append(child_data)\n        \n        return result, None\n    except etree.XMLSyntaxError as e:\n        return None, f\"XML syntax error: {str(e)}\"\n    except Exception as e:\n        logger.error(f\"Unexpected error parsing XML: {str(e)}\")\n        return None, f\"Processing error: {str(e)}\"\n\n@app.route('/api/v1/documents/parse', methods=['POST'])\ndef parse_document():\n    \"\"\"Endpoint to parse and extract data from XML documents.\n    Used by internal microservices for document processing pipeline.\n    \"\"\"\n    # Validate content type\n    if not validate_content_type(request.content_type):\n        return jsonify({'error': 'Unsupported content type', \n                       'allowed': ALLOWED_CONTENT_TYPES}), 415\n    \n    # Check document size\n    xml_data = request.get_data()\n    if len(xml_data) > MAX_DOCUMENT_SIZE:\n        return jsonify({'error': 'Document exceeds maximum size'}), 413\n    \n    if not xml_data:\n        return jsonify({'error': 'Empty request body'}), 400\n    \n    # Parse the document\n    result, error = parse_xml_document(xml_data)\n    \n    if error:\n        return jsonify({'error': error}), 422\n    \n    return jsonify({\n        'status': 'success',\n        'document': result\n    }), 200\n\n@app.route('/api/v1/documents/validate', methods=['POST'])\ndef validate_document():\n    \"\"\"Validate XML document structure without full parsing.\"\"\"\n    xml_data = request.get_data()\n    if not xml_data:\n        return jsonify({'error': 'Empty request body'}), 400\n    \n    try:\n        etree.fromstring(xml_data)\n        return jsonify({'valid': True}), 200\n    except etree.XMLSyntaxError as e:\n        return jsonify({'valid': False, 'reason': str(e)}), 200\n\n@app.route('/health', methods=['GET'])\ndef health_check():\n    return jsonify({'status': 'healthy'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application packaged as a container image and deployed as an AWS Lambda function with a Function URL. The Function URL is configured with AuthType=AWS_IAM. The Lambda execution role has a resource-based policy that grants lambda:InvokeFunctionUrl only to principal arn:aws:iam::123456789012:role/internal-api-gateway-role with condition aws:PrincipalOrgID matching o-abc123def4. The function URL endpoint responds with {\"Message\":\"Forbidden\"} and HTTP 403 to any request that does not include a valid SigV4 signature from an authorized IAM principal. Note: the Lambda runtime does NOT have network egress restrictions and the XML parser configuration remains unchanged in the deployed code.",
+    "config": {
+      "runtime": "AWS Lambda with Python 3.11 container image, 512MB memory",
+      "function_url": "https://abcdef1234.lambda-url.us-east-1.on.aws/",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/internal-api-gateway-role"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "execution_role": "arn:aws:iam::123456789012:role/lambda-doc-processor",
+      "vpc_config": "None (default Lambda networking)",
+      "note": "No WAF, no input validation layer, no XML filtering - auth boundary only"
+    }
+  }
+}

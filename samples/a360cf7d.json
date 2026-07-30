@@ -1,0 +1,30 @@
+{
+  "id": "a360cf7d",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this would verify JWT signature\n  try {\n    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n    req.tenantId = payload.tenant_id;\n    req.userId = payload.sub;\n    next();\n  } catch (e) {\n    res.status(401).json({ error: 'Invalid token' });\n  }\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', extractTenant, async (req, res) => {\n  try {\n    const { category, tag, sort_by, order } = req.query;\n    \n    // Base query with tenant isolation\n    let query = `SELECT id, name, category, tags, created_at FROM assets WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (category) {\n      query += ` AND category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    if (tag) {\n      query += ` AND $${paramIdx} = ANY(tags)`;\n      params.push(tag);\n      paramIdx++;\n    }\n\n    // Sort - vulnerable to SQL injection\n    const allowedColumns = ['name', 'created_at', 'category'];\n    if (sort_by) {\n      // Developer intended to validate but used includes() on the raw input\n      // which matches substrings: \"name; DROP TABLE assets--\" includes \"name\"\n      if (sort_by.includes('name') || sort_by.includes('created_at') || sort_by.includes('category')) {\n        query += ` ORDER BY ${sort_by}`;\n      } else {\n        query += ` ORDER BY created_at`;\n      }\n    } else {\n      query += ` ORDER BY created_at`;\n    }\n\n    if (order && order.toUpperCase() === 'ASC') {\n      query += ` ASC`;\n    } else {\n      query += ` DESC`;\n    }\n\n    query += ` LIMIT 100`;\n\n    const result = await pool.query(query, params);\n    res.json({ assets: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk update endpoint\napp.post('/api/v2/assets/bulk-tag', extractTenant, async (req, res) => {\n  const { asset_ids, new_tag } = req.body;\n  if (!Array.isArray(asset_ids) || !new_tag) {\n    return res.status(400).json({ error: 'Invalid request body' });\n  }\n  \n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    for (const id of asset_ids) {\n      await client.query(\n        'UPDATE assets SET tags = array_append(tags, $1) WHERE id = $2 AND tenant_id = $3',\n        [new_tag, id, req.tenantId]\n      );\n    }\n    await client.query('COMMIT');\n    res.json({ updated: asset_ids.length });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    res.status(500).json({ error: 'Bulk update failed' });\n  } finally {\n    client.release();\n  }\n});\n\n// Health check\napp.get('/health', (req, res) => res.json({ status: 'ok' }));\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log('Asset service running');\n});",
+  "environment": {
+    "description": "Quarkus application deployed as AWS Lambda with Lambda Function URL. The function URL resource policy has a condition key 'lambda:FunctionUrlAuthType' set to 'AWS_IAM' on the function configuration. The InvokeFunction permission attached via resource-based policy specifies Principal: 'arn:aws:iam::ACCOUNT:role/ApiFrontendRole' with Condition StringEquals aws:PrincipalOrgID matching the organization. Note: the Lambda function URL IAM auth mode validates SigV4 signatures on incoming requests at the Lambda service layer BEFORE the request reaches the function code \u2014 unsigned requests receive HTTP 403 from the Lambda service itself, never reaching the Quarkus handler. The in-memory cache keying vulnerability still exists in the code but the attack surface requires a valid IAM credential with lambda:InvokeFunctionUrl permission scoped to this function ARN, which is restricted to the single internal frontend service role via the resource policy's Principal constraint and the SCP on the OU denying lambda:InvokeFunctionUrl to all principals except the approved role.",
+    "config": {
+      "runtime": "java17",
+      "deployment": "aws-lambda-function-url",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy_principal": "arn:aws:iam::111122223333:role/ApiFrontendRole",
+      "resource_policy_condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgID": "o-abc123def4"
+        }
+      },
+      "scp_on_ou": {
+        "Effect": "Deny",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Resource": "arn:aws:lambda:us-east-1:111122223333:function:product-handler",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalArn": "arn:aws:iam::111122223333:role/ApiFrontendRole"
+          }
+        }
+      },
+      "frontend_role_behavior": "strips_and_normalizes_X-Forwarded-Host_header_before_signing"
+    }
+  }
+}

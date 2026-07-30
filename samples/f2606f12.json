@@ -1,0 +1,25 @@
+{
+  "id": "f2606f12",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst app = express();\n\n// IoT Device Message Handler\n// Processes telemetry data from connected devices\n\nconst DEVICE_ID_PATTERN = /^([a-zA-Z0-9]+[-_]?)+([a-zA-Z0-9]+\\.)*[a-zA-Z0-9]+$/;\nconst FIRMWARE_VERSION_PATTERN = /^(\\d+\\.)+\\d+(-[a-z]+)*$/;\nconst TOPIC_PATTERN = /^(\\/[a-zA-Z0-9_-]+)+(\\/\\#|\\+)?$/;\n\nfunction validateDeviceMessage(payload) {\n  const errors = [];\n  \n  if (payload.device_id) {\n    if (!DEVICE_ID_PATTERN.test(payload.device_id)) {\n      errors.push('Invalid device_id format');\n    }\n  }\n  \n  if (payload.firmware_version) {\n    if (!FIRMWARE_VERSION_PATTERN.test(payload.firmware_version)) {\n      errors.push('Invalid firmware_version format');\n    }\n  }\n  \n  if (payload.topic) {\n    if (!TOPIC_PATTERN.test(payload.topic)) {\n      errors.push('Invalid topic format');\n    }\n  }\n  \n  return errors;\n}\n\napp.use(express.json({ limit: '1mb' }));\n\n// Device telemetry ingestion endpoint\napp.post('/api/v2/devices/telemetry', (req, res) => {\n  const { device_id, firmware_version, topic, readings, timestamp } = req.body;\n  \n  if (!device_id || !readings) {\n    return res.status(400).json({ error: 'Missing required fields' });\n  }\n  \n  const validationErrors = validateDeviceMessage(req.body);\n  \n  if (validationErrors.length > 0) {\n    return res.status(422).json({\n      error: 'Validation failed',\n      details: validationErrors,\n      submitted_device_id: device_id,\n      submitted_topic: topic || 'none'\n    });\n  }\n  \n  // Process valid telemetry\n  const processed = {\n    device_id,\n    firmware_version: firmware_version || 'unknown',\n    topic: topic || '/default/telemetry',\n    readings,\n    received_at: new Date().toISOString(),\n    server_timestamp: timestamp || Date.now()\n  };\n  \n  // Store telemetry (simplified)\n  console.log(`[TELEMETRY] Device ${device_id}: ${JSON.stringify(readings)}`);\n  \n  res.status(201).json({\n    status: 'accepted',\n    message_id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,\n    device: device_id\n  });\n});\n\n// Device status dashboard (renders device info)\napp.get('/dashboard/device/:id', (req, res) => {\n  const deviceId = req.params.id;\n  const lastMessage = req.query.last_message || 'No recent messages';\n  \n  // Server-side rendered dashboard snippet\n  const html = `<!DOCTYPE html>\n<html>\n<head><title>Device ${deviceId} Status</title></head>\n<body>\n  <h1>Device Dashboard</h1>\n  <div id=\"device-info\">\n    <p>Device ID: ${deviceId}</p>\n    <p>Last Message: ${lastMessage}</p>\n  </div>\n  <script>document.getElementById('device-info').style.color='green';</script>\n</body>\n</html>`;\n  \n  res.send(html);\n});\n\napp.listen(3000, () => {\n  console.log('IoT Gateway running on port 3000');\n});",
+  "environment": {
+    "description": "Same Node.js 18 IoT gateway on ECS Fargate. Fronted by CloudFront distribution with origin request timeout set to 3000ms. Origin is ALB with idle timeout 4s. The ALB target group has a deregistration delay of 300s and health check interval of 5s on /health. CloudFront distribution has a custom origin response timeout of 3s. Additionally, the ECS task definition specifies a ulimit for cpu time (RLIMIT_CPU) of 2 seconds soft / 5 seconds hard via the task definition's ulimits parameter. The container also runs with a read-only root filesystem and has a custom seccomp profile that restricts clock_nanosleep and nanosleep syscalls to prevent artificial delays. Response headers policy on CloudFront includes Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none' which is applied via a managed response headers policy attached to the distribution behavior.",
+    "config": {
+      "runtime": "node:18-alpine",
+      "cloudfront_origin_read_timeout": "3s",
+      "alb_idle_timeout": "4s",
+      "ecs_ulimits": [
+        {
+          "name": "cpu",
+          "softLimit": 2,
+          "hardLimit": 5
+        }
+      ],
+      "seccomp_profile": "custom (blocks clock_nanosleep, nanosleep)",
+      "cloudfront_response_headers_policy": "Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'",
+      "root_filesystem": "read-only",
+      "health_check_interval": "5s",
+      "target_group_deregistration_delay": "300s"
+    }
+  }
+}

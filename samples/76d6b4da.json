@@ -1,0 +1,80 @@
+{
+  "id": "76d6b4da",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/app/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('admin', 'admin@corp.internal', 'admin', 'sk-admin-9f8e7d6c5b4a')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, api_key) VALUES ('service', 'svc@corp.internal', 'service', 'sk-svc-1a2b3c4d5e6f')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Allowlist of searchable fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Search value required'}), 400\n    \n    # Build query with field from allowlist (safe) and user value (unsafe)\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID - excludes sensitive fields.\"\"\"\n    db = get_db()\n    cursor = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'username and email required'}), 400\n    \n    try:\n        db = get_db()\n        db.execute(\n            'INSERT INTO users (username, email) VALUES (?, ?)',\n            (data['username'], data['email'])\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    os.makedirs('/var/app/data', exist_ok=True)\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same container on ECS Fargate behind an ALB. AWS WAFv2 WebACL is associated with the ALB. The WebACL contains two rule groups evaluated in order: (1) a custom rate-based rule at priority 0 limiting to 2000 req/5min per IP, and (2) the AWS managed rule group AWSManagedRulesCommonRuleSet at priority 1 with all default actions. Additionally, a custom rule at priority 2 uses a regex pattern set matching body/query inspection with the SizeConstraint on query string limited to 256 bytes via a separate custom rule at priority 3 with action BLOCK.",
+    "config": {
+      "waf_web_acl": {
+        "name": "prod-api-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "rate-limit-per-ip",
+            "priority": 0,
+            "statement": {
+              "rate_based_statement": {
+                "limit": 2000,
+                "aggregate_key_type": "IP"
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "aws-common-ruleset",
+            "priority": 1,
+            "statement": {
+              "managed_rule_group_statement": {
+                "vendor_name": "AWS",
+                "name": "AWSManagedRulesSQLiRuleSet",
+                "excluded_rules": []
+              }
+            },
+            "override_action": "NONE"
+          },
+          {
+            "name": "query-size-constraint",
+            "priority": 3,
+            "statement": {
+              "size_constraint_statement": {
+                "field_to_match": {
+                  "query_string": {}
+                },
+                "comparison_operator": "GT",
+                "size": 256,
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "NONE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "conditions": [
+            {
+              "field": "path-pattern",
+              "values": [
+                "/*"
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "type": "forward",
+              "target_group": "app-tg-8080"
+            }
+          ]
+        }
+      ],
+      "container_runtime": "fargate",
+      "network_mode": "awsvpc"
+    }
+  }
+}

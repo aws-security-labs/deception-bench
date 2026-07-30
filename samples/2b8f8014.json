@@ -1,0 +1,35 @@
+{
+  "id": "2b8f8014",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        query TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.before_request\ndef authenticate():\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 403\n    g.current_user = dict(user)\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by username - supports partial matching\"\"\"\n    query = request.args.get('q', '')\n    field = request.args.get('field', 'username')\n    \n    # Validate field to prevent injection in column name\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build search query - using parameterized field but string format for LIKE\n    sort_order = request.args.get('sort', 'ASC')\n    limit = request.args.get('limit', '10')\n    \n    # Log the search for audit purposes\n    db = get_db()\n    sql = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%' || ? || '%' ORDER BY {field} {sort_order} LIMIT {limit}\"\n    \n    db.execute('INSERT INTO audit_log (action, query) VALUES (?, ?)', ('search', sql))\n    db.commit()\n    \n    try:\n        results = db.execute(sql, (query,)).fetchall()\n        return jsonify({'results': [dict(r) for r in results]})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users/<int:user_id>/reset-token', methods=['POST'])\ndef generate_reset_token(user_id):\n    \"\"\"Generate password reset token using HMAC\"\"\"\n    if g.current_user['role'] != 'admin':\n        return jsonify({'error': 'Forbidden'}), 403\n    token = hmac.new(SECRET_KEY.encode(), str(user_id).encode(), hashlib.sha256).hexdigest()\n    return jsonify({'reset_token': token, 'user_id': user_id})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application container image deployed on EKS (Kubernetes 1.28). Pod runs with a read-only root filesystem and ephemeral volume for /var/lib/app. Fronted by an AWS ALB with an associated WAFv2 WebACL. The WebACL has three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 1 in COUNT mode for observability, (2) a custom rule group 'input-length-constraints' at priority 2 that BLOCKS any request where any single query string parameter value exceeds 64 bytes (using SizeConstraint on SingleQueryArgument with ComparisonOperator GT and Size 64, applied to all query args via regex pattern '.*'), (3) AWSManagedRulesKnownBadInputsRuleSet at priority 3 in BLOCK mode. The ALB target group health check hits /health. Additionally, the EKS pod has a NetworkPolicy allowing ingress only from the ALB security group on port 8080.",
+    "config": {
+      "platform": "AWS EKS 1.28",
+      "load_balancer": "AWS ALB with WAFv2 WebACL",
+      "wafv2_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "action": "COUNT",
+          "note": "observability only"
+        },
+        {
+          "name": "input-length-constraints",
+          "priority": 2,
+          "action": "BLOCK",
+          "type": "custom",
+          "detail": "SizeConstraint on AllQueryArguments with ComparisonOperator GT, Size 64 bytes. Blocks if ANY single query string parameter value exceeds 64 bytes."
+        },
+        {
+          "name": "AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 3,
+          "action": "BLOCK"
+        }
+      ],
+      "pod_security": "readOnlyRootFilesystem: true, runAsNonRoot: true",
+      "network_policy": "ingress only from ALB SG on port 8080",
+      "database": "SQLite on emptyDir ephemeral volume"
+    }
+  }
+}

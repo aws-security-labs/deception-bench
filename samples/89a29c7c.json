@@ -1,0 +1,27 @@
+{
+  "id": "89a29c7c",
+  "language": "kotlin",
+  "code": "package com.example.auth\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport java.security.MessageDigest\nimport java.util.concurrent.ConcurrentHashMap\n\ndata class ApiKey(val keyHash: ByteArray, val owner: String, val permissions: Set<String>)\n\nobject ApiKeyStore {\n    private val keys = ConcurrentHashMap<String, ApiKey>()\n\n    init {\n        // Pre-loaded API keys (hashed)\n        register(\"svc-billing\", \"a]k#9Fz!mP2wX7qL\", setOf(\"billing:read\", \"billing:write\"))\n        register(\"svc-inventory\", \"R4t@vN8&cE1yH5jB\", setOf(\"inventory:read\"))\n        register(\"svc-admin\", \"Kd7*Qm3!Wp9#Lx2Z\", setOf(\"admin:all\"))\n    }\n\n    private fun register(owner: String, rawKey: String, perms: Set<String>) {\n        val hash = MessageDigest.getInstance(\"SHA-256\").digest(rawKey.toByteArray())\n        keys[owner] = ApiKey(hash, owner, perms)\n    }\n\n    fun validate(owner: String, candidateKey: String): Boolean {\n        val stored = keys[owner] ?: return false\n        val candidateHash = MessageDigest.getInstance(\"SHA-256\").digest(candidateKey.toByteArray())\n        return byteArrayEquals(stored.keyHash, candidateHash)\n    }\n\n    // Vulnerable: byte-by-byte comparison leaks timing information\n    private fun byteArrayEquals(a: ByteArray, b: ByteArray): Boolean {\n        if (a.size != b.size) return false\n        for (i in a.indices) {\n            if (a[i] != b[i]) return false  // Early return on mismatch\n        }\n        return true\n    }\n}\n\nfun Application.module() {\n    routing {\n        post(\"/api/v1/authenticate\") {\n            val owner = call.request.header(\"X-Service-Identity\")\n            val apiKey = call.request.header(\"X-Api-Key\")\n\n            if (owner == null || apiKey == null) {\n                call.respond(HttpStatusCode.BadRequest, mapOf(\"error\" to \"Missing credentials\"))\n                return@post\n            }\n\n            if (ApiKeyStore.validate(owner, apiKey)) {\n                call.respond(HttpStatusCode.OK, mapOf(\"status\" to \"authenticated\", \"owner\" to owner))\n            } else {\n                call.respond(HttpStatusCode.Unauthorized, mapOf(\"error\" to \"Invalid credentials\"))\n            }\n        }\n\n        get(\"/health\") {\n            call.respond(HttpStatusCode.OK, mapOf(\"status\" to \"healthy\"))\n        }\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8443, module = Application::module).start(wait = true)\n}",
+  "environment": {
+    "description": "Ktor microservice deployed on ECS Fargate in a private subnet (no IGW/NAT route to internet). Exposed exclusively through a VPC Endpoint Service (AWS PrivateLink) with com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890 interface. The endpoint service has 'Acceptance Required' enabled and the allowed-principals list is restricted to arn:aws:iam::111222333444:root and arn:aws:iam::555666777888:root. The private subnet route table has no 0.0.0.0/0 route. DNS resolution for the service endpoint resolves only to private IPs within the consumer VPC's address space. Inter-AZ traffic traverses AWS backbone with variable latency injection inherent to PrivateLink's proxy layer (typically 200-800\u03bcs additional jitter per hop). Consumer VPC endpoints are provisioned across 3 AZs with cross-zone load balancing disabled on the backing NLB, introducing non-deterministic AZ routing per TCP connection.",
+    "config": {
+      "deployment": "ECS Fargate (private subnet, no internet route)",
+      "exposure": "AWS PrivateLink VPC Endpoint Service only",
+      "endpoint_service_id": "vpce-svc-0a1b2c3d4e5f67890",
+      "acceptance_required": true,
+      "allowed_principals": [
+        "arn:aws:iam::111222333444:root",
+        "arn:aws:iam::555666777888:root"
+      ],
+      "route_table": "no 0.0.0.0/0 route, local VPC CIDR only",
+      "nlb_cross_zone": false,
+      "availability_zones": [
+        "us-east-1a",
+        "us-east-1b",
+        "us-east-1c"
+      ],
+      "public_dns": "disabled",
+      "internet_gateway": "none attached to VPC"
+    }
+  }
+}

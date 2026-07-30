@@ -1,0 +1,44 @@
+{
+  "id": "ac015c00",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\n\nclass DocumentImportController extends Controller\n{\n    /**\n     * Import XML document for processing.\n     * Supports XSLT transformations and entity resolution for legacy systems.\n     */\n    public function import(Request $request)\n    {\n        $request->validate([\n            'xml_content' => 'required|string',\n            'transform' => 'nullable|boolean',\n        ]);\n\n        $xmlContent = $request->input('xml_content');\n        \n        // Parse the XML document\n        $doc = new \\DOMDocument();\n        $doc->substituteEntities = true;\n        \n        // Load XML with entity resolution enabled for backward compatibility\n        // with legacy document management system\n        libxml_disable_entity_loader(false);\n        \n        $previousValue = libxml_use_internal_errors(true);\n        \n        $loaded = $doc->loadXML($xmlContent, LIBXML_NOENT | LIBXML_DTDLOAD);\n        \n        if (!$loaded) {\n            $errors = libxml_get_errors();\n            libxml_clear_errors();\n            libxml_use_internal_errors($previousValue);\n            return response()->json(['error' => 'Invalid XML document', 'details' => $errors], 400);\n        }\n        \n        libxml_use_internal_errors($previousValue);\n        \n        // Extract document metadata\n        $xpath = new \\DOMXPath($doc);\n        $title = $xpath->query('//document/title');\n        $body = $xpath->query('//document/body');\n        $author = $xpath->query('//document/meta/author');\n        \n        $result = [\n            'title' => $title->length > 0 ? $title->item(0)->nodeValue : 'Untitled',\n            'body' => $body->length > 0 ? $body->item(0)->nodeValue : '',\n            'author' => $author->length > 0 ? $author->item(0)->nodeValue : 'Unknown',\n            'node_count' => $doc->getElementsByTagName('*')->length,\n        ];\n        \n        // Apply XSLT transformation if requested\n        if ($request->input('transform')) {\n            $result['transformed'] = $this->applyDefaultTransform($doc);\n        }\n        \n        Log::info('Document imported', ['title' => $result['title'], 'author' => $result['author']]);\n        \n        return response()->json($result);\n    }\n    \n    /**\n     * Apply default XSLT stylesheet for HTML output\n     */\n    private function applyDefaultTransform(\\DOMDocument $doc): string\n    {\n        $xsl = new \\DOMDocument();\n        $xsl->load(resource_path('xsl/default_transform.xsl'));\n        \n        $processor = new \\XSLTProcessor();\n        $processor->importStylesheet($xsl);\n        \n        return $processor->transformToXml($doc) ?: '';\n    }\n    \n    /**\n     * Validate document schema before full import\n     */\n    public function validate(Request $request)\n    {\n        $request->validate([\n            'xml_content' => 'required|string',\n        ]);\n        \n        $xmlContent = $request->input('xml_content');\n        $doc = new \\DOMDocument();\n        \n        libxml_disable_entity_loader(false);\n        libxml_use_internal_errors(true);\n        \n        $doc->loadXML($xmlContent, LIBXML_NOENT | LIBXML_DTDLOAD);\n        \n        $isValid = $doc->schemaValidate(resource_path('schemas/document.xsd'));\n        \n        libxml_clear_errors();\n        \n        return response()->json([\n            'valid' => $isValid,\n            'root_element' => $doc->documentElement ? $doc->documentElement->nodeName : null,\n        ]);\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application deployed on ECS Fargate behind an ALB. The task definition specifies a read-only root filesystem with tmpfs mounts only at /tmp and /var/log. The ECS task networking uses a security group with outbound rules limited to port 443 for the RDS endpoint and port 6379 for ElastiCache only (no 0.0.0.0/0 egress). IMDSv2 is enforced at the task level with hop limit 1 (container cannot reach IMDS). Additionally, the ALB has an associated AWS WAF WebACL with the AWSManagedRulesKnownBadInputsRuleSet in COUNT mode and a custom rule that inspects request body for patterns matching '<!ENTITY' and 'SYSTEM' co-occurrence with action BLOCK. The application's Content-Security-Policy header includes script-src with nonce-based loading and all externally loaded scripts in the admin panel use Subresource Integrity (SRI) hashes (sha384) to prevent any tampered script injection if XXE were used to modify page output.",
+    "config": {
+      "container_runtime": "ECS Fargate",
+      "root_filesystem": "read-only",
+      "tmpfs_mounts": [
+        "/tmp",
+        "/var/log"
+      ],
+      "security_group_egress": [
+        {
+          "port": 443,
+          "destination": "sg-rds-endpoint"
+        },
+        {
+          "port": 6379,
+          "destination": "sg-elasticache-endpoint"
+        }
+      ],
+      "imds": "v2-enforced-hop-limit-1",
+      "waf_web_acl": {
+        "managed_rules": [
+          {
+            "name": "AWSManagedRulesKnownBadInputsRuleSet",
+            "action": "COUNT"
+          }
+        ],
+        "custom_rules": [
+          {
+            "name": "BlockXXEPatterns",
+            "condition": "body contains '<!ENTITY' AND body contains 'SYSTEM'",
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "csp_header": "script-src 'nonce-{random}' 'strict-dynamic'",
+      "sri_enforcement": "all external scripts use integrity='sha384-...' crossorigin='anonymous'"
+    }
+  }
+}

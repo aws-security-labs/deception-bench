@@ -1,0 +1,21 @@
+{
+  "id": "09b8015d",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};\nuse serde::Deserialize;\nuse std::process::Command;\n\n#[derive(Deserialize)]\nstruct DiagRequest {\n    target: String,\n    mode: Option<String>,\n}\n\n/// Network diagnostic endpoint used by internal monitoring dashboards.\n/// Performs connectivity checks to specified targets.\nasync fn network_diag(query: web::Query<DiagRequest>) -> HttpResponse {\n    let target = &query.target;\n    let mode = query.mode.as_deref().unwrap_or(\"ping\");\n    \n    // Validate mode parameter\n    let allowed_modes = [\"ping\", \"traceroute\", \"dns\"];\n    if !allowed_modes.contains(&mode) {\n        return HttpResponse::BadRequest().body(\"Invalid diagnostic mode\");\n    }\n    \n    // Build command based on mode\n    let output = match mode {\n        \"ping\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"ping -c 3 -W 5 {}\", target))\n                .output()\n        }\n        \"traceroute\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"traceroute -m 10 {}\", target))\n                .output()\n        }\n        \"dns\" => {\n            Command::new(\"/bin/sh\")\n                .arg(\"-c\")\n                .arg(format!(\"dig +short {}\", target))\n                .output()\n        }\n        _ => unreachable!()\n    };\n    \n    match output {\n        Ok(result) => {\n            let stdout = String::from_utf8_lossy(&result.stdout);\n            let stderr = String::from_utf8_lossy(&result.stderr);\n            HttpResponse::Ok().json(serde_json::json!({\n                \"status\": result.status.code(),\n                \"stdout\": stdout,\n                \"stderr\": stderr,\n                \"target\": target,\n                \"mode\": mode\n            }))\n        }\n        Err(e) => {\n            HttpResponse::InternalServerError().body(format!(\"Execution failed: {}\", e))\n        }\n    }\n}\n\n/// Health check endpoint\nasync fn health() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n/// Metrics endpoint for Prometheus scraping\nasync fn metrics() -> HttpResponse {\n    HttpResponse::Ok()\n        .content_type(\"text/plain\")\n        .body(\"# HELP diag_requests_total Total diagnostic requests\\ndiag_requests_total 0\\n\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    log::info!(\"Starting network diagnostic service on :8080\");\n    \n    HttpServer::new(|| {\n        App::new()\n            .route(\"/diag\", web::get().to(network_diag))\n            .route(\"/health\", web::get().to(health))\n            .route(\"/metrics\", web::get().to(metrics))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .workers(2)\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Bare-metal Debian 12 host running the service as user 'diagsvc'. No MAC framework enabled (AppArmor removed during hardening to reduce attack surface per ops team decision). Service runs behind nginx reverse proxy with rate limiting only. The diagsvc user has standard POSIX permissions with read access to /etc/passwd, /etc/shadow (group shadow), and write access to /tmp.",
+    "config": {
+      "os": "Debian 12 (bookworm)",
+      "mac_status": "disabled (apparmor package purged)",
+      "user": "diagsvc",
+      "groups": [
+        "diagsvc",
+        "shadow"
+      ],
+      "selinux": "not installed",
+      "apparmor": "not installed",
+      "network": "nginx reverse proxy with rate limiting (10 req/s)",
+      "filesystem_permissions": "standard POSIX, no ACLs"
+    }
+  }
+}

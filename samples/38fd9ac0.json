@@ -1,0 +1,45 @@
+{
+  "id": "38fd9ac0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/aes\"\n\t\"crypto/cipher\"\n\t\"encoding/base64\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/aws/aws-sdk-go/aws\"\n\t\"github.com/aws/aws-sdk-go/aws/session\"\n\t\"github.com/aws/aws-sdk-go/service/s3\"\n)\n\nvar encryptionKey []byte\nvar s3Client *s3.S3\nvar bucketName string\n\nfunc init() {\n\tencryptionKey = []byte(os.Getenv(\"AES_KEY\")) // 32 bytes for AES-256\n\tbucketName = os.Getenv(\"CONFIG_BUCKET\")\n\tsess := session.Must(session.NewSession())\n\ts3Client = s3.New(sess)\n}\n\n// decryptCBC decrypts AES-CBC ciphertext with PKCS7 padding\nfunc decryptCBC(ciphertextB64 string) ([]byte, error) {\n\tciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"base64 decode error\")\n\t}\n\n\tblock, err := aes.NewCipher(encryptionKey)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"cipher error\")\n\t}\n\n\tif len(ciphertext) < aes.BlockSize {\n\t\treturn nil, fmt.Errorf(\"ciphertext too short\")\n\t}\n\n\tiv := ciphertext[:aes.BlockSize]\n\tciphertext = ciphertext[aes.BlockSize:]\n\n\tif len(ciphertext)%aes.BlockSize != 0 {\n\t\treturn nil, fmt.Errorf(\"ciphertext not block aligned\")\n\t}\n\n\tmode := cipher.NewCBCDecrypter(block, iv)\n\tmode.CryptBlocks(ciphertext, ciphertext)\n\n\t// PKCS7 unpadding - VULNERABLE: leaks padding validity via distinct errors\n\tpadLen := int(ciphertext[len(ciphertext)-1])\n\tif padLen == 0 || padLen > aes.BlockSize {\n\t\treturn nil, fmt.Errorf(\"invalid padding length\")\n\t}\n\tfor i := 0; i < padLen; i++ {\n\t\tif ciphertext[len(ciphertext)-1-i] != byte(padLen) {\n\t\t\treturn nil, fmt.Errorf(\"invalid padding byte\")\n\t\t}\n\t}\n\n\treturn ciphertext[:len(ciphertext)-padLen], nil\n}\n\n// handleDecrypt processes encrypted session tokens and fetches user config from S3\nfunc handleDecrypt(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"read error\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tvar req struct {\n\t\tToken string `json:\"token\"`\n\t}\n\tif err := json.Unmarshal(body, &req); err != nil {\n\t\thttp.Error(w, \"json parse error\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tplaintext, err := decryptCBC(req.Token)\n\tif err != nil {\n\t\t// VULNERABILITY: Different error messages for padding vs other errors\n\t\t// enables padding oracle attack\n\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Use decrypted token as S3 key to fetch user configuration\n\tuserKey := string(plaintext)\n\tresult, err := s3Client.GetObject(&s3.GetObjectInput{\n\t\tBucket: aws.String(bucketName),\n\t\tKey:    aws.String(fmt.Sprintf(\"configs/%s.json\", userKey)),\n\t})\n\tif err != nil {\n\t\thttp.Error(w, \"config not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tdefer result.Body.Close()\n\n\tconfigData, _ := ioutil.ReadAll(result.Body)\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write(configData)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/decrypt\", handleDecrypt)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\tfmt.Println(\"Starting server on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Same Go microservice on ECS Fargate in a private subnet. Traffic arrives via internal ALB (scheme=internal). S3 access is routed through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint with a restrictive endpoint policy. The endpoint policy uses a condition key aws:sourceVpce to restrict which principals can call s3:GetObject, and critically includes a StringEquals condition on s3:prefix requiring the key to match a pattern derived from a signed HMAC of the request timestamp (verified server-side before the S3 call). The VPC endpoint policy also has a Deny statement for any request where the User-Agent header (passed via the SDK) does not match the service's compiled binary signature hash. The VPC has no NAT gateway and no internet gateway attached, so the only path to S3 is through this endpoint. Additionally, the security group on the Fargate task only allows inbound from the internal ALB's security group on port 8080, and the internal ALB is only accessible from a separate management VPC via VPC peering with a route table entry limited to 10.0.0.0/16.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network": "Private subnet, internal ALB, no IGW, no NAT",
+      "vpc_endpoint": "com.amazonaws.us-east-1.s3 Gateway endpoint",
+      "endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowOnlySignedPrefixAccess",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::app-configs-prod/configs/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:sourceVpce": "vpce-0a1b2c3d4e5f67890"
+              }
+            }
+          },
+          {
+            "Sid": "DenyNonServiceUA",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:UserAgent": "config-svc/v2.4.1-ab3f9c"
+              }
+            }
+          }
+        ]
+      },
+      "security_group_inbound": "sg-alb-internal only, port 8080",
+      "alb_access": "Internal ALB accessible only from 10.0.0.0/16 via VPC peering",
+      "internet_access": "none"
+    }
+  }
+}

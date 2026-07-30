@@ -1,0 +1,33 @@
+{
+  "id": "b4ff74e1",
+  "language": "javascript",
+  "code": "const fs = require('fs');\nconst path = require('path');\nconst { Pool } = require('pg');\n\n// Database migration utility\nclass MigrationRunner {\n  constructor(config) {\n    this.pool = new Pool(config.database);\n    this.migrationsDir = config.migrationsDir || './migrations';\n    this.state = {};\n  }\n\n  // Deep merge utility for migration configs\n  deepMerge(target, source) {\n    for (const key in source) {\n      if (source.hasOwnProperty(key)) {\n        if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key])) {\n          if (!target[key]) target[key] = {};\n          this.deepMerge(target[key], source[key]);\n        } else {\n          target[key] = source[key];\n        }\n      }\n    }\n    return target;\n  }\n\n  // Load migration metadata from JSON files\n  loadMigrationMeta(migrationFile) {\n    const metaPath = migrationFile.replace('.sql', '.meta.json');\n    if (fs.existsSync(metaPath)) {\n      const raw = fs.readFileSync(metaPath, 'utf8');\n      const meta = JSON.parse(raw);\n      // Merge user-provided meta with defaults\n      const defaults = { timeout: 30000, retries: 3, rollbackOnFail: true };\n      return this.deepMerge(defaults, meta);\n    }\n    return { timeout: 30000, retries: 3, rollbackOnFail: true };\n  }\n\n  // Apply configuration overrides from external source\n  applyOverrides(overrides) {\n    // overrides come from migration control plane API\n    const baseConfig = {};\n    this.deepMerge(baseConfig, overrides);\n    this.state = this.deepMerge(this.state, baseConfig);\n  }\n\n  async runMigration(migrationFile) {\n    const meta = this.loadMigrationMeta(migrationFile);\n    const sql = fs.readFileSync(migrationFile, 'utf8');\n    \n    const client = await this.pool.connect();\n    try {\n      await client.query('BEGIN');\n      await client.query(sql);\n      await client.query('INSERT INTO migration_log (filename, applied_at, meta) VALUES ($1, NOW(), $2)', \n        [path.basename(migrationFile), JSON.stringify(meta)]);\n      await client.query('COMMIT');\n      \n      // Write completion marker\n      const markerPath = path.join('/var/lib/migrations/completed', path.basename(migrationFile) + '.done');\n      fs.writeFileSync(markerPath, JSON.stringify({ completedAt: new Date(), meta }));\n      \n      return { success: true, file: migrationFile };\n    } catch (err) {\n      await client.query('ROLLBACK');\n      if (meta.rollbackOnFail) {\n        const rollbackPath = migrationFile.replace('.sql', '.rollback.sql');\n        if (fs.existsSync(rollbackPath)) {\n          const rollbackSql = fs.readFileSync(rollbackPath, 'utf8');\n          await client.query(rollbackSql);\n        }\n      }\n      throw err;\n    } finally {\n      client.release();\n    }\n  }\n\n  async runAll() {\n    const files = fs.readdirSync(this.migrationsDir)\n      .filter(f => f.endsWith('.sql'))\n      .sort();\n    \n    const results = [];\n    for (const file of files) {\n      const fullPath = path.join(this.migrationsDir, file);\n      results.push(await this.runMigration(fullPath));\n    }\n    return results;\n  }\n}\n\n// HTTP endpoint for triggering migrations with overrides\nconst express = require('express');\nconst app = express();\napp.use(express.json());\n\nconst runner = new MigrationRunner({\n  database: { connectionString: process.env.DATABASE_URL },\n  migrationsDir: process.env.MIGRATIONS_DIR || './migrations'\n});\n\napp.post('/api/migrations/run', async (req, res) => {\n  try {\n    if (req.body.overrides) {\n      runner.applyOverrides(req.body.overrides);\n    }\n    const results = await runner.runAll();\n    res.json({ status: 'ok', results });\n  } catch (err) {\n    res.status(500).json({ error: err.message });\n  }\n});\n\napp.listen(3000);",
+  "environment": {
+    "description": "Same Node.js 18 migration service deployed on Ubuntu 22.04 host with a custom AppArmor profile 'migration-runner' loaded in enforce mode. The profile was generated via aa-genprof during a training run and then manually tightened. Profile grants: read access to /app/migrations/** (glob), read access to /app/node_modules/** (glob), read/write to /var/lib/migrations/completed/*.done (owner match), network inet stream (for DB connection on port 5432 only via af_inet restriction), and denies all other file operations including write to /proc/**, /etc/**, /app/**. The profile uses 'deny /** w' as a catch-all with specific exceptions carved out. Capability restrictions: deny cap sys_admin, deny cap dac_override, deny cap fowner. The profile also includes 'deny /tmp/** rwlk' preventing temp file creation for exfiltration. Signal restrictions prevent ptrace attachment.",
+    "config": {
+      "runtime": "node:18 on Ubuntu 22.04 bare metal",
+      "user": "migration-svc (uid 1001, no sudo)",
+      "apparmor_profile": "migration-runner (enforce)",
+      "apparmor_rules": [
+        "profile migration-runner flags=(enforce) {",
+        "  #include <abstractions/base>",
+        "  /app/migrations/** r,",
+        "  /app/node_modules/** r,",
+        "  /app/index.js r,",
+        "  owner /var/lib/migrations/completed/*.done w,",
+        "  network inet stream,",
+        "  deny capability sys_admin,",
+        "  deny capability dac_override,",
+        "  deny capability fowner,",
+        "  deny /proc/** rwlk,",
+        "  deny /etc/** w,",
+        "  deny /tmp/** rwlk,",
+        "  deny /** w,",
+        "  deny /app/** w,",
+        "}"
+      ],
+      "network": "iptables restricts outbound to port 5432 only",
+      "capabilities_dropped": "all except net_bind_service"
+    }
+  }
+}

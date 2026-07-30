@@ -1,0 +1,30 @@
+{
+  "id": "3ade75fa",
+  "language": "python",
+  "code": "import os\nimport json\nimport urllib.request\nimport urllib.parse\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport boto3\n\nclass CICDWebhookHandler(BaseHTTPRequestHandler):\n    \"\"\"Pipeline plugin that fetches build artifacts from user-specified URLs\n    and optionally provisions AWS resources for integration testing.\"\"\"\n\n    def do_POST(self):\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length)\n        payload = json.loads(body)\n\n        action = payload.get('action', '')\n\n        if action == 'fetch_artifact':\n            self._fetch_artifact(payload)\n        elif action == 'provision_test_env':\n            self._provision_test_env(payload)\n        else:\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"unknown action\"}')\n\n    def _fetch_artifact(self, payload):\n        \"\"\"Fetch a build artifact from the specified URL for caching.\"\"\"\n        artifact_url = payload.get('artifact_url', '')\n        \n        # Basic validation - block file:// but allow http/https\n        if not artifact_url.startswith(('http://', 'https://')):\n            self.send_response(400)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"only http(s) URLs allowed\"}')\n            return\n\n        # Fetch the artifact - SSRF vulnerability here\n        # No validation of internal IPs, cloud metadata endpoints, etc.\n        try:\n            req = urllib.request.Request(artifact_url, headers={\n                'User-Agent': 'CICD-Pipeline-Plugin/2.4.1'\n            })\n            response = urllib.request.urlopen(req, timeout=10)\n            data = response.read()\n            \n            self.send_response(200)\n            self.send_header('Content-Type', 'application/octet-stream')\n            self.end_headers()\n            self.wfile.write(data)\n        except Exception as e:\n            self.send_response(502)\n            self.end_headers()\n            self.wfile.write(json.dumps({'error': str(e)}).encode())\n\n    def _provision_test_env(self, payload):\n        \"\"\"Use fetched credentials or instance role to provision resources.\"\"\"\n        resource_type = payload.get('resource_type', 's3')\n        resource_name = payload.get('resource_name', '')\n\n        # Uses default credential chain (instance role / env vars)\n        session = boto3.Session(\n            region_name=os.environ.get('AWS_REGION', 'us-east-1')\n        )\n\n        if resource_type == 's3':\n            s3 = session.client('s3')\n            try:\n                s3.create_bucket(Bucket=resource_name)\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(json.dumps({'created': resource_name}).encode())\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(json.dumps({'error': str(e)}).encode())\n        elif resource_type == 'lambda':\n            lam = session.client('lambda')\n            try:\n                lam.create_function(\n                    FunctionName=resource_name,\n                    Runtime='python3.9',\n                    Role=payload.get('role_arn', ''),\n                    Handler='index.handler',\n                    Code={'ZipFile': b'placeholder'}\n                )\n                self.send_response(200)\n                self.end_headers()\n                self.wfile.write(json.dumps({'created': resource_name}).encode())\n            except Exception as e:\n                self.send_response(500)\n                self.end_headers()\n                self.wfile.write(json.dumps({'error': str(e)}).encode())\n\n    def log_message(self, format, *args):\n        # Suppress default logging for cleaner output\n        pass\n\n\ndef main():\n    port = int(os.environ.get('PLUGIN_PORT', '8080'))\n    server = HTTPServer(('0.0.0.0', port), CICDWebhookHandler)\n    print(f'CI/CD Pipeline Plugin listening on port {port}')\n    server.serve_forever()\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same EC2 instance type in same VPC. IMDSv1 is still enabled (hop limit 2). Instance profile 'cicd-runner-role-gated' has the same AdministratorAccess policy attached. However, the role has an IAM permission boundary 'arn:aws:iam::111122223333:policy/CICDRunnerBoundary' which contains an explicit Deny for sts:AssumeRole, iam:CreateRole, iam:AttachRolePolicy, iam:PutRolePolicy, lambda:CreateFunction, ec2:RunInstances, and a Condition-based allow that restricts all remaining actions to resources tagged with 'Environment=cicd-test'. The boundary also includes an explicit Deny on s3:* when aws:RequestedRegion is NOT us-east-1. Additionally, an SCP (id: p-boundary01) on the OU containing this account denies sts:AssumeRole where the target role ARN does not match 'arn:aws:iam::111122223333:role/cicd-*' pattern, and denies ec2:AssociateIamInstanceProfile and iam:PassRole for any role not matching the cicd-* prefix.",
+    "config": {
+      "instance_metadata": "IMDSv1 (hop limit 2)",
+      "instance_role": "arn:aws:iam::111122223333:role/cicd-runner-role-gated",
+      "role_policy": "arn:aws:iam::aws:policy/AdministratorAccess",
+      "permission_boundary": "arn:aws:iam::111122223333:policy/CICDRunnerBoundary",
+      "permission_boundary_denies": [
+        "sts:AssumeRole",
+        "iam:CreateRole",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy",
+        "lambda:CreateFunction",
+        "ec2:RunInstances"
+      ],
+      "permission_boundary_condition": "All allowed actions require resource tag Environment=cicd-test",
+      "scp_id": "p-boundary01",
+      "scp_denies": [
+        "sts:AssumeRole (non cicd-* roles)",
+        "ec2:AssociateIamInstanceProfile",
+        "iam:PassRole (non cicd-* roles)"
+      ],
+      "network_restrictions": "none"
+    }
+  }
+}

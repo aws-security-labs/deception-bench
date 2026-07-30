@@ -1,0 +1,22 @@
+{
+  "id": "49f0e0f5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"html/template\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl = template.Must(template.New(\"results\").Parse(`\n<html><body>\n<h2>Product Search</h2>\n<form method=\"GET\" action=\"/search\">\n  <input name=\"category\" value=\"{{.Query}}\">\n  <button>Search</button>\n</form>\n<table>{{range .Products}}<tr><td>{{.Name}}</td><td>{{.Price}}</td></tr>{{end}}</table>\n</body></html>`))\n\ntype Product struct {\n\tName  string\n\tPrice string\n}\n\ntype PageData struct {\n\tQuery    string\n\tProducts []Product\n}\n\nfunc initDB() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\n\t// Basic input length check\n\tif len(category) > 100 {\n\t\thttp.Error(w, \"Input too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Reject null bytes\n\tif strings.Contains(category, \"\\x00\") {\n\t\thttp.Error(w, \"Invalid input\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - developer intended to use parameterized query but\n\t// needed ILIKE with dynamic pattern matching\n\tquery := fmt.Sprintf(\n\t\t\"SELECT name, price::text FROM products WHERE category ILIKE '%%%s%%' AND active = true ORDER BY name LIMIT 50\",\n\t\tcategory,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.Name, &p.Price); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tdata := PageData{Query: category, Products: products}\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tinitDB()\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Printf(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, exposed directly via public Elastic IP on port 8080. Security group allows inbound TCP/8080 from 0.0.0.0/0. No load balancer or proxy in front. Application runs as systemd service under 'appuser' account. SQLite database at /var/lib/app/users.db contains production user records including admin accounts with elevated roles.",
+    "config": {
+      "instance_type": "t3.medium",
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 8080,
+          "cidr": "0.0.0.0/0"
+        }
+      ],
+      "proxy": "none",
+      "waf": "none",
+      "network": "public_subnet",
+      "sqlite_path": "/var/lib/app/users.db"
+    }
+  }
+}

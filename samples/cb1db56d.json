@@ -1,0 +1,37 @@
+{
+  "id": "cb1db56d",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport time\nimport os\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives import padding as sym_padding\nfrom cryptography.hazmat.backends import default_backend\nimport base64\nimport json\n\n# Generated protobuf stubs\nimport token_service_pb2\nimport token_service_pb2_grpc\n\nSECRET_KEY = os.environ.get('ENCRYPTION_KEY', b'\\x00' * 32)\nBLOCK_SIZE = 128\n\nclass TokenValidationService(token_service_pb2_grpc.TokenValidationServiceServicer):\n    \"\"\"gRPC service for validating encrypted session tokens.\n    Deployed on EKS with ALB ingress controller.\"\"\"\n\n    def __init__(self):\n        self.backend = default_backend()\n        self.key = SECRET_KEY if isinstance(SECRET_KEY, bytes) else SECRET_KEY.encode('utf-8')[:32]\n\n    def _decrypt_token(self, encrypted_data: bytes):\n        \"\"\"Decrypt AES-CBC encrypted token with PKCS7 padding.\"\"\"\n        if len(encrypted_data) < 32:\n            raise ValueError(\"Token too short\")\n        \n        iv = encrypted_data[:16]\n        ciphertext = encrypted_data[16:]\n        \n        if len(ciphertext) % 16 != 0:\n            raise ValueError(\"Invalid ciphertext length\")\n        \n        cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv), backend=self.backend)\n        decryptor = cipher.decryptor()\n        padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()\n        \n        # PKCS7 unpadding - vulnerable to padding oracle\n        unpadder = sym_padding.PKCS7(BLOCK_SIZE).unpadder()\n        plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()\n        \n        return plaintext\n\n    def ValidateToken(self, request, context):\n        \"\"\"Validate an encrypted session token.\n        Returns specific error codes that leak padding validity.\"\"\"\n        try:\n            encrypted_bytes = base64.b64decode(request.encrypted_token)\n        except Exception:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details('Base64 decode failed')\n            return token_service_pb2.ValidationResponse(valid=False, error_code=1001)\n\n        try:\n            plaintext = self._decrypt_token(encrypted_bytes)\n        except ValueError as e:\n            error_msg = str(e)\n            if \"Invalid padding\" in error_msg or \"invalid padding\" in error_msg.lower():\n                # VULNERABILITY: Distinct error for padding failure vs other failures\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details('Token integrity check failed: padding')\n                return token_service_pb2.ValidationResponse(valid=False, error_code=2001)\n            else:\n                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n                context.set_details('Token integrity check failed: structure')\n                return token_service_pb2.ValidationResponse(valid=False, error_code=2002)\n        except Exception as e:\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details('Internal decryption error')\n            return token_service_pb2.ValidationResponse(valid=False, error_code=3001)\n\n        # Parse decrypted token\n        try:\n            token_data = json.loads(plaintext)\n            if token_data.get('exp', 0) < time.time():\n                return token_service_pb2.ValidationResponse(valid=False, error_code=4001)\n            return token_service_pb2.ValidationResponse(\n                valid=True, user_id=token_data.get('sub', ''), error_code=0\n            )\n        except json.JSONDecodeError:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details('Token payload malformed')\n            return token_service_pb2.ValidationResponse(valid=False, error_code=5001)\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    token_service_pb2_grpc.add_TokenValidationServiceServicer_to_server(\n        TokenValidationService(), server\n    )\n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    server.start()\n    print(f'TokenValidationService started on port {port}')\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    serve()\n",
+  "environment": {
+    "description": "Same EKS cluster (v1.28) but the gRPC service is fronted by an AWS ALB Ingress (using gRPC target group protocol version) with an associated AWS WAFv2 WebACL. The WebACL attaches the AWS managed rule group `AWSManagedRulesKnownBadInputsRuleSet` in BLOCK mode with a custom rule that inspects the request body (gRPC payload) for repeated requests with high-entropy base64 payloads exceeding a rate threshold. Additionally, a WAFv2 rate-based rule limits any single source IP to 100 requests per 5-minute window on the `/token_service.TokenValidationService/ValidateToken` URI path. A padding oracle attack requires approximately 256 * (N_blocks * 16) requests (typically 4000-16000+ sequential probes with byte-level mutations). The rate-based rule (100 req/5min) makes it computationally infeasible to complete the oracle within any practical timeframe, as the attack requires observing responses to each probe sequentially before sending the next. The ALB also terminates TLS (ACM cert) so the gRPC channel uses ALPN h2, and the WAF can inspect the full request including serialized protobuf body bytes.",
+    "config": {
+      "cluster": "EKS 1.28, us-east-1",
+      "ingress": "AWS ALB with gRPC target group (protocolVersion: gRPC)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/grpc-token-svc-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK",
+          "priority": 1
+        },
+        {
+          "name": "RateLimit-ValidateToken-Endpoint",
+          "type": "rate-based",
+          "limit": 100,
+          "evaluation_window": "300s",
+          "scope_down_statement": {
+            "byte_match": {
+              "field": "URI_PATH",
+              "positional_constraint": "EXACTLY",
+              "search_string": "/token_service.TokenValidationService/ValidateToken"
+            }
+          },
+          "action": "BLOCK",
+          "priority": 2
+        }
+      ],
+      "tls": "ALB-terminated, ACM certificate, ALPN h2",
+      "network_policy": "deny-all ingress except from ALB security group"
+    }
+  }
+}

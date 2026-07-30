@@ -1,0 +1,41 @@
+{
+  "id": "908ab6b5",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\tpriceRange := r.URL.Query().Get(\"price_range\")\n\n\t// Base query with parameterized category filter\n\tbaseQuery := \"SELECT id, name, price, description FROM products WHERE active = true\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND category_id = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\t// Price range filter - validated against known patterns\n\tif priceRange != \"\" {\n\t\tparts := strings.Split(priceRange, \"-\")\n\t\tif len(parts) == 2 {\n\t\t\tbaseQuery += fmt.Sprintf(\" AND price BETWEEN $%d AND $%d\", argIdx, argIdx+1)\n\t\t\targs = append(args, parts[0], parts[1])\n\t\t\targIdx += 2\n\t\t}\n\t}\n\n\t// Sort field - allow dynamic ORDER BY for UX flexibility\n\t// NOTE: sort values come from frontend dropdown, limited to known columns\n\tif sortField != \"\" {\n\t\tbaseQuery += \" ORDER BY \" + sortField\n\t} else {\n\t\tbaseQuery += \" ORDER BY name ASC\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\"))\n\t\t}\n\t\tfirst = false\n\t\tjson := fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`,\n\t\t\tid, strings.ReplaceAll(name, `\"`, `\\\"`), price, strings.ReplaceAll(description, `\"`, `\\\"`))\n\t\tw.Write([]byte(json))\n\t}\n\tw.Write([]byte(\"]\"))\n}\n\n// getProductDetail returns a single product\nfunc getProductDetail(w http.ResponseWriter, r *http.Request) {\n\tproductID := r.URL.Query().Get(\"id\")\n\trow := db.QueryRow(\"SELECT id, name, price, description FROM products WHERE id = $1\", productID)\n\tvar id int\n\tvar name, description string\n\tvar price float64\n\tif err := row.Scan(&id, &name, &price, &description); err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson := fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`,\n\t\tid, strings.ReplaceAll(name, `\"`, `\\\"`), price, strings.ReplaceAll(description, `\"`, `\\\"`))\n\tw.Write([]byte(json))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/detail\", getProductDetail)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application deployed on EC2 behind an AWS ALB. A WAF WebACL is associated with the ALB. The WebACL contains three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to COUNT (not BLOCK) to allow long department names, (2) a custom rule group 'corp-geo-restrict' that blocks non-US source IPs with priority 50, and (3) AWSManagedRulesSQLiRuleSet at priority 100 with all rules in default action (BLOCK) and no overrides. The WebACL default action is ALLOW. CloudWatch metrics confirm SQLi rule group evaluates on all requests passing prior rules. Additionally, the ALB access logs are shipped to a SIEM with a 15-minute alert on 403 responses, though this is observability only.",
+    "config": {
+      "infrastructure": "AWS ALB -> EC2 (Amazon Linux 2023)",
+      "alb_waf_webacl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/corp-directory-acl/abc123",
+      "waf_rules": [
+        {
+          "priority": 10,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_actions": {
+            "SizeRestrictions_QUERYSTRING": "COUNT"
+          },
+          "action": "none (use rule actions)"
+        },
+        {
+          "priority": 50,
+          "name": "corp-geo-restrict",
+          "type": "custom",
+          "description": "GeoMatch rule blocking non-US origins",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 100,
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "override_actions": "none",
+          "action": "none (use rule actions - all BLOCK by default)"
+        }
+      ],
+      "webacl_default_action": "ALLOW",
+      "security_group_inbound": "443/tcp from 0.0.0.0/0",
+      "network": "VPC with public subnet",
+      "database": "local SQLite on EBS volume",
+      "auth": "OIDC via ALB with X-Authenticated-User header injection",
+      "observability": "ALB access logs -> S3 -> SIEM with 403 alerting (15min SLA)"
+    }
+  }
+}

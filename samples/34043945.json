@@ -1,0 +1,66 @@
+{
+  "id": "34043945",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport pg from 'pg';\nimport crypto from 'crypto';\nimport jwt from 'jsonwebtoken';\n\nconst app = express();\nconst pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });\n\n// Middleware: extract tenant context from JWT\napp.use((req, res, next) => {\n  const token = req.headers['x-api-key'];\n  if (!token) return res.status(401).json({ error: 'missing key' });\n  try {\n    // NOTE: algorithm not pinned - potential alg confusion\n    req.tenant = jwt.verify(token, process.env.JWT_SECRET);\n    next();\n  } catch (e) {\n    res.status(403).json({ error: 'invalid token' });\n  }\n});\n\n// Helper: build dynamic report query\nfunction buildReportQuery(tenantId, params) {\n  const { metric, groupBy, dateRange, threshold } = params;\n  \n  // Allowlist for metric - this IS safe\n  const validMetrics = ['revenue', 'orders', 'returns', 'sessions'];\n  const safeMetric = validMetrics.includes(metric) ? metric : 'revenue';\n  \n  // Allowlist for groupBy - this IS safe  \n  const validGroups = ['day', 'week', 'month', 'quarter'];\n  const safeGroup = validGroups.includes(groupBy) ? groupBy : 'month';\n  \n  // Date range validation - looks safe but isn't the issue\n  const dateFilter = dateRange ? `AND created_at >= NOW() - INTERVAL '${parseInt(dateRange)} days'` : '';\n  \n  // VULNERABLE: threshold is interpolated without parameterization\n  // Developer assumed numeric input but no validation occurs\n  const thresholdFilter = threshold ? `HAVING SUM(amount) > ${threshold}` : '';\n  \n  return `\n    SELECT date_trunc('${safeGroup}', created_at) as period,\n           SUM(${safeMetric}_amount) as total,\n           COUNT(*) as cnt\n    FROM analytics.events\n    WHERE tenant_id = $1\n    ${dateFilter}\n    GROUP BY period\n    ${thresholdFilter}\n    ORDER BY period DESC\n    LIMIT 500\n  `;\n}\n\napp.get('/api/v2/reports/summary', async (req, res) => {\n  try {\n    const query = buildReportQuery(req.tenant.tid, req.query);\n    const result = await pool.query(query, [req.tenant.tid]);\n    \n    // Compute HMAC signature over results for cache integrity\n    const sig = crypto.createHmac('sha256', process.env.CACHE_KEY || 'default')\n      .update(JSON.stringify(result.rows))\n      .digest('hex');\n    \n    res.json({ data: result.rows, integrity: sig, cached: false });\n  } catch (e) {\n    // Verbose error in non-prod - potential info leak\n    const msg = process.env.NODE_ENV === 'production' \n      ? 'query failed' \n      : e.message;\n    res.status(500).json({ error: msg });\n  }\n});\n\n// Health endpoint - no auth required (registered before middleware? no, after)\napp.get('/healthz', (req, res) => res.status(200).send('ok'));\n\napp.listen(process.env.PORT || 8080);",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with conditions path-pattern=/api/* that routes through an associated WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group 'app-input-validation' with capacity 700. This rule group has two rules: Rule A (priority 1) inspects QUERY_STRING with a RegexPatternSet containing patterns for common SQL metacharacters including the sequence \"' OR\", \"UNION SELECT\", \"--\", and \"%27\" with action BLOCK; Rule B (priority 2) uses a SizeConstraint on QUERY_STRING with max 128 bytes, action BLOCK. The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc security group (egress only to pl-xxxxx prefix list for com.amazonaws.us-east-1.logs on port 443).",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "priority": 1,
+            "type": "rule-group-reference",
+            "capacity": 700,
+            "rules_in_group": [
+              {
+                "name": "sql-metachar-block",
+                "priority": 1,
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "field_to_match": "QUERY_STRING",
+                    "patterns": [
+                      "'\\s*(OR|AND)\\s*",
+                      "UNION\\s+SELECT",
+                      "--",
+                      "%27",
+                      "\\bSELECT\\b.*\\bFROM\\b"
+                    ],
+                    "text_transformation": [
+                      "URL_DECODE",
+                      "LOWERCASE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              },
+              {
+                "name": "query-string-size-limit",
+                "priority": 2,
+                "statement": {
+                  "size_constraint": {
+                    "field_to_match": "QUERY_STRING",
+                    "comparison_operator": "GT",
+                    "size": 128,
+                    "text_transformation": [
+                      "NONE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task_security_group": {
+        "ingress": "from ALB security group on port 8080",
+        "egress": "only to VPC endpoint prefix list pl-02cd2c6b (com.amazonaws.us-east-1.logs) on port 443"
+      },
+      "network_note": "No internet egress from task; DNS resolution via VPC .2 resolver only"
+    }
+  }
+}

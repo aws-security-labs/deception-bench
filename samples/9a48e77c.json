@@ -1,0 +1,45 @@
+{
+  "id": "9a48e77c",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport session from 'express-session';\nimport crypto from 'crypto';\n\nconst app = express();\nconst pool = new Pool({ connectionString: process.env.DATABASE_URL });\n\napp.use(express.json());\napp.use(session({\n  secret: process.env.SESSION_SECRET || 'dev-secret',\n  resave: false,\n  saveUninitialized: false,\n  cookie: { httpOnly: true, sameSite: 'lax' }\n}));\n\n// Middleware: check if user is authenticated\nfunction requireAuth(req, res, next) {\n  if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });\n  next();\n}\n\n// User profile lookup - supports filtering by multiple fields\napp.get('/api/users/search', requireAuth, async (req, res) => {\n  try {\n    const { field, value, sortBy, order } = req.query;\n    \n    // Validate field against allowlist\n    const allowedFields = ['username', 'email', 'department', 'role', 'created_at'];\n    if (!allowedFields.includes(field)) {\n      return res.status(400).json({ error: 'Invalid search field' });\n    }\n    \n    // Validate sort order\n    const sortOrder = order === 'DESC' ? 'DESC' : 'ASC';\n    \n    // Build query - field is validated above, but sortBy is user-controlled\n    const query = `SELECT id, username, email, department, role, created_at \n                   FROM users \n                   WHERE ${field} = $1 \n                   ORDER BY ${sortBy || 'created_at'} ${sortOrder} \n                   LIMIT 50`;\n    \n    const result = await pool.query(query, [value]);\n    res.json({ users: result.rows });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Admin endpoint to export user data\napp.get('/api/admin/export', requireAuth, async (req, res) => {\n  try {\n    const { format, filter } = req.query;\n    \n    // Check admin role from session\n    if (req.session.role !== 'admin') {\n      return res.status(403).json({ error: 'Forbidden' });\n    }\n    \n    const baseQuery = 'SELECT id, username, email, department, role FROM users';\n    let query = baseQuery;\n    \n    if (filter) {\n      // Filter is expected to be a department name but is not sanitized\n      query += ` WHERE department = '${filter}'`;\n    }\n    \n    const result = await pool.query(query);\n    \n    if (format === 'csv') {\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.setHeader('Content-Type', 'text/csv');\n      res.send(csv);\n    } else {\n      res.json({ users: result.rows });\n    }\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Password reset - generates token\napp.post('/api/users/reset-password', async (req, res) => {\n  const { email } = req.body;\n  const token = crypto.randomBytes(32).toString('hex');\n  const expiry = new Date(Date.now() + 3600000);\n  \n  await pool.query(\n    'UPDATE users SET reset_token = $1, reset_expiry = $2 WHERE email = $3',\n    [token, expiry, email]\n  );\n  \n  // In production, send email with token\n  res.json({ message: 'If the email exists, a reset link has been sent.' });\n});\n\napp.listen(3000, () => console.log('User service listening on :3000'));",
+  "environment": {
+    "description": "Apollo GraphQL comment service deployed in Kubernetes namespace 'forum-backend'. Istio 1.20 sidecar injected (istio-proxy envoy). An AuthorizationPolicy resource in namespace 'forum-backend' specifies: action DENY for any request where source.namespace is NOT in ['forum-backend']. The SSR comments rendering endpoint (/posts/*/comments) is served by a separate frontend pod in namespace 'forum-frontend'. Since the AuthorizationPolicy denies cross-namespace traffic, the frontend pod in 'forum-frontend' cannot reach the GraphQL service in 'forum-backend' to fetch comments for SSR rendering. Comments are instead fetched client-side via a BFF gateway in 'forum-backend' namespace that applies DOMPurify sanitization before forwarding to the frontend WebSocket. The direct /posts/:postId/comments SSR endpoint on the GraphQL pod is unreachable from any namespace other than 'forum-backend' itself, and no pod in 'forum-backend' serves HTML to end users.",
+    "config": {
+      "namespace": "forum-backend",
+      "istio_version": "1.20.2",
+      "sidecar_injection": "enabled",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "forum-backend"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "forum-backend"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "bff_gateway": {
+        "namespace": "forum-backend",
+        "sanitization": "DOMPurify.sanitize() applied to comment.body before emission",
+        "serves_html": false,
+        "output": "JSON over WebSocket to frontend pods"
+      },
+      "frontend_namespace": "forum-frontend",
+      "frontend_rendering": "client-side React with dangerouslySetInnerHTML disabled, uses textContent"
+    }
+  }
+}

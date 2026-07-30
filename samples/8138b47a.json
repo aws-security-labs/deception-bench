@@ -1,0 +1,78 @@
+{
+  "id": "8138b47a",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\napp.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-me')\napp.config['DB_PATH'] = os.environ.get('DB_PATH', '/data/users.db')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DB_PATH'])\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(app.config['DB_PATH'])\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT NOT NULL,\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    limit = request.args.get('limit', '20')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query - field is validated above so safe to interpolate\n    # But value is user-controlled and directly interpolated\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%' LIMIT {limit}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search\n        db.execute(\n            \"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n            ('search', f'field={field}, q={value}')\n        )\n        db.commit()\n        return jsonify({'users': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    auth = request.headers.get('X-API-Key')\n    if not auth:\n        return jsonify({'error': 'API key required'}), 401\n    \n    db = get_db()\n    user = db.execute(\n        'SELECT id, username, email, role FROM users WHERE id = ?',\n        (user_id,)\n    ).fetchone()\n    \n    if user is None:\n        return jsonify({'error': 'Not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data['password'].encode()).hexdigest()\n    api_key = hmac.new(app.config['SECRET_KEY'].encode(), \n                       data['username'].encode(), hashlib.sha256).hexdigest()[:32] if hasattr(hmac, 'new') else None\n    \n    try:\n        db = get_db()\n        db.execute(\n            'INSERT INTO users (username, email, role, password_hash, api_key) VALUES (?, ?, ?, ?, ?)',\n            (data['username'], data.get('email', ''), 'user', password_hash, api_key)\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'pid': os.getpid()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', False))",
+  "environment": {
+    "description": "Same application deployed in a hardened Kubernetes pod. The container runs with a restricted securityContext that drops CAP_NET_RAW and CAP_SYS_ADMIN capabilities (spec.containers[].securityContext.capabilities.drop: [NET_RAW, SYS_ADMIN]). The pod also has readOnlyRootFilesystem: true and runs as non-root (runAsNonRoot: true, runAsUser: 65534). A Cilium L7 NetworkPolicy is applied to the namespace that enforces HTTP-aware filtering on egress traffic from the proxy pod to the backend service, specifically limiting GraphQL query depth to 3 levels and blocking __schema/__type introspection fields in the POST body via a CiliumNetworkPolicy with L7 rules (matchPattern on JSON body). Additionally, the Cilium policy drops any egress packet where the resolved query references more than 2 relationship traversals as detected by the envoy sidecar filter parsing the proxied JSON payload.",
+    "config": {
+      "kubernetes_security_context": {
+        "capabilities": {
+          "drop": [
+            "NET_RAW",
+            "SYS_ADMIN"
+          ]
+        },
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "graphql-proxy"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "app": "internal-graphql"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "4000",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "http": [
+                      {
+                        "method": "POST",
+                        "path": "/graphql",
+                        "headerMatches": [
+                          {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ],
+              "l7Rules": {
+                "graphql": {
+                  "maxDepth": 3,
+                  "blockedFields": [
+                    "__schema",
+                    "__type"
+                  ],
+                  "maxRelationshipTraversals": 2
+                }
+              }
+            }
+          ]
+        }
+      },
+      "envoy_filter": "graphql-depth-limiter with max_depth=3, blocked_introspection=true"
+    }
+  }
+}

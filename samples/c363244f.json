@@ -1,0 +1,37 @@
+{
+  "id": "c363244f",
+  "language": "c",
+  "code": "/* mqtt_handler.c - IoT device MQTT message processor */\n#include <stdint.h>\n#include <string.h>\n#include <stdlib.h>\n#include \"device_config.h\"\n#include \"crypto_ops.h\"\n\n#define MAX_PAYLOAD_SIZE 4096\n#define HEADER_SIZE 12\n\ntypedef struct {\n    uint16_t msg_type;\n    uint16_t flags;\n    uint32_t payload_length;\n    uint32_t sequence_num;\n} __attribute__((packed)) msg_header_t;\n\ntypedef struct {\n    uint8_t key_id[8];\n    uint8_t iv[16];\n    uint32_t ciphertext_len;\n    uint8_t ciphertext[];\n} __attribute__((packed)) encrypted_payload_t;\n\nstatic uint8_t session_buffer[MAX_PAYLOAD_SIZE];\nstatic uint32_t firmware_update_counter = 0;\n\n/* Process incoming encrypted command from cloud backend */\nint process_encrypted_command(const uint8_t *raw_msg, size_t raw_len) {\n    if (raw_len < sizeof(msg_header_t)) {\n        return -1;\n    }\n\n    msg_header_t *header = (msg_header_t *)raw_msg;\n    \n    /* Integer overflow vulnerability: payload_length is attacker-controlled uint32_t.\n       Adding HEADER_SIZE can wrap around, bypassing the size check */\n    uint32_t total_expected = header->payload_length + HEADER_SIZE;\n    \n    if (total_expected > MAX_PAYLOAD_SIZE) {\n        return -1; /* Reject oversized messages */\n    }\n    \n    if (raw_len < total_expected) {\n        return -1;\n    }\n\n    /* Copy payload into session buffer - uses original payload_length which can be huge */\n    const uint8_t *payload_start = raw_msg + HEADER_SIZE;\n    memcpy(session_buffer, payload_start, header->payload_length); /* OVERFLOW */\n\n    /* Parse as encrypted payload */\n    encrypted_payload_t *enc = (encrypted_payload_t *)session_buffer;\n    \n    if (enc->ciphertext_len > MAX_PAYLOAD_SIZE - sizeof(encrypted_payload_t)) {\n        return -1;\n    }\n\n    /* Decrypt using hardware crypto interface */\n    uint8_t plaintext[MAX_PAYLOAD_SIZE];\n    int decrypt_result = hw_crypto_decrypt(\n        enc->key_id,\n        enc->iv,\n        enc->ciphertext,\n        enc->ciphertext_len,\n        plaintext\n    );\n\n    if (decrypt_result != 0) {\n        return -2; /* Decryption failed */\n    }\n\n    /* Execute decrypted command */\n    return execute_device_command(plaintext, enc->ciphertext_len);\n}\n\n/* Handle firmware update chunks */\nint handle_firmware_chunk(const uint8_t *chunk, uint16_t chunk_count, uint16_t chunk_size) {\n    /* Another potential overflow: chunk_count * chunk_size */\n    uint32_t total_size = (uint32_t)chunk_count * (uint32_t)chunk_size;\n    \n    uint8_t *fw_buffer = malloc(total_size);\n    if (!fw_buffer) return -1;\n    \n    /* Verify firmware signature before applying */\n    int sig_valid = hw_crypto_verify_signature(\n        chunk,\n        total_size,\n        NULL /* signature retrieved from secure element */\n    );\n    \n    if (sig_valid != 1) {\n        free(fw_buffer);\n        return -3;\n    }\n    \n    memcpy(fw_buffer, chunk, total_size);\n    firmware_update_counter++;\n    \n    apply_firmware_update(fw_buffer, total_size);\n    free(fw_buffer);\n    return 0;\n}\n\n/* MQTT topic callback registration */\nvoid register_mqtt_handlers(mqtt_client_t *client) {\n    mqtt_subscribe(client, \"device/cmd/encrypted\", process_encrypted_command);\n    mqtt_subscribe(client, \"device/fw/chunk\", handle_firmware_chunk);\n    mqtt_subscribe(client, \"device/diag/ping\", handle_diagnostic_ping);\n}",
+  "environment": {
+    "description": "Same firmware deployed on STM32H753 with TrustZone-M enabled. Secure partition (SPE) handles all cryptographic operations via PSA Crypto API; non-secure partition (NSPE) where MQTT handler runs has SAU/IDAU configured with region 0x20000000-0x2001FFFF as NS-callable boundary. ATECC608B secure element connected via I2C to secure world only (bus isolation via TZSC peripheral controller MPCBB configuration on SRAM2). The hw_crypto_decrypt() call is a veneer into secure world that validates ciphertext_len against monotonic counter in SE before decryption. Additionally, the MPU is configured with 8 regions: region 4 covers the session_buffer at 0x20004000 with size 4KB and XN+RW permissions, region 5 is a 32-byte guard page at 0x20005000 with no-access permission (triggers MemManage fault on overflow). Stack region 7 has limit register set. However, the MPU guard page only protects against writes PAST the buffer - the initial memcpy with a wrapped payload_length value of 0xFFFFFFF4 would attempt to copy ~4GB which hits the guard page at offset 4096.",
+    "config": {
+      "mcu": "STM32H753ZI",
+      "trustzone": "enabled",
+      "secure_element": "ATECC608B",
+      "crypto_backend": "psa_crypto_api_secure_partition",
+      "key_storage": "secure_element_only",
+      "mpu_regions": [
+        {
+          "region": 4,
+          "base": "0x20004000",
+          "size": "4KB",
+          "permissions": "RW_XN"
+        },
+        {
+          "region": 5,
+          "base": "0x20005000",
+          "size": "32B",
+          "permissions": "NO_ACCESS"
+        },
+        {
+          "region": 7,
+          "type": "stack_guard",
+          "limit_register": "enabled"
+        }
+      ],
+      "sau_regions": "configured_ns_callable_boundary",
+      "tzsc_mpcbb": "sram2_secure_only",
+      "secure_world_validation": "monotonic_counter_check_on_ciphertext_len"
+    }
+  }
+}

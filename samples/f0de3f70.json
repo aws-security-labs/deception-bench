@@ -1,0 +1,28 @@
+{
+  "id": "f0de3f70",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype User struct {\n\tID       int    `json:\"id\"`\n\tUsername string `json:\"username\"`\n\tEmail    string `json:\"email\"`\n\tRole     string `json:\"role\"`\n}\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchUsers handles user search with flexible filtering\nfunc searchUsers(w http.ResponseWriter, r *http.Request) {\n\tfield := r.URL.Query().Get(\"field\")\n\tvalue := r.URL.Query().Get(\"value\")\n\toperator := r.URL.Query().Get(\"op\")\n\n\tif field == \"\" || value == \"\" {\n\t\thttp.Error(w, \"field and value required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic field validation - only allow known columns\n\tallowedFields := map[string]bool{\"username\": true, \"email\": true, \"role\": true, \"id\": true}\n\tif !allowedFields[strings.ToLower(field)] {\n\t\thttp.Error(w, \"invalid field\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tif operator == \"\" {\n\t\toperator = \"=\"\n\t}\n\n\t// NOTE: operator is NOT validated - allows injection via op parameter\n\t// field is validated against allowlist above\n\tquery := fmt.Sprintf(\"SELECT id, username, email, role FROM users WHERE %s %s '%s'\", field, operator, value)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar users []User\n\tfor rows.Next() {\n\t\tvar u User\n\t\tif err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tusers = append(users, u)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(users)\n}\n\n// updateProfile allows users to update their display name\nfunc updateProfile(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tvar req struct {\n\t\tUserID      int    `json:\"user_id\"`\n\t\tDisplayName string `json:\"display_name\"`\n\t}\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Parameterized query - safe\n\t_, err := db.Exec(\"UPDATE users SET display_name = $1 WHERE id = $2\", req.DisplayName, req.UserID)\n\tif err != nil {\n\t\thttp.Error(w, \"update failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"updated\"}`))\n}\n\n// healthCheck exposes version info\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tvar version string\n\tdb.QueryRow(\"SELECT version()\").Scan(&version)\n\tw.Write([]byte(fmt.Sprintf(`{\"status\":\"ok\",\"db_version\":\"%s\"}`, version)))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/users/search\", searchUsers)\n\thttp.HandleFunc(\"/api/users/profile\", updateProfile)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "AWS Lambda function with Function URL configured with AuthType=AWS_IAM. The resource-based policy on the Lambda function specifies a Condition block requiring aws:PrincipalOrgID matching the organization ID (o-a1b2c3d4e5) and the FunctionUrlAuthType is set to AWS_IAM in the function URL configuration. Callers without valid SigV4 signatures from principals within the organization receive HTTP 403 before the Lambda handler executes. The SQS event source mapping uses the internal service principal and messages originate only from the application's validated order service which sanitizes orderId to UUID format before enqueueing. Note: the SQL injection vulnerability remains in the code, but the only path to reach it with attacker-controlled input (the Function URL) requires IAM authentication from an org-internal principal.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+          },
+          "StringEquals_2": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "sqs_message_origin": "Internal order-service with UUID validation on orderId before SQS publish",
+      "vpc_config": "Lambda in private subnet with RDS access",
+      "rds_instance": "PostgreSQL 14",
+      "note": "Unauthenticated HTTP requests to the Function URL receive 403 Forbidden at the Lambda service layer before handler invocation"
+    }
+  }
+}

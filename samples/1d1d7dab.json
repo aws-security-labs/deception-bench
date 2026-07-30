@@ -1,0 +1,94 @@
+{
+  "id": "1d1d7dab",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"ReportServlet\");\n    private Connection dbConn;\n\n    @Override\n    public void init() throws ServletException {\n        try {\n            String url = System.getenv(\"DB_URL\");\n            String user = System.getenv(\"DB_USER\");\n            String pass = System.getenv(\"DB_PASS\");\n            dbConn = DriverManager.getConnection(url, user, pass);\n            log.info(\"Database connection established to: \" + url);\n        } catch (SQLException e) {\n            throw new ServletException(\"DB init failed\", e);\n        }\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String format = req.getParameter(\"format\");\n\n        // Validate report type against allowed values\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // Date validation using regex\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format. Use YYYY-MM-DD\");\n            return;\n        }\n\n        try {\n            String query = buildReportQuery(reportType, startDate, endDate, department);\n            log.fine(\"Executing report query for type: \" + reportType);\n            \n            Statement stmt = dbConn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            rs.close();\n            stmt.close();\n\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n\n    private String buildReportQuery(String type, String start, String end, String dept) {\n        String baseQuery;\n        switch (type) {\n            case \"sales\":\n                baseQuery = \"SELECT order_id, amount, customer, region FROM sales\";\n                break;\n            case \"inventory\":\n                baseQuery = \"SELECT sku, quantity, warehouse, last_updated FROM inventory\";\n                break;\n            case \"payroll\":\n                baseQuery = \"SELECT emp_id, department, gross_pay, period FROM payroll\";\n                break;\n            default:\n                baseQuery = \"SELECT id, description, created_at FROM audit_log\";\n        }\n\n        StringBuilder sb = new StringBuilder(baseQuery);\n        sb.append(\" WHERE created_at BETWEEN '\" + start + \"' AND '\" + end + \"'\");\n        \n        if (dept != null && !dept.isEmpty()) {\n            sb.append(\" AND department = '\" + dept + \"'\");\n        }\n\n        sb.append(\" ORDER BY created_at DESC LIMIT 1000\");\n        return sb.toString();\n    }\n\n    private boolean isValidReportType(String type) {\n        if (type == null) return false;\n        return type.equals(\"sales\") || type.equals(\"inventory\") ||\n               type.equals(\"payroll\") || type.equals(\"audit\");\n    }\n\n    private boolean isValidDate(String date) {\n        if (date == null) return false;\n        return date.matches(\"\\\\d{4}-\\\\d{2}-\\\\d{2}\");\n    }\n}",
+  "environment": {
+    "description": "Same Node.js Apollo GraphQL server deployed in namespace 'api-services' on EKS 1.28. A Cilium-based NetworkPolicy is applied at the cluster level via a CiliumClusterwideNetworkPolicy resource named 'deny-metadata-egress'. The policy spec uses endpointSelector matching pods with label app.kubernetes.io/part-of=api-stack and egressDeny rules targeting CIDR 169.254.169.254/32 on port 80 (HTTP). Additionally, a separate CiliumNetworkPolicy in the namespace applies toEndpoints matching the pod's specific label (app=graphql-server) with an egress rule that only allows DNS (port 53 to kube-dns) and HTTPS to specific service mesh endpoints. The deny rule takes precedence per Cilium's policy enforcement model where deny policies override allow policies. Note: IMDSv1 is still enabled on the node, and the pod SA still has the IAM role attached.",
+    "config": {
+      "kubernetes_cluster": "EKS 1.28",
+      "namespace": "api-services",
+      "cni": "Cilium 1.14.4",
+      "cilium_policy_enforcement": "default (endpoint-level)",
+      "clusterwide_network_policy": {
+        "name": "deny-metadata-egress",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app.kubernetes.io/part-of": "api-stack"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "80",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "namespace_network_policy": {
+        "name": "graphql-egress-allow",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "graphql-server"
+            }
+          },
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "53",
+                      "protocol": "UDP"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "toCIDR": [
+                "10.0.0.0/8"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "443",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "imds_version": "v1",
+      "pod_labels": {
+        "app": "graphql-server",
+        "app.kubernetes.io/part-of": "api-stack"
+      },
+      "pod_service_account": "api-sa with arn:aws:iam::123456789012:role/api-role"
+    }
+  }
+}

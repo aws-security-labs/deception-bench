@@ -1,0 +1,51 @@
+{
+  "id": "9a0a9198",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Document struct {\n\tID    int    `json:\"id\"`\n\tTitle string `json:\"title\"`\n\tOwner string `json:\"owner\"`\n\tBody  string `json:\"body\"`\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tcategory := r.URL.Query().Get(\"cat\")\n\towner := r.URL.Query().Get(\"owner\")\n\n\t// Sanitize the main search query using parameterized approach\n\tbaseQuery := \"SELECT id, title, owner, body FROM documents WHERE to_tsvector('english', body) @@ plainto_tsquery('english', $1)\"\n\targs := []interface{}{query}\n\targIdx := 2\n\n\t// Apply category filter with whitelist\n\tvalidCategories := map[string]bool{\"public\": true, \"internal\": true, \"draft\": true}\n\tif category != \"\" && validCategories[category] {\n\t\tbaseQuery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\t// Owner filter - uses string formatting for the LIKE clause\n\t// Developer note: owner is always an email, validated client-side\n\tif owner != \"\" {\n\t\t// Strip obvious dangerous chars but allow normal email chars\n\t\tcleaned := strings.ReplaceAll(owner, \";\", \"\")\n\t\tcleaned = strings.ReplaceAll(cleaned, \"--\", \"\")\n\t\tbaseQuery += fmt.Sprintf(\" AND owner LIKE '%%%s%%'\", cleaned)\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Document\n\tfor rows.Next() {\n\t\tvar doc Document\n\t\tif err := rows.Scan(&doc.ID, &doc.Title, &doc.Owner, &doc.Body); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, doc)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// createDocument uses proper parameterized queries\nfunc createDocument(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodPost {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tvar doc Document\n\tif err := json.NewDecoder(r.Body).Decode(&doc); err != nil {\n\t\thttp.Error(w, \"Bad request\", 400)\n\t\treturn\n\t}\n\n\t_, err := db.Exec(\n\t\t\"INSERT INTO documents (title, owner, body) VALUES ($1, $2, $3)\",\n\t\tdoc.Title, doc.Owner, doc.Body,\n\t)\n\tif err != nil {\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\n\tw.WriteHeader(http.StatusCreated)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchDocuments)\n\thttp.HandleFunc(\"/api/documents\", createDocument)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Deployed identically on ECS Fargate behind an internet-facing ALB. However, the ALB is associated with an AWS WAFv2 WebACL. The WebACL contains three rule groups evaluated in priority order: (1) Priority 0: AWS Managed Rule Group 'AWSManagedRulesCommonRuleSet' with all rules in COUNT mode except 'SizeRestrictions_QUERYSTRING' which is in BLOCK mode (blocks query strings > 2048 bytes); (2) Priority 1: A custom rule group 'inventory-app-sqli-body' that inspects ONLY the request BODY with SqliMatchStatement and action BLOCK; (3) Priority 2: AWS Managed Rule Group 'AWSManagedRulesSQLiRuleSet' with override action NONE (meaning individual rule actions apply), which inspects ALL request components including query string parameters, URI path, and headers using the built-in SQLi detection engine. The WebACL default action is ALLOW. CloudWatch metrics confirm the SQLiRuleSet triggers on single-quote injection patterns in query parameters.",
+    "config": {
+      "alb": "internet-facing, HTTPS:443 -> TG:8080",
+      "alb_rules": "default forward, WAF WebACL associated",
+      "ecs_task": "fargate, 512MB, same as exploitable",
+      "database": "SQLite on EFS mount /var/data/inventory.db",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 0,
+            "name": "CommonRuleSet",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "override_action": "COUNT",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "BLOCK"
+              }
+            ]
+          },
+          {
+            "priority": 1,
+            "name": "inventory-app-sqli-body",
+            "type": "custom",
+            "statement": "SqliMatchStatement on BODY only",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 2,
+            "name": "SQLiRuleSet",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "override_action": "NONE",
+            "inspected_components": [
+              "QUERY_STRING",
+              "URI_PATH",
+              "BODY",
+              "SINGLE_HEADER(cookie)",
+              "SINGLE_HEADER(authorization)"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

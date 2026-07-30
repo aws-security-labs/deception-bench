@@ -1,0 +1,22 @@
+{
+  "id": "ebcaba7f",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\nimport { readFileSync } from 'fs';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  host: process.env.DB_HOST,\n  port: parseInt(process.env.DB_PORT || '5432'),\n  database: 'appdb',\n  user: process.env.DB_USER,\n  password: process.env.DB_PASS,\n  ssl: { ca: readFileSync('/etc/ssl/rds-ca.pem') },\n  max: 20\n});\n\n// Middleware: extract tenant from JWT\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-auth-token'];\n  if (!token) return res.status(401).json({ error: 'unauthorized' });\n  try {\n    const [, payload] = token.split('.');\n    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString());\n    req.tenantId = decoded.tenant_id;\n    req.userId = decoded.sub;\n    next();\n  } catch (e) {\n    return res.status(401).json({ error: 'invalid token' });\n  }\n}\n\n// Search endpoint with full-text search\napp.get('/api/v2/documents/search', extractTenant, async (req, res) => {\n  const { q, limit = '20', offset = '0', fields } = req.query;\n  \n  if (!q || typeof q !== 'string' || q.length > 500) {\n    return res.status(400).json({ error: 'invalid query parameter' });\n  }\n  \n  const maxLimit = Math.min(parseInt(limit) || 20, 100);\n  const offsetVal = parseInt(offset) || 0;\n  \n  // Build field selection - defaults to safe set\n  let selectFields = 'id, title, snippet, created_at, author';\n  if (fields && typeof fields === 'string') {\n    // Allow caller to specify return fields for performance\n    const requested = fields.split(',').map(f => f.trim());\n    const allowed = ['id', 'title', 'snippet', 'created_at', 'author', 'category', 'tags', 'word_count'];\n    const validated = requested.filter(f => allowed.includes(f));\n    if (validated.length > 0) {\n      selectFields = validated.join(', ');\n    }\n  }\n  \n  // Build search query with ts_rank ordering\n  // The search term is parameterized but we build a dynamic ts_query\n  const searchConfig = req.query.config || 'english';\n  \n  const query = `\n    SELECT ${selectFields},\n           ts_rank(search_vector, to_tsquery('${searchConfig}', $1)) as relevance\n    FROM documents\n    WHERE tenant_id = $2\n      AND search_vector @@ to_tsquery('${searchConfig}', $1)\n    ORDER BY relevance DESC\n    LIMIT $3 OFFSET $4\n  `;\n  \n  try {\n    // Normalize search input for tsquery\n    const normalizedQ = q.replace(/[^\\w\\s&|!()]/g, '').trim();\n    const result = await pool.query(query, [normalizedQ, req.tenantId, maxLimit, offsetVal]);\n    \n    res.json({\n      results: result.rows,\n      total: result.rowCount,\n      query: q,\n      offset: offsetVal\n    });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'search failed' });\n  }\n});\n\n// Document detail endpoint\napp.get('/api/v2/documents/:id', extractTenant, async (req, res) => {\n  const { id } = req.params;\n  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {\n    return res.status(400).json({ error: 'invalid document id' });\n  }\n  \n  const result = await pool.query(\n    'SELECT * FROM documents WHERE id = $1 AND tenant_id = $2',\n    [id, req.tenantId]\n  );\n  \n  if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });\n  res.json(result.rows[0]);\n});\n\napp.listen(8080, () => console.log('Document service listening on 8080'));",
+  "environment": {
+    "description": "ECS Fargate task running in a private subnet with an IAM task role (arn:aws:iam::111122223333:role/task-executor-role) that has dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query on the task table with no condition keys. The service is exposed via an internal ALB with no request filtering. Container runs as root with default seccomp profile (unconfined). The gob decoder accepts arbitrary registered types including exec.Cmd.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/task-execution-log"
+      },
+      "network": "internal ALB, no WAF, no request inspection",
+      "container": "root user, unconfined seccomp, CAP_SYS_ADMIN retained",
+      "runtime": "ECS Fargate, no read-only filesystem"
+    }
+  }
+}

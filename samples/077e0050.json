@@ -1,0 +1,68 @@
+{
+  "id": "077e0050",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom filter: blocks common attack keywords but allows legitimate queries\n    private static final Pattern BLOCKED_PATTERN = Pattern.compile(\n        \"(UNION\\\\s+ALL|SLEEP\\\\s*\\\\(|BENCHMARK\\\\s*\\\\(|LOAD_FILE|INTO\\\\s+OUTFILE)\",\n        Pattern.CASE_INSENSITIVE\n    );\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String sortCol = req.getParameter(\"sort\");\n        String orgId = req.getParameter(\"org_id\");\n        \n        if (reportType == null || dateRange == null || orgId == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Input validation on reportType\n        if (!reportType.matches(\"^(sales|inventory|audit)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date range format\n        if (!dateRange.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}$\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n        \n        // Check for obvious attack patterns\n        if (sortCol != null && BLOCKED_PATTERN.matcher(sortCol).find()) {\n            resp.sendError(403, \"Blocked\");\n            return;\n        }\n        \n        String[] dates = dateRange.split(\"_\");\n        String startDate = dates[0];\n        String endDate = dates[1];\n        \n        // sortCol is used directly in ORDER BY - parameterization not possible for identifiers\n        String orderClause = \"created_at ASC\";\n        if (sortCol != null && sortCol.length() < 64) {\n            // We \"sanitize\" by removing semicolons and comments\n            sortCol = sortCol.replace(\";\", \"\").replace(\"--\", \"\").replace(\"/*\", \"\");\n            orderClause = sortCol;\n        }\n        \n        String sql = \"SELECT id, item_name, quantity, total_price, created_at \" +\n                     \"FROM report_\" + reportType + \" \" +\n                     \"WHERE org_id = ? AND created_at BETWEEN ? AND ? \" +\n                     \"ORDER BY \" + orderClause + \" LIMIT 500\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(sql)) {\n            \n            stmt.setString(1, orgId);\n            stmt.setString(2, startDate);\n            stmt.setString(3, endDate);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"item_name\", rs.getString(\"item_name\"));\n                row.put(\"quantity\", rs.getInt(\"quantity\"));\n                row.put(\"total_price\", rs.getDouble(\"total_price\"));\n                row.put(\"created_at\", rs.getString(\"created_at\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            // Log but don't expose SQL details\n            getServletContext().log(\"DB error in report generation\", e);\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Laravel 10 on AWS ECS Fargate with a read-only root filesystem (readonlyRootFilesystem: true in task definition). The /storage/app/exports volume is an ephemeral tmpfs mount with 'nosuid,nodev,noexec' options configured via ECS volume mount. PostgreSQL 14 on RDS with row-level security policies active: the database role used by the application (tenant_app_role) has a connection-level variable app.current_tenant set via a Laravel middleware that issues SET LOCAL, and all tables have RLS policies of the form 'USING (tenant_id = current_setting(''app.current_tenant'')::uuid)' with FORCE ROW LEVEL SECURITY enabled on the role. Additionally, the ECS task runs with a custom seccomp profile that filters the symlink(2), symlinkat(2), and link(2) syscalls (returns EPERM), applied via the linuxParameters.seccompProfile field in the container definition pointing to a profile stored in SSM Parameter Store.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "volumes": [
+          {
+            "name": "exports-tmpfs",
+            "host": {},
+            "dockerVolumeConfiguration": null
+          }
+        ],
+        "mountPoints": [
+          {
+            "sourceVolume": "exports-tmpfs",
+            "containerPath": "/var/www/html/storage/app/exports",
+            "readOnly": false
+          }
+        ],
+        "tmpfs": [
+          {
+            "containerPath": "/var/www/html/storage/app/exports",
+            "size": 512,
+            "mountOptions": [
+              "nosuid",
+              "nodev",
+              "noexec"
+            ]
+          }
+        ],
+        "linuxParameters": {
+          "seccompProfile": {
+            "type": "SSM",
+            "value": "arn:aws:ssm:us-east-1:123456789:parameter/ecs/seccomp/no-symlinks"
+          }
+        }
+      },
+      "db_config": {
+        "engine": "PostgreSQL 14 on RDS",
+        "role": "tenant_app_role",
+        "rls_enabled": true,
+        "rls_policy": "USING (tenant_id = current_setting('app.current_tenant')::uuid)",
+        "force_rls": true,
+        "middleware_sets": "SET LOCAL app.current_tenant = :tenant_id on every request"
+      },
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "symlink",
+              "symlinkat",
+              "link",
+              "linkat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          }
+        ]
+      }
+    }
+  }
+}

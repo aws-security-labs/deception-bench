@@ -1,0 +1,29 @@
+{
+  "id": "b25ccc0e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// buildReportQuery constructs a dynamic query for the reporting dashboard.\n// The caller specifies which columns to aggregate and filter conditions.\nfunc buildReportQuery(table, columns, whereClause string) string {\n\t// We restrict table names to known reporting views\n\tallowedTables := map[string]bool{\n\t\t\"sales_summary\":    true,\n\t\t\"inventory_report\": true,\n\t\t\"user_activity\":    true,\n\t}\n\tif !allowedTables[table] {\n\t\ttable = \"sales_summary\"\n\t}\n\n\t// Basic column validation - only allow alphanumeric and underscores\n\tfor _, col := range strings.Split(columns, \",\") {\n\t\tcol = strings.TrimSpace(col)\n\t\tfor _, ch := range col {\n\t\t\tif !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == ' ') {\n\t\t\t\tcolumns = \"*\"\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n\n\t// WARNING: whereClause is not parameterized due to dynamic filter requirements\n\t// TODO: implement proper parameterization for complex filter expressions\n\tquery := fmt.Sprintf(\"SELECT %s FROM %s WHERE %s\", columns, table, whereClause)\n\treturn query\n}\n\nfunc reportHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\ttable := r.URL.Query().Get(\"table\")\n\tcolumns := r.URL.Query().Get(\"columns\")\n\tfilter := r.URL.Query().Get(\"filter\")\n\n\tif table == \"\" || columns == \"\" || filter == \"\" {\n\t\thttp.Error(w, \"Missing required parameters\", 400)\n\t\treturn\n\t}\n\n\t// Length check on filter to prevent overly complex queries\n\tif len(filter) > 500 {\n\t\thttp.Error(w, \"Filter too long\", 400)\n\t\treturn\n\t}\n\n\tquery := buildReportQuery(table, columns, filter)\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tcols, _ := rows.Columns()\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tfmt.Fprintf(w, \"Columns: %s\\n\", strings.Join(cols, \", \"))\n\n\tvalues := make([]interface{}, len(cols))\n\tptrs := make([]interface{}, len(cols))\n\tfor i := range values {\n\t\tptrs[i] = &values[i]\n\t}\n\n\tfor rows.Next() {\n\t\trows.Scan(ptrs...)\n\t\tfor i, v := range values {\n\t\t\tif i > 0 {\n\t\t\t\tfmt.Fprint(w, \" | \")\n\t\t\t}\n\t\t\tfmt.Fprintf(w, \"%v\", v)\n\t\t}\n\t\tfmt.Fprintln(w)\n\t}\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/report\", reportHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting report service on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "AWS Lambda function behind API Gateway (REST API) with proxy integration. Lambda connects to MongoDB Atlas M10 via mongos proxy sidecar (mongodb-query-proxy v2.3.1) running as ECS Fargate task in the same VPC. The proxy implements a prepared-statement-style parameterization layer: incoming find() operations are intercepted and any query document values containing MongoDB operator keys ($gt, $lt, $ne, $regex, $where, $exists, $in, $nin, $or, $and, $not, $nor, $expr, $elemMatch, $type) at any nesting depth are coerced to literal string comparison rather than interpreted as operators. The proxy configuration sets `strict_literal_mode: true` and `operator_passthrough: []` (empty allowlist). The MONGO_URI environment variable points to the proxy (mongodb://proxy.internal:27017) not directly to Atlas. Additionally, API Gateway has a request validator on the POST method requiring Content-Type: application/json with a JSON Schema model that constrains the 'filter' property to type object with additionalProperties restricted to type string only (no nested objects allowed in the schema). The schema validation returns 400 before the Lambda is invoked for non-conforming bodies.",
+    "config": {
+      "runtime": "python3.11",
+      "api_gateway": "REST API, proxy integration, request validator enabled on POST /users/search",
+      "request_body_schema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "mongodb_proxy": "mongodb-query-proxy v2.3.1 ECS Fargate sidecar, strict_literal_mode: true, operator_passthrough: []",
+      "mongo_uri_target": "mongodb://proxy.internal:27017 (proxy, not direct Atlas)",
+      "database": "MongoDB Atlas M10 behind proxy",
+      "mongo_user_role": "read@appdb (read-only)",
+      "network": "Lambda VPC -> proxy ECS task -> Atlas private endpoint",
+      "waf": "none"
+    }
+  }
+}

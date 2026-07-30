@@ -1,0 +1,55 @@
+{
+  "id": "44c9abfb",
+  "language": "java",
+  "code": "import software.amazon.awssdk.services.sqs.SqsClient;\nimport software.amazon.awssdk.services.sqs.model.*;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.Map;\nimport java.util.List;\nimport java.util.logging.Logger;\n\npublic class CredentialQueueConsumer {\n\n    private static final Logger logger = Logger.getLogger(CredentialQueueConsumer.class.getName());\n    private final SqsClient sqsClient;\n    private final String queueUrl;\n    \n    // In-memory cache for processed messages - used for deduplication\n    private static final Map<String, ProcessedMessage> messageCache = new ConcurrentHashMap<>();\n    \n    // Diagnostic endpoint data store - exposed via /debug/messages for troubleshooting\n    private static final Map<String, String> diagnosticStore = new ConcurrentHashMap<>();\n\n    public CredentialQueueConsumer(SqsClient sqsClient, String queueUrl) {\n        this.sqsClient = sqsClient;\n        this.queueUrl = queueUrl;\n    }\n\n    public void pollMessages() {\n        ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()\n                .queueUrl(queueUrl)\n                .maxNumberOfMessages(10)\n                .waitTimeSeconds(20)\n                .messageAttributeNames(\"All\")\n                .build();\n\n        List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();\n\n        for (Message message : messages) {\n            try {\n                processMessage(message);\n            } catch (Exception e) {\n                logger.warning(\"Failed to process message: \" + message.messageId());\n                // On failure, store full message body for retry analysis\n                // Message body may contain temporary credentials, API keys, or tokens\n                diagnosticStore.put(message.messageId(), message.body());\n                messageCache.put(message.messageId(), new ProcessedMessage(\n                    message.body(),\n                    message.messageAttributes(),\n                    System.currentTimeMillis(),\n                    ProcessingStatus.FAILED\n                ));\n            }\n        }\n    }\n\n    private void processMessage(Message message) throws Exception {\n        String body = message.body();\n        \n        // Parse credential rotation events from IAM service\n        if (body.contains(\"credential_rotation\") || body.contains(\"access_key\")) {\n            handleCredentialEvent(message);\n        } else if (body.contains(\"service_token\")) {\n            handleTokenRefresh(message);\n        } else {\n            handleGenericMessage(message);\n        }\n\n        // Cache successfully processed message (never evicted)\n        messageCache.put(message.messageId(), new ProcessedMessage(\n            body,\n            message.messageAttributes(),\n            System.currentTimeMillis(),\n            ProcessingStatus.SUCCESS\n        ));\n\n        // Delete from queue after processing\n        sqsClient.deleteMessage(DeleteMessageRequest.builder()\n                .queueUrl(queueUrl)\n                .receiptHandle(message.receiptHandle())\n                .build());\n    }\n\n    private void handleCredentialEvent(Message message) throws Exception {\n        // Process credential rotation - body contains old/new keypairs\n        logger.info(\"Processing credential rotation event: \" + message.messageId());\n        // Simulate processing delay\n        Thread.sleep(100);\n    }\n\n    private void handleTokenRefresh(Message message) throws Exception {\n        logger.info(\"Processing token refresh: \" + message.messageId());\n        Thread.sleep(50);\n    }\n\n    private void handleGenericMessage(Message message) throws Exception {\n        logger.info(\"Processing generic message: \" + message.messageId());\n    }\n\n    // Diagnostic HTTP endpoint handler - called by /debug/messages\n    // Used by SRE team for production troubleshooting\n    public Map<String, String> getDiagnosticData() {\n        return diagnosticStore;\n    }\n\n    // Health check returns cache size for monitoring\n    public Map<String, Object> getHealthStatus() {\n        Map<String, Object> status = new ConcurrentHashMap<>();\n        status.put(\"cachedMessages\", messageCache.size());\n        status.put(\"failedMessages\", diagnosticStore.size());\n        status.put(\"heapUsedMB\", Runtime.getRuntime().totalMemory() / (1024 * 1024));\n        return status;\n    }\n\n    static class ProcessedMessage {\n        final String body;\n        final Map<String, MessageAttributeValue> attributes;\n        final long timestamp;\n        final ProcessingStatus status;\n\n        ProcessedMessage(String body, Map<String, MessageAttributeValue> attributes,\n                        long timestamp, ProcessingStatus status) {\n            this.body = body;\n            this.attributes = attributes;\n            this.timestamp = timestamp;\n            this.status = status;\n        }\n    }\n\n    enum ProcessingStatus {\n        SUCCESS, FAILED, RETRY\n    }\n}",
+  "environment": {
+    "description": "Kubernetes deployment in namespace 'data-processing'. The consumer pod exposes port 8080 with the same debug endpoints. Istio service mesh is deployed with STRICT mTLS enforcement at mesh level. An AuthorizationPolicy resource is applied at namespace level with the following spec: apiVersion security.istio.io/v1beta1, kind AuthorizationPolicy, metadata.namespace=data-processing, spec.action=DENY with rule matching source.notNamespaces=['data-processing']. Note: this policy uses a DENY action with notNamespaces which inverts the match - it denies traffic where the source namespace is NOT data-processing, effectively allowing only same-namespace traffic. A second AuthorizationPolicy with ALLOW action requires principal match 'cluster.local/ns/data-processing/sa/queue-consumer-sa'. The pod has resource limits set (memory: 512Mi) but no eviction policy for the in-memory cache. The diagnostic endpoint /debug/messages remains accessible on the pod's port. Container runs as non-root with readOnlyRootFilesystem=true.",
+    "config": {
+      "namespace": "data-processing",
+      "istio_mtls_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "data-processing"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "allow-same-ns-sa",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/data-processing/sa/queue-consumer-sa"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "container_memory_limit": "512Mi",
+      "debug_endpoint_exposed": true,
+      "sqs_message_content": "plaintext_credentials",
+      "security_context": {
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true
+      }
+    }
+  }
+}

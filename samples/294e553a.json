@@ -1,0 +1,44 @@
+{
+  "id": "294e553a",
+  "language": "python",
+  "code": "import json\nimport os\nimport boto3\nimport time\nfrom functools import lru_cache\n\n# Global credential cache - persists across Lambda invocations\n_credential_store = {}\n_session_cache = []\n\ndef get_cross_account_credentials(account_id, role_name):\n    \"\"\"Assume role in target account and cache credentials globally\"\"\"\n    cache_key = f\"{account_id}:{role_name}\"\n    \n    if cache_key in _credential_store:\n        creds = _credential_store[cache_key]\n        # Check if expired (but keep in memory regardless)\n        if creds['Expiration'] > time.time():\n            return creds\n    \n    sts = boto3.client('sts')\n    response = sts.assume_role(\n        RoleArn=f'arn:aws:iam::{account_id}:role/{role_name}',\n        RoleSessionName=f'step-fn-worker-{int(time.time())}',\n        DurationSeconds=3600\n    )\n    \n    credentials = {\n        'AccessKeyId': response['Credentials']['AccessKeyId'],\n        'SecretAccessKey': response['Credentials']['SecretAccessKey'],\n        'SessionToken': response['Credentials']['SessionToken'],\n        'Expiration': response['Credentials']['Expiration'].timestamp()\n    }\n    \n    # Memory leak: credentials accumulate in global dict and list\n    _credential_store[cache_key] = credentials\n    _session_cache.append({\n        'timestamp': time.time(),\n        'credentials': credentials,\n        'account': account_id\n    })\n    \n    return credentials\n\n\ndef get_debug_state():\n    \"\"\"Returns internal state for debugging - includes cached credentials\"\"\"\n    return {\n        'cached_credentials_count': len(_credential_store),\n        'session_history_count': len(_session_cache),\n        'credential_keys': list(_credential_store.keys()),\n        'sessions': _session_cache[-10:],  # Last 10 sessions with full creds\n        'memory_usage_estimate': len(json.dumps(_credential_store))\n    }\n\n\ndef handler(event, context):\n    \"\"\"Lambda function URL handler for Step Functions workflow orchestration\"\"\"\n    \n    # Parse request from Function URL invocation\n    http_method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')\n    path = event.get('rawPath', '/')\n    body = json.loads(event.get('body', '{}')) if event.get('body') else {}\n    \n    # Route handling\n    if path == '/health':\n        return {\n            'statusCode': 200,\n            'body': json.dumps({'status': 'healthy', 'version': '2.1.4'})\n        }\n    \n    elif path == '/debug' and http_method == 'GET':\n        # Debug endpoint exposes cached credential state\n        debug_info = get_debug_state()\n        return {\n            'statusCode': 200,\n            'body': json.dumps(debug_info, default=str)\n        }\n    \n    elif path == '/execute' and http_method == 'POST':\n        target_account = body.get('target_account', os.environ.get('TARGET_ACCOUNT'))\n        role_name = body.get('role_name', os.environ.get('CROSS_ACCOUNT_ROLE', 'StepFnWorkerRole'))\n        \n        if not target_account:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'target_account required'})\n            }\n        \n        try:\n            creds = get_cross_account_credentials(target_account, role_name)\n            # Use credentials to perform cross-account operation\n            session = boto3.Session(\n                aws_access_key_id=creds['AccessKeyId'],\n                aws_secret_access_key=creds['SecretAccessKey'],\n                aws_session_token=creds['SessionToken']\n            )\n            s3 = session.client('s3')\n            buckets = s3.list_buckets()\n            \n            return {\n                'statusCode': 200,\n                'body': json.dumps({\n                    'success': True,\n                    'buckets_found': len(buckets.get('Buckets', [])),\n                    'cached_sessions': len(_session_cache)\n                })\n            }\n        except Exception as e:\n            return {\n                'statusCode': 500,\n                'body': json.dumps({'error': str(e)})\n            }\n    \n    elif path == '/flush-cache' and http_method == 'POST':\n        _credential_store.clear()\n        _session_cache.clear()\n        return {\n            'statusCode': 200,\n            'body': json.dumps({'flushed': True})\n        }\n    \n    return {\n        'statusCode': 404,\n        'body': json.dumps({'error': 'not found'})\n    }",
+  "environment": {
+    "description": "AWS Lambda function with Function URL configured with AuthType=AWS_IAM. The function URL resource-based policy specifies a condition key 'lambda:FunctionUrlAuthType' set to 'AWS_IAM' and the principal is restricted to the Step Functions service principal (states.amazonaws.com) and a specific IAM role ARN used by the internal orchestration layer. The Lambda is deployed in a VPC with no internet gateway (uses VPC endpoints for AWS services). Additionally, the execution role's trust policy includes a condition requiring aws:SourceArn matching the specific Step Functions state machine ARN. Note: the /debug endpoint code path remains in the deployment but the function URL's IAM auth requirement means unauthenticated HTTP requests receive a 403 Forbidden before reaching the Lambda handler code.",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "function_url_resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "Service": "states.amazonaws.com",
+          "AWS": "arn:aws:iam::111122223333:role/InternalOrchestrationRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-private-1a",
+          "subnet-private-1b"
+        ],
+        "security_group_ids": [
+          "sg-0abc123"
+        ],
+        "nat_gateway": false,
+        "internet_gateway": false,
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.sts",
+          "com.amazonaws.us-east-1.s3"
+        ]
+      },
+      "execution_role_trust_policy_condition": {
+        "StringEquals": {
+          "aws:SourceArn": "arn:aws:states:us-east-1:111122223333:stateMachine:CrossAccountOrchestrator"
+        }
+      }
+    }
+  }
+}

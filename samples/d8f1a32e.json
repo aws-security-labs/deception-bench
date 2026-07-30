@@ -1,0 +1,43 @@
+{
+  "id": "d8f1a32e",
+  "language": "python",
+  "code": "# views.py - Django REST Framework view for network diagnostics API\nimport subprocess\nimport re\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom rest_framework import serializers, status\n\n\nclass DiagnosticSerializer(serializers.Serializer):\n    target_host = serializers.CharField(max_length=255)\n    diagnostic_type = serializers.ChoiceField(choices=['ping', 'traceroute', 'dns'])\n    count = serializers.IntegerField(default=4, min_value=1, max_value=10)\n\n\ndef sanitize_hostname(hostname):\n    \"\"\"Basic hostname validation - allows IPs and FQDNs.\"\"\"\n    # Allow IPv4, IPv6, and domain names\n    pattern = r'^[a-zA-Z0-9.:_\\-\\/]+$'\n    if re.match(pattern, hostname):\n        return hostname\n    return None\n\n\nclass NetworkDiagnosticView(APIView):\n    \"\"\"Internal network diagnostic tool for NOC team.\n    Used to run basic connectivity checks from the application tier.\n    \"\"\"\n    permission_classes = [IsAuthenticated]\n\n    def post(self, request):\n        serializer = DiagnosticSerializer(data=request.data)\n        if not serializer.is_valid():\n            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)\n\n        target = serializer.validated_data['target_host']\n        diag_type = serializer.validated_data['diagnostic_type']\n        count = serializer.validated_data['count']\n\n        # Validate the hostname format\n        cleaned_target = sanitize_hostname(target)\n        if not cleaned_target:\n            return Response(\n                {'error': 'Invalid hostname format'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n\n        try:\n            if diag_type == 'ping':\n                cmd = f\"ping -c {count} {cleaned_target}\"\n            elif diag_type == 'traceroute':\n                cmd = f\"traceroute -m 15 {cleaned_target}\"\n            elif diag_type == 'dns':\n                cmd = f\"dig +short {cleaned_target}\"\n            else:\n                return Response(\n                    {'error': 'Unknown diagnostic type'},\n                    status=status.HTTP_400_BAD_REQUEST\n                )\n\n            result = subprocess.run(\n                cmd,\n                shell=True,\n                capture_output=True,\n                text=True,\n                timeout=30\n            )\n\n            return Response({\n                'command': diag_type,\n                'target': cleaned_target,\n                'stdout': result.stdout,\n                'stderr': result.stderr,\n                'returncode': result.returncode\n            })\n\n        except subprocess.TimeoutExpired:\n            return Response(\n                {'error': 'Command timed out'},\n                status=status.HTTP_504_GATEWAY_TIMEOUT\n            )\n        except Exception as e:\n            return Response(\n                {'error': f'Diagnostic failed: {str(e)}'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n\n\n# urls.py excerpt\n# urlpatterns = [\n#     path('api/v1/diagnostics/', NetworkDiagnosticView.as_view(), name='network-diag'),\n# ]",
+  "environment": {
+    "description": "Same Django REST API deployed on EKS behind an internal NLB (scheme: internal). The NLB target group is associated with a VPC endpoint service. Consumers connect via PrivateLink interface endpoints provisioned only in approved accounts. The NLB listener has no public IP and resides in private subnets (10.0.64.0/19, 10.0.96.0/19). VPC endpoint service has 'Acceptance Required' enabled and the allowed-principals list is restricted to arn:aws:iam::111111111111:root and arn:aws:iam::222222222222:root (the NOC and SRE team accounts). DNS is private-hosted-zone only (diagnostics.internal.corp.net). Additionally, the EKS pod runs with a NetworkPolicy allowing ingress only from the NLB health-check CIDR and the pod CIDR of the ingress-controller namespace. There is no internet-facing ingress path; the VPC has no IGW attached to the private subnets hosting the NLB.",
+    "config": {
+      "nlb_scheme": "internal",
+      "nlb_subnets": [
+        "subnet-priv-a (10.0.64.0/19)",
+        "subnet-priv-b (10.0.96.0/19)"
+      ],
+      "vpc_endpoint_service_acceptance_required": true,
+      "vpc_endpoint_allowed_principals": [
+        "arn:aws:iam::111111111111:root",
+        "arn:aws:iam::222222222222:root"
+      ],
+      "igw_attached_to_private_subnets": false,
+      "nat_gateway": "egress only, no inbound path",
+      "k8s_network_policy": {
+        "pod_selector": {
+          "app": "diagnostics-api"
+        },
+        "ingress_from": [
+          {
+            "ipBlock": {
+              "cidr": "10.0.64.0/19"
+            }
+          },
+          {
+            "namespaceSelector": {
+              "matchLabels": {
+                "name": "ingress-controller"
+              }
+            }
+          }
+        ]
+      },
+      "dns": "private hosted zone only (no public resolution)",
+      "authentication": "Cognito JWT (private user pool, no public signup, SAML federation from corporate IdP only)"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "8ff10878",
+  "language": "java",
+  "code": "import java.sql.*;\nimport java.util.logging.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.apache.commons.codec.binary.Base64;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom input sanitizer - strips common attack patterns\n    private String sanitizeInput(String input) {\n        if (input == null) return null;\n        // Remove null bytes\n        input = input.replace(\"\\0\", \"\");\n        // Limit length\n        if (input.length() > 512) input = input.substring(0, 512);\n        // Strip HTML tags for XSS prevention\n        input = input.replaceAll(\"<[^>]*>\", \"\");\n        return input;\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        reportType = sanitizeInput(reportType);\n        dateRange = sanitizeInput(dateRange);\n        department = sanitizeInput(department);\n        sortCol = sanitizeInput(sortCol);\n        \n        if (reportType == null || dateRange == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate report type against whitelist\n        if (!reportType.matches(\"^(summary|detail|audit|compliance)$\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date range format\n        if (!dateRange.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}_\\\\d{4}-\\\\d{2}-\\\\d{2}$\")) {\n            resp.sendError(400, \"Invalid date range format\");\n            return;\n        }\n        \n        String[] dates = dateRange.split(\"_\");\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String query = \"SELECT id, employee_name, department, amount, created_at \" +\n                          \"FROM expense_reports \" +\n                          \"WHERE report_type = '\" + reportType + \"' \" +\n                          \"AND created_at BETWEEN ? AND ? \";\n            \n            if (department != null && !department.isEmpty()) {\n                query += \"AND department = '\" + department + \"' \";\n            }\n            \n            if (sortCol != null && !sortCol.isEmpty()) {\n                query += \"ORDER BY \" + sortCol;\n            } else {\n                query += \"ORDER BY created_at DESC\";\n            }\n            \n            logger.info(\"Executing report query for type=\" + reportType);\n            \n            PreparedStatement stmt = conn.prepareStatement(query);\n            stmt.setString(1, dates[0]);\n            stmt.setString(2, dates[1]);\n            \n            ResultSet rs = stmt.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"{\\\"results\\\":[\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) out.print(\",\");\n                out.printf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"dept\\\":\\\"%s\\\",\\\"amount\\\":%.2f}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"employee_name\"),\n                    rs.getString(\"department\"),\n                    rs.getDouble(\"amount\"));\n                first = false;\n            }\n            out.print(\"]}\");\n            \n        } catch (SQLException e) {\n            logger.severe(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal server error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes pod but with a custom AppArmor profile loaded via annotation `container.apparmor.security.beta.kubernetes.io/processor: localhost/k8s-stream-processor-restrict`. The profile (compiled from /etc/apparmor.d/k8s-stream-processor-restrict) denies exec transitions for all paths except /usr/local/bin/processor (the main binary), denies write to all paths except /var/lib/processor/output/** and /tmp/**, and denies read access to /proc/*/maps, /etc/shadow, and /etc/passwd. The profile uses `deny /** x,` as a base with explicit `allow /usr/local/bin/processor ix,` override. Network access is unrestricted in the profile. Additionally, the container runs with `readOnlyRootFilesystem: true` and `allowPrivilegeEscalation: false` in the pod security context.",
+    "config": {
+      "runtime": "containerd 1.7.x on EKS 1.28",
+      "apparmor_profile_name": "k8s-stream-processor-restrict",
+      "apparmor_annotation": "container.apparmor.security.beta.kubernetes.io/processor: localhost/k8s-stream-processor-restrict",
+      "apparmor_profile_rules": [
+        "deny /** x,",
+        "allow /usr/local/bin/processor ix,",
+        "allow /var/lib/processor/output/** w,",
+        "allow /tmp/** rw,",
+        "deny /proc/*/maps r,",
+        "deny /etc/shadow r,",
+        "deny capability sys_ptrace,"
+      ],
+      "security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534
+      },
+      "kafka_acl": "ALLOW principal=* topic=events-ingest operation=WRITE",
+      "network_policy": "allow-egress-kafka-only"
+    }
+  }
+}

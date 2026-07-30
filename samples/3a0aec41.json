@@ -1,0 +1,71 @@
+{
+  "id": "3a0aec41",
+  "language": "python",
+  "code": "import os\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, session, g\nfrom functools import wraps\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-key-change-me')\n\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        password_hash TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        email TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin:superSecret2024!').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, email, department) VALUES (?, ?, 'admin', 'admin@corp.local', 'IT')\",\n               ('admin', admin_hash))\n    db.commit()\n    db.close()\n\ndef require_auth(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        if 'user_id' not in session:\n            return jsonify({'error': 'Authentication required'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/login', methods=['POST'])\ndef login():\n    data = request.get_json()\n    username = data.get('username', '')\n    password = data.get('password', '')\n    \n    db = get_db()\n    password_hash = hashlib.sha256(f\"{username}:{password}\".encode()).hexdigest()\n    \n    # Parameterized query for login - this is safe\n    user = db.execute(\n        \"SELECT * FROM users WHERE username = ? AND password_hash = ?\",\n        (username, password_hash)\n    ).fetchone()\n    \n    if user:\n        session['user_id'] = user['id']\n        session['role'] = user['role']\n        return jsonify({'message': 'Login successful', 'role': user['role']})\n    return jsonify({'error': 'Invalid credentials'}), 401\n\n@app.route('/api/users/search', methods=['GET'])\n@require_auth\ndef search_users():\n    \"\"\"Search users by department or role. Supports flexible filtering.\"\"\"\n    department = request.args.get('department', '')\n    role_filter = request.args.get('role', '')\n    sort_by = request.args.get('sort', 'username')\n    \n    # Basic input length check\n    if len(department) > 100 or len(role_filter) > 50:\n        return jsonify({'error': 'Input too long'}), 400\n    \n    db = get_db()\n    \n    # Build query with filters\n    query = \"SELECT id, username, email, department, role FROM users WHERE 1=1\"\n    \n    if department:\n        query += f\" AND department = '{department}'\"\n    if role_filter:\n        query += f\" AND role = '{role_filter}'\"\n    \n    # Validate sort column against allowlist\n    allowed_sorts = ['username', 'email', 'department', 'role', 'id']\n    if sort_by not in allowed_sorts:\n        sort_by = 'username'\n    query += f\" ORDER BY {sort_by}\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search action\n        db.execute(\"INSERT INTO audit_log (action, user_id) VALUES (?, ?)\",\n                   (f\"search:dept={department}\", session.get('user_id')))\n        db.commit()\n        \n        return jsonify({'users': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        app.logger.error(f\"Database error: {e}\")\n        return jsonify({'error': 'Search failed'}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\n@require_auth\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute(\n        \"SELECT id, username, email, department, role FROM users WHERE id = ?\",\n        (user_id,)\n    ).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "EC2 instance (m5.large) in VPC subnet-0e5f6a7b with S3 Gateway VPC Endpoint (vpce-0x9y8z7w6v). Endpoint policy document restricts PutObject operations with condition key s3:content-type-starts-with requiring value to match image/ or application/pdf. The endpoint policy uses aws:PrincipalOrgID condition to scope to the organization AND includes a StringNotLike condition on s3:prefix denying any key containing executable extensions (.html, .htm, .js, .svg, .xml, .php, .jsp, .exe, .sh, .bat). Route table rtb-0m1n2o3p only has the vpce prefix list route for S3 (no NAT/IGW route to S3 CIDR ranges). Instance security group sg-0q4r5s6t has no outbound rules to S3 public IP ranges.",
+    "config": {
+      "vpc_id": "vpc-0abc123def456",
+      "subnet": "subnet-0e5f6a7b (private, no NAT route for S3 prefixes)",
+      "s3_access_path": "VPC Gateway Endpoint vpce-0x9y8z7w6v only",
+      "vpce_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowRestrictedPut",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::legacy-app-uploads-prod/*",
+            "Condition": {
+              "StringLike": {
+                "s3:content-type": [
+                  "image/*",
+                  "application/pdf"
+                ]
+              },
+              "StringNotLike": {
+                "s3:prefix": [
+                  "*.html",
+                  "*.htm",
+                  "*.js",
+                  "*.svg",
+                  "*.xml",
+                  "*.php",
+                  "*.jsp",
+                  "*.exe",
+                  "*.sh",
+                  "*.bat"
+                ]
+              },
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+              }
+            }
+          },
+          {
+            "Sid": "AllowRead",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::legacy-app-uploads-prod/*",
+              "arn:aws:s3:::legacy-app-uploads-prod"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:PrincipalOrgID": "o-a1b2c3d4e5"
+              }
+            }
+          }
+        ]
+      },
+      "route_table": "rtb-0m1n2o3p: S3 prefix list -> vpce-0x9y8z7w6v (no alternate S3 route)",
+      "security_group": "sg-0q4r5s6t: no outbound to S3 public CIDR",
+      "instance_role": "LegacyMonolithRole with s3:PutObject/*"
+    }
+  }
+}

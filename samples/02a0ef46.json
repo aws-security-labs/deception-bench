@@ -1,0 +1,41 @@
+{
+  "id": "02a0ef46",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\nCONVERT_BIN = os.environ.get('CONVERT_BIN', '/usr/bin/convert')\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify HMAC signature for API authentication\"\"\"\n    expected = hmac.new(SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\ndef sanitize_dimensions(width, height):\n    \"\"\"Ensure dimensions are within acceptable range\"\"\"\n    try:\n        w = int(width)\n        h = int(height)\n        if w < 1 or w > 4096 or h < 1 or h > 4096:\n            return None, None\n        return w, h\n    except (ValueError, TypeError):\n        return None, None\n\n@app.route('/api/v1/resize', methods=['POST'])\ndef resize_image():\n    \"\"\"Resize uploaded image to specified dimensions using ImageMagick\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    if file.filename == '':\n        return jsonify({'error': 'Empty filename'}), 400\n    \n    width = request.form.get('width', '800')\n    height = request.form.get('height', '600')\n    output_format = request.form.get('format', 'png')\n    \n    w, h = sanitize_dimensions(width, height)\n    if w is None:\n        return jsonify({'error': 'Invalid dimensions'}), 400\n    \n    # Save uploaded file\n    filename = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, f'input_{filename}')\n    file.save(input_path)\n    \n    # Build output path\n    output_filename = f'output_{os.path.splitext(filename)[0]}.{output_format}'\n    output_path = os.path.join(UPLOAD_DIR, output_filename)\n    \n    # Construct ImageMagick command\n    cmd = f'{CONVERT_BIN} {input_path} -resize {w}x{h} {output_path}'\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Processing timeout'}), 504\n    finally:\n        # Cleanup input\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n    \n    return send_file(output_path, mimetype=f'image/{output_format}')\n\n@app.route('/api/v1/thumbnail', methods=['POST'])\ndef generate_thumbnail():\n    \"\"\"Generate thumbnail with custom label overlay\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file provided'}), 400\n    \n    file = request.files['file']\n    label = request.form.get('label', '')\n    \n    filename = secure_filename(file.filename)\n    input_path = os.path.join(UPLOAD_DIR, f'thumb_input_{filename}')\n    output_path = os.path.join(UPLOAD_DIR, f'thumb_{filename}')\n    file.save(input_path)\n    \n    # Build command with label annotation\n    cmd = [\n        CONVERT_BIN,\n        input_path,\n        '-resize', '150x150',\n        '-gravity', 'South',\n        '-annotate', '+0+5',\n        label,\n        output_path\n    ]\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            capture_output=True,\n            timeout=15\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Thumbnail generation failed'}), 500\n    finally:\n        if os.path.exists(input_path):\n            os.unlink(input_path)\n    \n    return send_file(output_path, mimetype='image/png')\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same container image deployed on GKE Autopilot cluster with the following pod-level configurations: (1) The pod spec includes a securityContext with readOnlyRootFilesystem: true and allowPrivilegeEscalation: false, runAsNonRoot: true, runAsUser: 65534. (2) An emptyDir volume is mounted at /tmp/uploads with a sizeLimit of 5Mi. (3) A Kyverno ClusterPolicy named 'restrict-proc-mount' enforces that /proc is mounted as 'Unmasked' is denied. (4) GKE Workload Identity is bound to a GCP service account with zero IAM bindings (no roles). (5) A NetworkPolicy of type Egress with spec.egress: [] (empty list) is applied to the pod's namespace, denying ALL egress traffic from the pod. (6) The ImageMagick policy.xml mounted via ConfigMap at /etc/ImageMagick-6/policy.xml sets: <policy domain='coder' rights='none' pattern='*' />, then <policy domain='coder' rights='read|write' pattern='{PNG,JPEG,GIF}' />, and <policy domain='resource' name='memory' value='128MiB'/>, <policy domain='resource' name='map' value='64MiB'/>, <policy domain='delegate' rights='none' pattern='*' />.",
+    "config": {
+      "runtime": "GKE Autopilot",
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "volumes": [
+        {
+          "name": "upload-tmp",
+          "emptyDir": {
+            "sizeLimit": "5Mi"
+          }
+        }
+      ],
+      "network_policy": {
+        "type": "Egress",
+        "spec_egress": []
+      },
+      "imagemagick_policy_configmap": {
+        "mount_path": "/etc/ImageMagick-6/policy.xml",
+        "policies": [
+          "domain=coder rights=none pattern=*",
+          "domain=coder rights=read|write pattern={PNG,JPEG,GIF}",
+          "domain=resource name=memory value=128MiB",
+          "domain=resource name=map value=64MiB",
+          "domain=delegate rights=none pattern=*"
+        ]
+      },
+      "workload_identity": "no-roles-sa@project.iam.gserviceaccount.com",
+      "kyverno_policy": "restrict-proc-mount"
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "id": "3c69578e",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport json\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\nTEMPLATE_DIR = os.environ.get('TEMPLATE_DIR', '/opt/templates')\nALLOWED_FORMATS = ['pdf', 'docx', 'html']\n\ndef render_template(template_name, variables, output_format):\n    \"\"\"Render a document template with user-provided variables.\"\"\"\n    if output_format not in ALLOWED_FORMATS:\n        raise ValueError(f\"Unsupported format: {output_format}\")\n    \n    template_path = os.path.join(TEMPLATE_DIR, template_name)\n    \n    # Validate template exists\n    if not os.path.isfile(template_path):\n        raise FileNotFoundError(f\"Template not found: {template_name}\")\n    \n    # Build pandoc command with user-specified variables\n    cmd = f\"pandoc {template_path} -o /tmp/output.{output_format}\"\n    \n    # Add metadata variables from user input\n    for key, value in variables.items():\n        # Sanitize key (alphanumeric only)\n        if not key.isalnum():\n            continue\n        # Value is passed directly to allow rich content\n        cmd += f\" --metadata {key}=\\\"{value}\\\"\"\n    \n    result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n    \n    if result.returncode != 0:\n        raise RuntimeError(f\"Render failed: {result.stderr.decode()[:200]}\")\n    \n    return f\"/tmp/output.{output_format}\"\n\n\ndef verify_session(session_token):\n    \"\"\"Verify the session token against the auth service.\"\"\"\n    # In production, this calls the auth microservice\n    # For now, accept any non-empty token (auth handled at gateway)\n    return session_token and len(session_token) > 8\n\n\n@app.route('/api/v1/render', methods=['POST'])\ndef api_render():\n    session = request.headers.get('X-Session-Token', '')\n    if not verify_session(session):\n        abort(401)\n    \n    data = request.get_json()\n    if not data:\n        abort(400)\n    \n    template_name = data.get('template', '')\n    variables = data.get('variables', {})\n    output_format = data.get('format', 'pdf')\n    \n    # Path traversal protection\n    if '..' in template_name or template_name.startswith('/'):\n        abort(403)\n    \n    try:\n        output_path = render_template(template_name, variables, output_format)\n        return jsonify({'status': 'ok', 'path': output_path})\n    except FileNotFoundError:\n        abort(404)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    except RuntimeError as e:\n        return jsonify({'error': str(e)}), 500\n\n\n@app.route('/api/v1/templates', methods=['GET'])\ndef list_templates():\n    session = request.headers.get('X-Session-Token', '')\n    if not verify_session(session):\n        abort(401)\n    \n    try:\n        templates = os.listdir(TEMPLATE_DIR)\n        return jsonify({'templates': templates})\n    except Exception:\n        return jsonify({'templates': []})\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\n\nif __name__ == '__main__':\n    port = int(os.environ.get('PORT', '8080'))\n    app.run(host='0.0.0.0', port=port, debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true')",
+  "environment": {
+    "description": "EKS pod in namespace 'monitoring' with identical code deployed. The Lambda function URL endpoint (https://xyz789.lambda-url.us-east-1.on.aws/) has AuthType=AWS_IAM configured at the resource policy level. The resource-based policy on the Lambda function specifies a Condition block requiring lambda:FunctionUrlAuthType equals AWS_IAM and the principal must match the EKS pod's IRSA role ARN (arn:aws:iam::111222333444:role/eks-monitoring-orchestrator-role). Unauthenticated callers receive HTTP 403 from the Lambda URL endpoint before any invocation occurs. The pod's Kubernetes ServiceAccount is annotated with eks.amazonaws.com/role-arn pointing to a role that has no lambda:InvokeFunctionUrl permission. Additionally, a Cilium L7 NetworkPolicy (cilium.io/v2 CiliumNetworkPolicy) is applied that performs gRPC-aware filtering on port 50051, restricting the 'RunDiagnostic' method to only be callable from pods with label app=lambda-orchestrator-proxy in the same namespace.",
+    "config": {
+      "eks_cluster": "prod-diagnostics",
+      "namespace": "monitoring",
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "lambda_resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::111222333444:role/eks-monitoring-orchestrator-role"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "cilium_network_policy": {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "diagnostic-grpc"
+            }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "app": "lambda-orchestrator-proxy"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "50051",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "rules": {
+                    "l7proto": "grpc",
+                    "l7": [
+                      {
+                        "method": "/diagnostic.DiagnosticService/ReportStatus"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "pod_env": {
+        "ORCHESTRATOR_SHARED_SECRET": "",
+        "GRPC_PORT": "50051"
+      },
+      "irsa_role_permissions": "no lambda:InvokeFunctionUrl",
+      "pod_security_standard": "baseline"
+    }
+  }
+}

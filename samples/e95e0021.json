@@ -1,0 +1,68 @@
+{
+  "id": "e95e0021",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID          int     `json:\"id\"`\n\tName        string  `json:\"name\"`\n\tDescription string  `json:\"description\"`\n\tPrice       float64 `json:\"price\"`\n\tCategory    string  `json:\"category\"`\n\tSKU         string  `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n\tdb.SetMaxIdleConns(5)\n}\n\n// searchProducts handles product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\n\t// Build query with validated sort options\n\tvalidSorts := map[string]string{\n\t\t\"price_asc\":  \"price ASC\",\n\t\t\"price_desc\": \"price DESC\",\n\t\t\"name\":       \"name ASC\",\n\t}\n\n\torderClause := \"id ASC\"\n\tif s, ok := validSorts[sortBy]; ok {\n\t\torderClause = s\n\t}\n\n\t// Category filter uses parameterized query for safety\n\tvar query string\n\tvar args []interface{}\n\n\tif category != \"\" && minPrice != \"\" && maxPrice != \"\" {\n\t\t// Performance optimization: direct string interpolation for range queries\n\t\t// since price values are expected to be numeric\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, description, price, category, sku FROM products WHERE category = $1 AND price BETWEEN %s AND %s ORDER BY %s\",\n\t\t\tminPrice, maxPrice, orderClause,\n\t\t)\n\t\targs = append(args, category)\n\t} else if category != \"\" {\n\t\tquery = \"SELECT id, name, description, price, category, sku FROM products WHERE category = $1 ORDER BY \" + orderClause\n\t\targs = append(args, category)\n\t} else {\n\t\tquery = \"SELECT id, name, description, price, category, sku FROM products ORDER BY \" + orderClause\n\t}\n\n\trows, err := db.Query(query, args...)\n\tif err != nil {\n\t\thttp.Error(w, \"Query failed\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// getProduct retrieves a single product by ID (safe parameterized query)\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tid := strings.TrimPrefix(r.URL.Path, \"/api/products/\")\n\tvar p Product\n\terr := db.QueryRow(\n\t\t\"SELECT id, name, description, price, category, sku FROM products WHERE id = $1\", id,\n\t).Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.SKU)\n\tif err != nil {\n\t\thttp.Error(w, \"Not found\", http.StatusNotFound)\n\t\treturn\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(p)\n}\n\n// healthCheck for load balancer probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/\", getProduct)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind ALB. AWS WAFv2 WebACL attached to ALB with three rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet priority 1 with default action, (2) AWSManagedRulesKnownBadInputsRuleSet priority 2 with default action, (3) Custom rule group 'app-query-hygiene' priority 3 containing a single rule with ByteMatchStatement inspecting AllQueryArguments with TextTransformation URL_DECODE and LOWERCASE, using RegexPatternSet matching '(union|select|insert|update|delete|drop|alter|exec|xp_)\\s' with BLOCK action. WebACL default action is ALLOW. Additionally, the ECS task role IAM policy has a condition restricting the task's outbound network to VPC endpoints only via aws:sourceVpc condition on all API calls, and the Fargate platform version is 1.4.0 with runtime seccomp profile set to runtime/default.",
+    "config": {
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 1,
+            "override_action": "none",
+            "visibility_config": {
+              "sampled_requests_enabled": true
+            }
+          },
+          {
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "priority": 2,
+            "override_action": "none",
+            "visibility_config": {
+              "sampled_requests_enabled": true
+            }
+          },
+          {
+            "name": "app-query-hygiene",
+            "priority": 3,
+            "override_action": "none",
+            "rules": [
+              {
+                "name": "sqli-pattern-block",
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                    "field_to_match": "all_query_arguments",
+                    "text_transformations": [
+                      {
+                        "priority": 0,
+                        "type": "URL_DECODE"
+                      },
+                      {
+                        "priority": 1,
+                        "type": "LOWERCASE"
+                      }
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "ecs_task_role_policy": {
+        "Effect": "Allow",
+        "Condition": {
+          "StringEquals": {
+            "aws:sourceVpc": "vpc-0abc123"
+          }
+        }
+      },
+      "fargate_platform_version": "1.4.0",
+      "seccomp_profile": "runtime/default"
+    }
+  }
+}

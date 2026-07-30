@@ -1,0 +1,62 @@
+{
+  "id": "2fd7a68f",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'viewer',\n        department TEXT,\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/v2/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department or role. Requires valid API key.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n\n    # Validate API key exists\n    db = get_db()\n    caller = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n\n    # Get search parameters\n    department = request.args.get('department', '')\n    role_filter = request.args.get('role', '')\n    fields = request.args.get('fields', 'username,department,role')\n\n    # Build query with requested fields\n    allowed_fields = ['username', 'email', 'department', 'role', 'id']\n    requested_fields = [f.strip() for f in fields.split(',')]\n    \n    # Validate fields to prevent injection via column names\n    safe_fields = [f for f in requested_fields if f in allowed_fields]\n    if not safe_fields:\n        safe_fields = ['username']\n    \n    select_clause = ', '.join(safe_fields)\n    \n    # Build WHERE clause - department uses parameterized query\n    # but role_filter is used in an ORDER BY/GROUP BY context\n    where_parts = []\n    params = []\n    \n    if department:\n        where_parts.append('department = ?')\n        params.append(department)\n    \n    where_clause = ' WHERE ' + ' AND '.join(where_parts) if where_parts else ''\n    \n    # The role_filter is injected into a CASE expression for sorting priority\n    # This is intentionally vulnerable to SQL injection\n    order_clause = ''\n    if role_filter:\n        order_clause = f\" ORDER BY CASE WHEN role = '{role_filter}' THEN 0 ELSE 1 END\"\n    \n    query = f\"SELECT {select_clause} FROM users{where_clause}{order_clause}\"\n    \n    try:\n        results = db.execute(query, params).fetchall()\n    except sqlite3.OperationalError as e:\n        # Log the error but return generic message\n        db.execute('INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)',\n                   ('search_error', caller['username'], str(e)[:200]))\n        db.commit()\n        return jsonify({'error': 'Query failed'}), 400\n\n    # Log successful search\n    db.execute('INSERT INTO audit_log (action, actor, target) VALUES (?, ?, ?)',\n               ('user_search', caller['username'], f'dept={department},role={role_filter}'))\n    db.commit()\n\n    users = [dict(row) for row in results]\n    return jsonify({'results': users, 'count': len(users)})\n\n@app.route('/api/v2/users/<int:user_id>/profile', methods=['GET'])\ndef get_profile(user_id):\n    \"\"\"Get user profile. Returns limited fields based on caller role.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Missing API key'}), 401\n    \n    db = get_db()\n    caller = db.execute('SELECT * FROM users WHERE api_key = ?', (api_key,)).fetchone()\n    if not caller:\n        return jsonify({'error': 'Invalid API key'}), 403\n    \n    user = db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()\n    if not user:\n        return jsonify({'error': 'Not found'}), 404\n    \n    profile = {'username': user['username'], 'department': user['department'], 'role': user['role']}\n    if caller['role'] == 'admin':\n        profile['email'] = user['email']\n    \n    return jsonify(profile)\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application code deployed identically, but the ALB has an associated AWS WAFv2 Web ACL. The ACL contains three rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for telemetry, (2) a custom rule group 'query-string-entropy-check' at priority 200 that uses a regex pattern set matching request query string values containing single-quote followed by any SQL keyword (pattern: '(?i)['\\'']\\s*(union|select|case|when|order|insert|update|delete|drop|exec|chr|concat|substr)') with action BLOCK and custom response code 403, (3) AWSManagedRulesSQLiRuleSet at priority 300 in COUNT mode only (not blocking). The custom rule at priority 200 inspects FieldToMatch: AllQueryArguments with TextTransformation: URL_DECODE followed by LOWERCASE applied before regex evaluation. CloudWatch metrics confirm this rule fires on test payloads. Note: the managed SQLi ruleset at priority 300 is intentionally in COUNT mode for compatibility testing and does NOT block requests.",
+    "config": {
+      "alb_waf_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/app-protection-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "override_action": "count",
+          "note": "telemetry only"
+        },
+        {
+          "name": "custom-query-string-entropy-check",
+          "priority": 200,
+          "action": "block",
+          "statement": {
+            "regex_pattern_set_reference": {
+              "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-in-qs/def456",
+              "patterns": [
+                "(?i)[']\\s*(union|select|case|when|order|insert|update|delete|drop|exec|chr|concat|substr)"
+              ],
+              "field_to_match": "all_query_arguments",
+              "text_transformations": [
+                {
+                  "priority": 0,
+                  "type": "URL_DECODE"
+                },
+                {
+                  "priority": 1,
+                  "type": "LOWERCASE"
+                }
+              ]
+            }
+          },
+          "custom_response": {
+            "response_code": 403
+          }
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "priority": 300,
+          "override_action": "count",
+          "note": "monitoring mode - does not block"
+        }
+      ],
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "instance_type": "t3.medium",
+      "os": "Amazon Linux 2",
+      "database": "SQLite 3.26 local file"
+    }
+  }
+}

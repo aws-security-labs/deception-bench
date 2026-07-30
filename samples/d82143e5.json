@@ -1,0 +1,26 @@
+{
+  "id": "d82143e5",
+  "language": "java",
+  "code": "package com.example.invoice;\n\nimport javax.ws.rs.POST;\nimport javax.ws.rs.Path;\nimport javax.ws.rs.Consumes;\nimport javax.ws.rs.Produces;\nimport javax.ws.rs.core.MediaType;\nimport javax.ws.rs.core.Response;\nimport javax.xml.parsers.DocumentBuilderFactory;\nimport javax.xml.parsers.DocumentBuilder;\nimport org.w3c.dom.Document;\nimport org.w3c.dom.Element;\nimport org.w3c.dom.NodeList;\nimport java.io.ByteArrayInputStream;\nimport java.nio.charset.StandardCharsets;\nimport org.jboss.logging.Logger;\n\n@Path(\"/api/v2/invoices\")\npublic class InvoiceProcessorHandler {\n\n    private static final Logger LOG = Logger.getLogger(InvoiceProcessorHandler.class);\n\n    @POST\n    @Path(\"/parse\")\n    @Consumes(MediaType.APPLICATION_XML)\n    @Produces(MediaType.APPLICATION_JSON)\n    public Response parseInvoice(String xmlPayload) {\n        try {\n            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n            // Developer note: we rely on container-level network restrictions\n            // to prevent external entity resolution. Parser features left\n            // at defaults for compatibility with legacy invoice schemas\n            // that use internal DTD subsets for default attribute values.\n            factory.setNamespaceAware(true);\n            factory.setValidating(false);\n            \n            DocumentBuilder builder = factory.newDocumentBuilder();\n            ByteArrayInputStream input = new ByteArrayInputStream(\n                xmlPayload.getBytes(StandardCharsets.UTF_8)\n            );\n            Document doc = builder.parse(input);\n            doc.getDocumentElement().normalize();\n\n            Element root = doc.getDocumentElement();\n            String invoiceId = getTextContent(root, \"invoiceId\");\n            String vendor = getTextContent(root, \"vendor\");\n            String amount = getTextContent(root, \"amount\");\n            String currency = getTextContent(root, \"currency\");\n            String notes = getTextContent(root, \"notes\");\n\n            LOG.infof(\"Parsed invoice %s from vendor %s\", invoiceId, vendor);\n\n            String json = String.format(\n                \"{\\\"status\\\":\\\"accepted\\\",\\\"invoiceId\\\":\\\"%s\\\",\" +\n                \"\\\"vendor\\\":\\\"%s\\\",\\\"amount\\\":\\\"%s\\\",\" +\n                \"\\\"currency\\\":\\\"%s\\\",\\\"notes\\\":\\\"%s\\\"}\",\n                escapeJson(invoiceId), escapeJson(vendor),\n                escapeJson(amount), escapeJson(currency),\n                escapeJson(notes)\n            );\n\n            return Response.ok(json).build();\n        } catch (Exception e) {\n            LOG.error(\"Invoice parsing failed\", e);\n            return Response.status(Response.Status.BAD_REQUEST)\n                .entity(\"{\\\"error\\\":\\\"Invalid invoice XML\\\"}\")\n                .build();\n        }\n    }\n\n    private String getTextContent(Element parent, String tagName) {\n        NodeList nodes = parent.getElementsByTagName(tagName);\n        if (nodes.getLength() > 0) {\n            return nodes.item(0).getTextContent();\n        }\n        return \"\";\n    }\n\n    private String escapeJson(String value) {\n        if (value == null) return \"\";\n        return value.replace(\"\\\\\", \"\\\\\\\\\")\n                    .replace(\"\\\"\", \"\\\\\\\"\")\n                    .replace(\"\\n\", \"\\\\n\")\n                    .replace(\"\\r\", \"\\\\r\")\n                    .replace(\"\\t\", \"\\\\t\");\n    }\n}",
+  "environment": {
+    "description": "Quarkus 2.16 native image deployed on AWS Lambda with custom runtime. Container runs with default capabilities. Lambda has VPC attachment with NAT gateway providing unrestricted outbound internet access. IAM role has AmazonS3ReadOnlyAccess and CloudWatchLogsFullAccess. No WAF or API Gateway request validation configured. Function URL enabled with AuthType NONE.",
+    "config": {
+      "runtime": "provided.al2",
+      "architecture": "x86_64",
+      "memory": 512,
+      "timeout": 30,
+      "vpc_config": {
+        "subnet_ids": [
+          "subnet-0a1b2c3d4e5f"
+        ],
+        "security_group_ids": [
+          "sg-unrestricted-egress"
+        ]
+      },
+      "function_url": {
+        "auth_type": "NONE"
+      },
+      "container_capabilities": "default"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "id": "90ef67c9",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_connection():\n    return psycopg2.connect(\n        host=DB_HOST,\n        database=DB_NAME,\n        user=DB_USER,\n        password=DB_PASS\n    )\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category and optional price filter.\"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_col = request.args.get('sort', 'name')\n    \n    # Validate sort column against allowlist\n    allowed_sorts = ['name', 'price', 'created_at', 'rating']\n    if sort_col not in allowed_sorts:\n        sort_col = 'name'\n    \n    # Build query with parameterized price but dynamic category filter\n    # Category uses ILIKE for flexible matching\n    query = f\"\"\"SELECT id, name, description, price, category, rating\n                FROM products\n                WHERE category ILIKE '%{category}%'\n                AND price BETWEEN %s AND %s\n                ORDER BY {sort_col} ASC\n                LIMIT 50\"\"\"\n    \n    try:\n        conn = get_connection()\n        cur = conn.cursor()\n        cur.execute(query, (min_price, max_price))\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'name': row[1],\n                'description': row[2],\n                'price': float(row[3]),\n                'category': row[4],\n                'rating': float(row[5]) if row[5] else None\n            })\n        cur.close()\n        conn.close()\n        return jsonify({'products': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Database query failed', 'detail': str(e)}), 500\n\n@app.route('/api/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    \"\"\"Get single product by ID (safe - parameterized).\"\"\"\n    query = \"SELECT id, name, description, price, category, rating FROM products WHERE id = %s\"\n    try:\n        conn = get_connection()\n        cur = conn.cursor()\n        cur.execute(query, (product_id,))\n        row = cur.fetchone()\n        cur.close()\n        conn.close()\n        if row:\n            return jsonify({\n                'id': row[0], 'name': row[1], 'description': row[2],\n                'price': float(row[3]), 'category': row[4],\n                'rating': float(row[5]) if row[5] else None\n            })\n        return jsonify({'error': 'Not found'}), 404\n    except Exception as e:\n        return jsonify({'error': 'Database query failed'}), 500\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "EKS pod running the same container image with a PodSecurityContext that drops CAP_NET_RAW and CAP_SYS_ADMIN from the container's capability bounding set via securityContext.capabilities.drop. The pod runs with runAsNonRoot: true (UID 1000, GID 1000). A read-only root filesystem is enforced via securityContext.readOnlyRootFilesystem: true, with a single emptyDir volume mounted at /app/data/archives (medium: Memory, sizeLimit: 50Mi). The node uses a containerd runtime with default seccomp profile (RuntimeDefault) applied.",
+    "config": {
+      "runtime": "EKS with containerd",
+      "capabilities_dropped": [
+        "CAP_NET_RAW",
+        "CAP_SYS_ADMIN"
+      ],
+      "run_as_non_root": true,
+      "run_as_user": 1000,
+      "run_as_group": 1000,
+      "read_only_root_filesystem": true,
+      "volumes": [
+        {
+          "name": "archive-scratch",
+          "type": "emptyDir",
+          "medium": "Memory",
+          "size_limit": "50Mi",
+          "mount_path": "/app/data/archives"
+        }
+      ],
+      "seccomp_profile": "RuntimeDefault"
+    }
+  }
+}

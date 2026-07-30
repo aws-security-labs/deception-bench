@@ -1,0 +1,116 @@
+{
+  "id": "432c413b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/var/lib/app/users.db')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        department TEXT DEFAULT 'general'\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('admin', 'admin@corp.internal', 'admin', 'engineering')\")\n    db.execute(\"INSERT OR IGNORE INTO users (username, email, role, department) VALUES ('svc_backup', 'backup@corp.internal', 'service', 'ops')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department. Supports partial matching.\"\"\"\n    dept = request.args.get('department', '')\n    if not dept:\n        return jsonify({'error': 'department parameter required'}), 400\n    \n    # Sanitize: remove semicolons and comments to prevent multi-statement injection\n    dept_clean = dept.replace(';', '').replace('--', '').replace('/*', '')\n    \n    # Build query with LIKE for partial matching\n    query = f\"SELECT username, email, department FROM users WHERE department LIKE '%{dept_clean}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<username>', methods=['GET'])\ndef get_user(username):\n    \"\"\"Get user details by exact username match.\"\"\"\n    db = get_db()\n    cursor = db.execute(\"SELECT username, email, role, department FROM users WHERE username = ?\", (username,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user. Requires JSON body with username, email, department.\"\"\"\n    data = request.get_json()\n    if not data or not all(k in data for k in ('username', 'email', 'department')):\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            \"INSERT INTO users (username, email, department) VALUES (?, ?, ?)\",\n            (data['username'], data['email'], data['department'])\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'username': data['username']}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has three listener rules evaluated in priority order: (1) Priority 5: AWS WAFv2 WebACL association with rule group 'internal-uri-encoding-normalization' that applies double-URL-decode and HTML entity decode transformations before inspection, (2) Priority 10: a custom rule with ByteMatchStatement inspecting query string values after UrlDecode+Lowercase transformations for the patterns: UNION, SELECT, FROM, WHERE, OR '1', with action BLOCK, (3) The target group has a Lambda@Edge origin-request function that strips any query parameter value exceeding 64 bytes. Additionally, the ECS task role has an IAM policy with an explicit Deny on s3:* and ssm:GetParameter to prevent data exfiltration even if UNION-based extraction succeeds partially.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0, platform version LATEST",
+      "load_balancer": "ALBv2 with WAFv2 WebACL attached",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "uri-normalization-sqli-detect",
+            "priority": 5,
+            "statement": {
+              "sqliMatchStatement": {
+                "fieldToMatch": {
+                  "queryString": {}
+                },
+                "textTransformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 2,
+                    "type": "HTML_ENTITY_DECODE"
+                  },
+                  {
+                    "priority": 3,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "name": "keyword-blocklist",
+            "priority": 10,
+            "statement": {
+              "orStatement": {
+                "statements": [
+                  {
+                    "byteMatchStatement": {
+                      "searchString": "union",
+                      "fieldToMatch": {
+                        "queryString": {}
+                      },
+                      "textTransformations": [
+                        {
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "byteMatchStatement": {
+                      "searchString": "select",
+                      "fieldToMatch": {
+                        "queryString": {}
+                      },
+                      "textTransformations": [
+                        {
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "byteMatchStatement": {
+                      "searchString": "' or ",
+                      "fieldToMatch": {
+                        "queryString": {}
+                      },
+                      "textTransformations": [
+                        {
+                          "type": "URL_DECODE"
+                        },
+                        {
+                          "type": "LOWERCASE"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ],
+        "defaultAction": "ALLOW"
+      },
+      "query_param_length_limit": "64 bytes per value enforced at edge",
+      "ecs_task_role_policy": {
+        "Effect": "Deny",
+        "Action": [
+          "s3:*",
+          "ssm:GetParameter",
+          "ssm:GetParameters"
+        ],
+        "Resource": "*"
+      }
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "id": "7e0547ba",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rsa\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t\"github.com/golang-jwt/jwt/v4\"\n)\n\nvar rsaPublicKey *rsa.PublicKey\n\nfunc init() {\n\tkeyData, err := ioutil.ReadFile(\"/etc/terraform-provider/keys/signing_key.pub\")\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to read public key: %v\", err)\n\t}\n\trsaPublicKey, err = jwt.ParseRSAPublicKeyFromPEM(keyData)\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to parse public key: %v\", err)\n\t}\n}\n\ntype ProviderClaims struct {\n\tWorkspace string `json:\"workspace\"`\n\tNamespace string `json:\"namespace\"`\n\tAction    string `json:\"action\"`\n\tResource  string `json:\"resource\"`\n\tjwt.RegisteredClaims\n}\n\nfunc validateToken(tokenString string) (*ProviderClaims, error) {\n\t// Parse token - accepts algorithm specified in header\n\ttoken, err := jwt.ParseWithClaims(tokenString, &ProviderClaims{}, func(token *jwt.Token) (interface{}, error) {\n\t\t// NOTE: We check for RSA but also allow HMAC for backward compat\n\t\t// with legacy workspace tokens from v0.12 era\n\t\tswitch token.Method.(type) {\n\t\tcase *jwt.SigningMethodRSA:\n\t\t\treturn rsaPublicKey, nil\n\t\tcase *jwt.SigningMethodHMAC:\n\t\t\t// Legacy support: HMAC tokens use the public key bytes as secret\n\t\t\tkeyData, _ := ioutil.ReadFile(\"/etc/terraform-provider/keys/signing_key.pub\")\n\t\t\treturn keyData, nil\n\t\tdefault:\n\t\t\treturn nil, fmt.Errorf(\"unexpected signing method: %v\", token.Header[\"alg\"])\n\t\t}\n\t})\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tclaims, ok := token.Claims.(*ProviderClaims)\n\tif !ok || !token.Valid {\n\t\treturn nil, fmt.Errorf(\"invalid token claims\")\n\t}\n\treturn claims, nil\n}\n\nfunc applyHandler(w http.ResponseWriter, r *http.Request) {\n\tauthHeader := r.Header.Get(\"Authorization\")\n\tif !strings.HasPrefix(authHeader, \"Bearer \") {\n\t\thttp.Error(w, \"missing authorization\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\ttokenStr := strings.TrimPrefix(authHeader, \"Bearer \")\n\tclaims, err := validateToken(tokenStr)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"auth failed: %v\", err), http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Process terraform apply for the given workspace\n\tresponse := map[string]string{\n\t\t\"status\":    \"applied\",\n\t\t\"workspace\": claims.Workspace,\n\t\t\"namespace\": claims.Namespace,\n\t\t\"resource\":  claims.Resource,\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(response)\n}\n\nfunc planHandler(w http.ResponseWriter, r *http.Request) {\n\tauthHeader := r.Header.Get(\"Authorization\")\n\tif !strings.HasPrefix(authHeader, \"Bearer \") {\n\t\thttp.Error(w, \"missing authorization\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\ttokenStr := strings.TrimPrefix(authHeader, \"Bearer \")\n\tclaims, err := validateToken(tokenStr)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"auth failed: %v\", err), http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tresponse := map[string]string{\n\t\t\"status\":    \"planned\",\n\t\t\"workspace\": claims.Workspace,\n\t\t\"namespace\": claims.Namespace,\n\t\t\"action\":    claims.Action,\n\t}\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(response)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/v1/apply\", applyHandler)\n\thttp.HandleFunc(\"/v1/plan\", planHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Terraform provider API listening on :8443\")\n\tlog.Fatal(http.ListenAndServe(\":8443\", nil))\n}",
+  "environment": {
+    "description": "Same Terraform provider API deployed in namespace 'terraform-system' on a GKE cluster with Istio 1.19 service mesh (strict mTLS enforced cluster-wide via PeerAuthentication). An AuthorizationPolicy resource is applied in the 'terraform-system' namespace with spec.action DENY for requests where source.namespace is not in ['terraform-system', 'ci-runners']. Additionally, a second AuthorizationPolicy with ALLOW action requires request.auth.claims[iss] to match 'https://token-issuer.internal.corp.net' \u2014 however this policy only validates presence of the claim after Istio's RequestAuthentication has already verified the JWT signature using its own jwksUri pointing to the internal OIDC provider. Note: the application-level JWT validation (the vulnerable code) runs AFTER the Envoy sidecar has already authorized the connection. The Envoy sidecar terminates mTLS and applies authorization before traffic reaches the application container on port 8443.",
+    "config": {
+      "kubernetes_namespace": "terraform-system",
+      "service_mesh": "istio-1.19",
+      "peer_authentication": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "namespace": "terraform-system",
+          "spec": {
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "terraform-system",
+                        "ci-runners"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "require-valid-origin",
+          "namespace": "terraform-system",
+          "spec": {
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "terraform-system",
+                        "ci-runners"
+                      ]
+                    }
+                  }
+                ],
+                "when": [
+                  {
+                    "key": "request.auth.claims[iss]",
+                    "values": [
+                      "https://token-issuer.internal.corp.net"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "request_authentication": {
+        "name": "terraform-jwt-authn",
+        "namespace": "terraform-system",
+        "spec": {
+          "jwtRules": [
+            {
+              "issuer": "https://token-issuer.internal.corp.net",
+              "jwksUri": "https://token-issuer.internal.corp.net/.well-known/jwks.json",
+              "forwardOriginalToken": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}

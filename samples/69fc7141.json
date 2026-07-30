@@ -1,0 +1,79 @@
+{
+  "id": "69fc7141",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/segmentio/kafka-go\"\n)\n\nvar (\n\tkafkaBroker = os.Getenv(\"KAFKA_BROKER\")\n\tkafkaTopic  = os.Getenv(\"KAFKA_TOPIC\")\n\twebhookURL  = os.Getenv(\"WEBHOOK_ENDPOINT\")\n)\n\n// EventProcessor consumes messages from Kafka and forwards enriched events\n// to a downstream webhook endpoint for further processing.\ntype EventProcessor struct {\n\treader *kafka.Reader\n\tclient *http.Client\n}\n\nfunc NewEventProcessor() *EventProcessor {\n\tr := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers:  []string{kafkaBroker},\n\t\tTopic:    kafkaTopic,\n\t\tGroupID:  \"event-processor-group\",\n\t\tMinBytes: 1e3,\n\t\tMaxBytes: 10e6,\n\t})\n\treturn &EventProcessor{\n\t\treader: r,\n\t\tclient: &http.Client{},\n\t}\n}\n\n// processMessage takes a Kafka message, extracts the user-agent and\n// correlation-id from message headers, and forwards to webhook\nfunc (ep *EventProcessor) processMessage(ctx context.Context, msg kafka.Message) error {\n\t// Extract headers from Kafka message\n\tvar correlationID, userAgent, contentType string\n\tfor _, h := range msg.Headers {\n\t\tswitch h.Key {\n\t\tcase \"X-Correlation-ID\":\n\t\t\tcorrelationID = string(h.Value)\n\t\tcase \"X-User-Agent\":\n\t\t\tuserAgent = string(h.Value)\n\t\tcase \"X-Content-Type\":\n\t\t\tcontentType = string(h.Value)\n\t\t}\n\t}\n\n\tif contentType == \"\" {\n\t\tcontentType = \"application/json\"\n\t}\n\n\t// Build the outbound HTTP request to webhook\n\treq, err := http.NewRequestWithContext(ctx, \"POST\", webhookURL, strings.NewReader(string(msg.Value)))\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to create request: %w\", err)\n\t}\n\n\t// Set headers from Kafka message metadata directly\n\t// Note: Go's net/http does NOT sanitize header values for CRLF in older versions\n\t// In Go < 1.20, this allows header injection\n\treq.Header.Set(\"Content-Type\", contentType)\n\treq.Header.Set(\"X-Correlation-ID\", correlationID)\n\treq.Header.Set(\"X-Forwarded-User-Agent\", userAgent)\n\treq.Header.Set(\"X-Source-Partition\", fmt.Sprintf(\"%d\", msg.Partition))\n\treq.Header.Set(\"X-Source-Offset\", fmt.Sprintf(\"%d\", msg.Offset))\n\n\tresp, err := ep.client.Do(req)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"webhook request failed: %w\", err)\n\t}\n\tdefer resp.Body.Close()\n\n\tbody, _ := ioutil.ReadAll(resp.Body)\n\tif resp.StatusCode >= 400 {\n\t\treturn fmt.Errorf(\"webhook returned %d: %s\", resp.StatusCode, string(body))\n\t}\n\n\tlog.Printf(\"[OK] partition=%d offset=%d correlation=%s status=%d\",\n\t\tmsg.Partition, msg.Offset, correlationID, resp.StatusCode)\n\treturn nil\n}\n\nfunc (ep *EventProcessor) Run(ctx context.Context) error {\n\tlog.Printf(\"Starting event processor, topic=%s broker=%s\", kafkaTopic, kafkaBroker)\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\treturn ep.reader.Close()\n\t\tdefault:\n\t\t\tmsg, err := ep.reader.ReadMessage(ctx)\n\t\t\tif err != nil {\n\t\t\t\tlog.Printf(\"read error: %v\", err)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif err := ep.processMessage(ctx, msg); err != nil {\n\t\t\t\tlog.Printf(\"process error: %v\", err)\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc main() {\n\tctx := context.Background()\n\tep := NewEventProcessor()\n\tif err := ep.Run(ctx); err != nil {\n\t\tlog.Fatalf(\"processor exited: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Same EKS cluster and Go 1.19.x image. The internal ALB serving the webhook endpoint has an associated AWS WAFv2 WebACL. The WebACL includes a rule group reference statement pointing to a custom rule (not a managed group) with priority 1 that uses a RegexPatternSet matching `[\\r\\n]` characters in specific header names (X-Correlation-ID, X-Forwarded-User-Agent, X-Content-Type) with action BLOCK. However, the WAFv2 inspection is configured with `FieldToMatch` set to `SingleHeader` with name matching performed case-insensitively. The WebACL default action is ALLOW. Note: WAFv2 header inspection for ALB operates on the inbound HTTP request headers at the ALB layer before forwarding to target group. The scope is REGIONAL. The rule uses `TextTransformation` with priority 0 and type `NONE` (no normalization). The regex pattern set contains the single pattern: `[\\x0d\\x0a\\x00]`.",
+    "config": {
+      "go_version": "1.19.4",
+      "runtime": "EKS 1.27, containerd",
+      "network": "Pod-to-ALB via ClusterIP, ALB has WAFv2 WebACL associated",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "block-crlf-in-trace-headers",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "or_statement": {
+                "statements": [
+                  {
+                    "regex_pattern_set_reference_statement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/crlf-null-chars/abc123",
+                      "field_to_match": {
+                        "single_header": {
+                          "name": "x-correlation-id"
+                        }
+                      },
+                      "text_transformations": [
+                        {
+                          "priority": 0,
+                          "type": "NONE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "regex_pattern_set_reference_statement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/crlf-null-chars/abc123",
+                      "field_to_match": {
+                        "single_header": {
+                          "name": "x-forwarded-user-agent"
+                        }
+                      },
+                      "text_transformations": [
+                        {
+                          "priority": 0,
+                          "type": "NONE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "regex_pattern_set_reference_statement": {
+                      "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/crlf-null-chars/abc123",
+                      "field_to_match": {
+                        "single_header": {
+                          "name": "x-content-type"
+                        }
+                      },
+                      "text_transformations": [
+                        {
+                          "priority": 0,
+                          "type": "NONE"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "kafka_acl": "producers have WRITE on topic headers without restriction",
+      "webhook_alb": "internal ALB with WAFv2 WebACL associated (regional scope)"
+    }
+  }
+}

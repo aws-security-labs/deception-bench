@@ -1,0 +1,35 @@
+{
+  "id": "c96cc280",
+  "language": "python",
+  "code": "# views.py - Django REST Framework API for user profile comments\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom rest_framework import status\nfrom django.utils.html import escape as django_escape\nfrom django.db import models\nfrom django.http import HttpResponse\nfrom django.template import Template, Context\nimport bleach\nimport re\n\n# models.py equivalent\nfrom django.db import models\nfrom django.contrib.auth.models import User\n\nclass ProfileComment(models.Model):\n    author = models.ForeignKey(User, on_delete=models.CASCADE)\n    target_profile = models.ForeignKey(User, on_delete=models.CASCADE, related_name='profile_comments')\n    content = models.TextField(max_length=2000)\n    created_at = models.DateTimeField(auto_now_add=True)\n    is_pinned = models.BooleanField(default=False)\n\n    class Meta:\n        app_label = 'profiles'\n\n\nclass CommentCreateView(APIView):\n    permission_classes = [IsAuthenticated]\n\n    def post(self, request, profile_id):\n        \"\"\"Create a new comment on a user's profile.\"\"\"\n        content = request.data.get('content', '')\n        \n        # Basic length validation\n        if len(content) > 2000:\n            return Response({'error': 'Comment too long'}, status=status.HTTP_400_BAD_REQUEST)\n        \n        # Sanitize: strip script tags but allow formatting\n        # NOTE: This uses a allowlist approach for tags\n        allowed_tags = ['b', 'i', 'u', 'em', 'strong', 'a', 'span', 'p', 'br']\n        allowed_attrs = {'a': ['href', 'title'], 'span': ['class', 'style']}\n        cleaned_content = bleach.clean(content, tags=allowed_tags, attributes=allowed_attrs, strip=False)\n        \n        comment = ProfileComment.objects.create(\n            author=request.user,\n            target_profile_id=profile_id,\n            content=cleaned_content\n        )\n        \n        return Response({'id': comment.id, 'content': comment.content}, status=status.HTTP_201_CREATED)\n\n\nclass ProfileView(APIView):\n    \"\"\"Renders profile page with comments - serves HTML for browser rendering.\"\"\"\n    \n    def get(self, request, profile_id):\n        try:\n            profile_user = User.objects.get(id=profile_id)\n        except User.DoesNotExist:\n            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)\n        \n        comments = ProfileComment.objects.filter(target_profile=profile_user).order_by('-created_at')[:50]\n        \n        # Build HTML response for profile page\n        comments_html = ''\n        for comment in comments:\n            # Render comment content directly - bleach already sanitized on input\n            comments_html += f'''\n            <div class=\"comment\" data-id=\"{comment.id}\">\n                <span class=\"author\">{django_escape(comment.author.username)}</span>\n                <div class=\"comment-body\">{comment.content}</div>\n                <time>{comment.created_at.isoformat()}</time>\n            </div>\\n'''\n        \n        html_template = f'''\n        <!DOCTYPE html>\n        <html>\n        <head><title>Profile: {django_escape(profile_user.username)}</title></head>\n        <body>\n            <h1>{django_escape(profile_user.username)}'s Profile</h1>\n            <section id=\"comments\">\n                {comments_html}\n            </section>\n            <script src=\"/static/js/profile.js\"></script>\n        </body>\n        </html>'''\n        \n        response = HttpResponse(html_template, content_type='text/html')\n        return response\n\n\nclass PinnedCommentView(APIView):\n    \"\"\"Admin endpoint to pin/feature a comment with custom styling.\"\"\"\n    permission_classes = [IsAuthenticated]\n    \n    def put(self, request, comment_id):\n        if not request.user.is_staff:\n            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)\n        \n        try:\n            comment = ProfileComment.objects.get(id=comment_id)\n        except ProfileComment.DoesNotExist:\n            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)\n        \n        comment.is_pinned = True\n        # Admin can inject custom HTML wrapper for pinned styling\n        custom_wrapper = request.data.get('wrapper_html', '<div class=\"pinned\">')\n        comment.content = f\"{custom_wrapper}{comment.content}</div>\"\n        comment.save()\n        \n        return Response({'status': 'pinned'})",
+  "environment": {
+    "description": "Same Django 4.2 application deployed on AWS ECS Fargate behind CloudFront distribution. CloudFront is configured with a Response Headers Policy (ID: managed-policy-id-67890) that appends security headers to ALL origin responses before delivery to clients. The policy includes a custom Content-Security-Policy header value. Additionally, the ECS task definition includes a sidecar Envoy proxy with a Lua filter that validates response content-type and conditionally applies header overrides. The CloudFront Response Headers Policy specifies: 'Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example.com; style-src 'self' 'unsafe-inline'; img-src *; object-src 'none'; base-uri 'self'; frame-ancestors 'self'' with override-origin=true, ensuring the header is present even if the origin sets a different value. The Envoy sidecar additionally strips any CSP headers from the origin response to prevent conflicts with CloudFront's policy injection.",
+    "config": {
+      "django_version": "4.2.7",
+      "middleware": [
+        "django.middleware.security.SecurityMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.middleware.csrf.CsrfViewMiddleware"
+      ],
+      "cloudfront_response_headers_policy": {
+        "security_headers": {
+          "content_security_policy": {
+            "value": "default-src 'self'; script-src 'self' https://cdn.example.com; style-src 'self' 'unsafe-inline'; img-src *; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+            "override_origin": true
+          },
+          "x_content_type_options": {
+            "value": "nosniff",
+            "override_origin": true
+          },
+          "x_frame_options": {
+            "value": "SAMEORIGIN",
+            "override_origin": true
+          }
+        }
+      },
+      "envoy_sidecar": "lua filter strips origin CSP headers to prevent duplication",
+      "ecs_task_role": "arn:aws:iam::123456789:role/profile-service-task",
+      "bleach_version": "6.1.0"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "id": "f8e46276",
+  "language": "java",
+  "code": "import java.sql.Connection;\nimport java.sql.DriverManager;\nimport java.sql.PreparedStatement;\nimport java.sql.ResultSet;\nimport javax.servlet.http.HttpServlet;\nimport javax.servlet.http.HttpServletRequest;\nimport javax.servlet.http.HttpServletResponse;\nimport javax.servlet.annotation.WebServlet;\nimport java.io.IOException;\nimport java.io.PrintWriter;\n\n@WebServlet(\"/api/reports\")\npublic class ReportServlet extends HttpServlet {\n    \n    private Connection getConnection() throws Exception {\n        String url = System.getenv(\"JDBC_URL\") != null ? \n            System.getenv(\"JDBC_URL\") : \"jdbc:postgresql://db:5432/analytics\";\n        String user = System.getenv(\"DB_USER\") != null ? System.getenv(\"DB_USER\") : \"app_user\";\n        String pass = System.getenv(\"DB_PASS\") != null ? System.getenv(\"DB_PASS\") : \"changeme\";\n        return DriverManager.getConnection(url, user, pass);\n    }\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws IOException {\n        String sortCol = req.getParameter(\"sort\");\n        String direction = req.getParameter(\"dir\");\n        String department = req.getParameter(\"dept\");\n        \n        if (sortCol == null) sortCol = \"created_at\";\n        if (direction == null) direction = \"DESC\";\n        \n        // Validate direction to prevent injection there\n        if (!direction.equalsIgnoreCase(\"ASC\") && !direction.equalsIgnoreCase(\"DESC\")) {\n            direction = \"DESC\";\n        }\n        \n        // Build query - department uses parameterized query\n        // sortCol is validated against allowlist... or is it?\n        String query;\n        if (isValidColumn(sortCol)) {\n            query = \"SELECT id, title, department, created_at, status FROM reports \" +\n                    \"WHERE department = ? ORDER BY \" + sortCol + \" \" + direction;\n        } else {\n            // Fallback: still uses the raw input in error logging path\n            logInvalidSort(sortCol);\n            query = \"SELECT id, title, department, created_at, status FROM reports \" +\n                    \"WHERE department = ? ORDER BY created_at \" + direction;\n        }\n        \n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        \n        try (Connection conn = getConnection();\n             PreparedStatement stmt = conn.prepareStatement(query)) {\n            stmt.setString(1, department);\n            ResultSet rs = stmt.executeQuery();\n            \n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(String.format(\n                    \"  {\\\"id\\\": %d, \\\"title\\\": \\\"%s\\\", \\\"department\\\": \\\"%s\\\", \" +\n                    \"\\\"created_at\\\": \\\"%s\\\", \\\"status\\\": \\\"%s\\\"}\",\n                    rs.getInt(\"id\"),\n                    rs.getString(\"title\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"department\").replace(\"\\\"\", \"\\\\\\\"\"),\n                    rs.getString(\"created_at\"),\n                    rs.getString(\"status\").replace(\"\\\"\", \"\\\\\\\"\")\n                ));\n                first = false;\n            }\n            json.append(\"\\n]\");\n            out.print(json.toString());\n        } catch (Exception e) {\n            resp.setStatus(500);\n            // Leak error details for debugging\n            out.print(\"{\\\"error\\\": \\\"\" + e.getMessage().replace(\"\\\"\", \"\\\\\\\"\") + \"\\\"}\");\n        }\n    }\n    \n    private boolean isValidColumn(String col) {\n        // BUG: allowlist check uses contains() on a concatenated string\n        // rather than checking set membership. This allows injection via\n        // substrings like \"created_at--\" or \"id,extractvalue(1,concat(0x7e,version()))\"\n        String allowed = \"id,title,department,created_at,status\";\n        return allowed.contains(col);\n    }\n    \n    private void logInvalidSort(String col) {\n        System.err.println(\"[WARN] Invalid sort column requested: \" + col);\n    }\n}",
+  "environment": {
+    "description": "Same Kubernetes cluster (v1.28) with Istio 1.20 sidecar injection enabled on all namespaces. PeerAuthentication set to STRICT mTLS cluster-wide. An AuthorizationPolicy resource is applied to the user-service workload in 'backend' namespace. The policy uses a combination of 'from' source principals and 'to' operation paths. Specifically, the policy has a DENY action for requests to paths prefixed with '/internal/' where the source principal does NOT match 'cluster.local/ns/backend/sa/admin-service'. However, the policy is defined with a 'rules' block using notPrincipals rather than an explicit ALLOW, and the mesh-wide policy is set to ALLOW by default with this single targeted DENY rule. The Envoy sidecar enforces this at L7 before traffic reaches the application container on port 8080.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "backend",
+      "service_mesh": "istio-1.20.2",
+      "istio_peer_authentication": "STRICT",
+      "istio_authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "user-service-internal-deny",
+          "namespace": "backend"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "user-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notPrincipals": [
+                      "cluster.local/ns/backend/sa/admin-service"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/internal/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "mesh_wide_policy": "ALLOW (no global deny-all)",
+      "sidecar_injection": "enabled on all namespaces"
+    }
+  }
+}

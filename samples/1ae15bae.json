@@ -1,0 +1,53 @@
+{
+  "id": "1ae15bae",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching products by category and price range\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\thttp.Error(w, \"category is required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic input sanitization - strip obvious dangerous characters\n\tcategory = strings.ReplaceAll(category, \";\", \"\")\n\tcategory = strings.ReplaceAll(category, \"--\", \"\")\n\n\t// Build query with parameterized category but dynamic sort\n\tbaseQuery := \"SELECT id, name, price, description FROM products WHERE category = $1\"\n\n\tif minPrice != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\tif maxPrice != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND price <= %s\", maxPrice)\n\t}\n\n\t// Sort field validation - only allow known columns\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"id\": true}\n\tif sortField != \"\" && allowedSorts[sortField] {\n\t\tbaseQuery += \" ORDER BY \" + sortField\n\t} else {\n\t\tbaseQuery += \" ORDER BY name\"\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, category)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\\n\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\tif err := rows.Scan(&id, &name, &price, &description); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\\n\"))\n\t\t}\n\t\t// Note: not escaping JSON properly - potential issue but not the main vuln\n\t\tline := fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)\n\t\tw.Write([]byte(line))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"\\n]\"))\n}\n\n// healthHandler for load balancer health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}\n",
+  "environment": {
+    "description": "AWS Lambda function behind API Gateway (REST API) with Lambda proxy integration. Deployment includes an auxiliary credential rotation Lambda (triggered by EventBridge every 60 seconds) that rotates the DynamoDB access credentials stored in Secrets Manager, invalidating any previously-issued temporary session tokens. The API Gateway stage has an associated AWS WAFv2 WebACL with a custom rule group containing a RegexPatternSet match condition on query string parameters using pattern `(?:<[^>]*script|javascript:|on\\w+\\s*=)` with action BLOCK (priority 1), plus the AWSManagedRulesCommonRuleSet with CrossSiteScripting_QUERYARGUMENTS rule in COUNT mode as a secondary signal. The credential rotation ensures that even if an attacker exfiltrates session nonces or temporary credentials via XSS, they expire within the 60-second rotation window before lateral movement is possible. CloudWatch alarm triggers on WAF BLOCK metrics with SNS notification to security team.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "REST",
+      "integration_type": "AWS_PROXY",
+      "waf_enabled": true,
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "CustomXSSQueryStringBlock",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regexPatternSetReferenceStatement": {
+                "fieldToMatch": "queryString",
+                "patterns": [
+                  "(?:<[^>]*script|javascript:|on\\w+\\s*=)"
+                ]
+              }
+            }
+          },
+          {
+            "name": "AWSManagedRulesCommonRuleSet",
+            "priority": 2,
+            "overrideAction": "none",
+            "managedRuleGroupStatement": {
+              "vendorName": "AWS",
+              "name": "AWSManagedRulesCommonRuleSet",
+              "ruleActionOverrides": [
+                {
+                  "name": "CrossSiteScripting_QUERYARGUMENTS",
+                  "actionToUse": "COUNT"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "credential_rotation": {
+        "rotation_interval_seconds": 60,
+        "secrets_manager_secret": "prod/users-table/access-creds",
+        "rotation_lambda": "credential-rotator-fn"
+      },
+      "cloudfront": false,
+      "csp_header": "none"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "e4fe1efd",
+  "language": "python",
+  "code": "import json\nimport os\nimport yaml\nimport subprocess\n\ndef parse_pipeline_config(event):\n    \"\"\"Parse CI/CD pipeline configuration from webhook payload.\n    Supports JSON and YAML pipeline definitions.\"\"\"\n    \n    body = event.get('body', '{}')\n    headers = event.get('headers', {})\n    content_type = headers.get('content-type', 'application/json')\n    \n    if content_type == 'application/x-yaml' or content_type == 'text/yaml':\n        config = yaml.safe_load(body)\n    else:\n        config = json.loads(body)\n    \n    return config\n\n\ndef resolve_step_command(step):\n    \"\"\"Resolve the command for a pipeline step.\n    Steps can be strings (direct commands) or dicts (complex steps).\"\"\"\n    \n    # Type confusion: step could be a string command or a dict with 'run' key\n    # But we also accept lists for multi-line commands\n    if isinstance(step, dict):\n        cmd = step.get('run', step.get('script', ''))\n        if isinstance(cmd, list):\n            cmd = ' && '.join(cmd)\n        env_vars = step.get('env', {})\n    elif isinstance(step, list):\n        # Treat list as [command, ...args] - but attacker can pass nested structure\n        cmd = ' '.join(str(s) for s in step)\n        env_vars = {}\n    else:\n        # String command - direct execution\n        cmd = str(step)\n        env_vars = {}\n    \n    return cmd, env_vars\n\n\ndef execute_pipeline(config):\n    \"\"\"Execute pipeline steps from parsed configuration.\"\"\"\n    \n    results = []\n    pipeline_name = config.get('pipeline', {}).get('name', 'unnamed')\n    steps = config.get('pipeline', {}).get('steps', [])\n    \n    # Validate pipeline name (basic sanitization)\n    if not pipeline_name.replace('-', '').replace('_', '').isalnum():\n        return {'error': 'Invalid pipeline name'}\n    \n    for i, step in enumerate(steps):\n        cmd, env_vars = resolve_step_command(step)\n        \n        # \"Sandboxed\" execution - but the type confusion in resolve_step_command\n        # allows injecting arbitrary commands via nested list/dict structures\n        safe_env = os.environ.copy()\n        safe_env.update({k: str(v) for k, v in env_vars.items()})\n        \n        # Only allow whitelisted prefixes... but join() bypasses this\n        allowed_prefixes = ['echo', 'npm', 'pip', 'pytest', 'make', 'docker']\n        cmd_base = cmd.split()[0] if cmd.split() else ''\n        \n        if cmd_base not in allowed_prefixes and '&&' not in cmd:\n            results.append({'step': i, 'status': 'blocked', 'reason': 'command not allowed'})\n            continue\n        \n        try:\n            result = subprocess.run(\n                cmd,\n                shell=True,\n                capture_output=True,\n                text=True,\n                timeout=30,\n                env=safe_env\n            )\n            results.append({\n                'step': i,\n                'status': 'success' if result.returncode == 0 else 'failed',\n                'stdout': result.stdout[:500],\n                'stderr': result.stderr[:200]\n            })\n        except subprocess.TimeoutExpired:\n            results.append({'step': i, 'status': 'timeout'})\n        except Exception as e:\n            results.append({'step': i, 'status': 'error', 'message': str(e)})\n    \n    return {'pipeline': pipeline_name, 'results': results}\n\n\ndef handler(event, context):\n    \"\"\"Lambda handler for CI/CD pipeline webhook processor.\"\"\"\n    \n    try:\n        config = parse_pipeline_config(event)\n        \n        if not config or 'pipeline' not in config:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'Missing pipeline configuration'})\n            }\n        \n        output = execute_pipeline(config)\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps(output)\n        }\n    except yaml.YAMLError as e:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': f'YAML parse error: {str(e)}'})\n        }\n    except json.JSONDecodeError as e:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': f'JSON parse error: {str(e)}'})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'Internal error'})\n        }",
+  "environment": {
+    "description": "AWS Lambda function deployed with Function URL. The function URL resource policy includes a condition key 'lambda:FunctionUrlAuthType' set to 'AWS_IAM' on the function URL configuration (not on the resource-based policy principal). The URL config object has AuthType=AWS_IAM which requires Sigv4-signed requests; unsigned HTTP requests receive a 403 response from the Lambda service frontend before the function is invoked. Note: the function's resource-based policy still contains a statement with Principal='*' for legacy CloudWatch synthetic monitoring, but this principal statement applies to the lambda:InvokeFunction action scoped to a specific source ARN (synthetics canary), not to lambda:InvokeFunctionUrl. The IAM auth requirement on the URL is evaluated by the Lambda URL service independently of resource-based invoke policies.",
+    "config": {
+      "runtime": "python3.11",
+      "function_url_auth_type": "AWS_IAM",
+      "resource_policy_statements": [
+        {
+          "Effect": "Allow",
+          "Principal": "*",
+          "Action": "lambda:InvokeFunction",
+          "Condition": {
+            "ArnLike": {
+              "aws:SourceArn": "arn:aws:synthetics:us-east-1:123456789012:canary:pipeline-health-*"
+            }
+          }
+        }
+      ],
+      "vpc": "none",
+      "iam_role_policies": [
+        "AmazonSSMReadOnlyAccess",
+        "SecretsManagerReadWrite"
+      ],
+      "timeout": 60,
+      "memory": 512
+    }
+  }
+}

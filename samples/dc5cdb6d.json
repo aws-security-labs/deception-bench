@@ -1,0 +1,80 @@
+{
+  "id": "dc5cdb6d",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  max: 20,\n  idleTimeoutMillis: 30000\n});\n\n// Middleware: parse tenant context from JWT (simplified)\nfunction tenantContext(req, res, next) {\n  const tenantId = req.headers['x-tenant-id'];\n  const apiKey = req.headers['x-api-key'];\n  if (!tenantId || !apiKey) return res.status(401).json({ error: 'missing credentials' });\n  req.tenantId = tenantId;\n  req.apiKey = apiKey;\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', tenantContext, async (req, res) => {\n  try {\n    const { category, status, sort_by, direction, limit } = req.query;\n    \n    // Build base query with tenant isolation\n    let query = `SELECT id, name, category, status, metadata, created_at \n                 FROM assets WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (category) {\n      query += ` AND category = $${paramIdx}`;\n      params.push(category);\n      paramIdx++;\n    }\n\n    if (status) {\n      query += ` AND status = $${paramIdx}`;\n      params.push(status);\n      paramIdx++;\n    }\n\n    // Sort - validated against allowlist... or so we think\n    const allowedSorts = ['name', 'created_at', 'category', 'status'];\n    const sortCol = sort_by || 'created_at';\n    const sortDir = direction === 'asc' ? 'ASC' : 'DESC';\n    \n    // BUG: sortCol checked but result not used; raw sort_by injected\n    const isValid = allowedSorts.includes(sortCol);\n    query += ` ORDER BY ${sort_by || 'created_at'} ${sortDir}`;\n\n    // Limit\n    const rowLimit = Math.min(parseInt(limit) || 50, 200);\n    query += ` LIMIT ${rowLimit}`;\n\n    const result = await pool.query(query, params);\n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Search error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk update endpoint\napp.post('/api/v2/assets/bulk-update', tenantContext, async (req, res) => {\n  const { asset_ids, updates } = req.body;\n  if (!Array.isArray(asset_ids) || asset_ids.length === 0) {\n    return res.status(400).json({ error: 'asset_ids required' });\n  }\n  if (asset_ids.length > 100) {\n    return res.status(400).json({ error: 'max 100 assets per batch' });\n  }\n\n  const client = await pool.connect();\n  try {\n    await client.query('BEGIN');\n    const setClauses = [];\n    const setParams = [req.tenantId];\n    let idx = 2;\n\n    for (const [key, value] of Object.entries(updates)) {\n      if (['status', 'category', 'metadata'].includes(key)) {\n        setClauses.push(`${key} = $${idx}`);\n        setParams.push(value);\n        idx++;\n      }\n    }\n\n    if (setClauses.length === 0) {\n      await client.query('ROLLBACK');\n      return res.status(400).json({ error: 'no valid fields' });\n    }\n\n    const placeholders = asset_ids.map((_, i) => `$${idx + i}`).join(',');\n    const allParams = [...setParams, ...asset_ids];\n\n    const updateQuery = `UPDATE assets SET ${setClauses.join(', ')}, updated_at = NOW()\n                         WHERE tenant_id = $1 AND id IN (${placeholders})`;\n    \n    const result = await client.query(updateQuery, allParams);\n    await client.query('COMMIT');\n    res.json({ updated: result.rowCount });\n  } catch (err) {\n    await client.query('ROLLBACK');\n    console.error('Bulk update error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  } finally {\n    client.release();\n  }\n});\n\n// Health check with DB connectivity test\napp.get('/health', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Asset service running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same Apollo GraphQL server deployed on EKS 1.28 in namespace 'api-gateway'. The cluster uses Cilium CNI (v1.14.2) with CiliumNetworkPolicy enforcement. A namespace-scoped CiliumNetworkPolicy named 'restrict-metadata-egress' applies to pods with label app=graphql-gateway. The policy spec has an egressDeny rule with toCIDR ['169.254.169.254/32'] covering all ports. Additionally, a separate CiliumClusterwideNetworkPolicy 'baseline-deny-link-local' denies egress to 169.254.0.0/16 for all pods cluster-wide. The backend-svc gRPC service also has a CiliumNetworkPolicy restricting its egress to only the database CIDR (10.0.64.0/18) and internal service mesh endpoints. IMDSv2 is enforced at the node level (HttpTokens: required, hop-limit: 1) meaning even if traffic somehow reached 169.254.169.254, containerized pods at hop 2+ cannot obtain a session token.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "api-gateway",
+      "cni_plugin": "cilium-1.14.2-eni-mode",
+      "cilium_policy_enforcement": "always",
+      "network_policies": [
+        {
+          "name": "restrict-metadata-egress",
+          "kind": "CiliumNetworkPolicy",
+          "spec": {
+            "endpointSelector": {
+              "matchLabels": {
+                "app": "graphql-gateway"
+              }
+            },
+            "egressDeny": [
+              {
+                "toCIDR": [
+                  "169.254.169.254/32"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "baseline-deny-link-local",
+          "kind": "CiliumClusterwideNetworkPolicy",
+          "spec": {
+            "endpointSelector": {},
+            "egressDeny": [
+              {
+                "toCIDR": [
+                  "169.254.0.0/16"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "backend-svc-egress-restrict",
+          "kind": "CiliumNetworkPolicy",
+          "spec": {
+            "endpointSelector": {
+              "matchLabels": {
+                "app": "backend-svc"
+              }
+            },
+            "egress": [
+              {
+                "toCIDR": [
+                  "10.0.64.0/18"
+                ]
+              },
+              {
+                "toEndpoints": [
+                  {
+                    "matchLabels": {
+                      "io.cilium.k8s.policy.cluster": "default"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "imds_config": {
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1
+      },
+      "node_instance_profile": "arn:aws:iam::123456789012:instance-profile/eks-node-minimal-read"
+    }
+  }
+}

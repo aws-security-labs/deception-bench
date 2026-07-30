@@ -1,0 +1,44 @@
+{
+  "id": "6e24da58",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\nimport yaml\nimport hashlib\n\napp = Flask(__name__)\n\nUPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')\nALLOWED_EXTENSIONS = {'.yaml', '.yml', '.json'}\nMAX_FILE_SIZE = 1024 * 1024  # 1MB\n\ndef validate_filename(filename):\n    \"\"\"Basic filename sanitization\"\"\"\n    if not filename:\n        return None\n    # Remove directory traversal attempts\n    clean = os.path.basename(filename)\n    # Check extension\n    _, ext = os.path.splitext(clean)\n    if ext.lower() not in ALLOWED_EXTENSIONS:\n        return None\n    return clean\n\ndef compute_checksum(filepath):\n    \"\"\"Compute SHA256 checksum of uploaded file\"\"\"\n    h = hashlib.sha256()\n    with open(filepath, 'rb') as f:\n        while chunk := f.read(8192):\n            h.update(chunk)\n    return h.hexdigest()\n\ndef process_config(filepath):\n    \"\"\"Parse and validate configuration file\"\"\"\n    with open(filepath, 'r') as f:\n        config = yaml.safe_load(f)\n    \n    if not isinstance(config, dict):\n        raise ValueError(\"Config must be a mapping\")\n    \n    required_keys = ['name', 'version', 'deploy_target']\n    for key in required_keys:\n        if key not in config:\n            raise ValueError(f\"Missing required key: {key}\")\n    \n    return config\n\ndef run_deployment(config, filepath):\n    \"\"\"Execute deployment based on parsed config\"\"\"\n    deploy_target = config.get('deploy_target', '')\n    name = config.get('name', 'unnamed')\n    version = config.get('version', '0.0.0')\n    \n    # Build deployment command\n    log_msg = f\"Deploying {name} v{version} to {deploy_target}\"\n    app.logger.info(log_msg)\n    \n    # Run pre-deploy hook if specified\n    pre_hook = config.get('pre_deploy_hook', '')\n    if pre_hook:\n        # Validate hook is a known script\n        allowed_hooks = ['validate.sh', 'lint.sh', 'test.sh']\n        hook_base = os.path.basename(pre_hook)\n        if hook_base not in allowed_hooks:\n            raise ValueError(f\"Unknown pre-deploy hook: {hook_base}\")\n        \n        hook_path = f\"/opt/hooks/{hook_base}\"\n        # Pass config file path and deploy target as arguments\n        cmd = f\"{hook_path} {filepath} {deploy_target}\"\n        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=30)\n        if result.returncode != 0:\n            raise RuntimeError(f\"Pre-deploy hook failed: {result.stderr.decode()}\")\n    \n    return {\"status\": \"deployed\", \"target\": deploy_target, \"checksum\": compute_checksum(filepath)}\n\n@app.route('/api/v1/deploy', methods=['POST'])\ndef deploy():\n    \"\"\"Handle deployment config upload and execution\"\"\"\n    if 'config' not in request.files:\n        return jsonify({\"error\": \"No config file provided\"}), 400\n    \n    file = request.files['config']\n    filename = validate_filename(file.filename)\n    if not filename:\n        return jsonify({\"error\": \"Invalid filename or extension\"}), 400\n    \n    # Check file size\n    file.seek(0, 2)\n    size = file.tell()\n    file.seek(0)\n    if size > MAX_FILE_SIZE:\n        return jsonify({\"error\": \"File too large\"}), 413\n    \n    # Save to temp location\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    filepath = os.path.join(UPLOAD_DIR, filename)\n    file.save(filepath)\n    \n    try:\n        config = process_config(filepath)\n        result = run_deployment(config, filepath)\n        return jsonify(result), 200\n    except ValueError as e:\n        return jsonify({\"error\": str(e)}), 422\n    except RuntimeError as e:\n        return jsonify({\"error\": str(e)}), 500\n    finally:\n        # Cleanup\n        if os.path.exists(filepath):\n            os.unlink(filepath)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"ok\"}), 200\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Lambda function deployed with identical VPC configuration and IoT Core rule. DynamoDB table has identical schema. However, the Lambda execution role uses a scoped policy with dynamodb:LeadingKeys condition restricting writes to items where tenant_id matches the ${aws:PrincipalTag/tenant} tag on the role session. Additionally, the LDAP directory server runs behind an internal NLB with a TCP listener that has connection draining enabled and the target group health check validates LDAP bind responses. The VPC security group sg-0a1b2c3d4e5f67890 attached to the Lambda ENI has an outbound rule allowing TCP 636 (LDAPS) only - port 389 (plaintext LDAP) is NOT in the egress rules. The LDAP server's own host-based firewall (iptables) accepts connections only on port 636 with TLS certificate verification required. The NLB target group is registered on port 636.",
+    "config": {
+      "lambda_role_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:UpdateItem",
+          "dynamodb:PutItem"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111122223333:table/iot_device_registry",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/tenant}"
+            ]
+          }
+        }
+      },
+      "security_group_egress": {
+        "sg_id": "sg-0a1b2c3d4e5f67890",
+        "rules": [
+          {
+            "protocol": "tcp",
+            "port": 636,
+            "destination": "10.0.5.0/24",
+            "description": "LDAPS to directory NLB"
+          },
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "0.0.0.0/0",
+            "description": "HTTPS for AWS APIs"
+          }
+        ]
+      },
+      "nlb_target_group": "tg-ldaps-directory on port 636 with TLS passthrough",
+      "ldap_server_config": "slapd configured with TLS-only (ldaps://) on port 636, olcSecurity: tls=1"
+    }
+  }
+}

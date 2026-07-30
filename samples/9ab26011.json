@@ -1,0 +1,63 @@
+{
+  "id": "9ab26011",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\t\"sync\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\nvar upgrader = websocket.Upgrader{\n\tReadBufferSize:  1024,\n\tWriteBufferSize: 1024,\n\tCheckOrigin: func(r *http.Request) bool {\n\t\treturn true\n\t},\n}\n\ntype Client struct {\n\tconn     *websocket.Conn\n\tnickname string\n\troom     string\n}\n\ntype Hub struct {\n\tmu      sync.RWMutex\n\tclients map[*Client]bool\n}\n\nvar hub = &Hub{clients: make(map[*Client]bool)}\n\nfunc (h *Hub) broadcast(room string, msg string) {\n\th.mu.RLock()\n\tdefer h.mu.RUnlock()\n\tfor client := range h.clients {\n\t\tif client.room == room {\n\t\t\tclient.conn.WriteMessage(websocket.TextMessage, []byte(msg))\n\t\t}\n\t}\n}\n\nfunc handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tconn, err := upgrader.Upgrade(w, r, nil)\n\tif err != nil {\n\t\tlog.Printf(\"Upgrade error: %v\", err)\n\t\treturn\n\t}\n\tdefer conn.Close()\n\n\tnickname := r.URL.Query().Get(\"nickname\")\n\troom := r.URL.Query().Get(\"room\")\n\n\tif nickname == \"\" || room == \"\" {\n\t\tconn.WriteMessage(websocket.TextMessage, []byte(\"nickname and room required\"))\n\t\treturn\n\t}\n\n\tclient := &Client{conn: conn, nickname: nickname, room: room}\n\thub.mu.Lock()\n\thub.clients[client] = true\n\thub.mu.Unlock()\n\n\tdefer func() {\n\t\thub.mu.Lock()\n\t\tdelete(hub.clients, client)\n\t\thub.mu.Unlock()\n\t}()\n\n\t// Log join event - nickname is written directly into log stream\n\tlogEntry := fmt.Sprintf(\"JOIN %s %s %s\\n\", room, nickname, r.RemoteAddr)\n\twriteToEventLog(logEntry)\n\n\tjoinMsg := fmt.Sprintf(\"[%s] %s joined the room\", room, nickname)\n\thub.broadcast(room, joinMsg)\n\n\tfor {\n\t\t_, message, err := conn.ReadMessage()\n\t\tif err != nil {\n\t\t\tbreak\n\t\t}\n\n\t\tuserMsg := string(message)\n\t\t// Build protocol frame for internal relay service\n\t\t// Format: RELAY\\r\\nRoom: <room>\\r\\nFrom: <nickname>\\r\\nBody: <msg>\\r\\n\\r\\n\n\t\trelayFrame := buildRelayFrame(room, nickname, userMsg)\n\t\tsendToRelayService(relayFrame)\n\n\t\tbroadcastMsg := fmt.Sprintf(\"[%s] %s: %s\", room, nickname, userMsg)\n\t\thub.broadcast(room, broadcastMsg)\n\t}\n}\n\nfunc buildRelayFrame(room, nickname, body string) string {\n\t// VULNERABILITY: nickname is injected directly into CRLF-delimited protocol frame\n\t// An attacker can inject \\r\\n sequences in the nickname to manipulate headers\n\tvar sb strings.Builder\n\tsb.WriteString(\"RELAY\\r\\n\")\n\tsb.WriteString(fmt.Sprintf(\"Room: %s\\r\\n\", room))\n\tsb.WriteString(fmt.Sprintf(\"From: %s\\r\\n\", nickname))\n\tsb.WriteString(fmt.Sprintf(\"Priority: normal\\r\\n\"))\n\tsb.WriteString(fmt.Sprintf(\"Body: %s\\r\\n\", body))\n\tsb.WriteString(\"\\r\\n\")\n\treturn sb.String()\n}\n\nfunc sendToRelayService(frame string) {\n\t// In production this sends to internal TCP relay on port 9090\n\t// For now just log it\n\tlog.Printf(\"Relay frame: %q\", frame)\n}\n\nfunc writeToEventLog(entry string) {\n\t// Writes to /var/log/ws-events/events.log (hostPath volume in k8s)\n\t// In production, this appends to a shared log file\n\tlog.Printf(\"Event: %s\", entry)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/ws\", handleWebSocket)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tlog.Println(\"WebSocket server starting on :8080\")\n\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tlog.Fatalf(\"Server failed: %v\", err)\n\t}\n}",
+  "environment": {
+    "description": "Same Kubernetes 1.24 cluster but namespace has label pod-security.kubernetes.io/enforce: restricted applied. The restricted Pod Security Standard rejects pods with spec.containers[].securityContext.privileged=true and blocks hostPath volume types. Additionally, a ValidatingAdmissionPolicy (CEL-based, v1beta1) evaluates spec.volumes and rejects any volume where type is 'HostPath'. The container must run as non-root (runAsNonRoot: true, runAsUser: 65534). The relay service port 9090 is only reachable via a Kubernetes NetworkPolicy that restricts ingress to pods with label app=relay-authorized, which this WebSocket pod does NOT carry. The combination means: (1) no hostPath for log poisoning escalation, (2) non-root prevents binding to privileged ports or accessing host filesystem even if volume somehow mounted, (3) NetworkPolicy blocks TCP connection to relay service so injected frames never reach the vulnerable parser.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.25"
+      },
+      "validating_admission_policy": {
+        "name": "deny-hostpath-volumes",
+        "expression": "object.spec.volumes.all(v, !has(v.hostPath))",
+        "action": "Deny"
+      },
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [],
+      "network_policy": {
+        "name": "restrict-relay-ingress",
+        "pod_selector": {
+          "matchLabels": {
+            "app": "relay-service"
+          }
+        },
+        "ingress_rules": [
+          {
+            "from": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "relay-authorized"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 9090,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      },
+      "websocket_pod_labels": {
+        "app": "ws-chat-service",
+        "tier": "frontend"
+      }
+    }
+  }
+}

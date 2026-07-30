@@ -1,0 +1,28 @@
+{
+  "id": "9a676f6d",
+  "language": "java",
+  "code": "package com.acme.config;\n\nimport io.quarkus.funqy.Funq;\nimport io.quarkus.funqy.Context;\nimport io.quarkus.funqy.knative.events.CloudEvent;\n\nimport javax.inject.Inject;\nimport javax.enterprise.context.ApplicationScoped;\nimport java.util.Map;\nimport java.util.HashMap;\nimport java.util.concurrent.ConcurrentHashMap;\n\n@ApplicationScoped\npublic class ConfigMergeHandler {\n\n    // Global configuration store shared across all tenants\n    private static final Map<String, Object> BASE_CONFIG = new ConcurrentHashMap<>();\n    \n    static {\n        BASE_CONFIG.put(\"maxRetries\", 3);\n        BASE_CONFIG.put(\"timeout\", 5000);\n        BASE_CONFIG.put(\"debugMode\", false);\n        BASE_CONFIG.put(\"adminAccess\", false);\n    }\n\n    @Funq\n    public Map<String, Object> mergeConfig(Map<String, Object> userInput) {\n        Map<String, Object> result = new HashMap<>(BASE_CONFIG);\n        deepMerge(result, userInput);\n        return result;\n    }\n\n    @SuppressWarnings(\"unchecked\")\n    private void deepMerge(Map<String, Object> target, Map<String, Object> source) {\n        if (source == null) return;\n        \n        for (Map.Entry<String, Object> entry : source.entrySet()) {\n            String key = entry.getKey();\n            Object value = entry.getValue();\n            \n            // Traverse nested maps recursively - allows __proto__ equivalent keys\n            if (value instanceof Map && target.containsKey(key) && target.get(key) instanceof Map) {\n                deepMerge((Map<String, Object>) target.get(key), (Map<String, Object>) value);\n            } else {\n                // Direct property injection into shared config\n                target.put(key, value);\n                // Also propagate to BASE_CONFIG for persistence across invocations\n                BASE_CONFIG.put(key, value);\n            }\n        }\n    }\n\n    @Funq\n    public Map<String, Object> getStatus() {\n        Map<String, Object> status = new HashMap<>();\n        status.put(\"isAdmin\", BASE_CONFIG.getOrDefault(\"adminAccess\", false));\n        status.put(\"debug\", BASE_CONFIG.getOrDefault(\"debugMode\", false));\n        status.put(\"config\", new HashMap<>(BASE_CONFIG));\n        return status;\n    }\n\n    @Funq\n    public Map<String, Object> executeAdmin(Map<String, Object> request) {\n        // Check admin access from shared config\n        Boolean isAdmin = (Boolean) BASE_CONFIG.getOrDefault(\"adminAccess\", false);\n        if (!isAdmin) {\n            return Map.of(\"error\", \"Unauthorized\", \"code\", 403);\n        }\n        \n        String command = (String) request.get(\"command\");\n        // Admin operations - reset, export, etc.\n        if (\"reset\".equals(command)) {\n            BASE_CONFIG.put(\"maxRetries\", 3);\n            BASE_CONFIG.put(\"timeout\", 5000);\n            BASE_CONFIG.put(\"debugMode\", false);\n            BASE_CONFIG.put(\"adminAccess\", false);\n            return Map.of(\"status\", \"reset complete\");\n        } else if (\"export\".equals(command)) {\n            return new HashMap<>(BASE_CONFIG);\n        } else if (\"exec\".equals(command)) {\n            String target = (String) request.get(\"target\");\n            try {\n                Process p = Runtime.getRuntime().exec(target);\n                return Map.of(\"status\", \"executed\", \"pid\", p.pid());\n            } catch (Exception e) {\n                return Map.of(\"error\", e.getMessage());\n            }\n        }\n        return Map.of(\"error\", \"unknown command\");\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus 3.2 native function on AWS Lambda. API Gateway REST API (v1) with a usage plan attached to the stage. The usage plan enforces per-client throttle of 2 requests/second with burst of 3. Additionally, an AWS WAF WebACL is associated with the API Gateway stage containing a single custom rate-based rule (not a managed rule group) with a threshold of 100 requests per 5-minute window per source IP, action BLOCK. The rate-based rule uses the forwarded IP from X-Forwarded-For with fallback to source IP. Note: the WAF rule is rate-based only \u2014 it does NOT inspect request bodies or payloads. The usage plan's throttle settings are the primary control. Lambda reserved concurrency set to 1 to serialize execution.",
+    "config": {
+      "runtime": "quarkus-native-3.2.0",
+      "deployment": "aws-lambda",
+      "api_gateway_type": "REST_API_V1",
+      "usage_plan": {
+        "throttle_rate": 2,
+        "throttle_burst": 3,
+        "quota": "1000/day"
+      },
+      "waf_web_acl": {
+        "rule_type": "rate-based",
+        "threshold": 100,
+        "period": "5min",
+        "ip_source": "x-forwarded-for-with-fallback",
+        "action": "BLOCK",
+        "body_inspection": false
+      },
+      "lambda_reserved_concurrency": 1,
+      "function_url": "disabled"
+    }
+  }
+}

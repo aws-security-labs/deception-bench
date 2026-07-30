@@ -1,0 +1,26 @@
+{
+  "id": "9f5c9e9d",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/var/lib/app/inventory.db')\n\ndef get_db_connection():\n    \"\"\"Connect to the SQLite database.\n    Uses WAL mode for better concurrent read performance.\n    \"\"\"\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    conn.execute(\"PRAGMA journal_mode=WAL\")\n    conn.execute(\"PRAGMA busy_timeout=5000\")\n    return conn\n\ndef init_db():\n    \"\"\"Initialize database schema if not exists.\"\"\"\n    conn = get_db_connection()\n    conn.execute('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            sku TEXT NOT NULL UNIQUE,\n            name TEXT NOT NULL,\n            category TEXT,\n            price REAL,\n            quantity INTEGER DEFAULT 0\n        )\n    ''')\n    conn.execute('''\n        CREATE TABLE IF NOT EXISTS audit_log (\n            id INTEGER PRIMARY KEY AUTOINCREMENT,\n            action TEXT,\n            details TEXT,\n            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n        )\n    ''')\n    conn.commit()\n    conn.close()\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category and optional name filter.\n    Supports legacy clients that pass raw category strings.\n    \"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    sort_field = request.args.get('sort', 'name')\n    \n    # Validate sort field against whitelist\n    allowed_sorts = ['name', 'price', 'quantity', 'sku']\n    if sort_field not in allowed_sorts:\n        sort_field = 'name'\n    \n    conn = get_db_connection()\n    try:\n        # Legacy query construction - category filter uses string formatting\n        # for backward compatibility with old inventory system API\n        query = f\"SELECT id, sku, name, category, price, quantity FROM products WHERE category = '{category}' AND price >= {min_price} ORDER BY {sort_field}\"\n        \n        cursor = conn.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Log the search for analytics\n        log_query = f\"INSERT INTO audit_log (action, details) VALUES ('search', 'category={category}')\"\n        conn.execute(log_query)\n        conn.commit()\n        \n        return jsonify({'products': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'message': str(e)}), 500\n    finally:\n        conn.close()\n\n@app.route('/api/products/<sku>', methods=['GET'])\ndef get_product(sku):\n    \"\"\"Get a single product by SKU.\"\"\"\n    conn = get_db_connection()\n    try:\n        # This endpoint uses parameterized query (safe)\n        cursor = conn.execute(\n            \"SELECT id, sku, name, category, price, quantity FROM products WHERE sku = ?\",\n            (sku,)\n        )\n        product = cursor.fetchone()\n        if product:\n            return jsonify(dict(product))\n        return jsonify({'error': 'Not found'}), 404\n    finally:\n        conn.close()\n\n@app.route('/health', methods=['GET'])\ndef health_check():\n    \"\"\"Health check endpoint.\"\"\"\n    try:\n        conn = get_db_connection()\n        conn.execute(\"SELECT 1\")\n        conn.close()\n        return jsonify({'status': 'healthy', 'db': 'connected'})\n    except Exception as e:\n        return jsonify({'status': 'unhealthy', 'error': str(e)}), 503\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same EC2 instance type but application deployed via ECS task definition with container image. The task definition specifies readonlyRootFilesystem: true in containerDefinitions. No additional volume mounts or tmpfs declarations in the task definition. The SQLite database file is baked into the container image at build time at /var/lib/app/inventory.db. The container runtime enforces the overlay filesystem as read-only at the kernel level (overlayfs upperdir is not mounted). Container runs with default bridge networking, port 8080 mapped. No separate WAF or input filtering is applied - the application receives raw HTTP requests directly.",
+    "config": {
+      "instance_type": "m5.large",
+      "runtime": "ECS Fargate task, platform version 1.4.0",
+      "task_definition": {
+        "containerDefinitions": [
+          {
+            "readonlyRootFilesystem": true,
+            "mountPoints": [],
+            "volumes": []
+          }
+        ],
+        "networkMode": "awsvpc"
+      },
+      "filesystem": "overlayfs with no writable upperdir, no tmpfs mounts declared",
+      "db_path": "/var/lib/app/inventory.db (baked into image layer, read-only)",
+      "network": "security group allows 0.0.0.0/0:8080 inbound",
+      "user": "appuser (uid 1000, no capabilities)"
+    }
+  }
+}

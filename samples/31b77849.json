@@ -1,0 +1,33 @@
+{
+  "id": "31b77849",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/rand\"\n\t\"database/sql\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar templates *template.Template\n\ntype PageData struct {\n\tTitle   string\n\tContent string\n\tUser    string\n\tResults []map[string]string\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tif dsn == \"\" {\n\t\tdsn = \"postgres://app:app@localhost/appdb?sslmode=disable\"\n\t}\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// Template with custom delimiters to avoid conflicts\n\ttemplates = template.New(\"\").Delims(\"[[\", \"]]\")\n\ttemplates = template.Must(templates.Parse(profileTemplate))\n}\n\nvar profileTemplate = `<html><head><title>[[.Title]]</title></head>\n<body><h1>Welcome, [[.User]]</h1>\n<div class=\"content\">[[.Content]]</div>\n<div class=\"results\">[[ range .Results ]]<div>[[ index . \"name\" ]] - [[ index . \"email\" ]]</div>[[ end ]]</div>\n</body></html>`\n\nfunc generateCSRF() string {\n\tb := make([]byte, 16)\n\trand.Read(b)\n\treturn hex.EncodeToString(b)\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"GET\" {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tquery := r.URL.Query().Get(\"q\")\n\tpage := r.URL.Query().Get(\"page\")\n\tif page == \"\" {\n\t\tpage = \"1\"\n\t}\n\n\t// Audit logging - parameterized (safe)\n\t_, _ = db.Exec(\"INSERT INTO audit_log (action, param) VALUES ($1, $2)\", \"search\", query)\n\n\t// Build search query - developer attempted sanitization\n\tquery = strings.ReplaceAll(query, \";\", \"\")\n\tquery = strings.ReplaceAll(query, \"--\", \"\")\n\n\t// Construct query with ILIKE for case-insensitive search\n\tsqlQuery := fmt.Sprintf(\n\t\t\"SELECT name, email, department FROM employees WHERE name ILIKE '%%%s%%' OR department ILIKE '%%%s%%' ORDER BY name LIMIT 20 OFFSET %s\",\n\t\tquery, query, page,\n\t)\n\n\trows, err := db.Query(sqlQuery)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Search temporarily unavailable\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []map[string]string\n\tfor rows.Next() {\n\t\tvar name, email, dept string\n\t\tif err := rows.Scan(&name, &email, &dept); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, map[string]string{\"name\": name, \"email\": email, \"dept\": dept})\n\t}\n\n\tdata := PageData{\n\t\tTitle:   \"Search Results\",\n\t\tContent: fmt.Sprintf(\"Results for: %s\", template.HTMLEscapeString(query)),\n\t\tUser:    r.Header.Get(\"X-Authenticated-User\"),\n\t\tResults: results,\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html\")\n\ttemplates.ExecuteTemplate(w, \"\", data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an internal ALB (scheme=internal). The ALB's target group health check hits /health. An API Gateway (REST, regional) with a usage plan fronts the ALB via VPC Link (private integration). The API Gateway resource /api/users/search has request validation enabled with a request validator that requires the 'username', 'role', and 'email' parameters to each match the regex pattern ^[a-zA-Z0-9.@_-]{0,64}$ (configured via a JSON Schema model on the Method Request's URL Query String Parameters with 'Required: false' but pattern-constrained). The API Gateway returns 400 before the request reaches the application if any provided query parameter fails validation. Additionally, the Fargate task role has no network egress (VPC with no NAT gateway, no IGW, interface endpoints only for ECR/logs/secretsmanager), and the task's security group only allows inbound from the ALB's security group on port 8080.",
+    "config": {
+      "compute": "ECS Fargate in private subnet",
+      "load_balancer": "Internal ALB (scheme=internal)",
+      "api_gateway": "Regional REST API with VPC Link private integration",
+      "request_validation": {
+        "validator": "Validate query string parameters",
+        "parameters": {
+          "username": {
+            "pattern": "^[a-zA-Z0-9.@_-]{0,64}$",
+            "required": false
+          },
+          "role": {
+            "pattern": "^[a-zA-Z0-9.@_-]{0,64}$",
+            "required": false
+          },
+          "email": {
+            "pattern": "^[a-zA-Z0-9.@_-]{0,64}$",
+            "required": false
+          }
+        }
+      },
+      "network_egress": "No NAT, no IGW, interface endpoints only (ecr, logs, secretsmanager)",
+      "task_sg_ingress": "TCP/8080 from ALB security group only",
+      "direct_access": "Not possible - ALB is internal, only reachable via API Gateway VPC Link"
+    }
+  }
+}

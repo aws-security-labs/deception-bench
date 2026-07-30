@@ -1,0 +1,51 @@
+{
+  "id": "3bb1163e",
+  "language": "go",
+  "code": "package provider\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"os/exec\"\n\t\"strings\"\n\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/diag\"\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema\"\n)\n\nfunc resourceDNSRecord() *schema.Resource {\n\treturn &schema.Resource{\n\t\tCreateContext: resourceDNSRecordCreate,\n\t\tReadContext:   resourceDNSRecordRead,\n\t\tDeleteContext: resourceDNSRecordDelete,\n\t\tSchema: map[string]*schema.Schema{\n\t\t\t\"zone\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"name\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"type\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"value\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"ttl\": {\n\t\t\t\tType:     schema.TypeInt,\n\t\t\t\tOptional: true,\n\t\t\t\tDefault:  300,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t},\n\t}\n}\n\nfunc resourceDNSRecordCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\tconfig := meta.(*ProviderConfig)\n\n\tzone := d.Get(\"zone\").(string)\n\tname := d.Get(\"name\").(string)\n\trecordType := d.Get(\"type\").(string)\n\tvalue := d.Get(\"value\").(string)\n\tttl := d.Get(\"ttl\").(int)\n\n\t// Validate record type\n\tvalidTypes := []string{\"A\", \"AAAA\", \"CNAME\", \"MX\", \"TXT\", \"SRV\", \"NS\"}\n\ttypeValid := false\n\tfor _, t := range validTypes {\n\t\tif strings.EqualFold(recordType, t) {\n\t\t\ttypeValid = true\n\t\t\tbreak\n\t\t}\n\t}\n\tif !typeValid {\n\t\treturn diag.Errorf(\"invalid record type: %s\", recordType)\n\t}\n\n\t// Use nsupdate to dynamically update DNS zone via the internal DNS API service\n\t// The provider communicates with dns-api-service in the dns-system namespace\n\tupdateCmd := fmt.Sprintf(\n\t\t\"server %s\\nzone %s\\nupdate add %s.%s %d %s %s\\nsend\\n\",\n\t\tconfig.DNSServer, zone, name, zone, ttl, recordType, value,\n\t)\n\n\t// Shell out to nsupdate - the value field is user-controlled\n\tcmd := exec.CommandContext(ctx, \"/bin/sh\", \"-c\",\n\t\tfmt.Sprintf(\"echo '%s' | nsupdate -k %s\", updateCmd, config.TSIGKeyFile))\n\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\treturn diag.Errorf(\"nsupdate failed: %s\\nOutput: %s\", err, string(output))\n\t}\n\n\td.SetId(fmt.Sprintf(\"%s.%s/%s\", name, zone, recordType))\n\treturn nil\n}\n\nfunc resourceDNSRecordRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\t// Read is a no-op for this simplified provider\n\treturn nil\n}\n\nfunc resourceDNSRecordDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\tconfig := meta.(*ProviderConfig)\n\tzone := d.Get(\"zone\").(string)\n\tname := d.Get(\"name\").(string)\n\trecordType := d.Get(\"type\").(string)\n\n\tdeleteCmd := fmt.Sprintf(\n\t\t\"server %s\\nzone %s\\nupdate delete %s.%s %s\\nsend\\n\",\n\t\tconfig.DNSServer, zone, name, zone, recordType,\n\t)\n\n\tcmd := exec.CommandContext(ctx, \"/bin/sh\", \"-c\",\n\t\tfmt.Sprintf(\"echo '%s' | nsupdate -k %s\", deleteCmd, config.TSIGKeyFile))\n\n\tif output, err := cmd.CombinedOutput(); err != nil {\n\t\treturn diag.Errorf(\"nsupdate delete failed: %s\\nOutput: %s\", err, string(output))\n\t}\n\n\td.SetId(\"\")\n\treturn nil\n}\n\ntype ProviderConfig struct {\n\tDNSServer   string\n\tTSIGKeyFile string\n}\n",
+  "environment": {
+    "description": "Terraform provider runs as a pod in namespace 'terraform-runners' on a Kubernetes cluster with Istio 1.20 service mesh. An AuthorizationPolicy resource is applied at the mesh level with a DENY action for source principals not matching 'cluster.local/ns/terraform-runners/sa/terraform-provider-dns'. However, the command injection executes locally within the pod itself (nsupdate runs on localhost), so the Istio sidecar proxy only governs outbound L7 traffic to other mesh services. A PeerAuthentication policy enforces STRICT mTLS mesh-wide. The dns-api-service in namespace 'dns-system' has an additional AuthorizationPolicy that only allows requests from source namespace 'dns-controllers'. Note: the provider does NOT call dns-api-service over HTTP; it shells out to nsupdate which uses DNS protocol (UDP/TCP port 53) directly to config.DNSServer.",
+    "config": {
+      "namespace": "terraform-runners",
+      "service_mesh": "istio-1.20",
+      "istio_authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-to-dns",
+          "namespace": "dns-system"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "dns-controllers"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "istio-system"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "pod_security": "baseline",
+      "istio_outbound_traffic_policy": "REGISTRY_ONLY"
+    }
+  }
+}

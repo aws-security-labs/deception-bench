@@ -1,0 +1,16 @@
+{
+  "id": "ac18ed84",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Builder;\nusing Microsoft.Extensions.DependencyInjection;\nusing System.Collections.Concurrent;\nusing System.Threading.Tasks;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\nvar app = builder.Build();\napp.MapControllers();\napp.Run();\n\n[ApiController]\n[Route(\"api/[controller]\")]\npublic class PromotionController : ControllerBase\n{\n    // In-memory store for promotional code redemptions\n    private static ConcurrentDictionary<string, int> _promoUsage = new();\n    private static readonly int MAX_REDEMPTIONS = 1;\n    private static readonly object _lockObj = new();\n\n    // Simulated reward credit\n    private static ConcurrentDictionary<string, decimal> _userBalances = new();\n\n    [HttpPost(\"redeem\")]\n    public async Task<IActionResult> RedeemPromo([FromBody] RedeemRequest request)\n    {\n        if (string.IsNullOrEmpty(request.PromoCode) || string.IsNullOrEmpty(request.UserId))\n            return BadRequest(\"Missing required fields\");\n\n        // Check current usage count\n        var currentUsage = _promoUsage.GetOrAdd(request.PromoCode, 0);\n        \n        if (currentUsage >= MAX_REDEMPTIONS)\n        {\n            return Conflict(new { error = \"Promotion already fully redeemed\" });\n        }\n\n        // Simulate async validation (e.g., checking promo validity against external service)\n        await Task.Delay(50); // External API call latency\n\n        // TOCTOU: Re-read and increment are not atomic\n        var updatedUsage = _promoUsage.GetOrAdd(request.PromoCode, 0);\n        if (updatedUsage >= MAX_REDEMPTIONS)\n        {\n            return Conflict(new { error = \"Promotion already fully redeemed\" });\n        }\n\n        // Increment usage - race window between check and update\n        _promoUsage[request.PromoCode] = updatedUsage + 1;\n\n        // Credit the user\n        _userBalances.AddOrUpdate(request.UserId, 50.00m, (key, old) => old + 50.00m);\n\n        return Ok(new { \n            message = \"Promo redeemed successfully\", \n            credit = 50.00m,\n            userId = request.UserId \n        });\n    }\n\n    [HttpGet(\"balance/{userId}\")]\n    public IActionResult GetBalance(string userId)\n    {\n        var balance = _userBalances.GetOrAdd(userId, 0m);\n        return Ok(new { userId, balance });\n    }\n}\n\npublic class RedeemRequest\n{\n    public string PromoCode { get; set; }\n    public string UserId { get; set; }\n}",
+  "environment": {
+    "description": "ASP.NET Core 8.0 API deployed on AWS ECS Fargate behind an Application Load Balancer. The ALB forwards all traffic directly to the origin container on port 8080. No rate limiting, no request deduplication. The service is publicly accessible via the ALB DNS name. Multiple Fargate tasks (3 replicas) serve requests, each with their own in-memory state (no shared lock across instances).",
+    "config": {
+      "runtime": "dotnet8.0",
+      "deployment": "ECS Fargate, 3 tasks, ALB public-facing",
+      "rate_limiting": "none",
+      "request_dedup": "none",
+      "origin_access": "direct via ALB DNS",
+      "sticky_sessions": "disabled"
+    }
+  }
+}

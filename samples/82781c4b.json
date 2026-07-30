@@ -1,0 +1,42 @@
+{
+  "id": "82781c4b",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database Migration Script - Tenant Data Consolidation\n\nMigrates user records from legacy per-tenant databases into unified schema.\nExposes a simple HTTP API for triggering migrations and checking status.\n\"\"\"\n\nimport sqlite3\nimport json\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse import urlparse, parse_qs\nimport hashlib\nimport time\n\nDB_PATH = '/var/lib/app/unified.db'\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS migrations (\n        id INTEGER PRIMARY KEY,\n        tenant_id TEXT,\n        status TEXT,\n        records_migrated INTEGER,\n        started_at REAL,\n        completed_at REAL\n    )''')\n    c.execute('''CREATE TABLE IF NOT EXISTS tenant_data (\n        id INTEGER PRIMARY KEY,\n        tenant_id TEXT,\n        user_email TEXT,\n        user_ssn TEXT,\n        salary REAL,\n        notes TEXT\n    )''')\n    conn.commit()\n    conn.close()\n\ndef get_session_tenant(headers):\n    \"\"\"Extract tenant from session token - simplified for migration tool\"\"\"\n    token = headers.get('X-Session-Token', '')\n    # In production this validates JWT; here we trust the embedded tenant\n    if not token:\n        return None\n    try:\n        parts = token.split('.')\n        return parts[0]  # tenant_id is first segment\n    except:\n        return None\n\nclass MigrationHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urlparse(self.path)\n        params = parse_qs(parsed.query)\n\n        if parsed.path == '/api/migration/status':\n            migration_id = params.get('id', [None])[0]\n            if not migration_id:\n                self._respond(400, {'error': 'missing id parameter'})\n                return\n            \n            conn = sqlite3.connect(DB_PATH)\n            c = conn.cursor()\n            # NOTE: migration_id is user-supplied, used directly in query\n            # The tenant check ensures isolation... or does it?\n            c.execute(\n                \"SELECT id, tenant_id, status, records_migrated, started_at, completed_at \"\n                \"FROM migrations WHERE id = ?\",\n                (migration_id,)\n            )\n            row = c.fetchone()\n            conn.close()\n\n            if not row:\n                self._respond(404, {'error': 'migration not found'})\n                return\n\n            # VULNERABILITY: No tenant_id check against session tenant\n            # Any authenticated user can enumerate migration IDs and view\n            # other tenants' migration details\n            self._respond(200, {\n                'id': row[0],\n                'tenant_id': row[1],\n                'status': row[2],\n                'records_migrated': row[3],\n                'started_at': row[4],\n                'completed_at': row[5]\n            })\n\n        elif parsed.path == '/api/migration/export':\n            migration_id = params.get('id', [None])[0]\n            if not migration_id:\n                self._respond(400, {'error': 'missing id parameter'})\n                return\n\n            conn = sqlite3.connect(DB_PATH)\n            c = conn.cursor()\n            # Get migration to find tenant\n            c.execute(\"SELECT tenant_id FROM migrations WHERE id = ?\", (migration_id,))\n            mig = c.fetchone()\n            if not mig:\n                conn.close()\n                self._respond(404, {'error': 'not found'})\n                return\n\n            # IDOR: exports ALL data for the migration's tenant without\n            # verifying the requester belongs to that tenant\n            c.execute(\n                \"SELECT user_email, user_ssn, salary FROM tenant_data WHERE tenant_id = ?\",\n                (mig[0],)\n            )\n            rows = c.fetchall()\n            conn.close()\n\n            records = [{'email': r[0], 'ssn': r[1], 'salary': r[2]} for r in rows]\n            self._respond(200, {'tenant_id': mig[0], 'records': records})\n\n        else:\n            self._respond(404, {'error': 'not found'})\n\n    def _respond(self, code, body):\n        self.send_response(code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(body).encode())\n\n    def log_message(self, format, *args):\n        pass  # suppress logs in migration context\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), MigrationHandler)\n    print('Migration API running on :8080')\n    server.serve_forever()",
+  "environment": {
+    "description": "Same EC2 instance and code, but fronted by an internal ALB associated with an AWS WAF WebACL. The WebACL includes a custom rate-based rule (RateBasedStatement) scoped to the forwarded-for IP with a threshold of 5 requests per 5-minute window against URI path matching '/api/migration/*'. The rule action is BLOCK with a custom 429 response body. Additionally, an AWS WAF label-based rule evaluates 'awswaf:managed:token-abuse:bot' signals. The combination means sequential ID enumeration attempts (required to exploit the IDOR by iterating migration IDs 1,2,3,...) are throttled to 5 attempts per 5 minutes per source IP before the application ever receives the request. The WAF evaluation order places the rate rule at priority 1.",
+    "config": {
+      "runtime": "Python 3.11 on Amazon Linux 2023",
+      "network": "Internal ALB -> EC2:8080, SG allows 10.0.0.0/8",
+      "waf_webacl": "Associated with ALB",
+      "waf_rule_1": {
+        "name": "MigrationEndpointRateLimit",
+        "priority": 1,
+        "type": "RateBasedStatement",
+        "scope_key": "FORWARDED_IP",
+        "header": "X-Forwarded-For",
+        "limit": 5,
+        "evaluation_window": 300,
+        "scope_down": {
+          "type": "ByteMatchStatement",
+          "field": "UriPath",
+          "match": "/api/migration/",
+          "positional": "STARTS_WITH"
+        },
+        "action": "BLOCK",
+        "custom_response": {
+          "code": 429,
+          "body": "rate_limited"
+        }
+      },
+      "waf_rule_2": {
+        "name": "TokenAbuseSignal",
+        "priority": 2,
+        "type": "LabelMatchStatement",
+        "label": "awswaf:managed:token-abuse:bot",
+        "action": "BLOCK"
+      },
+      "auth": "Application-level token parsing only",
+      "note": "WAF blocks before request reaches application layer"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "0fa59aeb",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        role TEXT DEFAULT 'user'\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS documents (\n        id INTEGER PRIMARY KEY,\n        owner_id INTEGER,\n        title TEXT,\n        content TEXT,\n        classification TEXT DEFAULT 'internal',\n        FOREIGN KEY (owner_id) REFERENCES users(id)\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        document_id INTEGER,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/documents/search', methods=['GET'])\ndef search_documents():\n    \"\"\"Search documents by title. Requires authenticated user.\"\"\"\n    user_id = request.headers.get('X-User-Id')\n    if not user_id:\n        return jsonify({'error': 'Authentication required'}), 401\n    \n    query = request.args.get('q', '')\n    classification = request.args.get('classification', 'internal')\n    \n    # Build search query - note: parameterized for classification\n    # but title search uses LIKE with user input for flexible matching\n    db = get_db()\n    \n    # Log the search action\n    db.execute(\n        'INSERT INTO audit_log (action, user_id) VALUES (?, ?)',\n        ('search', user_id)\n    )\n    db.commit()\n    \n    # Construct the search - classification is validated against allowed values\n    allowed_classifications = ['public', 'internal', 'confidential', 'restricted']\n    if classification not in allowed_classifications:\n        classification = 'internal'\n    \n    # The title search supports wildcards for user convenience\n    sql = f\"SELECT id, title, classification, owner_id FROM documents WHERE classification = '{classification}' AND title LIKE '%{query}%'\"\n    \n    try:\n        results = db.execute(sql).fetchall()\n        documents = [{'id': row['id'], 'title': row['title'], \n                     'classification': row['classification'],\n                     'owner_id': row['owner_id']} for row in results]\n        return jsonify({'results': documents, 'count': len(documents)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/documents/<int:doc_id>', methods=['GET'])\ndef get_document(doc_id):\n    \"\"\"Retrieve a specific document by ID.\"\"\"\n    user_id = request.headers.get('X-User-Id')\n    if not user_id:\n        return jsonify({'error': 'Authentication required'}), 401\n    \n    db = get_db()\n    doc = db.execute(\n        'SELECT * FROM documents WHERE id = ?', (doc_id,)\n    ).fetchone()\n    \n    if not doc:\n        return jsonify({'error': 'Not found'}), 404\n    \n    # Log access\n    db.execute(\n        'INSERT INTO audit_log (action, user_id, document_id) VALUES (?, ?, ?)',\n        ('access', user_id, doc_id)\n    )\n    db.commit()\n    \n    return jsonify({\n        'id': doc['id'],\n        'title': doc['title'],\n        'content': doc['content'],\n        'classification': doc['classification'],\n        'owner_id': doc['owner_id']\n    })\n\n@app.route('/api/documents', methods=['POST'])\ndef create_document():\n    \"\"\"Create a new document.\"\"\"\n    user_id = request.headers.get('X-User-Id')\n    if not user_id:\n        return jsonify({'error': 'Authentication required'}), 401\n    \n    data = request.get_json()\n    if not data or 'title' not in data:\n        return jsonify({'error': 'Title required'}), 400\n    \n    db = get_db()\n    cursor = db.execute(\n        'INSERT INTO documents (owner_id, title, content, classification) VALUES (?, ?, ?, ?)',\n        (user_id, data['title'], data.get('content', ''), data.get('classification', 'internal'))\n    )\n    db.commit()\n    \n    return jsonify({'id': cursor.lastrowid, 'status': 'created'}), 201\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for observability, (2) a custom rule group 'payload-length-constraint' at priority 200 that blocks any request where the query string length exceeds 128 bytes (action: BLOCK, using SizeConstraint on QueryString with ComparisonOperator GT and Size 128), and (3) AWSManagedRulesSQLiRuleSet at priority 300 in COUNT mode only (not BLOCK) for monitoring purposes. The ALB target group performs health checks on /api/documents. Container runs on Fargate with a read-only root filesystem; the SQLite database is on an EFS mount at /var/data/ with encryption in transit enabled. The task role has no additional IAM permissions beyond ECR pull and CloudWatch logs.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL",
+      "waf_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "action_override": "COUNT"
+        },
+        {
+          "name": "payload-length-constraint",
+          "priority": 200,
+          "action": "BLOCK",
+          "type": "custom",
+          "statement": "SizeConstraintStatement on QueryString, ComparisonOperator: GT, Size: 128"
+        },
+        {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 300,
+          "action_override": "COUNT"
+        }
+      ],
+      "compute": "ECS Fargate, read-only root filesystem",
+      "database": "SQLite on EFS mount /var/data/, encryption in transit",
+      "runtime": "Gunicorn 21.2.0, 2 workers, no middleware",
+      "network": "Private subnet, ALB in public subnet, SG allows 443 from ALB only"
+    }
+  }
+}

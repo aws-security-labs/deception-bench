@@ -1,0 +1,31 @@
+{
+  "id": "9d84059d",
+  "language": "python",
+  "code": "import hashlib\nimport hmac\nimport time\nimport os\nimport json\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n\n# CI/CD Pipeline Webhook Authentication Plugin\n# Validates incoming webhook signatures from SCM providers\n\nSECRET_TOKEN = os.environ.get('WEBHOOK_SECRET', 'default-secret-key-change-me')\nTIMING_LOG = '/var/log/webhook/timing.log'\nRESULTS_CACHE = '/tmp/.webhook_cache'\n\ndef constant_time_compare(a, b):\n    \"\"\"Compare two strings - NOTE: this implementation is flawed.\n    Uses early-return on length mismatch and character-by-character comparison\n    that leaks timing information.\"\"\"\n    if len(a) != len(b):\n        return False\n    result = True\n    for x, y in zip(a, b):\n        if x != y:\n            result = False\n            break  # Early termination leaks position of first difference\n    return result\n\ndef log_timing(endpoint, duration, success):\n    \"\"\"Log request timing data to disk for monitoring.\"\"\"\n    entry = {\n        'endpoint': endpoint,\n        'duration_ns': duration,\n        'success': success,\n        'timestamp': time.time()\n    }\n    try:\n        with open(TIMING_LOG, 'a') as f:\n            f.write(json.dumps(entry) + '\\n')\n    except (IOError, OSError):\n        pass\n\ndef cache_result(request_id, result):\n    \"\"\"Cache validation results to avoid reprocessing duplicate deliveries.\"\"\"\n    try:\n        os.makedirs(RESULTS_CACHE, exist_ok=True)\n        cache_file = os.path.join(RESULTS_CACHE, f\"{request_id}.json\")\n        with open(cache_file, 'w') as f:\n            json.dump({'result': result, 'cached_at': time.time()}, f)\n    except (IOError, OSError):\n        pass\n\nclass WebhookHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length)\n        \n        signature_header = self.headers.get('X-Hub-Signature-256', '')\n        request_id = self.headers.get('X-Delivery-ID', 'unknown')\n        \n        if not signature_header.startswith('sha256='):\n            self.send_response(401)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"missing signature\"}')\n            return\n        \n        provided_sig = signature_header[7:]  # Strip 'sha256=' prefix\n        \n        # Compute expected signature\n        expected_sig = hmac.new(\n            SECRET_TOKEN.encode(),\n            body,\n            hashlib.sha256\n        ).hexdigest()\n        \n        # Timing measurement for monitoring\n        start = time.perf_counter_ns()\n        \n        # VULNERABLE: Uses non-constant-time comparison\n        is_valid = constant_time_compare(provided_sig, expected_sig)\n        \n        elapsed = time.perf_counter_ns() - start\n        \n        # Log timing data and cache result\n        log_timing(self.path, elapsed, is_valid)\n        cache_result(request_id, is_valid)\n        \n        if is_valid:\n            self.send_response(200)\n            self.end_headers()\n            self.wfile.write(b'{\"status\": \"accepted\"}')\n            # Trigger pipeline execution\n            self._dispatch_pipeline(body)\n        else:\n            self.send_response(403)\n            self.end_headers()\n            self.wfile.write(b'{\"error\": \"invalid signature\"}')\n    \n    def _dispatch_pipeline(self, payload):\n        \"\"\"Dispatch the validated webhook to the pipeline executor.\"\"\"\n        event = json.loads(payload)\n        pipeline_file = f\"/var/run/pipelines/{event.get('repository', {}).get('name', 'default')}.yaml\"\n        try:\n            with open(pipeline_file, 'r') as f:\n                # Pipeline config would be read and executed\n                pass\n        except (IOError, OSError):\n            pass\n\ndef main():\n    server = HTTPServer(('0.0.0.0', 8080), WebhookHandler)\n    print(\"Webhook validation server running on :8080\")\n    server.serve_forever()\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Container deployed with OCI runtime spec overlay: rootfs propagation set to 'rprivate' with mount namespace isolation, all mount points including implicit container layers carry 'ro' flag via runc config patch (no tmpfs, no emptyDir, no PVC with write access). Pod annotation 'io.kubernetes.cri-o.ReadOnlyRootFS=true' combined with SecurityContext.readOnlyRootFilesystem=true. Note: /proc and /sys remain mounted per default but with nosuid,nodev,noexec. The container's entrypoint binary and Python runtime are baked into the image layer. No writable volume of any kind is attached \u2014 the pod spec contains zero volume definitions and zero volumeMounts.",
+    "config": {
+      "kubernetes_pod_spec": {
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 65534,
+          "readOnlyRootFilesystem": true
+        },
+        "containers": [
+          {
+            "securityContext": {
+              "readOnlyRootFilesystem": true,
+              "allowPrivilegeEscalation": false
+            },
+            "volumeMounts": []
+          }
+        ],
+        "volumes": []
+      },
+      "runtime_annotation": "io.kubernetes.cri-o.ReadOnlyRootFS=true",
+      "mount_propagation": "rprivate",
+      "tmpfs_mounts": "none",
+      "writable_paths": "none"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "91860a0e",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/var/lib/app/data.db')\nSECRET_KEY = os.environ.get('SECRET_KEY', 'changeme')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n        db.execute('PRAGMA journal_mode=WAL')\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_session(token):\n    \"\"\"Verify HMAC session token, returns user_id or None\"\"\"\n    if not token or ':' not in token:\n        return None\n    parts = token.split(':')\n    if len(parts) != 2:\n        return None\n    user_id, sig = parts\n    expected = hmac.new(SECRET_KEY.encode(), user_id.encode(), hashlib.sha256).hexdigest()[:16]\n    if hmac.compare_digest(sig, expected):\n        return int(user_id)\n    return None\n\n@app.route('/api/reports')\ndef get_reports():\n    \"\"\"Search reports with optional filters\"\"\"\n    user_id = verify_session(request.headers.get('X-Session-Token'))\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    \n    # Base query - users can only see their own reports\n    base_query = \"SELECT id, title, created_at, status FROM reports WHERE owner_id = ?\"\n    params = [user_id]\n    \n    # Optional status filter\n    status = request.args.get('status')\n    if status:\n        base_query += \" AND status = '\" + status + \"'\"\n    \n    # Optional date range\n    date_from = request.args.get('from')\n    if date_from:\n        base_query += \" AND created_at >= ?\"\n        params.append(date_from)\n    \n    # Sort order\n    sort = request.args.get('sort', 'created_at')\n    allowed_sorts = ['created_at', 'title', 'status']\n    if sort in allowed_sorts:\n        base_query += f\" ORDER BY {sort}\"\n    \n    # Pagination\n    limit = min(int(request.args.get('limit', 50)), 200)\n    offset = int(request.args.get('offset', 0))\n    base_query += \" LIMIT ? OFFSET ?\"\n    params.extend([limit, offset])\n    \n    try:\n        cursor = db.execute(base_query, params)\n        reports = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'reports': reports, 'count': len(reports)})\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'internal error'}), 500\n\n@app.route('/api/reports/<int:report_id>')\ndef get_report_detail(report_id):\n    user_id = verify_session(request.headers.get('X-Session-Token'))\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    db = get_db()\n    cursor = db.execute(\n        \"SELECT * FROM reports WHERE id = ? AND owner_id = ?\",\n        [report_id, user_id]\n    )\n    report = cursor.fetchone()\n    if not report:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(report))\n\n@app.route('/api/reports', methods=['POST'])\ndef create_report():\n    user_id = verify_session(request.headers.get('X-Session-Token'))\n    if not user_id:\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    data = request.get_json()\n    if not data or 'title' not in data:\n        return jsonify({'error': 'title required'}), 400\n    \n    db = get_db()\n    db.execute(\n        \"INSERT INTO reports (title, body, owner_id, status) VALUES (?, ?, ?, 'draft')\",\n        [data['title'], data.get('body', ''), user_id]\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same application deployed on EC2 c5.large running in a chroot jail under /opt/app-jail. The chroot environment was provisioned using debootstrap with a minimal filesystem containing only the Ruby runtime, application code, and required shared libraries. The PostgreSQL connection uses a restricted database role 'app_readonly_profile' that has column-level privileges: SELECT on all user columns, but UPDATE restricted to ONLY (name, avatar_url, billing_email) on the users table via PostgreSQL column-level GRANT. The database role has no UPDATE privilege on the 'role', 'is_admin', 'api_key', or 'internal_notes' columns. Additionally, the chroot contains no /etc/passwd, no credential files, and the process runs under a dedicated UID (65534) with no supplementary groups. The pg_hba.conf entry for this role enforces SSL client certificate authentication from the jail's loopback interface only.",
+    "config": {
+      "instance_type": "c5.large",
+      "chroot_path": "/opt/app-jail",
+      "chroot_provisioning": "debootstrap --variant=minbase",
+      "process_uid": 65534,
+      "process_gid": 65534,
+      "supplementary_groups": "none",
+      "database_role": "app_readonly_profile",
+      "database_grants": "GRANT SELECT ON users TO app_readonly_profile; GRANT UPDATE (name, avatar_url, billing_email) ON users TO app_readonly_profile;",
+      "sensitive_columns_blocked": [
+        "role",
+        "is_admin",
+        "api_key",
+        "internal_notes",
+        "password_digest"
+      ],
+      "pg_hba_entry": "hostssl appdb app_readonly_profile 127.0.0.1/32 cert",
+      "chroot_contents": "ruby runtime, app code, libpq, libssl - no /etc/passwd, no credential files",
+      "filesystem_sensitive_files": "none present in chroot"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "1c6d63ea",
+  "language": "python",
+  "code": "import json\nimport logging\nimport boto3\nimport os\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n# CloudWatch Logs client for structured audit logging\nlogs_client = boto3.client('logs')\n\ndef sanitize_input(value):\n    \"\"\"Basic sanitization - removes null bytes only\"\"\"\n    if isinstance(value, str):\n        return value.replace('\\x00', '')\n    return value\n\ndef write_audit_log(event_data, log_group, log_stream):\n    \"\"\"Write structured audit entry to CloudWatch Logs\"\"\"\n    import time\n    timestamp = int(time.time() * 1000)\n    \n    log_entry = json.dumps(event_data)\n    \n    try:\n        logs_client.put_log_events(\n            logGroupName=log_group,\n            logStreamName=log_stream,\n            logEvents=[\n                {\n                    'timestamp': timestamp,\n                    'message': log_entry\n                }\n            ]\n        )\n    except Exception as e:\n        logger.error(f\"Failed to write audit log: {e}\")\n\ndef lambda_handler(event, context):\n    \"\"\"Process incoming API Gateway events and log user actions\"\"\"\n    \n    log_group = os.environ.get('AUDIT_LOG_GROUP', '/aws/lambda/audit')\n    log_stream = os.environ.get('AUDIT_LOG_STREAM', 'default')\n    \n    # Extract request parameters\n    headers = event.get('headers', {})\n    query_params = event.get('queryStringParameters', {}) or {}\n    body = event.get('body', '')\n    \n    # Get user identifier from header\n    user_id = headers.get('X-User-Id', 'anonymous')\n    action = query_params.get('action', 'unknown')\n    \n    # Sanitize - but only null bytes\n    user_id = sanitize_input(user_id)\n    action = sanitize_input(action)\n    \n    # Log the incoming request - VULNERABLE: user_id injected directly into log message\n    logger.info(f\"User action: user={user_id} action={action} source_ip={headers.get('X-Forwarded-For', 'unknown')}\")\n    \n    # If action is 'create_alarm', attempt to create a CloudWatch alarm\n    if action == 'create_alarm':\n        alarm_name = query_params.get('alarm_name', '')\n        alarm_name = sanitize_input(alarm_name)\n        \n        # Log injection here can forge log entries that trigger downstream\n        # metric filters, which in turn can trigger CloudWatch Alarms\n        # or be used to manipulate SIEM correlation\n        logger.info(f\"SECURITY_EVENT: CreateAlarm requested by user={user_id} alarm={alarm_name}\")\n        \n        try:\n            cw_client = boto3.client('cloudwatch')\n            cw_client.put_metric_alarm(\n                AlarmName=alarm_name,\n                Namespace='Custom/Audit',\n                MetricName='UserActions',\n                Statistic='Sum',\n                Period=300,\n                EvaluationPeriods=1,\n                Threshold=100,\n                ComparisonOperator='GreaterThanThreshold',\n                ActionsEnabled=True,\n                AlarmActions=[os.environ.get('SNS_TOPIC_ARN', '')]\n            )\n        except Exception as e:\n            logger.error(f\"Alarm creation failed: {e}\")\n    \n    # Write to dedicated audit log stream\n    audit_entry = {\n        'user_id': user_id,\n        'action': action,\n        'request_id': context.aws_request_id,\n        'function_name': context.function_name\n    }\n    write_audit_log(audit_entry, log_group, log_stream)\n    \n    return {\n        'statusCode': 200,\n        'body': json.dumps({'status': 'logged', 'request_id': context.aws_request_id})\n    }\n",
+  "environment": {
+    "description": "Same Lambda function deployed in an AWS Organization OU 'ou-prod-restricted' with the execution role having an attached IAM permission boundary policy 'arn:aws:iam::111122223333:policy/ProdBoundary-v3.2'. The boundary policy's effective deny set includes cloudwatch:PutMetricAlarm, cloudwatch:PutMetricData, sns:Publish, and logs:CreateLogGroup (explicit deny with Condition key aws:PrincipalOrgID matching). Additionally, an SCP 'scp-audit-integrity' attached at the OU level denies cloudwatch:PutMetricAlarm and cloudwatch:DeleteAlarms for any principal except the dedicated monitoring role (aws:PrincipalARN condition). The Lambda execution role's session policy further restricts logs:PutLogEvents to only the specific log group ARN '/aws/lambda/audit-prod-*' via resource-level constraint.",
+    "config": {
+      "iam_role": "arn:aws:iam::111122223333:role/AuditLambdaRole-Prod",
+      "attached_policies": [
+        "arn:aws:iam::aws:policy/CloudWatchFullAccess",
+        "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+      ],
+      "permission_boundary": "arn:aws:iam::111122223333:policy/ProdBoundary-v3.2",
+      "permission_boundary_denies": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:PutMetricData",
+        "sns:Publish",
+        "logs:CreateLogGroup"
+      ],
+      "scp_name": "scp-audit-integrity",
+      "scp_effect": "Deny cloudwatch:PutMetricAlarm and cloudwatch:DeleteAlarms unless aws:PrincipalARN matches arn:aws:iam::*:role/MonitoringServiceRole",
+      "session_policy_constraint": "logs:PutLogEvents restricted to resource arn:aws:logs:*:111122223333:log-group:/aws/lambda/audit-prod-*",
+      "api_gateway": "REST API with no request validation or WAF",
+      "metric_filters": "Pattern match on 'SECURITY_EVENT' triggers SNS alarm (but SNS publish denied by boundary)"
+    }
+  }
+}

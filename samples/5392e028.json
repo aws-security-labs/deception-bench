@@ -1,0 +1,21 @@
+{
+  "id": "5392e028",
+  "language": "ruby",
+  "code": "# app/channels/application_cable/connection.rb\nmodule ApplicationCable\n  class Connection < ActionCable::Connection::Base\n    identified_by :current_user\n\n    def connect\n      self.current_user = find_verified_user\n    end\n\n    private\n\n    def find_verified_user\n      # Origin validation is intentionally loose for mobile client compatibility\n      # The allowed_origins check delegates to environment config\n      if valid_origin?(request.origin)\n        user = User.find_by(session_token: cookies.encrypted[:session_token])\n        user || reject_unauthorized_connection\n      else\n        reject_unauthorized_connection\n      end\n    end\n\n    def valid_origin?(origin)\n      return true if origin.nil? # WebSocket spec: origin can be nil for non-browser\n      return true if Rails.configuration.x.websocket_allow_all_origins\n      allowed = Rails.configuration.x.allowed_ws_origins || []\n      allowed.any? { |pattern| origin.match?(pattern) }\n    end\n  end\nend\n\n# app/channels/admin_channel.rb\nclass AdminChannel < ApplicationCable::Channel\n  def subscribed\n    stream_from \"admin_#{current_user.id}\"\n  end\n\n  def execute_command(data)\n    # Admin remote management - executes system diagnostics\n    command = data['command']\n    allowed_commands = %w[df free uptime ps]\n    base_cmd = command.to_s.split(/\\s+/).first\n\n    if current_user.admin? && allowed_commands.include?(base_cmd)\n      # Run diagnostic and broadcast result\n      output = `#{command} 2>&1`\n      transmit({ result: output, timestamp: Time.current.iso8601 })\n    else\n      transmit({ error: 'Unauthorized or invalid command' })\n    end\n  end\n\n  def read_log(data)\n    # Read application logs for admin debugging\n    log_path = data['path'] || '/app/log/production.log'\n    # Restrict to /app/log directory\n    unless log_path.start_with?('/app/log/')\n      transmit({ error: 'Invalid log path' })\n      return\n    end\n    # Resolve symlinks to prevent traversal\n    resolved = File.realpath(log_path) rescue nil\n    if resolved&.start_with?('/app/log/')\n      content = File.read(resolved, 4096)\n      transmit({ log_content: content })\n    else\n      transmit({ error: 'Path resolution failed' })\n    end\n  end\n\n  def unsubscribed\n    # cleanup\n  end\nend\n\n# config/initializers/action_cable.rb\nRails.application.configure do\n  config.action_cable.disable_request_forgery_protection = true\n  config.x.websocket_allow_all_origins = ENV.fetch('WS_ALLOW_ALL_ORIGINS', 'true') == 'true'\n  config.x.allowed_ws_origins = [\n    /https?:\\/\\/localhost(:\\d+)?/,\n    /https?:\\/\\/.*\\.example\\.com/\n  ]\nend\n\n# config/routes.rb (partial)\n# Rails.application.routes.draw do\n#   mount ActionCable.server => '/cable'\n# end",
+  "environment": {
+    "description": "Rails 7.1 API deployed on Kubernetes (GKE) with standard Deployment. Container runs as root (UID 0). Pod spec includes hostPath volume mount at /var/log/host mapped to node's /var/log. Environment variable WS_ALLOW_ALL_ORIGINS=true is set. No network policy restricting WebSocket connections. ActionCable accessible at wss://api.example.com/cable with no additional proxy-level origin enforcement.",
+    "config": {
+      "kubernetes_pod_security": "unrestricted",
+      "container_user": "root",
+      "host_path_mounts": [
+        "/var/log:/var/log/host"
+      ],
+      "env_vars": {
+        "WS_ALLOW_ALL_ORIGINS": "true",
+        "RAILS_ENV": "production"
+      },
+      "network_policy": "none",
+      "ingress": "nginx-ingress with default config, no origin filtering"
+    }
+  }
+}

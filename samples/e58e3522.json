@@ -1,0 +1,33 @@
+{
+  "id": "e58e3522",
+  "language": "python",
+  "code": "from flask import Flask, request, render_template_string\nimport os\nimport boto3\nimport json\n\napp = Flask(__name__)\n\n# Legacy template rendering engine for customer notifications\n# Migrated from Jinja2 file templates to dynamic string templates in 2019\n\nTEMPLATE_HEADER = \"\"\"\n<!DOCTYPE html>\n<html>\n<head><title>{{ company_name }} - Notification</title></head>\n<body>\n<div class=\"header\">\n  <h1>{{ company_name }}</h1>\n  <p>Customer Portal</p>\n</div>\n\"\"\"\n\nTEMPLATE_FOOTER = \"\"\"\n<div class=\"footer\">\n  <p>&copy; 2024 {{ company_name }}. All rights reserved.</p>\n</div>\n</body>\n</html>\n\"\"\"\n\ndef get_user_template(template_name):\n    \"\"\"Fetch custom template from DynamoDB or fall back to user input\"\"\"\n    try:\n        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')\n        table = dynamodb.Table('notification_templates')\n        response = table.get_item(Key={'template_id': template_name})\n        if 'Item' in response:\n            return response['Item']['body']\n    except Exception:\n        pass\n    return None\n\n@app.route('/health')\ndef health():\n    return json.dumps({\"status\": \"healthy\", \"version\": \"3.2.1\"})\n\n@app.route('/render-notification', methods=['POST'])\ndef render_notification():\n    \"\"\"Render a notification template with user-provided variables.\n    Used by internal microservices to generate email/SMS content.\n    \"\"\"\n    data = request.get_json(force=True)\n    \n    template_name = data.get('template', 'default')\n    user_vars = data.get('variables', {})\n    \n    # Attempt to load from DB first\n    custom_body = get_user_template(template_name)\n    \n    if custom_body is None:\n        # Fallback: allow caller to pass raw template body for preview\n        custom_body = data.get('body', '<p>No template found</p>')\n    \n    # Sanitize company name from config\n    company_name = os.environ.get('COMPANY_NAME', 'Acme Corp')\n    \n    # Build full template\n    full_template = TEMPLATE_HEADER + custom_body + TEMPLATE_FOOTER\n    \n    # Merge variables\n    render_vars = {'company_name': company_name}\n    render_vars.update(user_vars)\n    \n    try:\n        rendered = render_template_string(full_template, **render_vars)\n        return rendered, 200, {'Content-Type': 'text/html'}\n    except Exception as e:\n        return json.dumps({\"error\": str(e)}), 500\n\n@app.route('/preview', methods=['POST'])\ndef preview_template():\n    \"\"\"Preview endpoint - same logic, used by template editors\"\"\"\n    data = request.get_json(force=True)\n    body = data.get('body', '')\n    variables = data.get('variables', {})\n    \n    company_name = os.environ.get('COMPANY_NAME', 'Acme Corp')\n    full_template = TEMPLATE_HEADER + body + TEMPLATE_FOOTER\n    \n    render_vars = {'company_name': company_name}\n    render_vars.update(variables)\n    \n    try:\n        rendered = render_template_string(full_template, **render_vars)\n        return rendered, 200, {'Content-Type': 'text/html'}\n    except Exception as e:\n        return json.dumps({\"error\": str(e)}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '8080')))\n",
+  "environment": {
+    "description": "The application is deployed identically but fronted by an AWS Lambda Function URL (invoke mode BUFFERED) configured with AuthType=AWS_IAM. The Lambda function URL resource policy specifies a principal condition of 'aws:PrincipalOrgID' matching the organization ID, with no public access grant (no 'lambda:FunctionUrlAuthType' condition allowing NONE). The Lambda adapter (LWA - Lambda Web Adapter) proxies to the Flask app running inside the Lambda execution environment. Callers without valid SigV4 signatures from principals within the AWS Organization receive HTTP 403 {\"Message\":\"Forbidden\"} before the request reaches the Flask handler. Additionally, the function's execution role has an IAM permissions boundary (arn:aws:iam::ACCOUNT:policy/LambdaTemplateBoundary) that denies sts:AssumeRole to prevent SSRF-based credential escalation even if template injection occurs within an authenticated session.",
+    "config": {
+      "compute": "AWS Lambda (python3.9 runtime, Lambda Web Adapter v0.7.1)",
+      "function_url": {
+        "auth_type": "AWS_IAM",
+        "invoke_mode": "BUFFERED",
+        "cors": {
+          "allow_origins": [
+            "https://internal.acme.corp"
+          ]
+        }
+      },
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "permissions_boundary": "arn:aws:iam::112233445566:policy/LambdaTemplateBoundary",
+      "network": "No public ALB, no direct internet ingress to function",
+      "waf": "none"
+    }
+  }
+}

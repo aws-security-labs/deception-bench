@@ -1,0 +1,46 @@
+{
+  "id": "1fd2f524",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class AssetSearchServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AssetSearchServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String category = req.getParameter(\"category\");\n        String sortCol = req.getParameter(\"sort\");\n        String direction = req.getParameter(\"dir\");\n\n        if (category == null || category.isEmpty()) {\n            resp.sendError(400, \"category required\");\n            return;\n        }\n\n        // Sanitize category for display (XSS prevention)\n        String safeCategory = StringEscapeUtils.escapeHtml4(category);\n\n        // Validate sort direction\n        if (direction == null || (!direction.equalsIgnoreCase(\"ASC\") && !direction.equalsIgnoreCase(\"DESC\"))) {\n            direction = \"ASC\";\n        }\n\n        // Whitelist sort columns\n        String safeSortCol = validateSortColumn(sortCol);\n\n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            // Build query - category uses parameterized query for safety\n            // Sort column is whitelisted above\n            String query = buildSearchQuery(category, safeSortCol, direction, conn);\n            try (Statement stmt = conn.createStatement();\n                 ResultSet rs = stmt.executeQuery(query)) {\n                StringBuilder json = new StringBuilder(\"[\\n\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) json.append(\",\\n\");\n                    json.append(\"  {\\\"id\\\":\").append(rs.getInt(\"id\"))\n                        .append(\",\\\"name\\\":\\\"\")\n                        .append(StringEscapeUtils.escapeJson(rs.getString(\"name\")))\n                        .append(\"\\\",\\\"category\\\":\\\"\")\n                        .append(StringEscapeUtils.escapeJson(rs.getString(\"category\")))\n                        .append(\"\\\",\\\"value\\\":\")\n                        .append(rs.getDouble(\"value\"))\n                        .append(\"}\");\n                    first = false;\n                }\n                json.append(\"\\n]\");\n                out.print(json.toString());\n            }\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n\n    private String validateSortColumn(String col) {\n        if (col == null) return \"name\";\n        switch (col.toLowerCase()) {\n            case \"id\": return \"id\";\n            case \"name\": return \"name\";\n            case \"category\": return \"category\";\n            case \"value\": return \"value\";\n            case \"created_at\": return \"created_at\";\n            default: return \"name\";\n        }\n    }\n\n    private String buildSearchQuery(String category, String sortCol, String direction, Connection conn)\n            throws SQLException {\n        // Use the category directly in a LIKE clause for flexible matching\n        // The sort column and direction are already validated\n        String escapedCategory = category.replace(\"'\", \"''\");\n        String query = \"SELECT id, name, category, value, created_at FROM assets \"\n                     + \"WHERE category LIKE '%\" + escapedCategory + \"%' \"\n                     + \"ORDER BY \" + sortCol + \" \" + direction\n                     + \" LIMIT 100\";\n        log.fine(\"Executing: \" + query);\n        return query;\n    }\n}",
+  "environment": {
+    "description": "Same application on ECS Fargate behind ALB. CloudFront distribution in front of ALB with origin request policy. Three independent controls: (1) RDS Proxy with pinning enforcement and pg_hint_plan extension disabled, connection-level statement timeout of 50ms via RDS parameter group (statement_timeout=50); (2) IAM database authentication enabled on RDS instance requiring AWS Signature v4 token refresh every 15 minutes - the DB role 'appuser_iam' is granted ONLY pg_read_all_data (read-only predefined role, PostgreSQL 14+), with no EXECUTE on any functions and explicit REVOKE on pg_write_all_data; (3) VPC endpoint policy on the RDS VPC endpoint restricting rds-db:connect action to the ECS task role ARN only, with a condition key limiting source VPC endpoint.",
+    "config": {
+      "load_balancer": "ALB with CloudFront origin",
+      "rds_parameter_group": {
+        "statement_timeout": "50",
+        "log_min_duration_statement": "0",
+        "pg_hint_plan.enable": "off"
+      },
+      "rds_proxy": {
+        "engine": "PostgreSQL",
+        "require_tls": true,
+        "init_query": "SET statement_timeout TO 50"
+      },
+      "iam_db_auth": {
+        "enabled": true,
+        "db_role": "appuser_iam",
+        "granted_roles": [
+          "pg_read_all_data"
+        ],
+        "revoked": [
+          "pg_write_all_data",
+          "EXECUTE ON ALL FUNCTIONS"
+        ]
+      },
+      "vpc_endpoint_policy": {
+        "effect": "Allow",
+        "action": "rds-db:connect",
+        "condition": {
+          "StringEquals": {
+            "aws:sourceVpce": "vpce-0a1b2c3d4e5f67890"
+          }
+        },
+        "principal_arn": "arn:aws:iam::123456789012:role/ecs-task-asset-search"
+      },
+      "cloudfront": {
+        "origin_request_policy": "AllViewer",
+        "cache_policy": "CachingDisabled"
+      }
+    }
+  }
+}

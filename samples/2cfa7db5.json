@@ -1,0 +1,76 @@
+{
+  "id": "2cfa7db5",
+  "language": "csharp",
+  "code": "using Microsoft.AspNetCore.Builder;\nusing Microsoft.AspNetCore.Http;\nusing Microsoft.Extensions.DependencyInjection;\nusing System.Text;\nusing System.IO;\n\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddResponseCaching();\nvar app = builder.Build();\n\n// Middleware to set security headers\napp.Use(async (context, next) =>\n{\n    context.Response.Headers[\"X-Frame-Options\"] = \"DENY\";\n    context.Response.Headers[\"X-Content-Type-Options\"] = \"nosniff\";\n    // Note: CSP header intentionally omitted for legacy browser compatibility\n    await next();\n});\n\n// Search endpoint that renders results inline\napp.MapGet(\"/api/search\", async (HttpContext context) =>\n{\n    var query = context.Request.Query[\"q\"].ToString();\n    var format = context.Request.Query[\"format\"].ToString();\n    \n    // Sanitize for common attack patterns\n    var sanitized = query.Replace(\"javascript:\", \"\", StringComparison.OrdinalIgnoreCase);\n    sanitized = sanitized.Replace(\"onerror\", \"\", StringComparison.OrdinalIgnoreCase);\n    sanitized = sanitized.Replace(\"onload\", \"\", StringComparison.OrdinalIgnoreCase);\n    \n    // Build response based on format\n    if (format == \"html\" || string.IsNullOrEmpty(format))\n    {\n        context.Response.ContentType = \"text/html; charset=utf-8\";\n        var html = new StringBuilder();\n        html.Append(\"<!DOCTYPE html><html><head><title>Search Results</title></head><body>\");\n        html.Append($\"<h2>Results for: {sanitized}</h2>\");\n        html.Append(\"<div class='results'>\");\n        \n        // Simulate search results from filesystem index\n        var indexPath = \"/app/data/search_index.txt\";\n        if (File.Exists(indexPath))\n        {\n            var lines = await File.ReadAllLinesAsync(indexPath);\n            foreach (var line in lines)\n            {\n                if (line.Contains(sanitized, StringComparison.OrdinalIgnoreCase))\n                {\n                    html.Append($\"<p class='result-item'>{line}</p>\");\n                }\n            }\n        }\n        else\n        {\n            html.Append(\"<p>No index available. Showing query echo.</p>\");\n        }\n        \n        html.Append(\"</div></body></html>\");\n        await context.Response.WriteAsync(html.ToString());\n    }\n    else\n    {\n        context.Response.ContentType = \"application/json\";\n        await context.Response.WriteAsync($\"{{\\\"query\\\": \\\"{sanitized}\\\", \\\"results\\\": []}}\");\n    }\n});\n\n// Error page with reflection\napp.MapGet(\"/api/error\", async (HttpContext context) =>\n{\n    var msg = context.Request.Query[\"message\"].ToString();\n    var code = context.Request.Query[\"code\"].ToString();\n    \n    context.Response.ContentType = \"text/html; charset=utf-8\";\n    context.Response.StatusCode = int.TryParse(code, out var statusCode) ? statusCode : 500;\n    \n    // Direct reflection without sanitization for error messages\n    var errorHtml = $\"<!DOCTYPE html><html><body><h1>Error {context.Response.StatusCode}</h1><p>{msg}</p></body></html>\";\n    await context.Response.WriteAsync(errorHtml);\n});\n\napp.MapGet(\"/health\", () => Results.Ok(new { status = \"healthy\" }));\n\napp.Run();",
+  "environment": {
+    "description": "Same application binary deployed inside a gVisor (runsc) sandboxed container on GKE Autopilot with a SecurityContext specifying readOnlyRootFilesystem. The pod runs under a dedicated ServiceAccount with no cluster roles. The container's root filesystem is mounted from a distroless base image with pivot_root applied at /app. Process namespace isolation (shareProcessNamespace: false) is enabled. The node pool has Shielded GKE Nodes with integrity monitoring. A Kubernetes NetworkPolicy restricts egress to only the cluster DNS (kube-dns on port 53/UDP) and an internal PostgreSQL service on port 5432 \u2014 all other egress including outbound HTTP/HTTPS to external hosts is denied. The Istio sidecar proxy enforces mTLS STRICT mode on all mesh traffic with an AuthorizationPolicy requiring JWT validation with audience claim matching 'search-api-internal'. The container filesystem is confined via pivot_root to /app containing only the application binary, the dotnet runtime, and an empty /app/data directory \u2014 no /etc/passwd, no /proc/self/environ, no sensitive files exist within the chroot boundary.",
+    "config": {
+      "runtime": "dotnet8.0 on distroless",
+      "sandbox": "gVisor (runsc) with platform=ptrace",
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "postgres"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432
+              }
+            ]
+          }
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "app": "istio-ingressgateway"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "istio_auth_policy": "STRICT mTLS + JWT required (aud: search-api-internal)",
+      "filesystem_root": "/app (pivot_root, contains only binary + runtime + empty data/)",
+      "process_isolation": "gVisor seccomp + pid namespace isolation"
+    }
+  }
+}

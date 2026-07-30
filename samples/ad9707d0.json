@@ -1,0 +1,22 @@
+{
+  "id": "ad9707d0",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching employee records by department and role\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tdept := r.URL.Query().Get(\"dept\")\n\trole := r.URL.Query().Get(\"role\")\n\tformat := r.URL.Query().Get(\"fmt\")\n\n\tif dept == \"\" {\n\t\thttp.Error(w, \"dept parameter required\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build query - role is optional filter\n\tvar query string\n\tif role != \"\" {\n\t\t// NOTE: role is validated against allowed list\n\t\tallowedRoles := []string{\"engineer\", \"manager\", \"director\", \"vp\", \"intern\"}\n\t\troleValid := false\n\t\tfor _, ar := range allowedRoles {\n\t\t\tif strings.EqualFold(role, ar) {\n\t\t\t\troleValid = true\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t\tif !roleValid {\n\t\t\thttp.Error(w, \"invalid role\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tquery = fmt.Sprintf(\"SELECT id, name, email, salary FROM employees WHERE department = '%s' AND role = '%s'\", dept, role)\n\t} else {\n\t\tquery = fmt.Sprintf(\"SELECT id, name, email, salary FROM employees WHERE department = '%s'\", dept)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tif format == \"csv\" {\n\t\tw.Header().Set(\"Content-Type\", \"text/csv\")\n\t\tfmt.Fprintf(w, \"id,name,email,salary\\n\")\n\t}\n\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, email string\n\t\tvar salary float64\n\t\tif err := rows.Scan(&id, &name, &email, &salary); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tif format == \"csv\" {\n\t\t\tfmt.Fprintf(w, \"%d,%s,%s,%.2f\\n\", id, name, email, salary)\n\t\t} else {\n\t\t\tfmt.Fprintf(w, \"ID: %d | Name: %s | Email: %s | Salary: %.2f\\n\", id, name, email, salary)\n\t\t}\n\t}\n}\n\n// healthHandler for ALB health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Deployed as a container on ECS Fargate behind an Application Load Balancer with default listener rules (forward all to target group). Container runs with task role granting read/write to the /var/data volume (EFS mount). ALB has no additional rule groups attached. Security group allows inbound 443 from 0.0.0.0/0 to ALB, ALB to container on 8080. No additional request filtering or transformation is configured on the ALB listener.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "inventory-svc-tg"
+        }
+      ],
+      "waf_web_acl": "none",
+      "container_runtime": "ECS Fargate 1.4.0",
+      "network": "public ALB -> private subnet container",
+      "efs_mount": "/var/data with read-write",
+      "task_role_policy": "arn:aws:iam::*:policy/EFSReadWriteAccess"
+    }
+  }
+}

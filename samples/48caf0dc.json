@@ -1,0 +1,75 @@
+{
+  "id": "48caf0dc",
+  "language": "python",
+  "code": "import os\nimport json\nfrom flask import Flask, request, jsonify\nfrom jinja2 import Environment, BaseLoader\n\napp = Flask(__name__)\n\n# Step Functions workflow template renderer\n# Used by the orchestration service to generate dynamic state machine definitions\n# before submitting them to AWS Step Functions via the SDK\n\nTEMPLATE_REGISTRY = {\n    \"notify\": '{\"Type\": \"Task\", \"Resource\": \"arn:aws:lambda:{{region}}:{{account_id}}:function:{{function_name}}\", \"Parameters\": {\"payload\": \"{{user_message}}\"}}',\n    \"transform\": '{\"Type\": \"Task\", \"Resource\": \"arn:aws:states:::glue:startJobRun.sync\", \"Parameters\": {\"JobName\": \"{{job_name}}\", \"Arguments\": {\"--input\": \"{{input_path}}\"}}}',\n    \"wait\": '{\"Type\": \"Wait\", \"Seconds\": {{wait_seconds}}, \"Next\": \"{{next_state}}\"}'\n}\n\ndef render_state_definition(template_name, parameters):\n    \"\"\"Render a state machine state definition from template and user parameters.\"\"\"\n    template_str = TEMPLATE_REGISTRY.get(template_name)\n    if not template_str:\n        raise ValueError(f\"Unknown template: {template_name}\")\n    \n    # Render the template with user-supplied parameters\n    env = Environment(loader=BaseLoader(), autoescape=False)\n    template = env.from_string(template_str)\n    rendered = template.render(**parameters)\n    return rendered\n\n\ndef validate_template_name(name):\n    \"\"\"Ensure template name is in registry.\"\"\"\n    return name in TEMPLATE_REGISTRY\n\n\n@app.route('/api/v1/workflow/render-state', methods=['POST'])\ndef render_state():\n    \"\"\"API endpoint called by the workflow-composer service in the orchestration namespace.\n    Accepts template name and parameters, returns rendered state definition JSON.\"\"\"\n    try:\n        data = request.get_json(force=True)\n        template_name = data.get('template_name', '')\n        parameters = data.get('parameters', {})\n        \n        if not validate_template_name(template_name):\n            return jsonify({\"error\": \"Invalid template name\"}), 400\n        \n        # Parameters come from user input in the workflow builder UI\n        # They are validated by the frontend but we trust the internal service mesh\n        rendered = render_state_definition(template_name, parameters)\n        \n        # Parse to verify valid JSON output\n        try:\n            parsed = json.loads(rendered)\n        except json.JSONDecodeError:\n            return jsonify({\"error\": \"Template rendering produced invalid JSON\"}), 500\n        \n        return jsonify({\"state_definition\": parsed}), 200\n    \n    except Exception as e:\n        return jsonify({\"error\": str(e)}), 500\n\n\n@app.route('/api/v1/workflow/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available state templates.\"\"\"\n    return jsonify({\"templates\": list(TEMPLATE_REGISTRY.keys())}), 200\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({\"status\": \"healthy\"}), 200\n\n\nif __name__ == '__main__':\n    port = int(os.environ.get('PORT', 8080))\n    app.run(host='0.0.0.0', port=port)",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio service mesh enabled. The orchestration namespace has sidecar injection enabled. An AuthorizationPolicy resource is applied to the state-renderer workload that uses a source principal match with a regex pattern on the SPIFFE identity. Specifically, the policy specifies 'action: ALLOW' with a single rule requiring 'source.namespaces' to equal ['orchestration'] AND 'source.principal' matching 'cluster.local/ns/orchestration/sa/workflow-composer'. A second AuthorizationPolicy with 'action: DENY' and empty rules list serves as the default-deny baseline for the workload. The mesh operates in STRICT mTLS mode via a PeerAuthentication resource scoped to the orchestration namespace. Note: the ALLOW policy uses a 'when' condition with 'request.headers[x-request-id]' not empty, which is automatically populated by Envoy for all proxied requests but would be absent for direct TCP connections bypassing the mesh.",
+    "config": {
+      "kubernetes_namespace": "orchestration",
+      "istio_sidecar_injection": true,
+      "istio_mtls_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "state-renderer-default-deny",
+          "namespace": "orchestration",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "state-renderer"
+              }
+            },
+            "action": "DENY",
+            "rules": [
+              {}
+            ]
+          }
+        },
+        {
+          "name": "state-renderer-allow-composer",
+          "namespace": "orchestration",
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "state-renderer"
+              }
+            },
+            "action": "ALLOW",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "namespaces": [
+                        "orchestration"
+                      ],
+                      "principals": [
+                        "cluster.local/ns/orchestration/sa/workflow-composer"
+                      ]
+                    }
+                  }
+                ],
+                "when": [
+                  {
+                    "key": "request.headers[x-request-id]",
+                    "notValues": [
+                      ""
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "peer_authentication": {
+        "name": "orchestration-strict",
+        "namespace": "orchestration",
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      }
+    }
+  }
+}

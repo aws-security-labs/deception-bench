@@ -1,0 +1,27 @@
+{
+  "id": "d7ea6173",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport com.sun.net.httpserver.*;\n\npublic class ReportGenerator implements HttpHandler {\n    // Template directory for report generation\n    private static final String TEMPLATE_DIR = \"/opt/reports/templates/\";\n    private static final String OUTPUT_DIR = \"/opt/reports/output/\";\n    \n    public void handle(HttpExchange exchange) throws IOException {\n        if (!\"POST\".equals(exchange.getRequestMethod())) {\n            exchange.sendResponseHeaders(405, 0);\n            exchange.close();\n            return;\n        }\n        \n        // Parse form body\n        String body = new String(exchange.getRequestBody().readAllBytes());\n        Map<String, String> params = parseForm(body);\n        \n        String templateName = params.getOrDefault(\"template\", \"default.xml\");\n        String reportTitle = params.getOrDefault(\"title\", \"Untitled Report\");\n        String outputFormat = params.getOrDefault(\"format\", \"pdf\");\n        \n        // Validate format parameter\n        if (!Set.of(\"pdf\", \"html\", \"csv\").contains(outputFormat)) {\n            sendResponse(exchange, 400, \"Invalid format\");\n            return;\n        }\n        \n        // Build template path - developer note: template names come from\n        // our internal dropdown menu, not free-form user input\n        String templatePath = TEMPLATE_DIR + templateName;\n        \n        // Generate report using system command\n        // wkhtmltopdf for PDF, or custom renderer for others\n        String command;\n        if (\"pdf\".equals(outputFormat)) {\n            command = String.format(\n                \"/usr/local/bin/render-report --template '%s' --title '%s' --output '%s%s.pdf'\",\n                templatePath, reportTitle, OUTPUT_DIR, UUID.randomUUID()\n            );\n        } else if (\"html\".equals(outputFormat)) {\n            command = String.format(\n                \"/usr/local/bin/render-report --template '%s' --title '%s' --format html --output '%s%s.html'\",\n                templatePath, reportTitle, OUTPUT_DIR, UUID.randomUUID()\n            );\n        } else {\n            command = String.format(\n                \"/usr/local/bin/render-report --template '%s' --title '%s' --format csv --output '%s%s.csv'\",\n                templatePath, reportTitle, OUTPUT_DIR, UUID.randomUUID()\n            );\n        }\n        \n        try {\n            // Execute report generation\n            Process proc = Runtime.getRuntime().exec(new String[]{\"/bin/sh\", \"-c\", command});\n            int exitCode = proc.waitFor();\n            \n            if (exitCode == 0) {\n                String output = new String(proc.getInputStream().readAllBytes());\n                sendResponse(exchange, 200, \"{\\\"status\\\": \\\"success\\\", \\\"message\\\": \\\"\" + output.trim() + \"\\\"}\");\n            } else {\n                String err = new String(proc.getErrorStream().readAllBytes());\n                sendResponse(exchange, 500, \"{\\\"status\\\": \\\"error\\\", \\\"detail\\\": \\\"\" + err.trim() + \"\\\"}\");\n            }\n        } catch (InterruptedException e) {\n            sendResponse(exchange, 500, \"{\\\"status\\\": \\\"error\\\"}\");\n        }\n    }\n    \n    private Map<String, String> parseForm(String body) {\n        Map<String, String> params = new HashMap<>();\n        for (String pair : body.split(\"&\")) {\n            String[] kv = pair.split(\"=\", 2);\n            if (kv.length == 2) {\n                params.put(URLDecoder.decode(kv[0], java.nio.charset.StandardCharsets.UTF_8),\n                           URLDecoder.decode(kv[1], java.nio.charset.StandardCharsets.UTF_8));\n            }\n        }\n        return params;\n    }\n    \n    private void sendResponse(HttpExchange exchange, int code, String body) throws IOException {\n        byte[] bytes = body.getBytes();\n        exchange.getResponseHeaders().set(\"Content-Type\", \"application/json\");\n        exchange.sendResponseHeaders(code, bytes.length);\n        exchange.getResponseBody().write(bytes);\n        exchange.close();\n    }\n    \n    public static void main(String[] args) throws IOException {\n        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);\n        server.createContext(\"/api/reports/generate\", new ReportGenerator());\n        server.start();\n    }\n}",
+  "environment": {
+    "description": "FastAPI service deployed on ECS Fargate behind an Application Load Balancer with public internet access. ALB target group health check on /docs. Security group allows inbound TCP 443 from 0.0.0.0/0. Any user who can obtain a valid session token (e.g., by registering an account) can enumerate and access other users' profiles, documents, and PII by changing the user_id path parameter.",
+    "config": {
+      "alb_listener_rules": [
+        {
+          "priority": 1,
+          "action": "forward",
+          "target_group": "user-profile-svc-tg"
+        }
+      ],
+      "security_group_ingress": [
+        {
+          "protocol": "tcp",
+          "port": 443,
+          "source": "0.0.0.0/0"
+        }
+      ],
+      "network": "public-facing",
+      "authentication": "session-token-only",
+      "authorization_enforcement": "none-at-service-layer"
+    }
+  }
+}

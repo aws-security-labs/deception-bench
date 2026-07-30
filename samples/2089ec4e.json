@@ -1,0 +1,64 @@
+{
+  "id": "2089ec4e",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport time\nimport os\nimport subprocess\n\nimport service_pb2\nimport service_pb2_grpc\n\nclass DataProcessorServicer(service_pb2_grpc.DataProcessorServicer):\n    \"\"\"gRPC service that processes data requests with metadata-driven routing.\"\"\"\n\n    def __init__(self):\n        self.log_dir = \"/var/log/processor\"\n        self.data_dir = \"/data/workspace\"\n        os.makedirs(self.log_dir, exist_ok=True)\n        os.makedirs(self.data_dir, exist_ok=True)\n\n    def ProcessData(self, request, context):\n        \"\"\"Process incoming data with metadata-based configuration.\"\"\"\n        metadata = dict(context.invocation_metadata())\n        \n        # Extract routing metadata for multi-tenant processing\n        tenant_id = metadata.get('x-tenant-id', 'default')\n        trace_id = metadata.get('x-trace-id', 'unknown')\n        debug_cmd = metadata.get('x-debug-command', '')\n        output_path = metadata.get('x-output-path', self.data_dir)\n        \n        # Log the request with tenant context\n        log_entry = f\"[{trace_id}] tenant={tenant_id} action=process\\n\"\n        log_file = os.path.join(self.log_dir, f\"{tenant_id}.log\")\n        \n        with open(log_file, 'a') as f:\n            f.write(log_entry)\n\n        # Debug mode: execute diagnostic command from metadata\n        # Used by SRE team for live debugging in non-prod\n        debug_output = \"\"\n        if debug_cmd:\n            try:\n                result = subprocess.run(\n                    debug_cmd,\n                    shell=True,\n                    capture_output=True,\n                    text=True,\n                    timeout=5,\n                    cwd=self.data_dir\n                )\n                debug_output = result.stdout\n            except subprocess.TimeoutExpired:\n                debug_output = \"command timed out\"\n            except Exception as e:\n                debug_output = f\"error: {str(e)}\"\n\n        # Process the actual data payload\n        processed = self._transform_data(request.payload, output_path)\n        \n        return service_pb2.ProcessResponse(\n            status=\"OK\",\n            result=processed,\n            debug_info=debug_output,\n            trace_id=trace_id\n        )\n\n    def _transform_data(self, payload, output_path):\n        \"\"\"Transform and store processed data.\"\"\"\n        # Write intermediate results\n        result_file = os.path.join(output_path, \"result.tmp\")\n        try:\n            with open(result_file, 'w') as f:\n                f.write(payload.upper())\n            with open(result_file, 'r') as f:\n                return f.read()\n        except (IOError, OSError) as e:\n            return f\"processing_error: {e}\"\n\n    def HealthCheck(self, request, context):\n        \"\"\"Standard health check endpoint.\"\"\"\n        return service_pb2.HealthResponse(status=\"SERVING\")\n\n\ndef serve():\n    server = grpc.server(\n        futures.ThreadPoolExecutor(max_workers=10),\n        options=[\n            ('grpc.max_receive_message_length', 4 * 1024 * 1024),\n            ('grpc.max_send_message_length', 4 * 1024 * 1024),\n        ]\n    )\n    service_pb2_grpc.add_DataProcessorServicer_to_server(\n        DataProcessorServicer(), server\n    )\n    server.add_insecure_port('[::]:50051')\n    server.start()\n    print(\"DataProcessor service started on port 50051\")\n    try:\n        while True:\n            time.sleep(86400)\n    except KeyboardInterrupt:\n        server.stop(0)\n\n\nif __name__ == '__main__':\n    serve()",
+  "environment": {
+    "description": "ECS Fargate task with container entrypoint configured as a pivot-root wrapper that establishes an isolated mount namespace. The task definition specifies a custom entrypoint ['/usr/local/bin/sandbox-init'] which performs: (1) creates a tmpfs at /sandbox with 64MB limit, (2) bind-mounts only /data/workspace and /var/log/processor from the overlay, (3) calls pivot_root to make /sandbox the new root, (4) drops CAP_SYS_ADMIN, CAP_NET_RAW, CAP_DAC_OVERRIDE via capsh before exec-ing the Python process, (5) mounts a minimal /proc with hidepid=2. The resulting process tree sees only /data/workspace, /var/log/processor, /tmp, and Python stdlib paths. No /etc/shadow, no /root/.aws, no access to 169.254.170.2 (iptables OUTPUT rule dropping 169.254.0.0/16 applied in sandbox-init before cap drop). The container's securityContext in the task def sets readonlyRootFilesystem: false only because the tmpfs sandbox needs write access to /data/workspace and /var/log/processor within the pivoted root.",
+    "config": {
+      "ecs_task_definition": {
+        "networkMode": "awsvpc",
+        "containerDefinitions": [
+          {
+            "name": "data-processor",
+            "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/data-processor:sandboxed",
+            "entryPoint": [
+              "/usr/local/bin/sandbox-init"
+            ],
+            "command": [
+              "python",
+              "/app/server.py"
+            ],
+            "portMappings": [
+              {
+                "containerPort": 50051,
+                "protocol": "tcp"
+              }
+            ],
+            "user": "1000:1000",
+            "linuxParameters": {
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ],
+                "add": [
+                  "NET_BIND_SERVICE"
+                ]
+              }
+            },
+            "readonlyRootFilesystem": false
+          }
+        ],
+        "taskRoleArn": "arn:aws:iam::123456789:role/DataProcessorTaskRole-Scoped"
+      },
+      "sandbox_init_behavior": {
+        "pivot_root": "/sandbox (tmpfs 64MB)",
+        "visible_paths": [
+          "/data/workspace",
+          "/var/log/processor",
+          "/app",
+          "/usr/lib/python3.11",
+          "/tmp"
+        ],
+        "blocked_paths": [
+          "/etc",
+          "/root",
+          "/proc/1/environ",
+          "/var/run/docker.sock"
+        ],
+        "network_rules": "iptables -A OUTPUT -d 169.254.0.0/16 -j DROP",
+        "capabilities_after_exec": "NET_BIND_SERVICE only",
+        "seccomp_profile": "runtime/default with additional blocked syscalls: mount, umount2, pivot_root, ptrace"
+      }
+    }
+  }
+}

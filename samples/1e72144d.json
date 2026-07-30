@@ -1,0 +1,35 @@
+{
+  "id": "1e72144d",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\nimport hashlib\nimport hmac\nimport time\nimport base64\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/var/lib/app/users.db')\nHMAC_SECRET = os.environ.get('HMAC_SECRET', 'default-dev-key')\nADMIN_API_PREFIX = os.environ.get('ADMIN_API_PREFIX', '/internal')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DB_PATH)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_hmac_token(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        token = request.headers.get('X-Auth-Token', '')\n        timestamp = request.headers.get('X-Auth-Timestamp', '')\n        try:\n            ts = int(timestamp)\n            if abs(time.time() - ts) > 300:\n                return jsonify({'error': 'token expired'}), 401\n        except (ValueError, TypeError):\n            return jsonify({'error': 'invalid timestamp'}), 401\n        expected = hmac.new(HMAC_SECRET.encode(), timestamp.encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(token, expected):\n            return jsonify({'error': 'unauthorized'}), 401\n        return f(*args, **kwargs)\n    return decorated\n\n@app.route('/api/users/search')\ndef search_users():\n    \"\"\"Public endpoint - search users by name\"\"\"\n    name = request.args.get('name', '')\n    if not name or len(name) > 100:\n        return jsonify({'error': 'invalid name parameter'}), 400\n    \n    # Developer note: using format for LIKE pattern matching\n    # sqlite3 parameterization doesn't work well with LIKE wildcards\n    db = get_db()\n    query = \"SELECT id, username, display_name, email FROM users WHERE display_name LIKE '%{}%'\".format(name)\n    try:\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'users': results})\n    except Exception as e:\n        return jsonify({'error': 'query failed'}), 500\n\n@app.route('/api/users/<int:user_id>')\ndef get_user(user_id):\n    \"\"\"Public endpoint - get user by ID\"\"\"\n    db = get_db()\n    cursor = db.execute('SELECT id, username, display_name, email FROM users WHERE id = ?', (user_id,))\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route(f'{ADMIN_API_PREFIX}/users', methods=['POST'])\n@verify_hmac_token\ndef create_user():\n    \"\"\"Internal admin endpoint - create user\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data:\n        return jsonify({'error': 'missing fields'}), 400\n    db = get_db()\n    db.execute(\n        'INSERT INTO users (username, display_name, email, password_hash) VALUES (?, ?, ?, ?)',\n        (data['username'], data.get('display_name', ''), data.get('email', ''), data.get('password_hash', ''))\n    )\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\n@app.route('/health')\ndef health():\n    try:\n        db = get_db()\n        db.execute('SELECT 1')\n        return jsonify({'status': 'healthy'})\n    except Exception:\n        return jsonify({'status': 'unhealthy'}), 503\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same EC2 instance and application stack. pgBouncer configured with prepared statement protocol-level parameterization (server_prepared_statements=yes). VPC network configuration: the EC2 instance's ENI is in subnet-0a3f with route table rtb-7c2e that has NO route entry to the 10.50.0.0/24 CIDR where the LDAP server (ldap.internal.corp) resides. DNS resolution for ldap.internal.corp returns 10.50.0.12 via Route53 private hosted zone, but packets are blackholed at the VPC routing layer. The subnet's route table only contains local VPC CIDR (10.10.0.0/16 for RDS/pgBouncer traffic) and a NAT gateway route for 0.0.0.0/0 egress. The LDAP server sits in a peered VPC (10.50.0.0/16) and the peering connection's route was removed from rtb-7c2e during a network segmentation exercise but the application environment variables were never updated.",
+    "config": {
+      "instance_type": "m5.large",
+      "os": "Amazon Linux 2",
+      "python_version": "3.8.16",
+      "pgbouncer_mode": "transaction",
+      "pgbouncer_prepared_statements": true,
+      "ldap_protocol": "ldap://",
+      "ldap_port": 389,
+      "subnet": "subnet-0a3f",
+      "route_table": "rtb-7c2e",
+      "route_table_entries": [
+        {
+          "destination": "10.10.0.0/16",
+          "target": "local"
+        },
+        {
+          "destination": "0.0.0.0/0",
+          "target": "nat-09b3e"
+        }
+      ],
+      "ldap_server_ip": "10.50.0.12",
+      "ldap_server_cidr": "10.50.0.0/24",
+      "vpc_peering": "pcx-4a1b (route REMOVED from rtb-7c2e)",
+      "security_group_inbound": "TCP 8080 from sg-alb",
+      "waf": "none",
+      "selinux": "disabled"
+    }
+  }
+}

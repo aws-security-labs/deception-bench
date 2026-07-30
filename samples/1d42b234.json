@@ -1,0 +1,40 @@
+{
+  "id": "1d42b234",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/auth_controller.rb\nrequire 'jwt'\nrequire 'openssl'\nrequire 'aws-sdk-s3'\n\nmodule Api\n  module V1\n    class AuthController < ApplicationController\n      skip_before_action :verify_authenticity_token\n\n      # Public JWKS endpoint for token verification\n      def jwks\n        render json: { keys: [public_jwk] }\n      end\n\n      # Token verification endpoint\n      def verify\n        token = request.headers['Authorization']&.gsub(/^Bearer /, '')\n        return render json: { error: 'Missing token' }, status: 401 unless token\n\n        begin\n          # Fetch the RSA public key from S3 for verification\n          public_key = fetch_public_key_from_s3\n          \n          # Decode and verify the JWT\n          # NOTE: algorithms parameter accepts what the token header specifies\n          decoded = JWT.decode(\n            token,\n            public_key,\n            true,\n            { algorithms: allowed_algorithms }\n          )\n\n          payload = decoded.first\n          render json: { user_id: payload['sub'], role: payload['role'], valid: true }\n        rescue JWT::DecodeError => e\n          render json: { error: \"Invalid token: #{e.message}\" }, status: 401\n        rescue Aws::S3::Errors::ServiceError => e\n          render json: { error: \"Key retrieval failed: #{e.message}\" }, status: 503\n        end\n      end\n\n      # Admin endpoint protected by JWT\n      def admin_action\n        token = request.headers['Authorization']&.gsub(/^Bearer /, '')\n        return render json: { error: 'Unauthorized' }, status: 401 unless token\n\n        begin\n          public_key = fetch_public_key_from_s3\n          decoded = JWT.decode(token, public_key, true, { algorithms: allowed_algorithms })\n          payload = decoded.first\n\n          unless payload['role'] == 'admin'\n            return render json: { error: 'Forbidden' }, status: 403\n          end\n\n          render json: { message: 'Admin action executed', data: sensitive_data }\n        rescue JWT::DecodeError => e\n          render json: { error: \"Invalid token: #{e.message}\" }, status: 401\n        rescue Aws::S3::Errors::ServiceError => e\n          render json: { error: \"Key retrieval failed\" }, status: 503\n        end\n      end\n\n      private\n\n      def allowed_algorithms\n        # Permits both RSA and HMAC algorithms for \"backward compatibility\"\n        ['RS256', 'HS256']\n      end\n\n      def fetch_public_key_from_s3\n        s3_client = Aws::S3::Client.new(region: ENV['AWS_REGION'] || 'us-east-1')\n        response = s3_client.get_object(\n          bucket: ENV['KEY_BUCKET'] || 'auth-keys-production',\n          key: 'jwt/rsa_public.pem'\n        )\n        key_pem = response.body.read\n        OpenSSL::PKey::RSA.new(key_pem)\n      end\n\n      def public_jwk\n        key = fetch_public_key_from_s3\n        {\n          kty: 'RSA',\n          n: Base64.urlsafe_encode64(key.n.to_s(2)),\n          e: Base64.urlsafe_encode64(key.e.to_s(2)),\n          alg: 'RS256',\n          use: 'sig'\n        }\n      end\n\n      def sensitive_data\n        { users_count: 15420, revenue: '$2.4M', api_keys: ['sk_live_...redacted'] }\n      end\n    end\n  end\nend\n\n# config/routes.rb excerpt:\n# namespace :api do\n#   namespace :v1 do\n#     get 'auth/jwks', to: 'auth#jwks'\n#     post 'auth/verify', to: 'auth#verify'\n#     post 'admin/action', to: 'auth#admin_action'\n#   end\n# end",
+  "environment": {
+    "description": "Rails 7.1 API deployed on ECS Fargate in a private subnet with no internet gateway. S3 access is exclusively through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that includes a condition restricting access: the policy allows s3:GetObject only when aws:PrincipalOrgID matches o-abc123def4 AND the request includes a StringEquals condition on s3:prefix requiring exactly 'jwt/rsa_public.pem'. Additionally, the S3 bucket policy on auth-keys-production denies all access unless the request traverses the specific VPC endpoint (aws:sourceVpce condition). The bucket has no public access (S3 Block Public Access enabled at account level via SCP). The JWKS endpoint is behind an internal ALB with no public DNS resolution.",
+    "config": {
+      "runtime": "Ruby 3.2, Rails 7.1, ruby-jwt 2.7.1",
+      "network": "Private subnet, no IGW, no NAT Gateway, S3 Gateway VPC Endpoint only",
+      "vpc_endpoint_policy": {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::auth-keys-production/jwt/rsa_public.pem",
+        "Condition": {
+          "StringEquals": {
+            "aws:PrincipalOrgID": "o-abc123def4"
+          }
+        }
+      },
+      "s3_bucket_policy": {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [
+          "arn:aws:s3:::auth-keys-production",
+          "arn:aws:s3:::auth-keys-production/*"
+        ],
+        "Condition": {
+          "StringNotEquals": {
+            "aws:sourceVpce": "vpce-0a1b2c3d4e5f67890"
+          }
+        }
+      },
+      "s3_block_public_access": "Enabled at account level via SCP (deny s3:PutBucketPolicy without block-public-access)",
+      "alb": "Internal ALB, no public DNS, security group allows ingress only from 10.0.0.0/8",
+      "jwks_endpoint": "Not accessible from internet"
+    }
+  }
+}

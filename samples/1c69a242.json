@@ -1,0 +1,32 @@
+{
+  "id": "1c69a242",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"os\"\n\t\"os/signal\"\n\t\"strings\"\n\t\"syscall\"\n\n\t\"github.com/segmentio/kafka-go\"\n\t_ \"github.com/lib/pq\"\n)\n\ntype OrderEvent struct {\n\tOrderID   string `json:\"order_id\"`\n\tCustomer  string `json:\"customer\"`\n\tProduct   string `json:\"product\"`\n\tQuantity  int    `json:\"quantity\"`\n\tStatus    string `json:\"status\"`\n\tRegion    string `json:\"region\"`\n}\n\nvar db *sql.DB\n\nfunc initDB() {\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to connect to database: %v\", err)\n\t}\n}\n\n// processOrderEvent handles incoming order events from Kafka\n// It updates inventory and writes audit records\nfunc processOrderEvent(ctx context.Context, event OrderEvent) error {\n\t// Validate required fields\n\tif event.OrderID == \"\" || event.Customer == \"\" {\n\t\treturn fmt.Errorf(\"missing required fields in order event\")\n\t}\n\n\t// Build dynamic query based on region-specific table partitioning\n\t// Region is used to route to the correct partition suffix\n\ttableSuffix := sanitizeRegion(event.Region)\n\t\n\t// Update inventory - uses parameterized query\n\t_, err := db.ExecContext(ctx,\n\t\t\"UPDATE inventory SET quantity = quantity - $1 WHERE product_id = $2\",\n\t\tevent.Quantity, event.Product)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"inventory update failed: %w\", err)\n\t}\n\n\t// Write audit record to region-partitioned table\n\t// Note: tableSuffix is derived from event data for dynamic routing\n\tauditQuery := fmt.Sprintf(\n\t\t\"INSERT INTO order_audit_%s (order_id, customer, product, quantity, status) VALUES ('%s', '%s', '%s', %d, '%s')\",\n\t\ttableSuffix, event.OrderID, event.Customer, event.Product, event.Quantity, event.Status)\n\t\n\t_, err = db.ExecContext(ctx, auditQuery)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"audit write failed: %w\", err)\n\t}\n\n\tlog.Printf(\"Processed order %s for customer %s in region %s\", event.OrderID, event.Customer, event.Region)\n\treturn nil\n}\n\n// sanitizeRegion performs basic validation on region identifier\nfunc sanitizeRegion(region string) string {\n\t// Only allow alphanumeric and underscore for table suffix\n\tvar cleaned strings.Builder\n\tfor _, r := range region {\n\t\tif (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {\n\t\t\tcleaned.WriteRune(r)\n\t\t}\n\t}\n\tresult := cleaned.String()\n\tif result == \"\" {\n\t\treturn \"default\"\n\t}\n\treturn result\n}\n\nfunc main() {\n\tinitDB()\n\tdefer db.Close()\n\n\tbrokers := strings.Split(os.Getenv(\"KAFKA_BROKERS\"), \",\")\n\ttopic := os.Getenv(\"KAFKA_TOPIC\")\n\tgroupID := os.Getenv(\"KAFKA_GROUP_ID\")\n\n\treader := kafka.NewReader(kafka.ReaderConfig{\n\t\tBrokers: brokers,\n\t\tTopic:   topic,\n\t\tGroupID: groupID,\n\t})\n\tdefer reader.Close()\n\n\tctx, cancel := context.WithCancel(context.Background())\n\tdefer cancel()\n\n\tsigChan := make(chan os.Signal, 1)\n\tsignal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)\n\n\tgo func() {\n\t\t<-sigChan\n\t\tcancel()\n\t}()\n\n\tlog.Printf(\"Starting order stream processor on topic %s\", topic)\n\n\tfor {\n\t\tmsg, err := reader.ReadMessage(ctx)\n\t\tif err != nil {\n\t\t\tif ctx.Err() != nil {\n\t\t\t\tlog.Println(\"Shutting down consumer\")\n\t\t\t\treturn\n\t\t\t}\n\t\t\tlog.Printf(\"Error reading message: %v\", err)\n\t\t\tcontinue\n\t\t}\n\n\t\tvar event OrderEvent\n\t\tif err := json.Unmarshal(msg.Value, &event); err != nil {\n\t\t\tlog.Printf(\"Failed to unmarshal event: %v\", err)\n\t\t\tcontinue\n\t\t}\n\n\t\tif err := processOrderEvent(ctx, event); err != nil {\n\t\t\tlog.Printf(\"Failed to process event: %v\", err)\n\t\t}\n\t}\n}",
+  "environment": {
+    "description": "Same EKS 1.28 cluster but namespace has label pod-security.kubernetes.io/enforce: restricted applied via Kyverno ClusterPolicy (not native PSA) with additional mutation webhook that strips any securityContext.runAsUser < 1000. The restricted profile baseline is augmented with a custom Kyverno policy 'disallow-host-path-audit-tables' that validates container filesystem is read-only (readOnlyRootFilesystem: true). Database connection uses pg_bouncer with transaction-level pooling and a custom pg_bouncer auth function that maps the service account to a PostgreSQL role limited to INSERT on order_audit_* tables and UPDATE on inventory table only. The role has no CREATE TABLE, DROP, or ALTER privileges. Additionally, a Cilium L7 network policy inspects PostgreSQL wire protocol and blocks any statement containing DDL keywords (CREATE, DROP, ALTER, TRUNCATE) at the proxy layer.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted"
+      },
+      "kyverno_policies": [
+        "disallow-privilege-escalation",
+        "require-ro-rootfs",
+        "restrict-seccomp-strict",
+        "disallow-host-path-audit-tables"
+      ],
+      "kyverno_mutation": "strip runAsUser < 1000, force runAsNonRoot: true",
+      "container_security_context": {
+        "runAsUser": 65534,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false
+      },
+      "db_role": "svc_order_processor",
+      "db_role_grants": "INSERT ON order_audit_* ; UPDATE(quantity) ON inventory",
+      "pgbouncer_pool_mode": "transaction",
+      "cilium_l7_policy": "deny PostgreSQL statements matching regex (?i)(CREATE|DROP|ALTER|TRUNCATE|COPY|pg_read_file|pg_ls_dir)",
+      "network_policies": "deny-all-egress except pgbouncer:6432 and kafka-brokers:9092"
+    }
+  }
+}

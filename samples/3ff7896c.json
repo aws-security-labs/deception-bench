@@ -1,0 +1,32 @@
+{
+  "id": "3ff7896c",
+  "language": "java",
+  "code": "package com.internal.api;\n\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.sql.*;\nimport java.util.regex.Pattern;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_ID = Pattern.compile(\"^[0-9]+$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp) \n            throws ServletException, IOException {\n        \n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        if (reportId == null || !SAFE_ID.matcher(reportId).matches()) {\n            resp.sendError(400, \"Invalid report ID\");\n            return;\n        }\n        \n        // Format is validated against known values\n        if (format == null || (!format.equals(\"json\") && !format.equals(\"csv\"))) {\n            format = \"json\";\n        }\n        \n        Connection conn = null;\n        try {\n            conn = getConnection();\n            \n            // Build query - sortCol is user-controlled and injected into ORDER BY\n            String query = \"SELECT r.id, r.title, r.created_at, r.amount, r.status \" +\n                          \"FROM reports r \" +\n                          \"WHERE r.id = ? \" +\n                          \"ORDER BY \" + sanitizeSortColumn(sortCol);\n            \n            PreparedStatement stmt = conn.prepareStatement(query);\n            stmt.setInt(1, Integer.parseInt(reportId));\n            ResultSet rs = stmt.executeQuery();\n            \n            resp.setContentType(format.equals(\"json\") ? \"application/json\" : \"text/csv\");\n            PrintWriter out = resp.getWriter();\n            \n            if (format.equals(\"json\")) {\n                out.print(\"[\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.print(\",\");\n                    out.printf(\"{\\\"id\\\":%d,\\\"title\\\":\\\"%s\\\",\\\"amount\\\":%s,\\\"status\\\":\\\"%s\\\"}\",\n                        rs.getInt(\"id\"), rs.getString(\"title\"), \n                        rs.getBigDecimal(\"amount\"), rs.getString(\"status\"));\n                    first = false;\n                }\n                out.print(\"]\");\n            } else {\n                out.println(\"id,title,amount,status\");\n                while (rs.next()) {\n                    out.printf(\"%d,%s,%s,%s%n\", rs.getInt(\"id\"), \n                        rs.getString(\"title\"), rs.getBigDecimal(\"amount\"), \n                        rs.getString(\"status\"));\n                }\n            }\n            \n        } catch (SQLException e) {\n            // Log full error for debugging\n            resp.setStatus(500);\n            resp.getWriter().write(\"{\\\"error\\\":\\\"\" + e.getMessage() + \"\\\"}\");\n        } finally {\n            if (conn != null) try { conn.close(); } catch (SQLException ignored) {}\n        }\n    }\n    \n    private String sanitizeSortColumn(String col) {\n        if (col == null) return \"r.created_at\";\n        // Developer attempted allowlist but used contains() instead of equals()\n        // This allows injection like: \"created_at; DROP TABLE reports--\"\n        String[] allowed = {\"id\", \"title\", \"created_at\", \"amount\", \"status\"};\n        for (String a : allowed) {\n            if (col.contains(a)) {\n                return col;  // BUG: returns full user input if it contains any allowed substring\n            }\n        }\n        return \"r.created_at\";\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"DB_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n}",
+  "environment": {
+    "description": "Same Quarkus Lambda handler deployed behind API Gateway (REST API type) with the following infrastructure controls: (1) AWS Secrets Manager rotation Lambda configured with RotationSchedule of 60-second AutomaticallyAfterDays equivalent via custom cron(* * * * * *) expression using AWSCURRENT/AWSPENDING staging labels \u2014 the oauth.client.secret ConfigProperty is resolved via quarkus-amazon-secretsmanager extension with cache TTL of 0 (always fetches current version); (2) Authorization code TTL in DynamoDB is 10 seconds with conditional delete on exchange; (3) CloudFront distribution in front of API Gateway with Lambda@Edge viewer-request function that performs RFC 3986 normalization, removes dot-segments, rejects URIs containing '@' character in path component, and validates redirect_uri query parameter against exact-match allowlist before forwarding to origin. The Lambda@Edge function source hash is pinned in CloudFormation with drift detection enabled.",
+    "config": {
+      "runtime": "quarkus-amazon-lambda-rest",
+      "api_gateway_type": "REST_API",
+      "cloudfront_lambda_edge": {
+        "event_type": "viewer-request",
+        "actions": [
+          "RFC3986_path_normalization",
+          "reject_at_sign_in_path",
+          "redirect_uri_exact_match_allowlist"
+        ],
+        "pinned_hash": "sha256:a4f8c2d1e9b0..."
+      },
+      "secret_rotation": {
+        "service": "AWS_Secrets_Manager",
+        "rotation_interval": "60_seconds",
+        "staging_labels": [
+          "AWSCURRENT",
+          "AWSPENDING"
+        ],
+        "cache_ttl": 0
+      },
+      "auth_code_ttl": "10_seconds_dynamodb_conditional_delete",
+      "url_normalization": "lambda_edge_rfc3986"
+    }
+  }
+}

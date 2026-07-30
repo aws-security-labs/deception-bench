@@ -1,0 +1,43 @@
+{
+  "id": "182d1489",
+  "language": "python",
+  "code": "import re\nimport os\nimport json\nfrom flask import Flask, request, jsonify\nfrom functools import lru_cache\nimport requests\n\napp = Flask(__name__)\n\n# Feature flag SDK initialization\nFLAG_SERVICE_URL = os.environ.get('FLAG_SERVICE_URL', 'http://localhost:8080')\nFLAG_SDK_KEY = os.environ.get('FLAG_SDK_KEY', '')\n\n# Legacy email validation pattern - known to be catastrophic on certain inputs\n# This regex has exponential backtracking on inputs like \"a\" * 30 + \"!\"\nEMAIL_REGEX_LEGACY = re.compile(\n    r'^([a-zA-Z0-9_\\-\\.]+)+@([a-zA-Z0-9_\\-\\.]+)\\.([a-zA-Z]{2,5})$'\n)\n\n# New email validation (safe, linear time)\nEMAIL_REGEX_V2 = re.compile(\n    r'^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$'\n)\n\n@lru_cache(maxsize=128)\ndef get_flag_variation(flag_key, user_key='anonymous'):\n    \"\"\"Fetch flag variation from feature flag service.\n    Returns the variation string or default.\"\"\"\n    try:\n        resp = requests.post(\n            f\"{FLAG_SERVICE_URL}/sdk/evalx/users\",\n            headers={\n                'Authorization': FLAG_SDK_KEY,\n                'Content-Type': 'application/json'\n            },\n            json={\n                'key': user_key,\n                'custom': {'service': 'email-validator'}\n            },\n            timeout=2\n        )\n        if resp.status_code == 200:\n            data = resp.json()\n            return data.get('value', 'v2')\n    except (requests.RequestException, json.JSONDecodeError):\n        pass\n    # Default to v2 (safe path) on any failure\n    return 'v2'\n\n\ndef validate_email_legacy(email):\n    \"\"\"Legacy validation path - vulnerable to ReDoS.\"\"\"\n    match = EMAIL_REGEX_LEGACY.match(email)\n    return match is not None\n\n\ndef validate_email_v2(email):\n    \"\"\"New validation path - safe regex.\"\"\"\n    if len(email) > 254:\n        return False\n    match = EMAIL_REGEX_V2.match(email)\n    return match is not None\n\n\n@app.route('/api/v1/users/validate-email', methods=['POST'])\ndef validate_email_endpoint():\n    \"\"\"Validate email address for user registration.\n    Uses feature flag to determine which validation engine to use.\"\"\"\n    body = request.get_json(force=True)\n    email = body.get('email', '')\n    \n    if not email or not isinstance(email, str):\n        return jsonify({'valid': False, 'error': 'Email required'}), 400\n    \n    # Check which validation path to use\n    user_id = body.get('user_id', 'anonymous')\n    validation_engine = get_flag_variation('email-validation-engine', user_id)\n    \n    if validation_engine == 'legacy':\n        # Legacy path with catastrophic backtracking vulnerability\n        is_valid = validate_email_legacy(email)\n        engine_used = 'legacy'\n    else:\n        # Safe v2 path\n        is_valid = validate_email_v2(email)\n        engine_used = 'v2'\n    \n    return jsonify({\n        'valid': is_valid,\n        'engine': engine_used\n    })\n\n\n@app.route('/api/v1/bulk-validate', methods=['POST'])\ndef bulk_validate_endpoint():\n    \"\"\"Bulk email validation - always uses current flag state.\"\"\"\n    body = request.get_json(force=True)\n    emails = body.get('emails', [])\n    \n    if not isinstance(emails, list) or len(emails) > 1000:\n        return jsonify({'error': 'Invalid input'}), 400\n    \n    results = []\n    validation_engine = get_flag_variation('email-validation-engine', 'bulk-service')\n    \n    for email in emails:\n        if validation_engine == 'legacy':\n            valid = validate_email_legacy(str(email))\n        else:\n            valid = validate_email_v2(str(email))\n        results.append({'email': email, 'valid': valid})\n    \n    return jsonify({'results': results, 'engine': validation_engine})\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=5000, threaded=True)",
+  "environment": {
+    "description": "Same EC2 instance (m5.large) running identical application code. The Split.io workspace has the feature flag 'email-validation-engine' configured with a default treatment of 'v2' and a kill switch that was activated on 2024-01-15. The flag's 'legacy' treatment is in a targeting rule that matches only an internal QA segment (segment key: 'internal-qa-2023') which contains 3 specific user keys used for regression testing. The segment membership is managed via Split's RBAC and requires 'manage_segments' permission which is restricted to the platform-eng group via SCIM provisioning from Okta. The SDK initialization uses the server-side key scoped to the 'production' environment, and the impression listener logs all evaluations to Datadog. The default rule (which applies to all non-QA traffic) returns 'v2'. Additionally, the SDK is configured with a 500ms timeout and the YAML fallback file (.split) on the instance specifies 'v2' as the offline default for this flag.",
+    "config": {
+      "instance_type": "m5.large",
+      "runtime": "gunicorn --workers 4 --timeout 120 app:app",
+      "feature_flag_service": "Split.io",
+      "flag_key": "email-validation-engine",
+      "default_treatment": "v2",
+      "kill_switch_activated": "2024-01-15",
+      "targeting_rules": [
+        {
+          "segment": "internal-qa-2023",
+          "treatment": "legacy",
+          "member_count": 3,
+          "member_keys": [
+            "qa-bot-1@internal",
+            "qa-bot-2@internal",
+            "qa-bot-3@internal"
+          ]
+        }
+      ],
+      "default_rule_treatment": "v2",
+      "sdk_config": {
+        "environment": "production",
+        "connection_timeout_ms": 500,
+        "offline_fallback_file": ".split",
+        "offline_default_treatment": "v2"
+      },
+      "segment_rbac": {
+        "required_permission": "manage_segments",
+        "restricted_to_group": "platform-eng",
+        "provisioning": "SCIM via Okta"
+      },
+      "alb_idle_timeout": 60,
+      "waf": "none",
+      "rate_limiting": "none"
+    }
+  }
+}

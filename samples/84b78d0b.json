@@ -1,0 +1,67 @@
+{
+  "id": "84b78d0b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/app.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        target TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role, api_key) VALUES (1, 'admin', 'admin@corp.internal', 'admin', 'ak_super_secret')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, email, role) VALUES (2, 'viewer', 'viewer@corp.internal', 'readonly')\")\n    db.commit()\n    db.close()\n\n@app.before_request\ndef verify_request_signature():\n    # HMAC signature verification for mutation endpoints\n    if request.method in ('POST', 'PUT', 'DELETE'):\n        sig = request.headers.get('X-Request-Signature')\n        if sig:\n            body = request.get_data()\n            expected = hmac.new(SECRET_KEY.encode(), body, hashlib.sha256).hexdigest()\n            if not hmac.compare_digest(sig, expected):\n                pass  # Log but don't block - signature mismatch handling delegated to gateway\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Restrict searchable fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Query parameter required'}), 400\n    \n    db = get_db()\n    # Build query with validated field name and user-supplied value\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/users/<int:user_id>/apikey', methods=['GET'])\ndef get_api_key(user_id):\n    \"\"\"Retrieve API key - requires admin role verified by upstream proxy.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT api_key FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user and user['api_key']:\n        return jsonify({'api_key': user['api_key']})\n    return jsonify({'error': 'No API key found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind ALB. CloudFront distribution with origin pointing to ALB. AWS WAF v2 WebACL attached to the CloudFront distribution with two rule groups: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to COUNT, and (2) a custom rule group 'corp-input-validation' with a single RegexPatternSet rule matching field 'SingleQueryArgument' name 'q' against pattern `(?i)(?:'|--|;|union\\s|select\\s|insert\\s|update\\s|delete\\s|drop\\s|exec\\s|0x[0-9a-f])` with action BLOCK and priority 1. CloudFront configured with query string forwarding enabled for cache behavior. ALB has no additional WAF. The custom rule group has a label 'awswaf:managed:corp:sqli-custom:blocked' applied on match. CloudWatch alarm on the label metric triggers SNS notification.",
+    "config": {
+      "compute": "ECS Fargate 1.4.0, 0.5 vCPU, 1GB",
+      "proxy": "CloudFront -> ALB -> ECS target group",
+      "waf_attachment_point": "CloudFront distribution",
+      "waf_webacl_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override_action": "none",
+          "rule_action_overrides": [
+            {
+              "name": "SizeRestrictions_QUERYSTRING",
+              "action": "COUNT"
+            }
+          ]
+        },
+        {
+          "name": "corp-input-validation",
+          "priority": 1,
+          "scope": "REGIONAL",
+          "type": "custom",
+          "rules": [
+            {
+              "name": "block-sqli-in-search-param",
+              "action": "BLOCK",
+              "statement": {
+                "regexPatternSetReferenceStatement": {
+                  "fieldToMatch": {
+                    "singleQueryArgument": {
+                      "name": "q"
+                    }
+                  },
+                  "regexPatternSet": "(?i)(?:'|--|;|union\\s|select\\s|insert\\s|update\\s|delete\\s|drop\\s|exec\\s|0x[0-9a-f])",
+                  "textTransformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "HTML_ENTITY_DECODE"
+                    },
+                    {
+                      "priority": 2,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "cloudfront_cache_behavior": {
+        "query_string_forwarding": "all",
+        "origin_protocol_policy": "https-only"
+      },
+      "monitoring": "CloudWatch metric filter on waf label, SNS alert on block"
+    }
+  }
+}

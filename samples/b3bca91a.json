@@ -1,0 +1,39 @@
+{
+  "id": "b3bca91a",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, abort\n\napp = Flask(__name__)\n\nUPLOAD_DIR = '/var/data/uploads'\nALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf'}\n\ndef allowed_file(filename):\n    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS\n\ndef sanitize_filename(filename):\n    # Remove directory traversal attempts\n    filename = filename.replace('..', '').replace('/', '').replace('\\\\', '')\n    return filename\n\n@app.route('/api/convert', methods=['POST'])\ndef convert_document():\n    \"\"\"Convert uploaded document to PDF using system utility.\"\"\"\n    if 'file' not in request.files:\n        abort(400, 'No file provided')\n    \n    uploaded = request.files['file']\n    if not uploaded.filename:\n        abort(400, 'Empty filename')\n    \n    # Validate extension\n    if not allowed_file(uploaded.filename):\n        abort(400, 'File type not allowed')\n    \n    safe_name = sanitize_filename(uploaded.filename)\n    \n    # Save to temp location\n    tmp_dir = tempfile.mkdtemp(prefix='convert_')\n    input_path = os.path.join(tmp_dir, safe_name)\n    uploaded.save(input_path)\n    \n    # Get optional output format from user\n    output_format = request.form.get('format', 'pdf')\n    output_name = safe_name.rsplit('.', 1)[0] + '.' + output_format\n    output_path = os.path.join(tmp_dir, output_name)\n    \n    # Get optional quality parameter\n    quality = request.form.get('quality', '90')\n    \n    # Build conversion command\n    # Uses ImageMagick convert for image files\n    cmd = f\"convert {input_path} -quality {quality} {output_path}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=30,\n            cwd=tmp_dir\n        )\n        if result.returncode != 0:\n            return jsonify({'error': 'Conversion failed', 'details': result.stderr.decode()[:200]}), 500\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Conversion timed out'}), 504\n    \n    if os.path.exists(output_path):\n        with open(output_path, 'rb') as f:\n            content = f.read()\n        # Cleanup\n        import shutil\n        shutil.rmtree(tmp_dir, ignore_errors=True)\n        return content, 200, {'Content-Type': 'application/octet-stream'}\n    \n    return jsonify({'error': 'Output file not generated'}), 500\n\n@app.route('/api/metadata', methods=['POST'])\ndef extract_metadata():\n    \"\"\"Extract EXIF/metadata from uploaded file.\"\"\"\n    if 'file' not in request.files:\n        abort(400, 'No file provided')\n    \n    uploaded = request.files['file']\n    if not uploaded.filename or not allowed_file(uploaded.filename):\n        abort(400, 'Invalid file')\n    \n    safe_name = sanitize_filename(uploaded.filename)\n    tmp_dir = tempfile.mkdtemp(prefix='meta_')\n    input_path = os.path.join(tmp_dir, safe_name)\n    uploaded.save(input_path)\n    \n    # Use exiftool for metadata extraction\n    tag_filter = request.form.get('tags', '-all')\n    cmd = f\"exiftool {tag_filter} -json {input_path}\"\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            timeout=10,\n            cwd=tmp_dir\n        )\n        import shutil\n        shutil.rmtree(tmp_dir, ignore_errors=True)\n        return result.stdout, 200, {'Content-Type': 'application/json'}\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Timeout'}), 504\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    os.makedirs(UPLOAD_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Application deployed in an EKS pod with the following runtime constraints: (1) The pod spec sets securityContext.seccompProfile to RuntimeDefault (docker/default profile), which permits basic syscalls but the node uses a custom RuntimeClass 'hardened' backed by a gVisor (runsc) sandbox that intercepts all syscalls through its application kernel \u2014 critically, gVisor's netstack does not support raw sockets and restricts connect() to destinations allowed by a NetworkPolicy; (2) A Kubernetes NetworkPolicy of type Egress is applied to the pod's namespace allowing egress ONLY to the cluster DNS (kube-dns on port 53/UDP) and an internal S3 VPC endpoint (CIDR 10.0.48.0/24 on port 443) \u2014 all other egress including to 169.254.169.254 (IMDS) and any internet host is denied; (3) The pod runs as UID 65534 (nobody) with readOnlyRootFilesystem=true, allowPrivilegeEscalation=false, and capabilities dropped to an empty set (drop: ALL). Temp directories are backed by an emptyDir volume mounted at /tmp with a 50Mi sizeLimit.",
+    "config": {
+      "runtime_class": "gvisor-runsc",
+      "seccomp_profile": "RuntimeDefault (gVisor intercepts all syscalls)",
+      "network_policy_egress": [
+        {
+          "to": "kube-dns",
+          "port": "53/UDP"
+        },
+        {
+          "to": "10.0.48.0/24",
+          "port": "443",
+          "note": "S3 VPC endpoint only"
+        }
+      ],
+      "imds_access": "blocked by NetworkPolicy (169.254.169.254 not in allowed egress)",
+      "outbound_internet": "blocked",
+      "pod_security_context": {
+        "runAsUser": 65534,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "tmp_volume": "emptyDir with 50Mi sizeLimit",
+      "imagemagick_policy": "/etc/ImageMagick-6/policy.xml restricts delegates, path reads to /tmp only",
+      "selinux": "not applicable (gVisor sandbox)"
+    }
+  }
+}

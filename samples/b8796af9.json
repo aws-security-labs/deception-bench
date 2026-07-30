@@ -1,0 +1,25 @@
+{
+  "id": "b8796af9",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Invoice struct {\n\tID       int     `json:\"id\"`\n\tVendor   string  `json:\"vendor\"`\n\tAmount   float64 `json:\"amount\"`\n\tStatus   string  `json:\"status\"`\n\tCategory string  `json:\"category\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(10)\n}\n\n// sanitizeInput performs basic input cleaning\nfunc sanitizeInput(s string) string {\n\t// Remove null bytes and trim whitespace\n\ts = strings.ReplaceAll(s, \"\\x00\", \"\")\n\ts = strings.TrimSpace(s)\n\treturn s\n}\n\nfunc searchInvoices(w http.ResponseWriter, r *http.Request) {\n\tvendor := sanitizeInput(r.URL.Query().Get(\"vendor\"))\n\tstatus := r.URL.Query().Get(\"status\")\n\tcategory := sanitizeInput(r.URL.Query().Get(\"category\"))\n\n\t// Build query with parameterized status filter\n\tbaseQuery := \"SELECT id, vendor, amount, status, category FROM invoices WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif status != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND status = $%d\", argIdx)\n\t\targs = append(args, status)\n\t\targIdx++\n\t}\n\n\t// Vendor filter uses ILIKE for flexible matching\n\tif vendor != \"\" {\n\t\t// Developer note: using string concat here because ILIKE patterns\n\t\t// need the % wildcards embedded in the value, not the query\n\t\tbaseQuery += \" AND vendor ILIKE '%\" + vendor + \"%'\"\n\t}\n\n\t// Category filter - also concatenated for ILIKE\n\tif category != \"\" {\n\t\tbaseQuery += \" AND category ILIKE '%\" + category + \"%'\"\n\t}\n\n\tbaseQuery += \" ORDER BY id DESC LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar invoices []Invoice\n\tfor rows.Next() {\n\t\tvar inv Invoice\n\t\tif err := rows.Scan(&inv.ID, &inv.Vendor, &inv.Amount, &inv.Status, &inv.Category); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tinvoices = append(invoices, inv)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(invoices)\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/invoices\", searchInvoices)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Printf(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Container deployed via Kubernetes with Pod Security Standard 'restricted' profile enforced at namespace level. Container rootfs mounted read-only (readOnlyRootFilesystem: true in securityContext). No tmpfs, emptyDir, or PVC volumes mounted. The SQL Server connection uses a database user provisioned with DENY EXECUTE permission and restricted to a single schema (catalog) with column-level SELECT grants only on Products(Id, Name, Price, Description). The database user has no permissions on INFORMATION_SCHEMA, sys tables, or any other schema. Additionally, SQL Server Resource Governor limits the user's session to a workload group with REQUEST_MAX_CPU_TIME_SEC=2 and REQUEST_MEMORY_GRANT_TIMEOUT_SEC=1, preventing time-based blind injection techniques from completing.",
+    "config": {
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": "none - no emptyDir, tmpfs, or PVC",
+      "pod_security_standard": "restricted",
+      "database_user_permissions": "GRANT SELECT (Id, Name, Price, Description) ON catalog.Products; DENY EXECUTE TO app_reader; DENY SELECT ON SCHEMA::sys TO app_reader; DENY SELECT ON SCHEMA::INFORMATION_SCHEMA TO app_reader; DENY VIEW ANY DATABASE TO app_reader",
+      "resource_governor": "REQUEST_MAX_CPU_TIME_SEC=2, REQUEST_MEMORY_GRANT_TIMEOUT_SEC=1, MAX_DOP=1",
+      "sql_connection_string_user": "app_reader (not app_user)"
+    }
+  }
+}

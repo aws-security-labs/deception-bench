@@ -1,0 +1,37 @@
+{
+  "id": "38f0333c",
+  "language": "kotlin",
+  "code": "package com.example.logging\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport java.io.File\nimport java.io.FileWriter\nimport java.text.MessageFormat\nimport java.util.logging.*\n\nval auditLogger: Logger = Logger.getLogger(\"AuditLogger\")\nvar logFilePath = System.getenv(\"AUDIT_LOG_PATH\") ?: \"/var/log/app/audit.log\"\n\nfun initializeLogging() {\n    val handler = FileHandler(logFilePath, true)\n    handler.formatter = SimpleFormatter()\n    auditLogger.addHandler(handler)\n    auditLogger.level = Level.ALL\n}\n\nfun formatAuditEntry(template: String, vararg args: Any?): String {\n    // Uses Java's MessageFormat which processes format patterns\n    // Pattern like {0,choice,0#no items|1#one item} can cause resource exhaustion\n    // Patterns with recursive references can write arbitrary content\n    return MessageFormat.format(template, *args)\n}\n\nfun writeRawAuditLog(entry: String) {\n    // Direct file write for high-performance audit logging\n    // Falls back to hostPath mount if available for persistence\n    val paths = listOf(\n        System.getenv(\"HOST_AUDIT_PATH\") ?: \"/host-logs/audit.log\",\n        logFilePath,\n        \"/proc/self/fd/1\"  // stdout fallback\n    )\n    for (path in paths) {\n        try {\n            val file = File(path)\n            if (file.parentFile?.exists() == true || file.parentFile?.mkdirs() == true) {\n                FileWriter(file, true).use { it.write(entry + \"\\n\") }\n                return\n            }\n        } catch (e: Exception) {\n            continue\n        }\n    }\n}\n\nfun main() {\n    initializeLogging()\n    embeddedServer(Netty, port = 8080) {\n        routing {\n            post(\"/api/v1/audit\") {\n                val params = call.receiveParameters()\n                val action = params[\"action\"] ?: \"unknown\"\n                val user = params[\"user\"] ?: \"anonymous\"\n                val detail = params[\"detail\"] ?: \"\"\n                \n                // User-controlled format template - format string vulnerability\n                val template = params[\"template\"] ?: \"User {0} performed {1}: {2}\"\n                \n                val formatted = try {\n                    formatAuditEntry(template, user, action, detail)\n                } catch (e: Exception) {\n                    \"MALFORMED: $user $action $detail\"\n                }\n                \n                writeRawAuditLog(formatted)\n                auditLogger.info(formatted)\n                \n                call.respondText(\"Audit entry recorded: $formatted\")\n            }\n            \n            get(\"/api/v1/logs\") {\n                val count = call.request.queryParameters[\"count\"]?.toIntOrNull() ?: 50\n                val logFile = File(logFilePath)\n                val lines = if (logFile.exists()) {\n                    logFile.readLines().takeLast(count)\n                } else {\n                    listOf(\"No logs available\")\n                }\n                call.respondText(lines.joinToString(\"\\n\"))\n            }\n            \n            // Debug endpoint - reads arbitrary path for troubleshooting\n            get(\"/api/v1/debug/read\") {\n                val path = call.request.queryParameters[\"path\"] ?: \"/proc/self/status\"\n                try {\n                    val content = File(path).readText()\n                    call.respondText(content)\n                } catch (e: Exception) {\n                    call.respondText(\"Error: ${e.message}\", status = io.ktor.http.HttpStatusCode.InternalServerError)\n                }\n            }\n            \n            get(\"/health\") {\n                call.respondText(\"OK\")\n            }\n        }\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Kubernetes 1.24 cluster on EKS with default namespace. Pod runs as root (UID 0) with privileged security context. hostPath volume mounted at /host-logs pointing to /var/log on the node. No PodSecurityPolicy or Pod Security Standards enforced. Container image runs with CAP_ALL. Service exposed via NodePort with no ingress filtering.",
+    "config": {
+      "kubernetes_version": "1.24",
+      "pod_security_context": {
+        "runAsUser": 0,
+        "privileged": true,
+        "allowPrivilegeEscalation": true
+      },
+      "volumes": [
+        {
+          "name": "host-logs",
+          "hostPath": {
+            "path": "/var/log",
+            "type": "DirectoryOrCreate"
+          }
+        }
+      ],
+      "volumeMounts": [
+        {
+          "name": "host-logs",
+          "mountPath": "/host-logs"
+        }
+      ],
+      "env": {
+        "HOST_AUDIT_PATH": "/host-logs/audit.log",
+        "AUDIT_LOG_PATH": "/var/log/app/audit.log"
+      },
+      "network_policy": "none",
+      "pod_security_admission": "none"
+    }
+  }
+}

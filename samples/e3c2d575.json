@@ -1,0 +1,39 @@
+{
+  "id": "e3c2d575",
+  "language": "python",
+  "code": "import json\nimport urllib.request\nimport urllib.parse\nimport os\nimport hashlib\nimport base64\n\n# Configuration loader for external service endpoints\nSERVICE_REGISTRY_URL = os.environ.get('SERVICE_REGISTRY_URL', 'http://internal-registry.corp.local')\nMETADATA_ENDPOINT = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/'\n\ndef compute_sri_hash(content, algorithm='sha384'):\n    \"\"\"Compute Subresource Integrity hash for content verification.\"\"\"\n    if algorithm == 'sha384':\n        digest = hashlib.sha384(content).digest()\n    elif algorithm == 'sha256':\n        digest = hashlib.sha256(content).digest()\n    else:\n        digest = hashlib.sha512(content).digest()\n    return f\"{algorithm}-{base64.b64encode(digest).decode()}\"\n\ndef verify_integrity(content, expected_hash):\n    \"\"\"Verify content against expected SRI hash.\"\"\"\n    if not expected_hash:\n        return True  # No hash provided, skip verification\n    algorithm = expected_hash.split('-')[0]\n    computed = compute_sri_hash(content, algorithm)\n    return computed == expected_hash\n\ndef fetch_service_config(service_name, config_url=None):\n    \"\"\"Fetch configuration for a named service from registry or custom URL.\"\"\"\n    if config_url:\n        # Allow override URL for service configuration\n        target_url = config_url\n    else:\n        target_url = f\"{SERVICE_REGISTRY_URL}/services/{service_name}/config.json\"\n    \n    try:\n        req = urllib.request.Request(target_url)\n        req.add_header('X-Lambda-Source', 'config-loader')\n        with urllib.request.urlopen(req, timeout=5) as response:\n            return response.read()\n    except Exception as e:\n        return json.dumps({'error': str(e)}).encode()\n\ndef load_plugin_script(plugin_url, integrity_hash=None):\n    \"\"\"Load and verify a plugin script with optional SRI verification.\"\"\"\n    try:\n        req = urllib.request.Request(plugin_url)\n        with urllib.request.urlopen(req, timeout=10) as response:\n            content = response.read()\n        \n        if integrity_hash and not verify_integrity(content, integrity_hash):\n            raise ValueError(f\"Integrity check failed for {plugin_url}\")\n        \n        return content\n    except ValueError:\n        raise\n    except Exception as e:\n        return None\n\ndef handler(event, context):\n    \"\"\"AWS Lambda handler for service configuration management.\"\"\"\n    action = event.get('action', 'get_config')\n    \n    if action == 'get_config':\n        service_name = event.get('service_name', 'default')\n        custom_url = event.get('config_url')  # SSRF vector: user-controlled URL\n        \n        config_data = fetch_service_config(service_name, config_url=custom_url)\n        \n        return {\n            'statusCode': 200,\n            'body': config_data.decode('utf-8', errors='replace')\n        }\n    \n    elif action == 'load_plugin':\n        plugin_url = event.get('plugin_url')\n        integrity = event.get('integrity')  # SRI hash for plugin verification\n        \n        if not plugin_url:\n            return {'statusCode': 400, 'body': 'plugin_url required'}\n        \n        try:\n            content = load_plugin_script(plugin_url, integrity_hash=integrity)\n            if content:\n                return {\n                    'statusCode': 200,\n                    'body': content.decode('utf-8', errors='replace'),\n                    'verified': integrity is not None\n                }\n        except ValueError as e:\n            return {'statusCode': 403, 'body': str(e)}\n        \n        return {'statusCode': 502, 'body': 'Failed to load plugin'}\n    \n    elif action == 'health_check':\n        # Internal health check - fetches metadata for diagnostics\n        role_name = event.get('role_check', '')\n        if role_name:\n            url = f\"{METADATA_ENDPOINT}{role_name}\"\n            try:\n                with urllib.request.urlopen(url, timeout=2) as resp:\n                    return {'statusCode': 200, 'body': resp.read().decode()}\n            except:\n                return {'statusCode': 200, 'body': 'healthy'}\n        return {'statusCode': 200, 'body': 'healthy'}\n    \n    return {'statusCode': 400, 'body': 'Unknown action'}",
+  "environment": {
+    "description": "Same Lambda function deployed with a VPC endpoint policy on the execute-api interface endpoint that enforces request body schema validation at the network layer. Additionally, the Lambda function's ENI is associated with a security group that has outbound rules restricted to port 443 only toward a prefix list (pl-02cd2c6b) for S3 and the internal registry CIDR (10.0.0.0/16). The subnet route table has no route to 169.254.169.254 link-local range due to a custom blackhole route entry (169.254.169.254/32 -> blackhole) added via Terraform aws_route resource. The function also uses a Lambda Extension layer (arn:aws:lambda:us-east-1:634166935893:layer:vault-lambda-extension:14) that rotates credentials and the execution role has a permissions boundary (arn:aws:iam::ACCOUNT:policy/DenyIMDSBoundary) that includes an explicit deny on sts:AssumeRole for the Lambda's own role ARN from non-VPC-endpoint sources.",
+    "config": {
+      "runtime": "python3.9",
+      "vpc_config": {
+        "security_group_outbound_rules": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "pl-02cd2c6b (S3 prefix list)"
+          },
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "10.0.0.0/16 (internal registry)"
+          }
+        ],
+        "subnet_route_table": {
+          "custom_routes": [
+            {
+              "destination": "169.254.169.254/32",
+              "target": "blackhole"
+            }
+          ]
+        }
+      },
+      "lambda_extension": "vault-lambda-extension v14 (credential rotation, no static creds in env)",
+      "permissions_boundary": "DenyIMDSBoundary - explicit deny on ec2:DescribeInstances, sts:AssumeRole from non-VPC-endpoint sourceVpce condition",
+      "api_gateway": {
+        "request_validation": "body schema enforced via VPC endpoint policy condition",
+        "integration_type": "LAMBDA_PROXY"
+      }
+    }
+  }
+}

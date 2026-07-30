@@ -1,0 +1,42 @@
+{
+  "id": "8f523eb0",
+  "language": "python",
+  "code": "from fastapi import FastAPI, Depends, HTTPException, Header\nfrom pydantic import BaseModel\nimport jwt\nimport os\nimport json\nfrom typing import Optional\n\napp = FastAPI()\n\n# Public key loaded from mounted volume\nPUBLIC_KEY_PATH = os.getenv(\"JWT_PUBLIC_KEY_PATH\", \"/etc/keys/public.pem\")\nALGORITHM = os.getenv(\"JWT_ALGORITHM\", \"RS256\")\nISSUER = os.getenv(\"JWT_ISSUER\", \"auth.internal.svc\")\n\ndef load_public_key():\n    \"\"\"Load the RSA public key from the mounted secrets volume\"\"\"\n    try:\n        with open(PUBLIC_KEY_PATH, 'r') as f:\n            return f.read()\n    except FileNotFoundError:\n        raise RuntimeError(f\"Public key not found at {PUBLIC_KEY_PATH}\")\n\nclass TokenPayload(BaseModel):\n    sub: str\n    role: str\n    iss: str\n    exp: int\n\ndef verify_token(authorization: Optional[str] = Header(None)):\n    \"\"\"Verify JWT token from Authorization header\"\"\"\n    if not authorization:\n        raise HTTPException(status_code=401, detail=\"Missing authorization header\")\n    \n    if not authorization.startswith(\"Bearer \"):\n        raise HTTPException(status_code=401, detail=\"Invalid authorization scheme\")\n    \n    token = authorization[7:]\n    public_key = load_public_key()\n    \n    try:\n        # Decode the token header to get the algorithm\n        unverified_header = jwt.get_unverified_header(token)\n        token_algorithm = unverified_header.get(\"alg\", ALGORITHM)\n        \n        # Verify token with the algorithm specified in the token header\n        payload = jwt.decode(\n            token,\n            public_key,\n            algorithms=[token_algorithm],\n            issuer=ISSUER\n        )\n        return TokenPayload(**payload)\n    except jwt.ExpiredSignatureError:\n        raise HTTPException(status_code=401, detail=\"Token expired\")\n    except jwt.InvalidIssuerError:\n        raise HTTPException(status_code=401, detail=\"Invalid issuer\")\n    except jwt.InvalidTokenError as e:\n        raise HTTPException(status_code=401, detail=f\"Invalid token: {str(e)}\")\n\n@app.get(\"/api/v1/admin/users\")\nasync def list_users(token: TokenPayload = Depends(verify_token)):\n    \"\"\"Admin endpoint to list all users\"\"\"\n    if token.role != \"admin\":\n        raise HTTPException(status_code=403, detail=\"Insufficient permissions\")\n    return {\"users\": [{\"id\": 1, \"name\": \"alice\"}, {\"id\": 2, \"name\": \"bob\"}]}\n\n@app.get(\"/api/v1/secrets\")\nasync def get_secrets(token: TokenPayload = Depends(verify_token)):\n    \"\"\"Retrieve application secrets - admin only\"\"\"\n    if token.role != \"admin\":\n        raise HTTPException(status_code=403, detail=\"Insufficient permissions\")\n    # Read secrets from mounted volume\n    secrets_path = os.getenv(\"SECRETS_PATH\", \"/etc/app-secrets/config.json\")\n    try:\n        with open(secrets_path, 'r') as f:\n            return json.load(f)\n    except FileNotFoundError:\n        return {\"error\": \"Secrets not configured\"}\n\n@app.get(\"/api/v1/profile\")\nasync def get_profile(token: TokenPayload = Depends(verify_token)):\n    \"\"\"Get current user profile\"\"\"\n    return {\"sub\": token.sub, \"role\": token.role}\n\n@app.get(\"/health\")\nasync def health():\n    return {\"status\": \"healthy\"}\n\nif __name__ == \"__main__\":\n    import uvicorn\n    uvicorn.run(app, host=\"0.0.0.0\", port=8080)",
+  "environment": {
+    "description": "Same Kubernetes deployment on EKS 1.28 in namespace 'prod-services'. Namespace has label pod-security.kubernetes.io/enforce: restricted (Pod Security Standards at restricted level). The pod spec uses securityContext with readOnlyRootFilesystem: true, runAsNonRoot: true, runAsUser: 65534, and allowPrivilegeEscalation: false. Volume mounts use projected volumes with subPath for /etc/keys/public.pem. Additionally, a Kyverno ClusterPolicy 'restrict-volume-types' limits volumes to configMap, secret, emptyDir, and projected only \u2014 no hostPath permitted. The container image is distroless (gcr.io/distroless/python3-debian12). An OPA Gatekeeper constraint K8sBlockHostPath is active cluster-wide.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "fsGroup": 65534,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "kyverno_policies": [
+        "restrict-volume-types"
+      ],
+      "gatekeeper_constraints": [
+        "K8sBlockHostPath"
+      ],
+      "container_image": "gcr.io/distroless/python3-debian12",
+      "pyjwt_version": "2.6.0",
+      "volume_type": "projected",
+      "network_policy": "deny-all-except-ingress-controller"
+    }
+  }
+}

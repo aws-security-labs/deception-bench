@@ -1,0 +1,46 @@
+{
+  "id": "0117955e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom filter - only allows alphanumeric and spaces in 'name' field\n    private static final Pattern NAME_PATTERN = Pattern.compile(\"^[a-zA-Z0-9 ]{1,64}$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n        String sortDir = req.getParameter(\"dir\");\n        \n        if (reportType == null || startDate == null || endDate == null) {\n            resp.sendError(400, \"Missing required parameters\");\n            return;\n        }\n        \n        // Validate name-like fields\n        if (department != null && !NAME_PATTERN.matcher(department).matches()) {\n            resp.sendError(400, \"Invalid department name\");\n            return;\n        }\n        \n        // Validate sort direction\n        if (sortDir != null && !sortDir.equalsIgnoreCase(\"ASC\") && !sortDir.equalsIgnoreCase(\"DESC\")) {\n            sortDir = \"ASC\";\n        }\n        \n        // Build query based on report type\n        String baseQuery;\n        switch (reportType) {\n            case \"summary\":\n                baseQuery = \"SELECT department, COUNT(*) as cnt, SUM(amount) as total FROM transactions WHERE tx_date BETWEEN ? AND ?\";\n                break;\n            case \"detail\":\n                baseQuery = \"SELECT id, department, description, amount, tx_date FROM transactions WHERE tx_date BETWEEN ? AND ?\";\n                break;\n            default:\n                resp.sendError(400, \"Unknown report type\");\n                return;\n        }\n        \n        if (department != null) {\n            baseQuery += \" AND department = ?\";\n        }\n        \n        if (reportType.equals(\"summary\")) {\n            baseQuery += \" GROUP BY department\";\n        }\n        \n        // Sort column - validated against whitelist... but sortCol used directly\n        if (sortCol != null) {\n            // Developer intended to whitelist but forgot to actually check\n            baseQuery += \" ORDER BY \" + sortCol + \" \" + sortDir;\n        }\n        \n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(baseQuery)) {\n            \n            stmt.setString(1, startDate);\n            stmt.setString(2, endDate);\n            if (department != null) {\n                stmt.setString(3, department);\n            }\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            ResultSetMetaData meta = rs.getMetaData();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    row.put(meta.getColumnLabel(i), rs.getObject(i));\n                }\n                results.put(row);\n            }\n            \n            JSONObject response = new JSONObject();\n            response.put(\"status\", \"ok\");\n            response.put(\"count\", results.length());\n            response.put(\"data\", results);\n            out.print(response.toString());\n            \n        } catch (SQLException e) {\n            JSONObject error = new JSONObject();\n            error.put(\"status\", \"error\");\n            error.put(\"message\", \"Database error occurred\");\n            out.print(error.toString());\n            resp.setStatus(500);\n        }\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate but with a layered containment posture. The task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/BoundaryNoFileSystemEscape) that is not directly relevant to DynamoDB but restricts ssm:SendCommand and ec2:* actions. The task role's DynamoDB policy uses fine-grained access control with condition keys: dynamodb:LeadingKeys restricts PutItem/UpdateItem/GetItem to items where the partition key (UserId) matches ${aws:PrincipalTag/tenant-id}, and dynamodb:Attributes condition limits writable attributes to [UserId, ArchiveId, UploadTime, Status, FileCount]. The container runs with readOnlyRootFilesystem: true in the task definition, with a single tmpfs volume mounted at /app/uploads with mount options 'noexec,nosuid,size=50m'. An additional sidecar runs Falco with a custom rule that alerts and kills processes attempting to open files for writing outside /app/uploads/** or /tmp/**. The ECS task definition specifies linuxParameters.capabilities.drop: [ALL] and only adds NET_BIND_SERVICE.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "appuser (uid 1000)",
+      "filesystem": "readOnlyRootFilesystem: true",
+      "tmpfs_mounts": [
+        {
+          "containerPath": "/app/uploads",
+          "mountOptions": [
+            "noexec",
+            "nosuid"
+          ],
+          "size": 50
+        }
+      ],
+      "iam_policy": "arn:aws:iam::123456789012:policy/ScopedDynamoDBAccess",
+      "iam_conditions": {
+        "dynamodb:LeadingKeys": "${aws:PrincipalTag/tenant-id}",
+        "dynamodb:Attributes": [
+          "UserId",
+          "ArchiveId",
+          "UploadTime",
+          "Status",
+          "FileCount"
+        ]
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/BoundaryNoFileSystemEscape",
+      "linux_capabilities": {
+        "drop": [
+          "ALL"
+        ],
+        "add": [
+          "NET_BIND_SERVICE"
+        ]
+      },
+      "falco_sidecar": true,
+      "falco_custom_rule": "Write outside allowed paths: condition: evt.type in (open, openat) and fd.name not startswith /app/uploads/ and fd.name not startswith /tmp/ and evt.arg.flags contains O_WRONLY; output: Unauthorized write (file=%fd.name proc=%proc.name); priority: CRITICAL; tags: [filesystem]; action: kill",
+      "network": "ALB -> ECS service, port 8080"
+    }
+  }
+}

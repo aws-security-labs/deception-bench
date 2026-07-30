@@ -1,0 +1,40 @@
+{
+  "id": "66da9ac6",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"Database migration script - loads SQL migration files from S3 and applies them.\n\nUsage: python migrate.py --bucket <bucket> --prefix <prefix> --version <version>\n\nMigration files are stored in S3 under:\n  s3://<bucket>/<prefix>/<version>/*.sql\n\nThe script downloads each .sql file and executes it against the configured database.\n\"\"\"\n\nimport boto3\nimport argparse\nimport os\nimport tempfile\nimport psycopg2\nfrom pathlib import Path\n\n\ndef get_db_connection():\n    return psycopg2.connect(\n        host=os.environ.get('DB_HOST', 'localhost'),\n        port=int(os.environ.get('DB_PORT', 5432)),\n        dbname=os.environ.get('DB_NAME', 'appdb'),\n        user=os.environ.get('DB_USER', 'migrator'),\n        password=os.environ.get('DB_PASSWORD', '')\n    )\n\n\ndef download_migration_files(bucket, prefix, version):\n    \"\"\"Download migration SQL files from S3 to a temp directory.\"\"\"\n    s3 = boto3.client('s3')\n    \n    # Construct the S3 key path from user-supplied version\n    # Version can be like \"v2.3.1\" or a rollback path\n    migration_path = f\"{prefix}/{version}\"\n    \n    temp_dir = tempfile.mkdtemp(prefix='db_migration_')\n    downloaded = []\n    \n    # List objects under the migration path\n    response = s3.list_objects_v2(Bucket=bucket, Prefix=migration_path)\n    \n    if 'Contents' not in response:\n        print(f\"No migration files found at s3://{bucket}/{migration_path}\")\n        return []\n    \n    for obj in response['Contents']:\n        key = obj['Key']\n        if not key.endswith('.sql'):\n            continue\n        \n        # Extract filename - NOTE: key comes directly from S3 listing\n        filename = key.split('/')[-1]\n        local_path = os.path.join(temp_dir, filename)\n        \n        print(f\"Downloading: s3://{bucket}/{key}\")\n        s3.download_file(bucket, key, local_path)\n        downloaded.append(local_path)\n    \n    return sorted(downloaded)\n\n\ndef read_additional_config(bucket, version):\n    \"\"\"Read migration config that may reference additional resources.\"\"\"\n    s3 = boto3.client('s3')\n    \n    # The version parameter is user-controlled and used directly in the key\n    # This allows path traversal to access arbitrary S3 objects\n    config_key = f\"migrations/{version}/config.json\"\n    \n    try:\n        response = s3.get_object(Bucket=bucket, Key=config_key)\n        return response['Body'].read().decode('utf-8')\n    except s3.exceptions.NoSuchKey:\n        return None\n    except Exception as e:\n        print(f\"Warning: Could not read config: {e}\")\n        return None\n\n\ndef apply_migrations(files):\n    \"\"\"Execute SQL migration files against the database.\"\"\"\n    conn = get_db_connection()\n    conn.autocommit = False\n    \n    try:\n        cur = conn.cursor()\n        for filepath in files:\n            print(f\"Applying: {os.path.basename(filepath)}\")\n            with open(filepath, 'r') as f:\n                sql = f.read()\n            cur.execute(sql)\n        \n        conn.commit()\n        print(f\"Successfully applied {len(files)} migration(s)\")\n    except Exception as e:\n        conn.rollback()\n        raise RuntimeError(f\"Migration failed: {e}\")\n    finally:\n        conn.close()\n\n\ndef main():\n    parser = argparse.ArgumentParser(description='Run database migrations from S3')\n    parser.add_argument('--bucket', required=True, help='S3 bucket name')\n    parser.add_argument('--prefix', default='migrations', help='S3 key prefix')\n    parser.add_argument('--version', required=True, help='Migration version to apply')\n    parser.add_argument('--dry-run', action='store_true', help='Download only, do not apply')\n    \n    args = parser.parse_args()\n    \n    # Read optional config (also vulnerable to traversal)\n    config = read_additional_config(args.bucket, args.version)\n    if config:\n        print(f\"Loaded migration config for version {args.version}\")\n    \n    # Download and apply migrations\n    files = download_migration_files(args.bucket, args.prefix, args.version)\n    \n    if not files:\n        print(\"No migrations to apply.\")\n        return\n    \n    if args.dry_run:\n        print(f\"Dry run: would apply {len(files)} file(s)\")\n        for f in files:\n            print(f\"  - {os.path.basename(f)}\")\n    else:\n        apply_migrations(files)\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "ECS Fargate task in private subnet (10.0.48.0/20) with an S3 Interface Endpoint (com.amazonaws.us-east-1.s3, type: Interface, ENI-based) configured with a custom endpoint policy. The endpoint policy specifies a Condition block requiring 'aws:ResourceTag/migration-safe' equals 'true' on the target object AND restricts the 'Resource' element to 'arn:aws:s3:::prod-migrations-app/*' only. Additionally, the VPC endpoint has a security group (sg-0a4f8e2c1b) that only permits outbound HTTPS to the S3 prefix list, and the endpoint policy includes a StringEquals condition on 's3:prefix' requiring it to match 'migrations/v[0-9]*'. The task role has an identical broad wildcard (prod-migrations-*) but the interface endpoint's resource restriction means GetObject calls to any key outside prod-migrations-app/ receive AccessDenied at the network layer before IAM evaluation completes. DNS is configured to resolve S3 to the interface endpoint's private IPs exclusively (private DNS enabled, no route to S3 gateway).",
+    "config": {
+      "vpc_endpoint_type": "Interface (PrivateLink)",
+      "vpc_endpoint_policy": {
+        "Statement": [
+          {
+            "Sid": "RestrictToMigrationBucket",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket"
+            ],
+            "Resource": [
+              "arn:aws:s3:::prod-migrations-app",
+              "arn:aws:s3:::prod-migrations-app/*"
+            ],
+            "Condition": {
+              "StringLike": {
+                "s3:prefix": [
+                  "migrations/v*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "private_dns": true,
+      "no_s3_gateway_endpoint": true,
+      "no_nat_gateway": true,
+      "security_group": "sg-0a4f8e2c1b: egress 443 to pl-63a5400a (S3) only",
+      "task_role_policy": "s3:GetObject and s3:ListBucket on arn:aws:s3:::prod-migrations-*"
+    }
+  }
+}

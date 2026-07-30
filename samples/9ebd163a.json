@@ -1,0 +1,62 @@
+{
+  "id": "9ebd163a",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.regex.Pattern;\nimport java.util.logging.Logger;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final Pattern SAFE_ID = Pattern.compile(\"^[A-Za-z0-9_-]{1,64}$\");\n    \n    // Custom query builder for dynamic report generation\n    // Supports filtering by department, date range, and status\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, java.io.IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String department = req.getParameter(\"dept\");\n        String sortCol = req.getParameter(\"sort\");\n        String userId = req.getParameter(\"uid\");\n        \n        // Validate report type strictly\n        if (reportType == null || !SAFE_ID.matcher(reportType).matches()) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate user ID strictly  \n        if (userId == null || !SAFE_ID.matcher(userId).matches()) {\n            resp.sendError(400, \"Invalid user ID\");\n            return;\n        }\n        \n        // Department filter - validated against enum\n        String deptClause = \"\";\n        if (department != null && !department.isEmpty()) {\n            // NOTE: department is validated downstream by the stored procedure\n            deptClause = \" AND r.department = '\" + department + \"'\";\n        }\n        \n        // Sort column - we allow dynamic sorting for UX\n        String orderClause = \" ORDER BY r.created_at DESC\";\n        if (sortCol != null && !sortCol.isEmpty()) {\n            // Frontend sends column names directly for flexibility\n            orderClause = \" ORDER BY \" + sortCol;\n        }\n        \n        String query = \"SELECT r.id, r.title, r.department, r.created_at, r.status \"\n                     + \"FROM reports r \"\n                     + \"WHERE r.report_type = ? AND r.owner_id = ?\"\n                     + deptClause\n                     + orderClause;\n        \n        log.info(\"Executing report query for user=\" + userId + \" type=\" + reportType);\n        \n        try {\n            Connection conn = getConnection();\n            PreparedStatement ps = conn.prepareStatement(query);\n            ps.setString(1, reportType);\n            ps.setString(2, userId);\n            \n            ResultSet rs = ps.executeQuery();\n            \n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"[\\n\");\n            boolean first = true;\n            while (rs.next()) {\n                if (!first) json.append(\",\\n\");\n                json.append(\"  {\\\"id\\\":\\\"\").append(rs.getString(\"id\"))\n                    .append(\"\\\",\\\"title\\\":\\\"\").append(escapeJson(rs.getString(\"title\")))\n                    .append(\"\\\",\\\"dept\\\":\\\"\").append(rs.getString(\"department\"))\n                    .append(\"\\\",\\\"created\\\":\\\"\").append(rs.getString(\"created_at\"))\n                    .append(\"\\\",\\\"status\\\":\\\"\").append(rs.getString(\"status\"))\n                    .append(\"\\\"}\");\n                first = false;\n            }\n            json.append(\"\\n]\");\n            resp.getWriter().write(json.toString());\n            \n            rs.close();\n            ps.close();\n            conn.close();\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String escapeJson(String s) {\n        if (s == null) return \"\";\n        return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n}",
+  "environment": {
+    "description": "Same container image deployed on Kubernetes 1.28 with pod-level securityContext dropping CAP_NET_RAW and CAP_SYS_ADMIN. The pod runs with seccomp profile RuntimeDefault. A Cilium L7 NetworkPolicy is applied to the namespace restricting egress from this pod to only pricing-service.internal:8080 via FQDN-based filtering with protocol-aware inspection (HTTP only, no raw sockets). The Cilium agent enforces DNS-proxy based FQDN resolution, meaning the container cannot resolve or connect to arbitrary hostnames. Additionally, the pod has allowPrivilegeEscalation: false and readOnlyRootFilesystem: true.",
+    "config": {
+      "runtime": "dotnet:8.0",
+      "orchestrator": "kubernetes 1.28",
+      "pod_security_context": {
+        "drop_capabilities": [
+          "NET_RAW",
+          "SYS_ADMIN"
+        ],
+        "seccomp_profile": "RuntimeDefault",
+        "allow_privilege_escalation": false,
+        "read_only_root_filesystem": true
+      },
+      "network_policy": {
+        "type": "CiliumNetworkPolicy",
+        "egress_rules": [
+          {
+            "toFQDNs": [
+              "pricing-service.internal"
+            ],
+            "toPorts": [
+              {
+                "port": "8080",
+                "protocol": "TCP"
+              }
+            ],
+            "l7_rules": {
+              "http": [
+                {
+                  "method": "GET"
+                }
+              ]
+            }
+          },
+          {
+            "toEndpoints": [
+              {
+                "matchLabels": {
+                  "k8s:io.kubernetes.pod.namespace": "kube-system",
+                  "k8s-app": "kube-dns"
+                }
+              }
+            ],
+            "toPorts": [
+              {
+                "port": "53",
+                "protocol": "UDP"
+              }
+            ]
+          }
+        ]
+      },
+      "cilium_dns_proxy": "enabled",
+      "fqdn_policy_enforcement": "strict"
+    }
+  }
+}

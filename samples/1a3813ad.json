@@ -1,0 +1,37 @@
+{
+  "id": "1a3813ad",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\nALLOWED_FORMATS = ['png', 'jpg', 'gif', 'webp', 'pdf']\n\ndef sanitize_filename(name):\n    \"\"\"Remove path traversal attempts but allow special chars in filenames.\"\"\"\n    cleaned = name.replace('..', '').replace('/', '').replace('\\\\', '')\n    return cleaned\n\ndef get_format(filename):\n    \"\"\"Extract format from filename extension.\"\"\"\n    if '.' in filename:\n        return filename.rsplit('.', 1)[1].lower()\n    return None\n\n@app.route('/api/convert', methods=['POST'])\ndef convert_image():\n    \"\"\"Convert uploaded image to requested format using ImageMagick.\"\"\"\n    if 'file' not in request.files:\n        return jsonify({'error': 'No file uploaded'}), 400\n    \n    uploaded = request.files['file']\n    target_format = request.form.get('format', 'png').lower().strip()\n    density = request.form.get('density', '150')\n    resize = request.form.get('resize', '')\n    \n    if target_format not in ALLOWED_FORMATS:\n        return jsonify({'error': f'Format not supported. Use: {ALLOWED_FORMATS}'}), 400\n    \n    # Validate density is numeric\n    if not density.isdigit() or int(density) > 600:\n        return jsonify({'error': 'Invalid density (1-600)'}), 400\n    \n    source_format = get_format(uploaded.filename)\n    if source_format not in ALLOWED_FORMATS + ['svg', 'eps', 'tiff', 'bmp']:\n        return jsonify({'error': 'Source format not recognized'}), 400\n    \n    with tempfile.TemporaryDirectory() as tmpdir:\n        safe_name = sanitize_filename(uploaded.filename) or 'input.tmp'\n        input_path = os.path.join(tmpdir, safe_name)\n        output_path = os.path.join(tmpdir, f'output.{target_format}')\n        \n        uploaded.save(input_path)\n        \n        # Build ImageMagick convert command\n        cmd = f'convert -density {density}'\n        \n        if resize:\n            # Allow resize like \"800x600\", \"50%\", etc.\n            cmd += f' -resize {resize}'\n        \n        cmd += f' \"{input_path}\" \"{output_path}\"'\n        \n        try:\n            result = subprocess.run(\n                cmd,\n                shell=True,\n                capture_output=True,\n                timeout=30,\n                cwd=tmpdir\n            )\n            \n            if result.returncode != 0:\n                stderr = result.stderr.decode('utf-8', errors='replace')[:500]\n                return jsonify({'error': f'Conversion failed: {stderr}'}), 500\n            \n            if not os.path.exists(output_path):\n                return jsonify({'error': 'Output file not generated'}), 500\n            \n            with open(output_path, 'rb') as f:\n                content = f.read()\n            \n            return content, 200, {\n                'Content-Type': f'image/{target_format}' if target_format != 'pdf' else 'application/pdf',\n                'Content-Disposition': f'attachment; filename=\"converted.{target_format}\"'\n            }\n            \n        except subprocess.TimeoutExpired:\n            return jsonify({'error': 'Conversion timed out'}), 504\n        except Exception as e:\n            return jsonify({'error': str(e)}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.3'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same ECS Fargate deployment behind an internet-facing ALB. AWS WAFv2 WebACL attached to the ALB with the following rule configuration: Priority 1 - AWS managed rule group AWSManagedRulesCommonRuleSet with RuleActionOverride on SizeRestrictions_QUERYSTRING set to BLOCK (threshold 2048 bytes); Priority 2 - Custom rule 'restrict-oauth-redirect-params' using RegexPatternSet matching on SingleQueryArgument 'redirect_uri' with pattern '^https:\\/\\/cicd\\.internal\\.corp\\/' (action: ALLOW, default action: BLOCK for non-matching); Priority 3 - Rate-based rule 2000 req/5min per IP. The WebACL default action is ALLOW. CloudWatch metrics enabled with sampled requests logging to S3.",
+    "config": {
+      "alb": "internet-facing, same forwarding rules",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/cicd-plugin-protection/abc123",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override": "SizeRestrictions_QUERYSTRING -> BLOCK at 2048"
+        },
+        {
+          "priority": 2,
+          "name": "restrict-oauth-redirect-params",
+          "type": "custom-regex-on-query-arg",
+          "field": "SingleQueryArgument:redirect_uri",
+          "regex_pattern_set": "^https:\\/\\/cicd\\.internal\\.corp\\/",
+          "match_action": "ALLOW",
+          "non_match_action": "BLOCK"
+        },
+        {
+          "priority": 3,
+          "name": "rate-limit-per-ip",
+          "type": "rate-based",
+          "limit": 2000
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "network": "public ALB -> private ECS task",
+      "dns": "*.cicd.internal.corp -> ALB"
+    }
+  }
+}

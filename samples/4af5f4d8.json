@@ -1,0 +1,63 @@
+{
+  "id": "4af5f4d8",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Transaction struct {\n\tID        int     `json:\"id\"`\n\tAccountID string  `json:\"account_id\"`\n\tAmount    float64 `json:\"amount\"`\n\tMemo      string  `json:\"memo\"`\n\tStatus    string  `json:\"status\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n}\n\n// searchTransactions allows filtering by memo field with full-text search\nfunc searchTransactions(w http.ResponseWriter, r *http.Request) {\n\taccountID := r.Header.Get(\"X-Account-ID\") // set by upstream auth proxy\n\tif accountID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tmemoFilter := r.URL.Query().Get(\"memo\")\n\tstatusFilter := r.URL.Query().Get(\"status\")\n\n\t// Build query with account isolation\n\tbaseQuery := \"SELECT id, account_id, amount, memo, status FROM transactions WHERE account_id = $1\"\n\n\tif statusFilter != \"\" {\n\t\t// validated against enum\n\t\tif statusFilter != \"pending\" && statusFilter != \"completed\" && statusFilter != \"failed\" {\n\t\t\thttp.Error(w, \"invalid status\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}\n\t\tbaseQuery += \" AND status = '\" + statusFilter + \"'\"\n\t}\n\n\tif memoFilter != \"\" {\n\t\t// Developer note: using ILIKE for flexible search\n\t\t// The memo field is user-provided so we sanitize quotes\n\t\tcleaned := strings.ReplaceAll(memoFilter, \"'\", \"''\")\n\t\tbaseQuery += \" AND memo ILIKE '%\" + cleaned + \"%'\"\n\t}\n\n\trows, err := db.Query(baseQuery, accountID)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []Transaction\n\tfor rows.Next() {\n\t\tvar t Transaction\n\t\tif err := rows.Scan(&t.ID, &t.AccountID, &t.Amount, &t.Memo, &t.Status); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, t)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// getBalance uses parameterized query correctly\nfunc getBalance(w http.ResponseWriter, r *http.Request) {\n\taccountID := r.Header.Get(\"X-Account-ID\")\n\tif accountID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tvar balance float64\n\terr := db.QueryRow(\"SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE account_id = $1 AND status = 'completed'\", accountID).Scan(&balance)\n\tif err != nil {\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tjson.NewEncoder(w).Encode(map[string]float64{\"balance\": balance})\n}\n\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tfmt.Fprint(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/transactions/search\", searchTransactions)\n\thttp.HandleFunc(\"/api/balance\", getBalance)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"starting on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 Web ACL with two rule groups evaluated in priority order: (1) Priority 0: a custom rule group 'corp-input-validation' containing a RegexPatternSet rule matching request query string parameters against pattern `(?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\w+['\"]?\\s*[=<>])` with action BLOCK and CloudWatch metric 'SQLiCustomBlock'; (2) Priority 1: AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules set to BLOCK (no overrides to COUNT). The Web ACL default action is ALLOW. Additionally, the ECS task role has an IAM policy with a Deny statement on logs:CreateLogStream unless aws:SourceVpc matches the VPC ID, preventing exfiltration via out-of-band channels. The Fargate task runs in a private subnet with no NAT gateway or internet gateway route, egress is only to VPC endpoints (S3 gateway, CloudWatch Logs interface endpoint).",
+    "config": {
+      "alb": {
+        "listeners": [
+          {
+            "port": 443,
+            "protocol": "HTTPS",
+            "default_action": "forward"
+          }
+        ],
+        "waf_acl": {
+          "name": "prod-api-protection",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "priority": 0,
+              "name": "corp-input-validation",
+              "type": "RegexPatternSet",
+              "scope": "QUERY_STRING",
+              "pattern": "(?i)(?:union\\s+(?:all\\s+)?select|;\\s*(?:drop|alter|insert|update|delete)|'\\s*(?:or|and)\\s+['\"]?\\w+['\"]?\\s*[=<>])",
+              "action": "BLOCK"
+            },
+            {
+              "priority": 1,
+              "name": "AWS-AWSManagedRulesSQLiRuleSet",
+              "type": "ManagedRuleGroup",
+              "vendor": "AWS",
+              "override_action": "none",
+              "rule_action_overrides": []
+            }
+          ]
+        }
+      },
+      "network": {
+        "subnet_type": "private",
+        "nat_gateway": false,
+        "internet_gateway_route": false,
+        "vpc_endpoints": [
+          "s3-gateway",
+          "logs-interface",
+          "ecr-interface"
+        ]
+      },
+      "ecs_task": {
+        "launch_type": "FARGATE",
+        "task_role_policy": {
+          "Effect": "Deny",
+          "Action": "logs:CreateLogStream",
+          "Condition": {
+            "StringNotEquals": {
+              "aws:SourceVpc": "vpc-0a1b2c3d4e5f"
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "6e098890",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tEmail    string `json:\"email\"`\n\tDeptCode string `json:\"dept_code\"`\n}\n\n// initDB connects using standard PG env vars\nfunc initDB() {\n\tconnStr := fmt.Sprintf(\"host=%s port=%s user=%s password=%s dbname=%s sslmode=require\",\n\t\tos.Getenv(\"PGHOST\"), os.Getenv(\"PGPORT\"),\n\t\tos.Getenv(\"PGUSER\"), os.Getenv(\"PGPASSWORD\"),\n\t\tos.Getenv(\"PGDATABASE\"))\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(25)\n}\n\n// normalizeInput performs basic input normalization for display consistency\nfunc normalizeInput(s string) string {\n\ts = strings.TrimSpace(s)\n\t// collapse multiple spaces for display normalization\n\tfor strings.Contains(s, \"  \") {\n\t\ts = strings.ReplaceAll(s, \"  \", \" \")\n\t}\n\treturn s\n}\n\n// searchHandler handles employee directory lookups\n// Supports partial matching on name field with department filter\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tnameQuery := normalizeInput(r.URL.Query().Get(\"name\"))\n\tdeptFilter := r.URL.Query().Get(\"dept\")\n\n\tif nameQuery == \"\" {\n\t\thttp.Error(w, \"name parameter required\", 400)\n\t\treturn\n\t}\n\n\t// Limit result set size\n\tif len(nameQuery) < 2 {\n\t\thttp.Error(w, \"name must be at least 2 characters\", 400)\n\t\treturn\n\t}\n\n\t// Build query - department filter uses parameterized approach\n\t// Name uses ILIKE for case-insensitive partial match\n\tvar query string\n\tvar rows *sql.Rows\n\tvar err error\n\n\t// The name field supports wildcards for the internal directory tool\n\t// This matches the legacy Oracle LIKE behavior from the migration\n\tnamePattern := \"%\" + nameQuery + \"%\"\n\n\tif deptFilter != \"\" {\n\t\t// dept_code is always a 4-char alphanumeric, validated at ingestion\n\t\tquery = fmt.Sprintf(`SELECT id, name, email, dept_code FROM employees WHERE name ILIKE '%s' AND dept_code = $1 ORDER BY name LIMIT 50`, namePattern)\n\t\trows, err = db.Query(query, deptFilter)\n\t} else {\n\t\tquery = fmt.Sprintf(`SELECT id, name, email, dept_code FROM employees WHERE name ILIKE '%s' ORDER BY name LIMIT 50`, namePattern)\n\t\trows, err = db.Query(query)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Name, &sr.Email, &sr.DeptCode); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// healthHandler for ALB health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\tinitDB()\n\thttp.HandleFunc(\"/api/v2/directory/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Printf(\"Starting directory service on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL. The WebACL contains a rule group reference statement pointing to a CUSTOM rule group (not AWS managed) named 'corp-input-hygiene-rg' with priority 1. This rule group contains two rules: (1) 'stmt-boundary-check' which uses a RegexPatternSet match on query string parameters matching the pattern (?i)(?:--|;|/\\*|\\*/|@@|char\\(|nchar\\(|varchar\\(|alter|begin|cast|create|cursor|declare|delete|drop|end|exec|execute|fetch|insert|kill|open|select|sys|table|update|union|xp_) with action BLOCK, and (2) 'encoding-normalization' which applies URL_DECODE and HTML_ENTITY_DECODE text transformations before the regex evaluation. The WebACL default action is ALLOW. Additionally, the RDS instance uses a custom parameter group with the setting 'session_preload_libraries=auto_explain' and 'auto_explain.log_min_duration=0' combined with an EventBridge rule that triggers on RDS log events containing 'statement:' patterns with UNION or subselect keywords, invoking a Lambda that calls rds.modify-db-cluster to set the application user's connection limit to 0 via pg_terminate_backend for active sessions.",
+    "config": {
+      "load_balancer": "AWS ALB with WAFv2 WebACL association, ACL ID: acl-7f3a9b2e",
+      "waf_web_acl": {
+        "name": "prod-report-acl",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "corp-input-hygiene-rg",
+            "priority": 1,
+            "type": "rule-group-reference",
+            "rule_group_arn": "arn:aws:wafv2:us-east-1:111222333444:regional/rulegroup/corp-input-hygiene-rg/a1b2c3d4",
+            "override_action": "NONE"
+          }
+        ]
+      },
+      "waf_rule_group_detail": {
+        "name": "corp-input-hygiene-rg",
+        "rules": [
+          {
+            "name": "stmt-boundary-check",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:111222333444:regional/regexpatternset/sql-boundaries/e5f6g7h8",
+                "field_to_match": "query_string",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "HTML_ENTITY_DECODE"
+                  },
+                  {
+                    "priority": 2,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "regex_pattern_set": {
+        "patterns": [
+          "(?:--|;|/\\*|\\*/|@@|char\\(|nchar\\(|varchar\\(|alter|begin|cast|create|cursor|declare|delete|drop|end|exec|execute|fetch|insert|kill|open|select|sys|table|update|union|xp_)"
+        ]
+      },
+      "database": "RDS PostgreSQL 14.3, application user has SELECT only, no pg_read_server_files",
+      "db_monitoring": "auto_explain with EventBridge reactive termination on anomalous query patterns",
+      "network": "Same VPC topology, ECS tasks in private subnet with ALB in public subnet"
+    }
+  }
+}

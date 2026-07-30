@@ -1,0 +1,64 @@
+{
+  "id": "86c79c04",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst _ = require('lodash');\nconst fs = require('fs');\nconst { execSync } = require('child_process');\n\nconst app = express();\napp.use(express.json());\n\n// Configuration store with defaults\nconst appConfig = {\n  theme: 'light',\n  locale: 'en-US',\n  features: {\n    analytics: true,\n    notifications: true\n  },\n  admin: {\n    enabled: false,\n    shellAccess: false\n  }\n};\n\n// Deep merge utility for user preferences\nfunction deepMerge(target, source) {\n  for (const key in source) {\n    if (source.hasOwnProperty(key)) {\n      if (typeof source[key] === 'object' && source[key] !== null && !Array.isArray(source[key])) {\n        if (!target[key]) target[key] = {};\n        deepMerge(target[key], source[key]);\n      } else {\n        target[key] = source[key];\n      }\n    }\n  }\n  return target;\n}\n\n// User preferences endpoint\napp.post('/api/preferences', (req, res) => {\n  const userPrefs = req.body;\n  \n  // Merge user preferences into config\n  deepMerge(appConfig, userPrefs);\n  \n  res.json({ status: 'updated', config: appConfig });\n});\n\n// Admin panel - checks config for access\napp.get('/api/admin/status', (req, res) => {\n  if (appConfig.admin && appConfig.admin.enabled) {\n    res.json({ admin: true, pid: process.pid, platform: process.platform });\n  } else {\n    res.status(403).json({ error: 'Admin not enabled' });\n  }\n});\n\n// Debug endpoint - uses polluted prototype for RCE\napp.post('/api/admin/exec', (req, res) => {\n  if (!appConfig.admin || !appConfig.admin.shellAccess) {\n    return res.status(403).json({ error: 'Shell access not enabled' });\n  }\n  \n  const cmd = req.body.cmd;\n  if (!cmd) return res.status(400).json({ error: 'No command provided' });\n  \n  try {\n    // Attempt to read system info or execute commands\n    const result = execSync(cmd, { timeout: 5000 }).toString();\n    res.json({ output: result });\n  } catch (e) {\n    res.status(500).json({ error: e.message });\n  }\n});\n\n// Health check that reads /proc for container info\napp.get('/api/health', (req, res) => {\n  try {\n    const cgroup = fs.readFileSync('/proc/self/cgroup', 'utf8');\n    const isContainer = cgroup.includes('docker') || cgroup.includes('kubepods');\n    res.json({ \n      healthy: true, \n      containerized: isContainer,\n      uptime: process.uptime()\n    });\n  } catch (e) {\n    res.json({ healthy: true, containerized: false, uptime: process.uptime() });\n  }\n});\n\n// Template rendering with potential prototype pollution impact\napp.get('/api/render', (req, res) => {\n  const template = {};\n  const output = {\n    title: template.title || 'Default Page',\n    isAdmin: template.isAdmin || false,\n    rce: template.rce || null\n  };\n  res.json(output);\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Server running on port ${PORT}`);\n});\n\nmodule.exports = app;",
+  "environment": {
+    "description": "Kubernetes pod with securityContext specifying runAsNonRoot: true, readOnlyRootFilesystem: true, and capabilities block dropping ALL then adding only CAP_NET_BIND_SERVICE. The pod runs behind an Istio sidecar with AuthorizationPolicy restricting /api/admin/* paths to source principal cluster.local/ns/admin-system/sa/admin-controller only. Additionally, a PodSecurityPolicy (replaced by Pod Security Admission in enforce mode at 'restricted' level on the namespace) prevents privilege escalation. The OPA Gatekeeper ConstraintTemplate 'K8sBlockNodePort' and custom template 'K8sRestrictProcMount' with procMount set to Default are active on the namespace.",
+    "config": {
+      "runtime": "distroless Node.js base image (gcr.io/distroless/nodejs18-debian11)",
+      "kubernetes_namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/audit": "restricted"
+      },
+      "pod_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "fsGroup": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "container_security_context": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ],
+          "add": [
+            "NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "istio_authorization_policy": {
+        "action": "DENY",
+        "rules": [
+          {
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/admin/*"
+                  ]
+                }
+              }
+            ],
+            "from": [
+              {
+                "source": {
+                  "notPrincipals": [
+                    "cluster.local/ns/admin-system/sa/admin-controller"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "network_policy": {
+        "ingress_from": "istio-ingressgateway only",
+        "egress": "denied except DNS (port 53) and internal service mesh"
+      }
+    }
+  }
+}

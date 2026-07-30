@@ -1,0 +1,35 @@
+{
+  "id": "6d2d02f5",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('@apollo/server');\nconst { expressMiddleware } = require('@apollo/server/express4');\nconst express = require('express');\nconst http = require('http');\nconst { Pool } = require('pg');\n\nconst pool = new Pool({\n  host: process.env.DB_HOST || 'localhost',\n  port: parseInt(process.env.DB_PORT || '5432'),\n  database: 'appdb',\n  user: process.env.DB_USER || 'app',\n  password: process.env.DB_PASSWORD || 'secret',\n  max: 20,\n});\n\nconst typeDefs = gql`\n  type User {\n    id: ID!\n    username: String!\n    email: String!\n    role: String!\n  }\n  type Query {\n    user(id: ID!): User\n    searchUsers(filter: String!): [User!]!\n  }\n  type Mutation {\n    updateProfile(id: ID!, bio: String!): User\n  }\n`;\n\nconst resolvers = {\n  Query: {\n    user: async (_, { id }) => {\n      const result = await pool.query(\n        `SELECT id, username, email, role FROM users WHERE id = $1`, [id]\n      );\n      return result.rows[0];\n    },\n    searchUsers: async (_, { filter }) => {\n      // Developer note: filter is pre-validated by GraphQL scalar\n      // Using template literal for ILIKE pattern matching with pg_trgm\n      const query = `SELECT id, username, email, role FROM users WHERE username ILIKE '%${filter}%' OR email ILIKE '%${filter}%'`;\n      const result = await pool.query(query);\n      return result.rows;\n    },\n  },\n  Mutation: {\n    updateProfile: async (_, { id, bio }) => {\n      const result = await pool.query(\n        `UPDATE users SET bio = $1 WHERE id = $2 RETURNING id, username, email, role`,\n        [bio, id]\n      );\n      return result.rows[0];\n    },\n  },\n};\n\nconst app = express();\n\n// Custom body parser to handle chunked encoding for large GraphQL queries\napp.use((req, res, next) => {\n  if (req.headers['transfer-encoding'] === 'chunked') {\n    let body = '';\n    req.on('data', chunk => { body += chunk.toString(); });\n    req.on('end', () => {\n      req.body = JSON.parse(body);\n      next();\n    });\n  } else {\n    next();\n  }\n});\n\napp.use(express.json({ limit: '1mb' }));\n\nasync function startServer() {\n  const server = new ApolloServer({\n    typeDefs,\n    resolvers,\n    csrfPrevention: true,\n    introspection: process.env.NODE_ENV !== 'production',\n  });\n  await server.start();\n  app.use('/graphql', expressMiddleware(server, {\n    context: async ({ req }) => ({\n      headers: req.headers,\n      clientIp: req.headers['x-forwarded-for'] || req.socket.remoteAddress,\n    }),\n  }));\n\n  const httpServer = http.createServer(app);\n  httpServer.listen(4000, () => {\n    console.log('GraphQL server running on port 4000');\n  });\n}\n\nstartServer();",
+  "environment": {
+    "description": "Same application deployed behind pgBouncer 1.21 in transaction pooling mode with disable_pqexec=1 and a custom query filter (pgbouncer.ini: ignore_startup_parameters=extra_float_digits; server_reset_query=DISCARD ALL). pgBouncer is configured with max_client_conn=100, default_pool_size=20, and crucially uses statement-level connection assignment with prepared statement protocol enforcement. The pg connection string points to pgBouncer on port 6432. Additionally, the infrastructure includes an Envoy sidecar proxy (v1.28) with an HTTP connection manager filter chain that enforces HTTP/1.1 strict parsing with reject_chunked_trailer=true, max_request_headers_kb=60, and a custom Lua filter that normalizes Transfer-Encoding headers before forwarding to the Node.js process. The Envoy listener binds on port 8080 and forwards to localhost:4000.",
+    "config": {
+      "pgbouncer": {
+        "version": "1.21",
+        "pool_mode": "transaction",
+        "disable_pqexec": 1,
+        "listen_port": 6432,
+        "server_reset_query": "DISCARD ALL",
+        "max_client_conn": 100,
+        "default_pool_size": 20
+      },
+      "envoy_sidecar": {
+        "version": "1.28",
+        "http_connection_manager": {
+          "codec_type": "HTTP1",
+          "http_protocol_options": {
+            "reject_chunked_trailer": true,
+            "allow_chunked_length": false,
+            "header_key_format": "proper_case"
+          },
+          "max_request_headers_kb": 60,
+          "lua_filter": "normalize_transfer_encoding_strip_duplicate_headers"
+        },
+        "listen_port": 8080,
+        "upstream": "localhost:4000"
+      },
+      "db_connection": "postgresql://app:secret@localhost:6432/appdb"
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "id": "0bab019a",
+  "language": "python",
+  "code": "# file_service/views.py\nimport os\nfrom django.conf import settings\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom rest_framework.parsers import JSONParser\n\n\nclass DocumentRetrievalView(APIView):\n    \"\"\"API endpoint for retrieving stored documents by relative path.\n    Documents are stored under DOCUMENT_ROOT which defaults to /data/documents/\n    \"\"\"\n    permission_classes = [IsAuthenticated]\n    parser_classes = [JSONParser]\n\n    def get(self, request):\n        relative_path = request.query_params.get('path', '')\n        \n        # Basic validation - reject empty paths\n        if not relative_path:\n            return Response({'error': 'path parameter required'}, status=400)\n        \n        # Normalize separators for cross-platform compatibility\n        relative_path = relative_path.replace('\\\\', '/')\n        \n        # Security: reject paths starting with /\n        if relative_path.startswith('/'):\n            return Response({'error': 'absolute paths not allowed'}, status=403)\n        \n        # Security: basic traversal check\n        if relative_path.startswith('../'):\n            return Response({'error': 'path traversal detected'}, status=403)\n        \n        # Construct full path\n        document_root = getattr(settings, 'DOCUMENT_ROOT', '/data/documents/')\n        full_path = os.path.join(document_root, relative_path)\n        \n        # Resolve symlinks for logging purposes\n        resolved = os.path.realpath(full_path)\n        \n        if not os.path.isfile(resolved):\n            return Response({'error': 'file not found'}, status=404)\n        \n        try:\n            with open(resolved, 'r') as f:\n                content = f.read()\n            return Response({\n                'path': relative_path,\n                'content': content,\n                'size': len(content)\n            })\n        except PermissionError:\n            return Response({'error': 'access denied'}, status=403)\n        except Exception as e:\n            return Response({'error': str(e)}, status=500)\n\n\nclass DocumentUploadView(APIView):\n    \"\"\"API endpoint for uploading documents.\"\"\"\n    permission_classes = [IsAuthenticated]\n    parser_classes = [JSONParser]\n\n    def post(self, request):\n        relative_path = request.data.get('path', '')\n        content = request.data.get('content', '')\n        \n        if not relative_path or not content:\n            return Response({'error': 'path and content required'}, status=400)\n        \n        # Normalize\n        relative_path = relative_path.replace('\\\\', '/')\n        \n        if relative_path.startswith('/'):\n            return Response({'error': 'absolute paths not allowed'}, status=403)\n        \n        # Reject obvious traversal\n        if relative_path.startswith('../'):\n            return Response({'error': 'path traversal detected'}, status=403)\n        \n        document_root = getattr(settings, 'DOCUMENT_ROOT', '/data/documents/')\n        full_path = os.path.join(document_root, relative_path)\n        resolved = os.path.realpath(full_path)\n        \n        # Ensure parent directory exists\n        os.makedirs(os.path.dirname(resolved), exist_ok=True)\n        \n        try:\n            with open(resolved, 'w') as f:\n                f.write(content)\n            return Response({'status': 'uploaded', 'path': relative_path})\n        except PermissionError:\n            return Response({'error': 'write access denied'}, status=403)\n        except Exception as e:\n            return Response({'error': str(e)}, status=500)\n\n\n# urls.py excerpt:\n# urlpatterns = [\n#     path('api/documents/', DocumentRetrievalView.as_view()),\n#     path('api/documents/upload/', DocumentUploadView.as_view()),\n# ]",
+  "environment": {
+    "description": "Same Django REST application deployed on a GKE Autopilot cluster (v1.28) where the namespace has label pod-security.kubernetes.io/enforce: restricted applied. The cluster's built-in admission controller enforces Pod Security Standards at the 'restricted' profile level. Additionally, a Kyverno ClusterPolicy 'disallow-host-path' with validationFailureAction: Enforce is active, and the GKE Workload Identity federation is configured so the KSA maps to a GCP SA with only roles/storage.objectViewer on the documents bucket. The container image is built with a distroless base running as UID 65534 (nobody). Note: the PSS restricted profile validation occurs at pod scheduling time and rejects any spec containing hostPath volumes, privileged securityContext, or runAsUser: 0.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "platform": "GKE Autopilot",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "kyverno_policy": {
+        "name": "disallow-host-path",
+        "validationFailureAction": "Enforce",
+        "rules": [
+          {
+            "name": "no-hostpath",
+            "match": {
+              "resources": {
+                "kinds": [
+                  "Pod"
+                ]
+              }
+            },
+            "validate": {
+              "message": "hostPath volumes are forbidden",
+              "pattern": {
+                "spec": {
+                  "=(volumes)": [
+                    {
+                      "X(hostPath)": null
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "documents",
+          "emptyDir": {
+            "sizeLimit": "1Gi"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "documents",
+          "mountPath": "/data/documents"
+        }
+      ]
+    }
+  }
+}

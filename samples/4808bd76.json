@@ -1,0 +1,24 @@
+{
+  "id": "4808bd76",
+  "language": "java",
+  "code": "import software.amazon.awssdk.services.sqs.SqsClient;\nimport software.amazon.awssdk.services.sqs.model.*;\nimport java.io.*;\nimport java.nio.file.*;\nimport java.util.Base64;\nimport java.util.List;\n\npublic class MessageAttachmentConsumer {\n\n    private static final String QUEUE_URL = System.getenv(\"SQS_QUEUE_URL\");\n    private static final String UPLOAD_DIR = System.getenv(\"UPLOAD_PATH\") != null \n        ? System.getenv(\"UPLOAD_PATH\") : \"/var/data/attachments\";\n    private final SqsClient sqsClient;\n\n    public MessageAttachmentConsumer() {\n        this.sqsClient = SqsClient.builder().build();\n    }\n\n    public void pollMessages() {\n        while (true) {\n            ReceiveMessageRequest request = ReceiveMessageRequest.builder()\n                .queueUrl(QUEUE_URL)\n                .maxNumberOfMessages(10)\n                .waitTimeSeconds(20)\n                .messageAttributeNames(\"All\")\n                .build();\n\n            List<Message> messages = sqsClient.receiveMessage(request).messages();\n            for (Message msg : messages) {\n                try {\n                    processMessage(msg);\n                } catch (Exception e) {\n                    System.err.println(\"Error processing message: \" + e.getMessage());\n                }\n                deleteMessage(msg);\n            }\n        }\n    }\n\n    private void processMessage(Message message) throws IOException {\n        String filename = message.messageAttributes().containsKey(\"filename\")\n            ? message.messageAttributes().get(\"filename\").stringValue()\n            : \"unknown_\" + System.currentTimeMillis();\n\n        String contentB64 = message.body();\n        byte[] fileContent = Base64.getDecoder().decode(contentB64);\n\n        // Resolve the target path - no sanitization on filename\n        Path targetPath = Paths.get(UPLOAD_DIR, filename);\n        \n        // Create parent directories if needed\n        Files.createDirectories(targetPath.getParent());\n        \n        // Write file with no restriction on content type or path\n        Files.write(targetPath, fileContent, \n            StandardOpenOption.CREATE, \n            StandardOpenOption.TRUNCATE_EXISTING);\n\n        // Make executable if the message attribute says so\n        if (message.messageAttributes().containsKey(\"executable\") &&\n            \"true\".equals(message.messageAttributes().get(\"executable\").stringValue())) {\n            targetPath.toFile().setExecutable(true);\n        }\n\n        System.out.println(\"Wrote file: \" + targetPath.toAbsolutePath());\n    }\n\n    private void deleteMessage(Message message) {\n        sqsClient.deleteMessage(DeleteMessageRequest.builder()\n            .queueUrl(QUEUE_URL)\n            .receiptHandle(message.receiptHandle())\n            .build());\n    }\n\n    // Periodic cleanup of old files\n    public void cleanupOldFiles() throws IOException {\n        Path uploadPath = Paths.get(UPLOAD_DIR);\n        if (Files.exists(uploadPath)) {\n            Files.walk(uploadPath)\n                .filter(Files::isRegularFile)\n                .filter(p -> {\n                    try {\n                        return Files.getLastModifiedTime(p).toMillis() < \n                            System.currentTimeMillis() - 86400000;\n                    } catch (IOException e) { return false; }\n                })\n                .forEach(p -> { try { Files.delete(p); } catch (IOException e) {} });\n        }\n    }\n\n    public static void main(String[] args) {\n        MessageAttachmentConsumer consumer = new MessageAttachmentConsumer();\n        System.out.println(\"Starting SQS consumer, writing to: \" + UPLOAD_DIR);\n        consumer.pollMessages();\n    }\n}",
+  "environment": {
+    "description": "Kubernetes deployment on EKS 1.28 with default namespace. Pod runs as root (UID 0) with hostPath volume mount at /var/data mapping to the node's /var/data directory. Container image is based on amazoncorretto:17. No PodSecurityPolicy or Pod Security Standards enforcement. The UPLOAD_PATH environment variable is set to /var/data/attachments. IAM role attached via IRSA has sqs:ReceiveMessage and sqs:DeleteMessage permissions.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "default",
+      "pod_security_admission": "none",
+      "container_uid": 0,
+      "volume_mounts": [
+        {
+          "hostPath": "/var/data",
+          "mountPath": "/var/data"
+        }
+      ],
+      "seccomp_profile": "unconfined",
+      "capabilities": [
+        "ALL"
+      ]
+    }
+  }
+}

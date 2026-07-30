@@ -1,0 +1,32 @@
+{
+  "id": "1c841441",
+  "language": "ruby",
+  "code": "# app/controllers/sessions_controller.rb\nclass SessionsController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :set_cors_headers\n\n  # POST /api/v1/login\n  def create\n    user = User.find_by(email: params[:email])\n    \n    if user&.authenticate(params[:password])\n      # Session ID is preserved across authentication boundary\n      # This allows pre-authentication session to carry over\n      session[:user_id] = user.id\n      session[:authenticated_at] = Time.current.to_i\n      session[:ip_address] = request.remote_ip\n      session[:user_agent] = request.user_agent\n      \n      # Log successful authentication event\n      Rails.logger.info(\"Auth success: user=#{user.id} session=#{session.id} ip=#{request.remote_ip}\")\n      \n      # Notify external audit service of login event\n      notify_audit_service(user, session.id)\n      \n      render json: {\n        status: 'authenticated',\n        user: { id: user.id, email: user.email, role: user.role },\n        session_token: session.id\n      }, status: :ok\n    else\n      session[:failed_attempts] = (session[:failed_attempts] || 0) + 1\n      render json: { error: 'Invalid credentials' }, status: :unauthorized\n    end\n  end\n\n  # DELETE /api/v1/logout\n  def destroy\n    reset_session\n    render json: { status: 'logged_out' }, status: :ok\n  end\n\n  # GET /api/v1/session/validate\n  def validate\n    if session[:user_id].present?\n      user = User.find(session[:user_id])\n      render json: { valid: true, user: { id: user.id, role: user.role } }\n    else\n      render json: { valid: false }, status: :unauthorized\n    end\n  end\n\n  private\n\n  def set_cors_headers\n    response.headers['Access-Control-Allow-Origin'] = request.headers['Origin'] || '*'\n    response.headers['Access-Control-Allow-Credentials'] = 'true'\n    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'\n    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Cookie, X-Session-Token'\n  end\n\n  def notify_audit_service(user, session_id)\n    # Posts login event to external SIEM collector\n    uri = URI.parse(ENV.fetch('AUDIT_ENDPOINT', 'https://siem.internal.corp/events'))\n    http = Net::HTTP.new(uri.host, uri.port)\n    http.use_ssl = uri.scheme == 'https'\n    http.open_timeout = 2\n    http.read_timeout = 2\n    \n    payload = {\n      event: 'user_login',\n      user_id: user.id,\n      session_id: session_id,\n      timestamp: Time.current.iso8601,\n      source_ip: request.remote_ip\n    }\n    \n    req = Net::HTTP::Post.new(uri.path)\n    req['Content-Type'] = 'application/json'\n    req['Authorization'] = \"Bearer #{ENV['AUDIT_TOKEN']}\"\n    req.body = payload.to_json\n    \n    http.request(req)\n  rescue StandardError => e\n    Rails.logger.warn(\"Audit notification failed: #{e.message}\")\n  end\nend\n\n# config/initializers/session_store.rb\n# Rails.application.config.session_store :cookie_store,\n#   key: '_myapp_session',\n#   expire_after: 30.minutes,\n#   secure: Rails.env.production?,\n#   httponly: true\n\n# Using Redis session store for horizontal scaling\nRails.application.config.session_store :redis_session_store,\n  key: '_myapp_session',\n  redis: {\n    expire_after: 30.minutes,\n    key_prefix: 'myapp:session:',\n    url: ENV.fetch('REDIS_URL', 'redis://localhost:6379/0')\n  },\n  expire_after: 30.minutes,\n  secure: Rails.env.production?,\n  httponly: true",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate tasks within a private subnet (10.0.128.0/20) in a VPC with no NAT Gateway, no VPC endpoint for external services, and no Internet Gateway route in the subnet route table. The only route table entry is local (10.0.0.0/16 -> local) plus a VPC endpoint route for the ElastiCache Redis cluster (com.amazonaws.us-east-1.elasticache) and an interface VPC endpoint for CloudWatch Logs. The ECS task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/NoExternalNetworkBoundary) that denies ec2:CreateNetworkInterface for any subnet with a route to 0.0.0.0/0. Security group sg-0a1b2c3d4e5f allows inbound only from the internal NLB (10.0.0.0/20) on port 3000 and outbound only to the Redis VPC endpoint (10.0.130.50/32:6379) and CloudWatch Logs endpoint (10.0.130.100/32:443). Session cookies are issued with Domain scoped to the internal NLB DNS name (internal-api.corp.internal) which is not resolvable outside the VPC.",
+    "config": {
+      "rails_version": "7.0.8",
+      "ruby_version": "3.2.2",
+      "deployment": "ECS Fargate in private subnet 10.0.128.0/20",
+      "session_store": "Redis ElastiCache via VPC endpoint",
+      "load_balancer": "Internal NLB (internal-api.corp.internal)",
+      "network": {
+        "subnet_route_table": "local only (10.0.0.0/16) + VPC endpoints",
+        "nat_gateway": "none",
+        "internet_gateway_route": "none in this subnet",
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.elasticache",
+          "com.amazonaws.us-east-1.logs"
+        ]
+      },
+      "security_group": {
+        "id": "sg-0a1b2c3d4e5f",
+        "inbound": "10.0.0.0/20:3000 (NLB health + traffic)",
+        "outbound": "10.0.130.50/32:6379, 10.0.130.100/32:443"
+      },
+      "session_regeneration": "disabled",
+      "cookie_domain": "internal-api.corp.internal",
+      "dns_resolution": "Route53 private hosted zone only"
+    }
+  }
+}

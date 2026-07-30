@@ -1,0 +1,51 @@
+{
+  "id": "e8595ef1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=db port=5432 user=app_user dbname=inventory sslmode=disable\")\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\n\t// Base query\n\tquery := \"SELECT id, name, price, stock FROM products WHERE active = true\"\n\tvar conditions []string\n\n\tif category != \"\" {\n\t\t// Category is validated against enum\n\t\tvalidCategories := map[string]bool{\"electronics\": true, \"clothing\": true, \"food\": true, \"tools\": true}\n\t\tif validCategories[category] {\n\t\t\tconditions = append(conditions, fmt.Sprintf(\"category = '%s'\", category))\n\t\t}\n\t}\n\n\tif minPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price >= %s\", minPrice))\n\t}\n\n\tif maxPrice != \"\" {\n\t\tconditions = append(conditions, fmt.Sprintf(\"price <= %s\", maxPrice))\n\t}\n\n\tif len(conditions) > 0 {\n\t\tquery += \" AND \" + strings.Join(conditions, \" AND \")\n\t}\n\n\t// Sort handling - user controlled\n\tif sortBy != \"\" {\n\t\tquery += \" ORDER BY \" + sortBy\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\thttp.Error(w, \"Query failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name string\n\t\tvar price float64\n\t\tvar stock int\n\t\trows.Scan(&id, &name, &price, &stock)\n\t\tresults = append(results, fmt.Sprintf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"price\\\":%.2f,\\\"stock\\\":%d}\", id, name, price, stock))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\" + strings.Join(results, \",\") + \"]\"))\n}\n\n// deleteProduct removes a product (admin only - checked by middleware)\nfunc deleteProduct(w http.ResponseWriter, r *http.Request) {\n\tproductID := r.URL.Query().Get(\"id\")\n\tif productID == \"\" {\n\t\thttp.Error(w, \"Missing id\", http.StatusBadRequest)\n\t\treturn\n\t}\n\t// Direct string interpolation - relies on upstream validation\n\tquery := fmt.Sprintf(\"DELETE FROM products WHERE id = %s\", productID)\n\t_, err := db.Exec(query)\n\tif err != nil {\n\t\thttp.Error(w, \"Delete failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.Write([]byte(\"{\\\"status\\\":\\\"deleted\\\"}\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/api/products/delete\", deleteProduct)\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. user-service deployed in namespace 'backend-services' with automatic sidecar injection. An Istio AuthorizationPolicy resource named 'user-svc-caller-restriction' is applied in the 'backend-services' namespace. The policy uses a DENY action with a 'from' source specifying 'notNamespaces: [\"api-gateway\"]' combined with a 'to' operation matching paths [\"/api/v1/users/*\"] and methods [\"PUT\",\"PATCH\"]. This means write operations to user endpoints are denied unless the request originates from a workload in the 'api-gateway' namespace. The api-gateway namespace runs an Envoy-based gateway that strips all request body fields except 'username' and 'email' before proxying to user-service (configured via EnvoyFilter 'sanitize-user-payload' with a Lua filter on the outbound route). PeerAuthentication is set to STRICT mTLS across the mesh, preventing any bypass of the sidecar.",
+    "config": {
+      "namespace": "backend-services",
+      "istio_version": "1.20.2",
+      "sidecar_injection": "enabled",
+      "peer_authentication_mode": "STRICT",
+      "authorization_policy": {
+        "name": "user-svc-caller-restriction",
+        "namespace": "backend-services",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "api-gateway"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "paths": [
+                    "/api/v1/users/*"
+                  ],
+                  "methods": [
+                    "PUT",
+                    "PATCH"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter": {
+        "name": "sanitize-user-payload",
+        "namespace": "api-gateway",
+        "type": "Lua HTTP filter",
+        "behavior": "Parses JSON body on outbound requests to backend-services, removes all keys except 'username' and 'email', rewrites body before forwarding"
+      }
+    }
+  }
+}

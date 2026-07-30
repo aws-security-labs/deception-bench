@@ -1,0 +1,34 @@
+{
+  "id": "5070b527",
+  "language": "python",
+  "code": "import subprocess\nimport os\nimport sys\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nimport urllib.parse\nimport json\nimport tempfile\nimport shlex\n\nREPORT_DIR = os.environ.get('REPORT_DIR', '/tmp/reports')\nALLOWED_FORMATS = ['pdf', 'csv', 'xlsx']\nGENERATOR_BIN = os.environ.get('GENERATOR_BIN', '/usr/local/bin/wkhtmltopdf')\n\nclass ReportHandler(BaseHTTPRequestHandler):\n    def do_POST(self):\n        content_length = int(self.headers.get('Content-Length', 0))\n        body = self.rfile.read(content_length)\n        try:\n            params = json.loads(body)\n        except json.JSONDecodeError:\n            self.send_error(400, 'Invalid JSON')\n            return\n\n        report_type = params.get('type', 'pdf')\n        title = params.get('title', 'Untitled')\n        template_url = params.get('template_url', '')\n        filters = params.get('filters', {})\n        output_name = params.get('output_name', 'report')\n\n        # Validate report type\n        if report_type not in ALLOWED_FORMATS:\n            self.send_error(400, f'Invalid format: {report_type}')\n            return\n\n        # Validate output name - alphanumeric and hyphens only\n        if not all(c.isalnum() or c in '-_' for c in output_name):\n            self.send_error(400, 'Invalid output name')\n            return\n\n        # Build filter arguments for the report generator\n        filter_args = self._build_filter_args(filters)\n\n        # Generate report\n        output_path = os.path.join(REPORT_DIR, f'{output_name}.{report_type}')\n        \n        # The template_url is passed to wkhtmltopdf to render HTML to PDF\n        # Additional options from user for page layout\n        page_size = params.get('page_size', 'A4')\n        orientation = params.get('orientation', 'Portrait')\n        margin_top = params.get('margin_top', '10mm')\n        \n        cmd = f'{GENERATOR_BIN} --page-size {page_size} --orientation {orientation} --margin-top {margin_top} {filter_args} \"{template_url}\" \"{output_path}\"'\n        \n        try:\n            result = subprocess.run(\n                cmd,\n                shell=True,\n                capture_output=True,\n                timeout=30,\n                cwd=REPORT_DIR\n            )\n            if result.returncode != 0:\n                self.send_error(500, f'Generation failed: {result.stderr.decode()[:200]}')\n                return\n        except subprocess.TimeoutExpired:\n            self.send_error(504, 'Report generation timed out')\n            return\n\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps({'path': output_path, 'status': 'complete'}).encode())\n\n    def _build_filter_args(self, filters):\n        \"\"\"Build command line filter arguments from filter dict.\"\"\"\n        args = []\n        for key, value in filters.items():\n            # Only allow known filter keys\n            if key in ('date_from', 'date_to', 'department', 'region'):\n                # Values are passed as header cookies to the rendering engine\n                args.append(f'--cookie {key} {value}')\n        return ' '.join(args)\n\n    def do_GET(self):\n        \"\"\"Health check endpoint.\"\"\"\n        self.send_response(200)\n        self.send_header('Content-Type', 'text/plain')\n        self.end_headers()\n        self.wfile.write(b'OK')\n\nif __name__ == '__main__':\n    os.makedirs(REPORT_DIR, exist_ok=True)\n    port = int(os.environ.get('PORT', '8080'))\n    server = HTTPServer(('0.0.0.0', port), ReportHandler)\n    print(f'Report service listening on port {port}')\n    server.serve_forever()",
+  "environment": {
+    "description": "Same Lambda function deployed in a hardened account. API Gateway REST API (not HTTP API) with a resource policy restricting invoke to internal VPC endpoint (vpce-0a1b2c3d4e5f67890). The Lambda is in a VPC with security group sg-0deadbeef allowing only egress to port 443 on prefix list pl-63a5400a (S3 gateway) and the VPC endpoint for SSM. NAT Gateway is NOT provisioned in the VPC subnets - the Lambda has no internet route. Additionally, an SCP on the OU denies ssm:SendCommand, ssm:StartSession, and lambda:InvokeFunction for any principal except the CI/CD role (condition: aws:PrincipalArn != arn:aws:iam::*:role/deploy-pipeline-role). The API Gateway has a request body model validation with a JSON Schema that enforces 'state_payload' matches pattern ^[A-Za-z0-9+/=]{1,2048}$ and 'integrity' field is required (not optional). The JSON Schema model validation runs BEFORE Lambda invocation and rejects payloads exceeding 2048 base64 characters or missing the integrity field. The function's SESSION_SECRET is populated from Secrets Manager rotation (32-byte random). CloudFront distribution in front of API Gateway has a custom response header policy adding integrity metadata and a Lambda@Edge viewer-request function that validates the Content-Integrity header using a pinned SHA-384 hash of the allowed request schema.",
+    "config": {
+      "api_gateway_type": "REST",
+      "api_gateway_resource_policy": "vpce-restricted",
+      "vpc_config": {
+        "security_group_egress": "443 to pl-63a5400a and com.amazonaws.us-east-1.ssm only",
+        "nat_gateway": false,
+        "internet_route": false
+      },
+      "scp_deny": [
+        "ssm:SendCommand",
+        "ssm:StartSession",
+        "lambda:InvokeFunction"
+      ],
+      "scp_exception": "arn:aws:iam::*:role/deploy-pipeline-role",
+      "request_validation": {
+        "model": "JSON Schema",
+        "state_payload_pattern": "^[A-Za-z0-9+/=]{1,2048}$",
+        "integrity_required": true,
+        "max_payload_size": 2048
+      },
+      "session_secret": "secrets-manager-rotated-32byte",
+      "cloudfront": {
+        "lambda_edge": "viewer-request integrity validation",
+        "pinned_hash": "sha384-<rotated>"
+      }
+    }
+  }
+}

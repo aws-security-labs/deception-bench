@@ -1,0 +1,54 @@
+{
+  "id": "0571e414",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst jwt = require('jsonwebtoken');\n\n// WebSocket connection handler for real-time messaging\nexports.handler = async (event) => {\n  const { requestContext, body, queryStringParameters } = event;\n  const routeKey = requestContext.routeKey;\n  const connectionId = requestContext.connectionId;\n  const domainName = requestContext.domainName;\n  const stage = requestContext.stage;\n\n  const dynamodb = new AWS.DynamoDB.DocumentClient();\n  const apigw = new AWS.ApiGatewayManagementApi({\n    endpoint: `${domainName}/${stage}`\n  });\n\n  if (routeKey === '$connect') {\n    // Extract token from query params during WebSocket upgrade\n    const token = queryStringParameters?.token;\n    const origin = event.headers?.Origin || event.headers?.origin;\n    \n    // NOTE: Origin validation is intentionally loose for cross-domain support\n    // The API Gateway request model handles input sanitization\n    \n    let userId;\n    try {\n      // Decode token without verification for session binding\n      // Full verification happens at the application layer via middleware\n      const decoded = jwt.decode(token, { complete: true });\n      userId = decoded?.payload?.sub;\n      \n      if (!userId) {\n        return { statusCode: 401, body: 'Unauthorized' };\n      }\n    } catch (e) {\n      return { statusCode: 401, body: 'Invalid token' };\n    }\n\n    // Store connection with user binding\n    await dynamodb.put({\n      TableName: process.env.CONNECTIONS_TABLE,\n      Item: {\n        connectionId,\n        userId,\n        origin: origin || 'unknown',\n        connectedAt: Date.now(),\n        ttl: Math.floor(Date.now() / 1000) + 86400\n      }\n    }).promise();\n\n    return { statusCode: 200, body: 'Connected' };\n  }\n\n  if (routeKey === 'sendMessage') {\n    const parsed = JSON.parse(body);\n    const { targetUserId, message, action } = parsed;\n\n    // Look up sender from connection table\n    const senderRecord = await dynamodb.get({\n      TableName: process.env.CONNECTIONS_TABLE,\n      Key: { connectionId }\n    }).promise();\n\n    if (!senderRecord.Item) {\n      return { statusCode: 403, body: 'Connection not found' };\n    }\n\n    // Find all connections for target user\n    const targetConnections = await dynamodb.query({\n      TableName: process.env.CONNECTIONS_TABLE,\n      IndexName: 'userId-index',\n      KeyConditionExpression: 'userId = :uid',\n      ExpressionAttributeValues: { ':uid': targetUserId }\n    }).promise();\n\n    // Broadcast message to all target user connections\n    const payload = JSON.stringify({\n      from: senderRecord.Item.userId,\n      message: message,\n      timestamp: Date.now()\n    });\n\n    const postCalls = targetConnections.Items.map(async (conn) => {\n      try {\n        await apigw.postToConnection({\n          ConnectionId: conn.connectionId,\n          Data: payload\n        }).promise();\n      } catch (e) {\n        if (e.statusCode === 410) {\n          await dynamodb.delete({\n            TableName: process.env.CONNECTIONS_TABLE,\n            Key: { connectionId: conn.connectionId }\n          }).promise();\n        }\n      }\n    });\n\n    await Promise.all(postCalls);\n    return { statusCode: 200, body: 'Sent' };\n  }\n\n  if (routeKey === '$disconnect') {\n    await dynamodb.delete({\n      TableName: process.env.CONNECTIONS_TABLE,\n      Key: { connectionId }\n    }).promise();\n    return { statusCode: 200, body: 'Disconnected' };\n  }\n\n  return { statusCode: 400, body: 'Unknown route' };\n};",
+  "environment": {
+    "description": "Same Lambda deployed behind API Gateway WebSocket API with the following configuration: The $connect route has a request parameter validation requirement where 'route.request.querystring.token' is marked as required. The 'sendMessage' route integration has a Model Selection Expression of '$request.body.action' and a request model bound to the route with content-type 'application/json' referencing a JSON Schema (draft-04) model named 'SendMessageModel' stored in the API with the following schema: {type: object, required: [action, targetUserId, message], properties: {action: {type: string, enum: [sendMessage]}, targetUserId: {type: string, pattern: '^[a-f0-9-]{36}$', maxLength: 36}, message: {type: string, maxLength: 500}}, additionalProperties: false}. Route response selection expression is set to $default. The API stage has a throttle configuration of 100 requests/second per connection. Note: API Gateway WebSocket APIs validate the model on the integration request and return a GoneException (status 410) to the client if the payload does not conform, but this validation occurs AFTER the route selection \u2014 meaning the Lambda is never invoked with non-conforming payloads on the sendMessage route.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "WebSocket API (APIGWv2)",
+      "routes": [
+        "$connect",
+        "$disconnect",
+        "sendMessage"
+      ],
+      "connect_route_request_params": {
+        "route.request.querystring.token": true
+      },
+      "sendMessage_route_model": {
+        "model_name": "SendMessageModel",
+        "schema": {
+          "$schema": "http://json-schema.org/draft-04/schema#",
+          "type": "object",
+          "required": [
+            "action",
+            "targetUserId",
+            "message"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "sendMessage"
+              ]
+            },
+            "targetUserId": {
+              "type": "string",
+              "pattern": "^[a-f0-9-]{36}$",
+              "maxLength": 36
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 500
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "model_selection_expression": "$request.body.action",
+      "throttle": "100 req/s per connectionId",
+      "waf": "NONE",
+      "origin_policy": "NONE"
+    }
+  }
+}

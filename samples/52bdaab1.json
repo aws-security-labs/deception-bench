@@ -1,0 +1,24 @@
+{
+  "id": "52bdaab1",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\nvar tmpl *template.Template\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tdb.SetMaxOpenConns(10)\n\ttmpl = template.Must(template.New(\"report\").Parse(reportTemplate))\n}\n\nconst reportTemplate = `<html><body>\n<h1>Employee Directory</h1>\n<table>{{range .Rows}}<tr><td>{{.Name}}</td><td>{{.Department}}</td><td>{{.Email}}</td></tr>{{end}}</table>\n</body></html>`\n\ntype Employee struct {\n\tName       string\n\tDepartment string\n\tEmail      string\n}\n\ntype PageData struct {\n\tRows []Employee\n}\n\n// sanitizeDept removes obvious dangerous characters but allows business names\nfunc sanitizeDept(input string) string {\n\t// Strip null bytes and control characters\n\tvar cleaned strings.Builder\n\tfor _, r := range input {\n\t\tif r >= 32 && r < 127 {\n\t\t\tcleaned.WriteRune(r)\n\t\t}\n\t}\n\treturn cleaned.String()\n}\n\nfunc handleDirectory(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tdept := r.URL.Query().Get(\"department\")\n\tif dept == \"\" {\n\t\tdept = \"Engineering\"\n\t}\n\n\t// Apply sanitization\n\tdept = sanitizeDept(dept)\n\n\t// Limit input length to prevent buffer issues\n\tif len(dept) > 64 {\n\t\tdept = dept[:64]\n\t}\n\n\t// Build query - using fmt for dynamic table filtering\n\tquery := fmt.Sprintf(\n\t\t\"SELECT name, department, email FROM employees WHERE department = '%s' AND active = true ORDER BY name ASC LIMIT 50\",\n\t\tdept,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar employees []Employee\n\tfor rows.Next() {\n\t\tvar emp Employee\n\t\tif err := rows.Scan(&emp.Name, &emp.Department, &emp.Email); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\temployees = append(employees, emp)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/html; charset=utf-8\")\n\tw.Header().Set(\"X-Content-Type-Options\", \"nosniff\")\n\ttmpl.Execute(w, PageData{Rows: employees})\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/directory\", handleDirectory)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Deployed behind Azure Front Door Premium with a custom security policy applying Microsoft_DefaultRuleSet_2.1 (DRS 2.1) and Microsoft_BotManagerRuleSet_1.0. Additionally, the Front Door instance has a custom rate-limit rule (priority 1) configured as: match condition 'RequestUri contains /api/products/search', rate-limit threshold of 5 requests per 1-minute window per SocketAddr, action Block with 429 response for 60 seconds. The origin is locked to only accept traffic from the Front Door service tag (AzureFrontDoor.Backend) via NSG and the X-Azure-FDID header is validated in the App Service access restrictions. The DRS 2.1 ruleset includes rule group SQLi with rules 942100, 942110, 942120, 942130, 942140, 942150, 942160, 942170, 942180, 942190, 942200, 942210, 942220, 942230, 942240, 942250, 942260, 942270, 942280, 942290, 942300, 942310, 942320, 942330, 942340, 942350, 942360, 942370, 942380, 942390, 942400 all in Block mode with anomaly scoring threshold 5.",
+    "config": {
+      "hosting": "Azure App Service B2",
+      "front_door": "Azure Front Door Premium",
+      "waf_policy": "Microsoft_DefaultRuleSet_2.1 in Prevention mode",
+      "bot_protection": "Microsoft_BotManagerRuleSet_1.0",
+      "rate_limit_rule": {
+        "match": "RequestUri contains /api/products/search",
+        "threshold": 5,
+        "window": "1 minute",
+        "group_by": "SocketAddr",
+        "action": "Block (429)",
+        "duration": "60 seconds"
+      },
+      "origin_lock": "NSG restricts to AzureFrontDoor.Backend service tag + X-Azure-FDID validation",
+      "sqli_rules": "942100-942400 series all in Block mode, anomaly threshold 5"
+    }
+  }
+}

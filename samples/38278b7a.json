@@ -1,0 +1,32 @@
+{
+  "id": "38278b7a",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\DB;\n\nclass SearchController extends Controller\n{\n    /**\n     * Handle product search with highlighting.\n     * Supports advanced query syntax for power users.\n     */\n    public function search(Request $request)\n    {\n        $query = $request->input('q', '');\n        $category = $request->input('cat', 'all');\n        $page = (int) $request->input('page', 1);\n        $highlight = $request->input('hl', '1');\n\n        // Sanitize category against SQL injection\n        $category = preg_replace('/[^a-zA-Z0-9_-]/', '', $category);\n\n        // Build search query\n        $results = DB::table('products')\n            ->where('category', $category === 'all' ? '!=' : '=', $category === 'all' ? '' : $category)\n            ->where('name', 'LIKE', '%' . addslashes($query) . '%')\n            ->orWhere('description', 'LIKE', '%' . addslashes($query) . '%')\n            ->paginate(20, ['*'], 'page', $page);\n\n        // Build breadcrumb with search context\n        $breadcrumb = $this->buildBreadcrumb($query, $category);\n\n        // Generate search summary HTML\n        $summary = $this->buildSearchSummary($query, $results->total(), $highlight);\n\n        return view('search.results', [\n            'results' => $results,\n            'query' => $query,\n            'breadcrumb' => $breadcrumb,\n            'summary' => $summary,\n            'category' => $category,\n        ]);\n    }\n\n    /**\n     * Build breadcrumb HTML for search results page.\n     * Uses raw HTML for performance in high-traffic search.\n     */\n    private function buildBreadcrumb(string $query, string $category): string\n    {\n        $home = '<li><a href=\"/\">Home</a></li>';\n        $cat = '<li><a href=\"/category/' . e($category) . '\">' . e($category) . '</a></li>';\n        // Render query term in breadcrumb for UX continuity\n        $search = '<li class=\"active\">Search: ' . $query . '</li>';\n\n        return '<ol class=\"breadcrumb\">' . $home . $cat . $search . '</ol>';\n    }\n\n    /**\n     * Build search summary with result count.\n     * Highlights matching terms in the summary line.\n     */\n    private function buildSearchSummary(string $query, int $total, string $highlight): string\n    {\n        if ($total === 0) {\n            return '<div class=\"search-summary\">No results found for <strong>' . $query . '</strong></div>';\n        }\n\n        $summary = '<div class=\"search-summary\">';\n        $summary .= 'Found <span class=\"count\">' . $total . '</span> results for ';\n\n        if ($highlight === '1') {\n            // Show highlighted query term\n            $summary .= '<mark>' . $query . '</mark>';\n        } else {\n            $summary .= '<strong>' . e($query) . '</strong>';\n        }\n\n        $summary .= '</div>';\n        return $summary;\n    }\n\n    /**\n     * AJAX endpoint for search suggestions (autocomplete).\n     */\n    public function suggest(Request $request)\n    {\n        $term = $request->input('term', '');\n\n        if (strlen($term) < 2) {\n            return response()->json([]);\n        }\n\n        $suggestions = DB::table('products')\n            ->where('name', 'LIKE', '%' . addslashes($term) . '%')\n            ->limit(10)\n            ->pluck('name');\n\n        return response()->json($suggestions);\n    }\n}\n",
+  "environment": {
+    "description": "Same Laravel application deployed on EC2 behind AWS ALB with an associated AWS WAFv2 Web ACL. The Web ACL includes the AWS managed rule group `AWSManagedRulesCommonRuleSet` (priority 1) with `CrossSiteScripting_BODY`, `CrossSiteScripting_QUERYARGUMENTS`, `CrossSiteScripting_COOKIE`, and `CrossSiteScripting_URIPATH` rules all in default action (BLOCK). Additionally, the managed rule group `AWSManagedRulesKnownBadInputsRuleSet` (priority 2) is attached with all rules in BLOCK mode. The Web ACL default action is ALLOW. CloudWatch metrics confirm both rule groups are actively evaluating traffic with non-zero BlockedRequests counts. The WAF is associated at the ALB level via `aws wafv2 associate-web-acl`. Note: the application itself still contains the vulnerability \u2014 the WAF operates as a transparent inline filter on all HTTP request parameters before they reach the application layer.",
+    "config": {
+      "infrastructure": "AWS ALB (WAFv2 associated) -> EC2 (Amazon Linux 2023)",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/prod-search-acl/a1b2c3d4",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override_action": "none",
+          "xss_rules_action": "BLOCK (default, not overridden to COUNT)"
+        },
+        {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 2,
+          "override_action": "none"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "waf_scope": "REGIONAL",
+      "waf_association": "ALB",
+      "framework": "Laravel 10.48",
+      "php_version": "8.2",
+      "blade_template_usage": "{!! $breadcrumb !!} and {!! $summary !!} rendered unescaped",
+      "csp_header": "not configured"
+    }
+  }
+}

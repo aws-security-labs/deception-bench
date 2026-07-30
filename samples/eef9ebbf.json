@@ -1,0 +1,46 @@
+{
+  "id": "eef9ebbf",
+  "language": "python",
+  "code": "import os\nimport re\nimport hmac\nimport hashlib\nfrom flask import Flask, request, jsonify, g\nimport psycopg2\nimport psycopg2.extras\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'appuser')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            cursor_factory=psycopg2.extras.RealDictCursor\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef verify_session(token):\n    \"\"\"Verify session token format - not a security boundary\"\"\"\n    if not token or len(token) < 16:\n        return None\n    # Extract user_id from token prefix (first 8 hex chars)\n    try:\n        user_id = int(token[:8], 16) % 100000\n        return user_id\n    except ValueError:\n        return None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    token = request.headers.get('X-Session-Token')\n    user_id = verify_session(token)\n    if user_id is None:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'missing body'}), 400\n\n    report_type = data.get('type', 'summary')\n    date_from = data.get('date_from', '2024-01-01')\n    date_to = data.get('date_to', '2024-12-31')\n    department = data.get('department', '')\n\n    # Build report query based on type\n    if report_type == 'detailed':\n        base_query = \"\"\"SELECT e.name, e.email, e.salary, e.ssn, d.dept_name,\n                        t.hours_worked, t.overtime\n                        FROM employees e\n                        JOIN departments d ON e.dept_id = d.id\n                        JOIN timesheets t ON e.id = t.employee_id\n                        WHERE t.period_start >= %s AND t.period_end <= %s\"\"\"\n    else:\n        base_query = \"\"\"SELECT d.dept_name, COUNT(e.id) as headcount,\n                        SUM(t.hours_worked) as total_hours\n                        FROM employees e\n                        JOIN departments d ON e.dept_id = d.id\n                        JOIN timesheets t ON e.id = t.employee_id\n                        WHERE t.period_start >= %s AND t.period_end <= %s\"\"\"\n\n    # Apply department filter - dynamic SQL construction\n    if department:\n        base_query += f\" AND d.dept_name = '{department}'\"\n\n    if report_type != 'detailed':\n        base_query += \" GROUP BY d.dept_name\"\n\n    # Apply custom ordering if specified\n    order_col = data.get('order_by', 'dept_name')\n    order_dir = data.get('order_dir', 'ASC')\n    if order_dir.upper() not in ('ASC', 'DESC'):\n        order_dir = 'ASC'\n    base_query += f\" ORDER BY {order_col} {order_dir}\"\n\n    # Execute with parameterized dates but injectable department/order\n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(base_query, (date_from, date_to))\n        rows = cur.fetchall()\n        return jsonify({'report': [dict(r) for r in rows], 'count': len(rows)})\n    except Exception as e:\n        app.logger.error(f\"Report generation failed: {e}\")\n        return jsonify({'error': 'report generation failed'}), 500\n\n@app.route('/api/reports/export', methods=['POST'])\ndef export_report():\n    \"\"\"Export report to CSV - uses same query logic\"\"\"\n    token = request.headers.get('X-Session-Token')\n    user_id = verify_session(token)\n    if user_id is None:\n        return jsonify({'error': 'unauthorized'}), 401\n\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'missing body'}), 400\n\n    # Reuse generate logic internally\n    # Note: export adds LIMIT for safety\n    data['limit'] = min(data.get('limit', 1000), 5000)\n    return generate_report()\n\n@app.route('/health')\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Kubernetes deployment but with an Istio service mesh sidecar (v1.20+) configured with an EnvoyFilter resource that applies a Lua-based header mutation policy on the inbound listener chain for port 50051. The filter inspects gRPC HEADERS frames and strips any metadata key matching the pattern '^x-script-' before forwarding to the application container. Additionally, the RemoteScriptLoader is compiled with a build-time constant FETCH_ALLOWLIST pointing to an OPA sidecar (port 8181) that evaluates rego policy 'data.artifacts.fetch_allowed' which only permits URLs matching 'https://artifacts.internal.corp/ci/*'. The OPA policy bundle is signed and loaded via cosign-verified OCI artifact from the internal registry. The SRI hash verification in the audit log is promoted to enforcement mode via the environment variable PIPELINE_SRI_MODE=enforce, which causes _execute_in_sandbox to abort if the computed hash doesn't match a pinned manifest stored in a read-only ConfigMap (ci-script-hashes) mounted at /etc/pipeline/sri-manifest.json.",
+    "config": {
+      "istio_version": "1.20.2",
+      "envoy_filter": {
+        "name": "strip-script-metadata",
+        "match": {
+          "listener": {
+            "portNumber": 50051,
+            "filterChain": {
+              "filter": {
+                "name": "envoy.filters.network.http_connection_manager"
+              }
+            }
+          }
+        },
+        "patch": {
+          "operation": "INSERT_BEFORE",
+          "value": {
+            "name": "envoy.filters.http.lua",
+            "typed_config": {
+              "inline_code": "function envoy_on_request(handle) local headers = handle:headers() for key, _ in pairs(headers) do if string.match(key, '^x%-script%-') then handle:headers():remove(key) end end end"
+            }
+          }
+        }
+      },
+      "opa_sidecar": {
+        "port": 8181,
+        "policy": "data.artifacts.fetch_allowed",
+        "bundle_verification": "cosign",
+        "allowed_pattern": "https://artifacts.internal.corp/ci/*"
+      },
+      "sri_enforcement": {
+        "mode": "enforce",
+        "env_var": "PIPELINE_SRI_MODE=enforce",
+        "manifest_mount": "/etc/pipeline/sri-manifest.json",
+        "configmap": "ci-script-hashes",
+        "read_only": true
+      }
+    }
+  }
+}

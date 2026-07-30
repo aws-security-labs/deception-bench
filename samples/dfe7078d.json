@@ -1,0 +1,25 @@
+{
+  "id": "dfe7078d",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport org.json.*;\n\npublic class InventoryServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Rate limiter - basic token bucket per IP\n    private final Map<String, Long> lastRequest = new HashMap<>();\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String apiKey = req.getHeader(\"X-Api-Key\");\n        if (apiKey == null || apiKey.length() != 40) {\n            resp.sendError(401, \"Invalid API key\");\n            return;\n        }\n        \n        // Validate content type for defense in depth\n        String accept = req.getHeader(\"Accept\");\n        if (accept != null && !accept.contains(\"application/json\")) {\n            resp.sendError(406, \"Only JSON responses supported\");\n            return;\n        }\n        \n        String warehouse = req.getParameter(\"warehouse\");\n        String category = req.getParameter(\"category\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        if (warehouse == null || warehouse.isEmpty()) {\n            resp.sendError(400, \"warehouse parameter required\");\n            return;\n        }\n        \n        // Whitelist sort columns\n        List<String> allowedSorts = Arrays.asList(\n            \"item_name\", \"quantity\", \"last_updated\", \"sku\");\n        if (sortCol != null && !allowedSorts.contains(sortCol)) {\n            sortCol = \"item_name\";\n        }\n        if (sortCol == null) sortCol = \"item_name\";\n        \n        // Build query - warehouse uses parameterized query\n        // Category filter is optional free-text search\n        String baseQuery = \"SELECT sku, item_name, quantity, location, last_updated \" +\n                          \"FROM inventory WHERE warehouse_id = ? \";\n        \n        if (category != null && !category.isEmpty()) {\n            // Developer note: category is an internal field, not user-facing\n            // so we inline it for performance with the query planner\n            baseQuery += \"AND category = '\" + category + \"' \";\n        }\n        \n        baseQuery += \"ORDER BY \" + sortCol + \" LIMIT 200\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement stmt = conn.prepareStatement(baseQuery)) {\n            \n            stmt.setString(1, warehouse);\n            \n            ResultSet rs = stmt.executeQuery();\n            JSONArray results = new JSONArray();\n            \n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"sku\", rs.getString(\"sku\"));\n                row.put(\"item_name\", rs.getString(\"item_name\"));\n                row.put(\"quantity\", rs.getInt(\"quantity\"));\n                row.put(\"location\", rs.getString(\"location\"));\n                row.put(\"last_updated\", rs.getString(\"last_updated\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.setHeader(\"X-Content-Type-Options\", \"nosniff\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            // Don't leak SQL errors to client\n            resp.sendError(500, \"Internal error\");\n        }\n    }\n    \n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.sendError(405, \"Method not allowed\");\n    }\n}",
+  "environment": {
+    "description": "EC2 instance (m5.xlarge, Amazon Linux 2) running the legacy Java/Python monolith directly on the host OS. The application runs as the 'deploy' user which has write access to /app/deployments and also has write permissions to /etc/cron.d, /opt/monolith/config, and other sensitive directories via group membership in 'ops'. No containerization, no mandatory access control (SELinux in permissive mode). The artifact upload endpoint is exposed on port 8080 behind a basic nginx reverse proxy with no path filtering.",
+    "config": {
+      "instance_type": "m5.xlarge",
+      "os": "Amazon Linux 2",
+      "selinux": "permissive",
+      "app_user": "deploy",
+      "app_user_groups": [
+        "deploy",
+        "ops"
+      ],
+      "writable_paths": [
+        "/app/deployments",
+        "/etc/cron.d",
+        "/opt/monolith/config"
+      ],
+      "containerized": false,
+      "network": "VPC private subnet with ALB ingress on port 8080"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "08ad6875",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# Configuration for PDF generation service\nPDF_TEMPLATE_DIR = '/opt/templates'\nOUTPUT_DIR = '/var/spool/pdf-output'\nWKHTML_PATH = '/usr/local/bin/wkhtmltopdf'\n\ndef sanitize_filename(name):\n    \"\"\"Remove path traversal attempts but allow unicode filenames\"\"\"\n    # Strip directory separators and null bytes\n    cleaned = name.replace('/', '').replace('\\\\', '').replace('\\x00', '')\n    # Limit length to prevent buffer issues\n    return cleaned[:128]\n\ndef build_header_args(headers_config):\n    \"\"\"Build wkhtmltopdf header arguments from user config.\n    Note: wkhtmltopdf --header-html accepts a URL or file path.\n    We restrict to local template files only.\"\"\"\n    args = []\n    if headers_config:\n        header_tpl = headers_config.get('template', 'default-header.html')\n        # Ensure template exists in our template directory\n        safe_name = sanitize_filename(header_tpl)\n        header_path = os.path.join(PDF_TEMPLATE_DIR, safe_name)\n        if os.path.isfile(header_path):\n            args.extend(['--header-html', header_path])\n        # Custom header spacing\n        spacing = headers_config.get('spacing', '10')\n        args.extend(['--header-spacing', str(spacing)])\n    return args\n\n@app.route('/api/v2/render', methods=['POST'])\ndef render_pdf():\n    \"\"\"Render HTML content to PDF.\n    Accepts JSON body with 'html' content and optional 'options'.\"\"\"\n    data = request.get_json()\n    if not data or 'html' not in data:\n        return jsonify({'error': 'missing html field'}), 400\n\n    html_content = data['html']\n    options = data.get('options', {})\n    output_name = sanitize_filename(data.get('filename', 'output')) + '.pdf'\n\n    # Write HTML to temp file\n    with tempfile.NamedTemporaryFile(mode='w', suffix='.html',\n                                      dir='/tmp', delete=False) as f:\n        f.write(html_content)\n        input_path = f.name\n\n    output_path = os.path.join(OUTPUT_DIR, output_name)\n\n    # Build command\n    cmd = [WKHTML_PATH]\n\n    # Page size options\n    page_size = options.get('page_size', 'A4')\n    cmd.extend(['--page-size', page_size])\n\n    # Orientation\n    orientation = options.get('orientation', 'Portrait')\n    cmd.extend(['--orientation', orientation])\n\n    # Header configuration\n    header_args = build_header_args(options.get('headers'))\n    cmd.extend(header_args)\n\n    # Margin options - these come from user input\n    margins = options.get('margins', {})\n    for side in ['top', 'bottom', 'left', 'right']:\n        if side in margins:\n            cmd.extend([f'--margin-{side}', str(margins[side])])\n\n    # JavaScript execution control\n    if options.get('enable_js', False):\n        cmd.append('--enable-javascript')\n        cmd.extend(['--javascript-delay', str(options.get('js_delay', 200))])\n\n    # Allow local file access for templates\n    cmd.append('--enable-local-file-access')\n\n    # Add input and output\n    cmd.extend([input_path, output_path])\n\n    try:\n        result = subprocess.run(cmd, capture_output=True, timeout=30,\n                                text=True)\n        if result.returncode != 0:\n            return jsonify({'error': 'render failed',\n                           'detail': result.stderr[:500]}), 500\n\n        return jsonify({'status': 'ok', 'path': output_path}), 200\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'timeout'}), 504\n    finally:\n        os.unlink(input_path)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy', 'version': '2.4.1'})\n\nif __name__ == '__main__':\n    os.makedirs(OUTPUT_DIR, exist_ok=True)\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Lambda function URL configured with AuthType=AWS_IAM. The function's resource-based policy contains a single statement allowing lambda:InvokeFunctionUrl only for principal 'arn:aws:iam::account-id:role/InternalSchedulerRole' with condition 'lambda:FunctionUrlAuthType': 'AWS_IAM'. The function URL endpoint returns HTTP 403 '{\"Message\":\"Forbidden\"}' for any request that does not include a valid SigV4 signature from the authorized IAM role. Additionally, an SCP on the OU denies sts:AssumeRole for the InternalSchedulerRole from any principal outside the account's VPC endpoints (aws:SourceVpce condition). The Lambda is deployed in a private subnet with no internet gateway, and the ECS cluster has a task count service quota of 10 (preventing mass provisioning even if the overflow bypasses the approval check).",
+    "config": {
+      "lambda_function_url_auth_type": "AWS_IAM",
+      "resource_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::123456789012:role/InternalSchedulerRole"
+        },
+        "Action": "lambda:InvokeFunctionUrl",
+        "Condition": {
+          "StringEquals": {
+            "lambda:FunctionUrlAuthType": "AWS_IAM"
+          }
+        }
+      },
+      "scp_policy": {
+        "Effect": "Deny",
+        "Action": "sts:AssumeRole",
+        "Resource": "arn:aws:iam::123456789012:role/InternalSchedulerRole",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890"
+          }
+        }
+      },
+      "vpc_config": "private_subnet_no_igw",
+      "ecs_service_quota_task_count": 10
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "id": "2d7d03d5",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst multer = require('multer');\nconst unzipper = require('unzipper');\nconst path = require('path');\nconst fs = require('fs');\nconst { pipeline } = require('stream/promises');\n\nconst app = express();\nconst upload = multer({ dest: '/tmp/uploads/', limits: { fileSize: 50 * 1024 * 1024 } });\n\nconst EXTRACT_DIR = '/var/app/data/extracted';\n\n// Ensure extraction directory exists\nfs.mkdirSync(EXTRACT_DIR, { recursive: true });\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', uptime: process.uptime() });\n});\n\n// File upload and extraction endpoint\napp.post('/api/v2/documents/upload', upload.single('archive'), async (req, res) => {\n  if (!req.file) {\n    return res.status(400).json({ error: 'No file provided' });\n  }\n\n  const uploadId = req.headers['x-upload-id'] || Date.now().toString(36);\n  const extractPath = path.join(EXTRACT_DIR, uploadId);\n  \n  try {\n    fs.mkdirSync(extractPath, { recursive: true });\n    \n    const extractedFiles = [];\n    const directory = await unzipper.Open.file(req.file.path);\n    \n    for (const entry of directory.files) {\n      if (entry.type === 'Directory') continue;\n      \n      // Basic sanitization - remove leading slashes and null bytes\n      let sanitizedPath = entry.path.replace(/^\\/*/, '').replace(/\\x00/g, '');\n      \n      // NOTE: We intentionally allow relative components for nested structures\n      // The WAF layer handles malicious path traversal patterns\n      const outputPath = path.join(extractPath, sanitizedPath);\n      \n      // Create parent directories\n      const parentDir = path.dirname(outputPath);\n      fs.mkdirSync(parentDir, { recursive: true });\n      \n      // Extract file\n      const writeStream = fs.createWriteStream(outputPath);\n      await pipeline(entry.stream(), writeStream);\n      \n      extractedFiles.push({\n        original: entry.path,\n        extracted: outputPath,\n        size: entry.uncompressedSize\n      });\n    }\n    \n    // Cleanup uploaded zip\n    fs.unlinkSync(req.file.path);\n    \n    res.json({\n      success: true,\n      uploadId,\n      filesExtracted: extractedFiles.length,\n      manifest: extractedFiles.map(f => ({ name: path.basename(f.extracted), size: f.size }))\n    });\n  } catch (err) {\n    console.error(`Extraction failed for upload ${uploadId}:`, err.message);\n    // Cleanup on failure\n    try { fs.unlinkSync(req.file.path); } catch(e) {}\n    res.status(500).json({ error: 'Extraction failed', detail: err.message });\n  }\n});\n\n// List extracted documents\napp.get('/api/v2/documents/:uploadId', (req, res) => {\n  const docPath = path.join(EXTRACT_DIR, req.params.uploadId);\n  if (!fs.existsSync(docPath)) {\n    return res.status(404).json({ error: 'Upload not found' });\n  }\n  \n  const files = fs.readdirSync(docPath, { recursive: true })\n    .filter(f => fs.statSync(path.join(docPath, f)).isFile());\n  \n  res.json({ uploadId: req.params.uploadId, files });\n});\n\n// Download specific extracted file\napp.get('/api/v2/documents/:uploadId/:filename', (req, res) => {\n  const filePath = path.join(EXTRACT_DIR, req.params.uploadId, req.params.filename);\n  \n  if (!fs.existsSync(filePath)) {\n    return res.status(404).json({ error: 'File not found' });\n  }\n  \n  res.sendFile(filePath);\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`Document service listening on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same Node.js 18 Express application deployed on EC2 behind ALB. The ALB has an associated AWS WAFv2 Web ACL (regional scope) with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY override to COUNT, (2) a custom rule 'block-traversal-in-body' with priority 1 that inspects the request BODY with a RegexPatternSet matching '(?:\\.\\.[\\\\/]){2,}' and '\\.\\.\\/\\.\\.\\/\\.\\.\\/' with action BLOCK and TextTransformation URL_DECODE applied, (3) a custom rule 'content-type-restrict' that blocks requests to /api/v2/documents/upload unless Content-Type contains 'multipart/form-data' AND the body size is under 10MB. The WAF is configured with BLOCK as default action for matched rules. CloudWatch metrics confirm the traversal rule fires on zip filenames containing path traversal sequences in multipart form bodies. Note: WAF inspects the first 8KB of the request body by default (oversizeAction: CONTINUE), but the multipart boundary and filename field appear within the first 2KB of typical uploads.",
+    "config": {
+      "runtime": "node:18-slim",
+      "platform": "EC2 t3.medium, Amazon Linux 2023",
+      "load_balancer": "ALB with HTTPS listener, WAFv2 Web ACL associated",
+      "waf_web_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/doc-service-acl/abc123",
+      "waf_rules": [
+        {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 10,
+          "override": "SizeRestrictions_BODY to COUNT"
+        },
+        {
+          "name": "block-traversal-in-body",
+          "priority": 1,
+          "type": "custom",
+          "statement": "RegexPatternSet match on BODY with URL_DECODE transform",
+          "patterns": [
+            "(?:\\.\\.[\\\\/]){2,}",
+            "\\.\\.\\/\\.\\.\\/\\.\\.\\/"
+          ],
+          "action": "BLOCK"
+        },
+        {
+          "name": "content-type-restrict",
+          "priority": 5,
+          "type": "custom",
+          "action": "BLOCK on mismatch"
+        }
+      ],
+      "waf_body_inspection": "first 8KB, oversizeAction CONTINUE",
+      "filesystem": "ext4, no mount restrictions, AppArmor disabled",
+      "user": "app (uid 1000)",
+      "selinux": "disabled"
+    }
+  }
+}

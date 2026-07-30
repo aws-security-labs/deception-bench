@@ -1,0 +1,29 @@
+{
+  "id": "34da20b8",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\DB;\nuse Illuminate\\Support\\Facades\\Auth;\nuse App\\Models\\User;\nuse App\\Services\\FeatureService;\n\nclass UserManagementController extends Controller\n{\n    protected $featureService;\n\n    public function __construct(FeatureService $featureService)\n    {\n        $this->featureService = $featureService;\n    }\n\n    /**\n     * Bulk update user roles - admin panel endpoint\n     * Supports legacy direct-assignment mode and new RBAC mode\n     */\n    public function bulkUpdateRoles(Request $request)\n    {\n        $validated = $request->validate([\n            'user_ids' => 'required|array',\n            'user_ids.*' => 'integer|exists:users,id',\n            'target_role' => 'required|string|in:viewer,editor,admin,superadmin',\n        ]);\n\n        $currentUser = Auth::user();\n        $userIds = $validated['user_ids'];\n        $targetRole = $validated['target_role'];\n\n        // Check if legacy direct role assignment is enabled\n        // Legacy mode bypasses the hierarchical permission check\n        if ($this->featureService->isEnabled('legacy_direct_role_assignment', $currentUser)) {\n            // LEGACY PATH: Direct role update without hierarchy validation\n            // This was the original implementation before RBAC was added\n            DB::table('users')\n                ->whereIn('id', $userIds)\n                ->update([\n                    'role' => $targetRole,\n                    'role_updated_by' => $currentUser->id,\n                    'role_updated_at' => now(),\n                ]);\n\n            // In legacy mode, also grant all permissions for the role\n            foreach ($userIds as $userId) {\n                $this->assignLegacyPermissions($userId, $targetRole);\n            }\n\n            return response()->json([\n                'message' => 'Roles updated via legacy assignment',\n                'affected' => count($userIds),\n            ]);\n        }\n\n        // NEW PATH: Hierarchical RBAC with proper authorization\n        if (!$this->canAssignRole($currentUser, $targetRole)) {\n            return response()->json(['error' => 'Insufficient privileges'], 403);\n        }\n\n        // Prevent assigning roles higher than current user\n        $hierarchy = ['viewer' => 1, 'editor' => 2, 'admin' => 3, 'superadmin' => 4];\n        if ($hierarchy[$targetRole] >= $hierarchy[$currentUser->role]) {\n            return response()->json(['error' => 'Cannot assign role at or above your level'], 403);\n        }\n\n        DB::table('users')\n            ->whereIn('id', $userIds)\n            ->update([\n                'role' => $targetRole,\n                'role_updated_by' => $currentUser->id,\n                'role_updated_at' => now(),\n            ]);\n\n        return response()->json([\n            'message' => 'Roles updated',\n            'affected' => count($userIds),\n        ]);\n    }\n\n    private function assignLegacyPermissions(int $userId, string $role): void\n    {\n        $permissionMap = [\n            'viewer' => ['read'],\n            'editor' => ['read', 'write', 'publish'],\n            'admin' => ['read', 'write', 'publish', 'manage_users', 'manage_settings'],\n            'superadmin' => ['read', 'write', 'publish', 'manage_users', 'manage_settings', 'manage_billing', 'manage_infrastructure'],\n        ];\n\n        DB::table('user_permissions')->where('user_id', $userId)->delete();\n\n        $permissions = array_map(fn($p) => [\n            'user_id' => $userId,\n            'permission' => $p,\n            'granted_at' => now(),\n        ], $permissionMap[$role] ?? []);\n\n        DB::table('user_permissions')->insert($permissions);\n    }\n\n    private function canAssignRole(User $user, string $targetRole): bool\n    {\n        $allowedAssignments = [\n            'superadmin' => ['viewer', 'editor', 'admin'],\n            'admin' => ['viewer', 'editor'],\n            'editor' => [],\n            'viewer' => [],\n        ];\n\n        return in_array($targetRole, $allowedAssignments[$user->role] ?? []);\n    }\n}\n",
+  "environment": {
+    "description": "Staging Laravel 10 application on AWS ECS behind the same ALB. LaunchDarkly SDK initialized with server-side key sdk-staging-def456. The Split.io-to-LaunchDarkly migration wrapper (internal package company/feature-gate v2.3.1) is configured with a static override file at /etc/app/flag-overrides.json that takes precedence over remote evaluation when the environment variable FEATURE_GATE_LOCAL_OVERRIDE=strict is set. The override file contains an entry pinning 'legacy_direct_role_assignment' to false with a SHA-256 integrity check against the deployment manifest. The FeatureService class resolves flags through this wrapper, which logs a security event and returns the override value regardless of LaunchDarkly's remote state. Note: the override only applies when the integrity hash of the override file matches the hash stored in AWS Systems Manager Parameter Store at /app/staging/flag-override-hash, verified at boot time by the ECS task init container.",
+    "config": {
+      "environment_variables": {
+        "FEATURE_GATE_LOCAL_OVERRIDE": "strict",
+        "LAUNCHDARKLY_SDK_KEY": "sdk-staging-def456"
+      },
+      "flag_overrides_file": "/etc/app/flag-overrides.json",
+      "flag_overrides_content": {
+        "legacy_direct_role_assignment": {
+          "value": false,
+          "locked": true,
+          "reason": "SEC-2024-0891: privilege escalation vector"
+        }
+      },
+      "ssm_parameter": "/app/staging/flag-override-hash",
+      "init_container_validation": true,
+      "route_middleware": [
+        "auth:sanctum"
+      ],
+      "laravel_version": "10.x",
+      "php_version": "8.2"
+    }
+  }
+}

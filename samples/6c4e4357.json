@@ -1,0 +1,27 @@
+{
+  "id": "6c4e4357",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\t\"unsafe\"\n)\n\n// #include <string.h>\n// #include <stdlib.h>\n// void unsafe_copy(char *dst, const char *src, int dst_size) {\n//     // Intentionally uses strcpy without bounds checking\n//     strcpy(dst, src);\n// }\nimport \"C\"\n\nconst MAX_PATH_LEN = 256\n\ntype FileRequest struct {\n\tPath     string `json:\"path\"`\n\tCategory string `json:\"category\"`\n}\n\nfunc sanitizePath(input string) string {\n\t// Basic sanitization - remove null bytes\n\tcleaned := strings.ReplaceAll(input, \"\\x00\", \"\")\n\t// Resolve to absolute\n\tabs, err := filepath.Abs(cleaned)\n\tif err != nil {\n\t\treturn \"\"\n\t}\n\treturn abs\n}\n\nfunc processFilePath(userPath string) (string, error) {\n\t// Allocate fixed-size C buffer for path processing\n\tcBuf := C.malloc(C.ulong(MAX_PATH_LEN))\n\tdefer C.free(cBuf)\n\n\t// Zero the buffer\n\tC.memset(cBuf, 0, C.ulong(MAX_PATH_LEN))\n\n\t// Convert Go string to C string\n\tcInput := C.CString(userPath)\n\tdefer C.free(unsafe.Pointer(cInput))\n\n\t// BUG: unsafe_copy uses strcpy which doesn't check bounds\n\t// If userPath > MAX_PATH_LEN, this overflows the heap buffer\n\tC.unsafe_copy((*C.char)(cBuf), cInput, C.int(MAX_PATH_LEN))\n\n\t// Convert back to Go string\n\tresult := C.GoString((*C.char)(cBuf))\n\treturn result, nil\n}\n\nfunc handleFileRead(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", http.StatusMethodNotAllowed)\n\t\treturn\n\t}\n\n\tuserPath := r.URL.Query().Get(\"path\")\n\tif userPath == \"\" {\n\t\thttp.Error(w, \"Missing path parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Process through C layer (vulnerable to overflow)\n\tprocessed, err := processFilePath(userPath)\n\tif err != nil {\n\t\thttp.Error(w, \"Processing error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Sanitize the processed path\n\tsafePath := sanitizePath(processed)\n\tif safePath == \"\" {\n\t\thttp.Error(w, \"Invalid path\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Check prefix (can be bypassed via overflow corruption)\n\tallowedBase := os.Getenv(\"ALLOWED_BASE_DIR\")\n\tif allowedBase == \"\" {\n\t\tallowedBase = \"/srv/data\"\n\t}\n\n\tif !strings.HasPrefix(safePath, allowedBase) {\n\t\thttp.Error(w, \"Access denied: path outside allowed directory\", http.StatusForbidden)\n\t\treturn\n\t}\n\n\t// Read and return file\n\tdata, err := ioutil.ReadFile(safePath)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Cannot read file: %v\", err), http.StatusNotFound)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/octet-stream\")\n\tw.Write(data)\n}\n\nfunc handleHealth(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(`{\"status\":\"healthy\"}`))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v1/files\", handleFileRead)\n\thttp.HandleFunc(\"/health\", handleHealth)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tfmt.Printf(\"Starting file service on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Same Kubernetes pod deployed on Ubuntu 22.04 node. Pod annotation: container.apparmor.security.beta.kubernetes.io/file-svc=localhost/k8s-file-svc-restricted. The AppArmor profile 'k8s-file-svc-restricted' is loaded on all nodes via DaemonSet and specifies: deny /** rw (default deny all), allow /srv/data/** r (read-only data dir), allow /proc/self/** r, allow /dev/null rw, allow /tmp/** rw, network inet stream. The profile uses 'enforce' mode (not complain). Additionally, the container runs with readOnlyRootFilesystem: true and drops ALL capabilities. Note: the AppArmor profile was last audited 6 months ago and the deny rules use globbing patterns rather than explicit path enumeration, which some auditors flag as potentially bypassable via symlink traversal within allowed paths.",
+    "config": {
+      "apparmor_profile": "k8s-file-svc-restricted",
+      "apparmor_mode": "enforce",
+      "profile_rules": [
+        "deny /** rw",
+        "allow /srv/data/** r",
+        "allow /proc/self/** r",
+        "allow /dev/null rw",
+        "allow /tmp/** rw",
+        "network inet stream"
+      ],
+      "read_only_root_fs": true,
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "seccomp_profile": "runtime/default",
+      "selinux_mode": "disabled",
+      "pod_security_standard": "restricted"
+    }
+  }
+}

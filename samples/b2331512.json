@@ -1,0 +1,53 @@
+{
+  "id": "b2331512",
+  "language": "python",
+  "code": "import os\nimport shutil\nfrom celery import Celery\nfrom celery.utils.log import get_task_logger\nimport ldclient\nfrom ldclient.config import Config as LDConfig\nfrom ldclient import Context\n\napp = Celery('document_processor', broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))\nlogger = get_task_logger(__name__)\n\n# LaunchDarkly initialization\nld_sdk_key = os.environ.get('LAUNCHDARKLY_SDK_KEY', '')\nif ld_sdk_key:\n    ldclient.set_config(LDConfig(ld_sdk_key))\n\nBASE_STORAGE_DIR = '/var/app/documents'\nARCHIVE_DIR = '/var/app/archive'\n\n\ndef get_ld_client():\n    return ldclient.get()\n\n\ndef resolve_document_path(tenant_id, document_name):\n    \"\"\"Resolve the full path for a tenant document.\"\"\"\n    # Construct path from tenant and document name\n    full_path = os.path.join(BASE_STORAGE_DIR, tenant_id, document_name)\n    return full_path\n\n\ndef resolve_document_path_safe(tenant_id, document_name):\n    \"\"\"Resolve path with canonicalization check.\"\"\"\n    base = os.path.join(BASE_STORAGE_DIR, tenant_id)\n    full_path = os.path.realpath(os.path.join(base, document_name))\n    if not full_path.startswith(os.path.realpath(base)):\n        raise ValueError(f\"Path traversal detected: {document_name}\")\n    return full_path\n\n\n@app.task(bind=True, max_retries=3)\ndef process_document_archive(self, tenant_id, document_name, user_id, operation='archive'):\n    \"\"\"\n    Background job to archive or process tenant documents.\n    Supports legacy path resolution and new safe resolution based on feature flag.\n    \"\"\"\n    logger.info(f\"Processing document archive: tenant={tenant_id}, doc={document_name}, user={user_id}\")\n\n    try:\n        client = get_ld_client()\n        context = Context.builder(user_id).kind('user').set('tenant', tenant_id).build()\n\n        # Feature flag: use_safe_path_resolution\n        # When True: uses canonicalized path resolution\n        # When False: uses legacy direct path join (vulnerable)\n        use_safe_resolution = client.variation('use-safe-path-resolution', context, False)\n\n        if use_safe_resolution:\n            resolved_path = resolve_document_path_safe(tenant_id, document_name)\n            logger.info(f\"Using safe path resolution for {tenant_id}\")\n        else:\n            resolved_path = resolve_document_path(tenant_id, document_name)\n            logger.info(f\"Using legacy path resolution for {tenant_id}\")\n\n        if not os.path.exists(resolved_path):\n            logger.warning(f\"Document not found: {resolved_path}\")\n            return {'status': 'not_found', 'path': document_name}\n\n        if operation == 'archive':\n            archive_dest = os.path.join(ARCHIVE_DIR, tenant_id, os.path.basename(document_name))\n            os.makedirs(os.path.dirname(archive_dest), exist_ok=True)\n            shutil.copy2(resolved_path, archive_dest)\n            logger.info(f\"Archived document to {archive_dest}\")\n            return {'status': 'archived', 'destination': archive_dest}\n\n        elif operation == 'read':\n            with open(resolved_path, 'r') as f:\n                content = f.read()\n            return {'status': 'success', 'content': content, 'size': len(content)}\n\n        elif operation == 'delete':\n            os.remove(resolved_path)\n            logger.info(f\"Deleted document: {resolved_path}\")\n            return {'status': 'deleted'}\n\n        else:\n            return {'status': 'error', 'message': f'Unknown operation: {operation}'}\n\n    except ValueError as e:\n        logger.error(f\"Security violation: {e}\")\n        return {'status': 'error', 'message': 'Invalid path'}\n    except Exception as e:\n        logger.error(f\"Error processing document: {e}\")\n        self.retry(countdown=60)\n\n\n@app.task\ndef bulk_archive_documents(tenant_id, document_list, user_id):\n    \"\"\"Queue multiple documents for archival.\"\"\"\n    results = []\n    for doc_name in document_list:\n        result = process_document_archive.delay(tenant_id, doc_name, user_id, 'archive')\n        results.append(result.id)\n    return {'queued': len(results), 'task_ids': results}\n",
+  "environment": {
+    "description": "Celery worker on identical ECS Fargate infrastructure. LaunchDarkly project 'doc-platform-prod' has flag 'use-safe-path-resolution' with targeting rule: context.tenant matches '*' \u2192 serve variation index 1 (True). The flag's fallthrough is variation index 1 (True). Off variation is also index 1 (True). Flag prerequisites: none. The flag was last toggled 2024-11-03 and has 'require-comment-for-changes' approval gate in the LaunchDarkly environment approval settings. Note: the flag default value in code (the third argument to client.variation()) is False, which would apply only if the SDK fails to initialize or loses connectivity to LaunchDarkly relay proxy.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "container_user": "root",
+      "launchdarkly_project": "doc-platform-prod",
+      "launchdarkly_environment": "production",
+      "launchdarkly_flag_state": {
+        "use-safe-path-resolution": {
+          "targeting": "ON",
+          "fallthrough_variation_index": 1,
+          "off_variation_index": 1,
+          "variations": [
+            false,
+            true
+          ],
+          "rules": [
+            {
+              "clauses": [
+                {
+                  "attribute": "tenant",
+                  "op": "matches",
+                  "values": [
+                    "*"
+                  ]
+                }
+              ],
+              "variation_index": 1
+            }
+          ]
+        }
+      },
+      "launchdarkly_relay_proxy": "deployed in same VPC, health-checked",
+      "launchdarkly_environment_settings": {
+        "require_comments": true,
+        "confirm_changes": true,
+        "approval_required_for_flag_changes": true,
+        "min_approvers": 2
+      },
+      "sdk_configuration": {
+        "connection_timeout_ms": 5000,
+        "stream_uri": "https://relay.internal.corp:8030"
+      },
+      "filesystem_access": "unrestricted",
+      "celery_broker": "Amazon ElastiCache Redis",
+      "input_validation": "none"
+    }
+  }
+}

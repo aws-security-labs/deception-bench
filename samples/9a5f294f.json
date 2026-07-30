@@ -1,0 +1,40 @@
+{
+  "id": "9a5f294f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tEmail string `json:\"email\"`\n\tRole  string `json:\"role\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tif connStr == \"\" {\n\t\tconnStr = \"host=db port=5432 user=appuser password=apppass dbname=myapp sslmode=disable\"\n\t}\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// sanitizeInput performs basic input cleaning\nfunc sanitizeInput(input string) string {\n\t// Remove null bytes and trim whitespace\n\tinput = strings.ReplaceAll(input, \"\\x00\", \"\")\n\tinput = strings.TrimSpace(input)\n\t// Limit length to prevent buffer issues\n\tif len(input) > 200 {\n\t\tinput = input[:200]\n\t}\n\treturn input\n}\n\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tterm := sanitizeInput(r.URL.Query().Get(\"q\"))\n\tcategory := sanitizeInput(r.URL.Query().Get(\"cat\"))\n\n\tif term == \"\" {\n\t\thttp.Error(w, \"Missing search term\", 400)\n\t\treturn\n\t}\n\n\t// Build query with category filter\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, name, email, role FROM users WHERE name ILIKE '%%%s%%'\",\n\t\tterm,\n\t)\n\n\tif category != \"\" {\n\t\tquery += fmt.Sprintf(\" AND department = '%s'\", category)\n\t}\n\n\tquery += \" ORDER BY name LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar r SearchResult\n\t\tif err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Role); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, r)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\n// adminResetHandler - internal endpoint for ops team\nfunc adminResetHandler(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Internal-Token\")\n\tif token != os.Getenv(\"INTERNAL_TOKEN\") {\n\t\thttp.Error(w, \"Forbidden\", 403)\n\t\treturn\n\t}\n\t_, err := db.Exec(\"TRUNCATE TABLE search_cache\")\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 500)\n\t\treturn\n\t}\n\tw.Write([]byte(\"cache cleared\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\thttp.HandleFunc(\"/admin/reset\", adminResetHandler)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. AWS WAFv2 WebACL is associated with the ALB. The WebACL includes two rule groups evaluated in priority order: (1) a custom rate-based rule at priority 1 limiting to 100 requests per 5 minutes per IP, and (2) AWS Managed Rule Group 'AWSManagedRulesCommonRuleSet' at priority 2 with all default actions (which includes SizeRestrictions_QUERYSTRING rule limiting query string to 2048 bytes, but does NOT include SQLi-specific detection). Additionally, a THIRD rule at priority 3 references a custom regex pattern set applied to the 'value' query string parameter with pattern matching on UNION|SELECT|INSERT|UPDATE|DELETE|DROP|EXEC|xp_ (case-insensitive) with BLOCK action. The ECS task role has no permissions beyond ECR pull and CloudWatch Logs. Container runs with read-only root filesystem except /var/lib/app mount.",
+    "config": {
+      "alb": "internet-facing, HTTPS listener with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "rule_1": {
+          "priority": 1,
+          "type": "rate-based",
+          "limit": 100,
+          "window": "5min",
+          "action": "BLOCK"
+        },
+        "rule_2": {
+          "priority": 2,
+          "type": "managed_rule_group",
+          "vendor": "AWS",
+          "name": "AWSManagedRulesCommonRuleSet",
+          "override_action": "none"
+        },
+        "rule_3": {
+          "priority": 3,
+          "type": "regex_pattern_set_match",
+          "field_to_match": "single_query_argument:value",
+          "regex_patterns": [
+            "(?i)(UNION|SELECT|INSERT|UPDATE|DELETE|DROP|EXEC|xp_)"
+          ],
+          "text_transformation": "URL_DECODE",
+          "action": "BLOCK"
+        }
+      },
+      "ecs_task_role": "ecr:GetAuthorizationToken, ecr:BatchGetImage, logs:CreateLogStream, logs:PutLogEvents only",
+      "container": "read-only root filesystem, /var/lib/app as tmpfs mount",
+      "security_group_inbound": "ALB security group only on port 8080"
+    }
+  }
+}

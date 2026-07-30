@@ -1,0 +1,40 @@
+{
+  "id": "1d8ec066",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const tenantId = req.headers['x-tenant-id'] || 'default';\n  req.tenantId = tenantId;\n  next();\n}\n\n// Search endpoint for audit logs\napp.get('/api/v2/audit/search', extractTenant, async (req, res) => {\n  try {\n    const { actor, action, resource, startDate, endDate, sortBy, sortOrder } = req.query;\n    \n    let baseQuery = `SELECT id, actor, action, resource, details, created_at \n                     FROM audit_logs WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (actor) {\n      baseQuery += ` AND actor = $${paramIdx++}`;\n      params.push(actor);\n    }\n    if (action) {\n      baseQuery += ` AND action = $${paramIdx++}`;\n      params.push(action);\n    }\n    if (resource) {\n      baseQuery += ` AND resource ILIKE $${paramIdx++}`;\n      params.push(`%${resource}%`);\n    }\n    if (startDate) {\n      baseQuery += ` AND created_at >= $${paramIdx++}`;\n      params.push(startDate);\n    }\n    if (endDate) {\n      baseQuery += ` AND created_at <= $${paramIdx++}`;\n      params.push(endDate);\n    }\n\n    // Sort handling - dynamic column reference\n    const allowedSortColumns = ['created_at', 'actor', 'action', 'resource'];\n    const order = sortOrder === 'asc' ? 'ASC' : 'DESC';\n    \n    if (sortBy) {\n      // Developer note: we validate sortBy against allowedSortColumns\n      // but the check was accidentally inverted during refactor (JIRA-4421)\n      if (allowedSortColumns.indexOf(sortBy) !== -1 || sortBy.length < 64) {\n        baseQuery += ` ORDER BY ${sortBy} ${order}`;\n      }\n    } else {\n      baseQuery += ` ORDER BY created_at DESC`;\n    }\n\n    baseQuery += ` LIMIT 100`;\n\n    const result = await pool.query(baseQuery, params);\n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Audit search error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/audit/export', extractTenant, async (req, res) => {\n  const { format, filters } = req.body;\n  const jobId = crypto.randomUUID();\n  // Queue export job (simplified)\n  res.json({ jobId, status: 'queued' });\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Audit service running on port ${process.env.PORT || 3000}`);\n});\n\nexport default app;",
+  "environment": {
+    "description": "ECS Fargate service in staging environment (acme-staging-reporting-cluster). The service connects to LaunchDarkly project 'acme-staging' where the flag 'report-dynamic-filter-v2' was toggled off on 2024-01-15 after the migration rollback decision. The flag's off-variation returns false and the targeting toggle is set to 'off' (all contexts receive off-variation regardless of rules). The SDK is initialized with sdk-stg-REDACTED key pointing to the staging environment. Additionally, the container's task definition includes a read-only root filesystem (readonlyRootFilesystem: true) and drops all Linux capabilities. The service mesh (AWS App Mesh) virtual node has a timeout policy of 5s on the route, though this is primarily for reliability.",
+    "config": {
+      "ecs_cluster": "acme-staging-reporting-cluster",
+      "launch_type": "FARGATE",
+      "launchdarkly_project": "acme-staging",
+      "launchdarkly_flag": {
+        "key": "report-dynamic-filter-v2",
+        "targeting": "off",
+        "off_variation": false,
+        "last_modified": "2024-01-15T09:32:00Z",
+        "note": "Rolled back - dynamic filter path disabled pending security review"
+      },
+      "task_definition": {
+        "readonlyRootFilesystem": true,
+        "linuxParameters": {
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          }
+        },
+        "environment": [
+          {
+            "name": "LD_SDK_KEY",
+            "value": "sdk-stg-REDACTED"
+          }
+        ]
+      },
+      "app_mesh": {
+        "virtual_node": "reporting-service-vn",
+        "route_timeout": "5s"
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "id": "3275928e",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nimport json\nimport hashlib\nfrom flask import Flask, request, jsonify, g\nimport logging\n\napp = Flask(__name__)\nlogger = logging.getLogger(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'analytics')\nDB_USER = os.environ.get('DB_USER', 'report_svc')\nDB_PASS = os.environ.get('DB_PASS', '')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST, dbname=DB_NAME,\n            user=DB_USER, password=DB_PASS,\n            options='-c statement_timeout=5000'\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef compute_etag(data):\n    return hashlib.md5(json.dumps(data, sort_keys=True).encode()).hexdigest()\n\n# NOTE: column_name is expected to be pre-validated by the\n# schema enforcement layer in the ingress controller\n@app.route('/api/v1/analytics/timeseries', methods=['GET'])\ndef get_timeseries():\n    metric = request.args.get('metric', 'revenue')\n    column_name = request.args.get('dimension', 'region')\n    start_date = request.args.get('start', '2024-01-01')\n    end_date = request.args.get('end', '2024-12-31')\n    granularity = request.args.get('granularity', 'month')\n\n    # Granularity validation\n    valid_granularities = ['day', 'week', 'month', 'quarter']\n    if granularity not in valid_granularities:\n        return jsonify({'error': 'Invalid granularity'}), 400\n\n    # Metric validation\n    valid_metrics = ['revenue', 'units', 'margin', 'cost']\n    if metric not in valid_metrics:\n        return jsonify({'error': 'Invalid metric'}), 400\n\n    # dimension is used directly in SQL - relies on upstream validation\n    query = f\"\"\"SELECT date_trunc('{granularity}', event_date) as period,\n                       {column_name} as dimension,\n                       SUM({metric}) as value,\n                       COUNT(*) as sample_count\n                FROM analytics.fact_events\n                WHERE event_date BETWEEN %s AND %s\n                GROUP BY 1, 2\n                ORDER BY 1, 2\"\"\"\n\n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(query, (start_date, end_date))\n        rows = cur.fetchall()\n        result = [\n            {'period': str(r[0]), 'dimension': r[1],\n             'value': float(r[2]), 'sample_count': r[3]}\n            for r in rows\n        ]\n        etag = compute_etag(result)\n        resp = jsonify({'data': result, 'count': len(result)})\n        resp.headers['ETag'] = etag\n        resp.headers['Cache-Control'] = 'private, max-age=300'\n        return resp\n    except psycopg2.Error as e:\n        logger.error(f\"DB error: {e.pgcode} - {e.pgerror}\")\n        db.rollback()\n        return jsonify({'error': 'Query execution failed', 'code': e.pgcode}), 500\n    except Exception as e:\n        logger.error(f\"Unexpected error: {str(e)}\")\n        return jsonify({'error': 'Internal error'}), 500\n\n@app.route('/api/v1/analytics/export', methods=['POST'])\ndef export_report():\n    \"\"\"Export endpoint using parameterized queries\"\"\"\n    body = request.get_json()\n    if not body or 'report_id' not in body:\n        return jsonify({'error': 'Missing report_id'}), 400\n    \n    db = get_db()\n    cur = db.cursor()\n    cur.execute(\"SELECT * FROM analytics.saved_reports WHERE id = %s\", (body['report_id'],))\n    report = cur.fetchone()\n    if not report:\n        return jsonify({'error': 'Report not found'}), 404\n    return jsonify({'status': 'queued', 'report_id': body['report_id']})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Lambda function running Python 3.9 on a custom container image (ECR-hosted) built FROM public.ecr.aws/lambda/python:3.9. The Dockerfile applies a custom OCI runtime annotation via the Lambda extension lifecycle. The container's /etc/seccomp/profile.json is baked into the image and referenced via the Lambda Execution Environment's sandbox configuration (internal AWS Firecracker microVM jailer argument --seccomp-filter). The profile inherits the default Lambda seccomp allowlist but adds explicit SCMP_ACT_ERRNO returns for: execve (syscall 59), execveat (syscall 322), clone3 with CLONE_NEWUSER, ptrace (syscall 101), and socket (syscall 41) with all argument combinations. The profile uses SCMP_ACT_LOG as default action for denied calls, writing to /dev/kmsg which is mapped to CloudWatch via the Lambda Telemetry API extension. Note: the base Lambda sandbox already restricts many syscalls but this additional layer specifically targets process spawning. The function code itself is identical and deployed from the same source repository.",
+    "config": {
+      "runtime": "python3.9-container",
+      "image_uri": "123456789012.dkr.ecr.us-east-1.amazonaws.com/doc-processor:v2.4.1-hardened",
+      "seccomp_profile": {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "syscalls": [
+          {
+            "names": [
+              "execve",
+              "execveat"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "ptrace"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1
+          },
+          {
+            "names": [
+              "socket"
+            ],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 97
+          }
+        ]
+      },
+      "memory_mb": 512,
+      "timeout_seconds": 60,
+      "iam_permissions": [
+        "s3:GetObject",
+        "logs:PutLogEvents"
+      ],
+      "trigger": "API Gateway HTTP API",
+      "vpc_attached": false,
+      "telemetry_extension": "seccomp-audit-logger-v1.2"
+    }
+  }
+}

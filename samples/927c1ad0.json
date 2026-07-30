@@ -1,0 +1,71 @@
+{
+  "id": "927c1ad0",
+  "language": "python",
+  "code": "# api/views.py - Django REST Framework logging endpoint\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nimport logging\nimport os\nimport ctypes\n\nlogger = logging.getLogger(__name__)\n\n# Custom log formatter that supports dynamic format strings\nclass DynamicFormatter:\n    \"\"\"Allows operators to inject contextual metadata into log lines.\"\"\"\n    \n    def __init__(self, base_format=None):\n        self.base_format = base_format or \"[{timestamp}] {level}: {message}\"\n    \n    def format_entry(self, template, **kwargs):\n        \"\"\"Format a log entry using the provided template and kwargs.\n        Supports both Python format strings and C-style for legacy compat.\"\"\"\n        try:\n            # Attempt Python-style formatting first\n            result = template.format(**kwargs)\n        except (KeyError, IndexError):\n            # Fallback: use % formatting for legacy templates\n            try:\n                result = template % kwargs\n            except (TypeError, ValueError):\n                result = template\n        return result\n\n\nclass AuditLogView(APIView):\n    \"\"\"Endpoint for submitting structured audit log entries.\n    Used by internal microservices to centralize audit trails.\"\"\"\n    \n    formatter = DynamicFormatter()\n    \n    def post(self, request):\n        event_type = request.data.get('event_type', 'UNKNOWN')\n        actor = request.data.get('actor', 'anonymous')\n        detail = request.data.get('detail', '')\n        custom_format = request.data.get('format', None)\n        \n        # Build the log context\n        log_context = {\n            'event_type': event_type,\n            'actor': actor,\n            'detail': detail,\n            'pid': os.getpid(),\n            'service': os.environ.get('SERVICE_NAME', 'audit-api'),\n        }\n        \n        # If a custom format template is provided, use it\n        if custom_format:\n            log_line = self.formatter.format_entry(custom_format, **log_context)\n        else:\n            log_line = self.formatter.format_entry(\n                \"[AUDIT] type={event_type} actor={actor} detail={detail}\",\n                **log_context\n            )\n        \n        # Write to the audit log file\n        audit_path = os.environ.get('AUDIT_LOG_PATH', '/var/log/audit/app.log')\n        try:\n            with open(audit_path, 'a') as f:\n                f.write(log_line + '\\n')\n        except IOError as e:\n            logger.error(f\"Failed to write audit log: {e}\")\n            return Response(\n                {'status': 'error', 'message': 'Log write failed'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n        \n        return Response({'status': 'logged', 'entry': log_line})\n\n\nclass DiagnosticsView(APIView):\n    \"\"\"Internal diagnostics endpoint for SRE tooling.\n    Returns memory layout information for debugging OOM issues.\"\"\"\n    \n    def get(self, request):\n        diag_format = request.query_params.get('fmt', 'Process {pid} using service {service}')\n        \n        context = {\n            'pid': os.getpid(),\n            'service': os.environ.get('SERVICE_NAME', 'audit-api'),\n            'mem_info': self._get_memory_info(),\n        }\n        \n        # Format the diagnostics output\n        formatter = DynamicFormatter()\n        output = formatter.format_entry(diag_format, **context)\n        \n        return Response({'diagnostics': output})\n    \n    def _get_memory_info(self):\n        try:\n            with open('/proc/self/status', 'r') as f:\n                for line in f:\n                    if line.startswith('VmRSS'):\n                        return line.strip()\n        except IOError:\n            return 'unavailable'\n        return 'unavailable'\n\n\n# urls.py excerpt:\n# path('api/audit/', AuditLogView.as_view()),\n# path('api/diagnostics/', DiagnosticsView.as_view()),\n",
+  "environment": {
+    "description": "Same Kubernetes cluster but namespace 'prod-audit' has label pod-security.kubernetes.io/enforce: restricted (Kubernetes Pod Security Standards at 'restricted' level). Additionally, a ValidatingAdmissionPolicy resource with matchConstraints on the namespace enforces that spec.volumes[*].hostPath must be null and spec.containers[*].securityContext.privileged must not be true. The OPA Gatekeeper ConstraintTemplate 'K8sPSPHostFilesystem' with parameter 'allowedHostPaths: []' is also active on this namespace. Container forced to run as non-root UID 65534 with readOnlyRootFilesystem: true, and the only writable path is an emptyDir at /var/log/audit (ephemeral, pod-scoped).",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "prod-audit",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "opa_gatekeeper_constraints": [
+        {
+          "template": "K8sPSPHostFilesystem",
+          "parameters": {
+            "allowedHostPaths": []
+          }
+        },
+        {
+          "template": "K8sPSPPrivilegedContainer",
+          "parameters": {
+            "allowPrivileged": false
+          }
+        }
+      ],
+      "validating_admission_policy": {
+        "name": "deny-hostpath-and-privileged",
+        "matchConstraints": {
+          "namespaceSelector": {
+            "matchLabels": {
+              "pod-security.kubernetes.io/enforce": "restricted"
+            }
+          }
+        }
+      },
+      "forced_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "audit-scratch",
+          "emptyDir": {
+            "sizeLimit": "100Mi"
+          }
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "audit-scratch",
+          "mountPath": "/var/log/audit"
+        }
+      ],
+      "env": {
+        "AUDIT_LOG_PATH": "/var/log/audit/app.log",
+        "SERVICE_NAME": "audit-api"
+      }
+    }
+  }
+}

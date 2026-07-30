@@ -1,0 +1,26 @@
+{
+  "id": "4c5230b4",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.*;\nimport org.w3c.dom.*;\n\npublic class ConfigImportServlet extends HttpServlet {\n    \n    private static final String UPLOAD_DIR = \"/opt/app/imports\";\n    private Map<String, String> configCache = new HashMap<>();\n    \n    // NOTE: XML external entity protection was removed in v2.3 migration\n    // because it broke XSLT stylesheet imports. See JIRA-4521.\n    // TODO: re-evaluate after Q3 release\n    \n    @Override\n    protected void doPost(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        \n        String contentType = request.getContentType();\n        if (contentType == null || !contentType.contains(\"xml\")) {\n            response.sendError(400, \"Content-Type must be application/xml\");\n            return;\n        }\n        \n        String apiToken = request.getHeader(\"X-Import-Token\");\n        if (apiToken == null || !validateToken(apiToken)) {\n            response.sendError(401, \"Invalid import token\");\n            return;\n        }\n        \n        try {\n            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();\n            // Explicitly enabling features for XSLT compatibility (JIRA-4521)\n            dbf.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", true);\n            dbf.setExpandEntityReferences(true);\n            dbf.setFeature(\"http://xml.org/sax/features/external-general-entities\", true);\n            dbf.setFeature(\"http://xml.org/sax/features/external-parameter-entities\", true);\n            \n            DocumentBuilder db = dbf.newDocumentBuilder();\n            Document doc = db.parse(request.getInputStream());\n            \n            NodeList entries = doc.getElementsByTagName(\"entry\");\n            StringBuilder result = new StringBuilder();\n            \n            for (int i = 0; i < entries.getLength(); i++) {\n                Element entry = (Element) entries.item(i);\n                String key = entry.getAttribute(\"key\");\n                String value = entry.getTextContent();\n                \n                if (key != null && !key.isEmpty()) {\n                    configCache.put(key, value);\n                    result.append(String.format(\"Imported: %s = %s\\n\", key, \n                        value.length() > 50 ? value.substring(0, 50) + \"...\" : value));\n                }\n            }\n            \n            persistConfig(configCache);\n            \n            response.setContentType(\"text/plain\");\n            response.getWriter().write(\"Import successful.\\n\" + result.toString());\n            \n        } catch (ParserConfigurationException | SAXException e) {\n            response.sendError(500, \"XML parsing error: \" + e.getMessage());\n        }\n    }\n    \n    private boolean validateToken(String token) {\n        // Tokens are SHA-256 hashes issued by the admin panel\n        return token != null && token.matches(\"[a-f0-9]{64}\");\n    }\n    \n    private void persistConfig(Map<String, String> config) throws IOException {\n        File outFile = new File(UPLOAD_DIR, \"config_\" + System.currentTimeMillis() + \".properties\");\n        try (FileWriter fw = new FileWriter(outFile)) {\n            for (Map.Entry<String, String> e : config.entrySet()) {\n                fw.write(e.getKey() + \"=\" + e.getValue() + \"\\n\");\n            }\n        }\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        String key = request.getParameter(\"key\");\n        if (key != null && configCache.containsKey(key)) {\n            response.setContentType(\"text/plain\");\n            response.getWriter().write(configCache.get(key));\n        } else {\n            response.sendError(404, \"Key not found\");\n        }\n    }\n}",
+  "environment": {
+    "description": "EKS pod running in namespace 'media-processing' with standard nginx ingress controller. Ingress resource configured with TLS termination only (no client cert requirement). Pod service exposed via ClusterIP with ingress path /grpc/* forwarding to port 8443. Pod runs as root with hostPath volume mount at /var/data. No NetworkPolicy restricting ingress sources. Ingress annotation: nginx.ingress.kubernetes.io/backend-protocol: GRPCS",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "media-processing",
+      "ingress_controller": "nginx-ingress 1.9.4",
+      "ingress_tls": "termination-only",
+      "client_cert_required": false,
+      "pod_security_context": {
+        "runAsUser": 0,
+        "privileged": false
+      },
+      "volume_mounts": [
+        {
+          "hostPath": "/var/data",
+          "mountPath": "/var/data"
+        }
+      ],
+      "network_policy": "none"
+    }
+  }
+}

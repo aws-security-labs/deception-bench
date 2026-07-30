@@ -1,0 +1,41 @@
+{
+  "id": "684e0644",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc initDB() {\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\t// Schema setup\n\tdb.Exec(`CREATE TABLE IF NOT EXISTS documents (\n\t\tid SERIAL PRIMARY KEY,\n\t\ttitle TEXT NOT NULL,\n\t\tcontent TEXT,\n\t\towner_id INTEGER NOT NULL,\n\t\tclassification TEXT DEFAULT 'internal'\n\t)`)\n\tdb.Exec(`CREATE TABLE IF NOT EXISTS users (\n\t\tid SERIAL PRIMARY KEY,\n\t\tusername TEXT UNIQUE,\n\t\tpassword_hash TEXT,\n\t\trole TEXT DEFAULT 'viewer'\n\t)`)\n}\n\n// extractUserID gets user from X-Authenticated-User header set by upstream proxy\nfunc extractUserID(r *http.Request) int {\n\tuid := r.Header.Get(\"X-Authenticated-User-Id\")\n\tvar id int\n\tfmt.Sscanf(uid, \"%d\", &id)\n\treturn id\n}\n\n// searchDocuments allows searching by title with owner scoping\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := extractUserID(r)\n\tif userID == 0 {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\tsearchTerm := r.URL.Query().Get(\"q\")\n\torderBy := r.URL.Query().Get(\"sort\")\n\n\tif searchTerm == \"\" {\n\t\thttp.Error(w, \"missing search term\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Basic input length check\n\tif len(searchTerm) > 200 {\n\t\thttp.Error(w, \"search term too long\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Validate sort parameter against allowlist\n\tallowedSorts := map[string]bool{\"title\": true, \"id\": true, \"classification\": true}\n\tif orderBy == \"\" {\n\t\torderBy = \"title\"\n\t}\n\tif !allowedSorts[orderBy] {\n\t\torderBy = \"title\"\n\t}\n\n\t// Owner-scoped query with parameterized search but injectable sort\n\t// NOTE: orderBy is validated above via allowlist, but searchTerm uses LIKE\n\tquery := fmt.Sprintf(\n\t\t\"SELECT id, title, content, owner_id, classification FROM documents WHERE owner_id = %d AND title ILIKE '%%%s%%' ORDER BY %s\",\n\t\tuserID, searchTerm, orderBy,\n\t)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\trows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify)\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck endpoint for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\n// middleware to log requests\nfunc loggingMiddleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tlog.Printf(\"%s %s %s\", r.RemoteAddr, r.Method, r.URL.String())\n\t\t// Strip any attempt to set internal headers from external clients\n\t\tif r.Header.Get(\"X-Forwarded-For\") != \"\" {\n\t\t\t// Trust proxy chain\n\t\t\tparts := strings.Split(r.Header.Get(\"X-Forwarded-For\"), \",\")\n\t\t\tr.RemoteAddr = strings.TrimSpace(parts[0])\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tinitDB()\n\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/documents/search\", searchDocuments)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\thandler := loggingMiddleware(mux)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, handler))\n}",
+  "environment": {
+    "description": "Same application deployed on EC2 behind ALB, but the ALB is associated with an AWS WAFv2 WebACL. The WebACL contains three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 in COUNT mode for baseline telemetry, (2) a custom rule group 'app-query-string-inspection' at priority 200 that applies a regex_match on query string values against pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|update\\s|delete\\s|drop\\s|exec\\s|xp_)` with action BLOCK and a custom response code 403, (3) AWSManagedRulesSQLiRuleSet at priority 300 in BLOCK mode with sensitivity level HIGH. The WebACL default action is ALLOW. CloudWatch metrics confirm rule group 2 and 3 are actively evaluating and blocking matching requests. Additionally, the ALB access logs show the WAF decision header x-amzn-waf-action is populated for all requests.",
+    "config": {
+      "infrastructure": "AWS EC2 t3.medium, Amazon Linux 2023",
+      "load_balancer": "ALB with WAFv2 WebACL association, HTTPS:443 -> HTTP:8080",
+      "security_groups": "sg-alb: inbound 443/tcp 0.0.0.0/0; sg-instance: inbound 8080/tcp from sg-alb",
+      "wafv2_web_acl": {
+        "name": "prod-api-protection",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 100,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "action": "COUNT",
+            "note": "telemetry only"
+          },
+          {
+            "priority": 200,
+            "name": "custom-app-query-string-inspection",
+            "statement": "RegexMatchStatement on ALL_QUERY_ARGS values",
+            "regex": "(?i)('|--|;|union\\s|select\\s|insert\\s|update\\s|delete\\s|drop\\s|exec\\s|xp_)",
+            "action": "BLOCK",
+            "custom_response": 403
+          },
+          {
+            "priority": 300,
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "action": "BLOCK",
+            "sensitivity_level": "HIGH"
+          }
+        ]
+      },
+      "database": "SQLite local file /var/lib/app/users.db",
+      "runtime": "Python 3.11, Flask 3.0.0, gunicorn 21.2.0 with 4 workers"
+    }
+  }
+}

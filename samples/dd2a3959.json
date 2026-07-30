@@ -1,0 +1,32 @@
+{
+  "id": "dd2a3959",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.util.Base64;\n\n/**\n * Legacy session restoration endpoint for backward compatibility\n * with pre-2019 mobile clients that send serialized session objects.\n * \n * NOTE: This endpoint is scheduled for deprecation in Q3 2025.\n * New clients use JSON-based session tokens (see /api/v2/session).\n */\npublic class LegacySessionServlet extends HttpServlet {\n    \n    private static final long serialVersionUID = 1L;\n    private static final int MAX_PAYLOAD_SIZE = 65536;\n    \n    @Override\n    protected void doPost(HttpServletRequest request, HttpServletResponse response)\n            throws ServletException, IOException {\n        \n        String clientVersion = request.getHeader(\"X-Client-Version\");\n        if (clientVersion == null || clientVersion.isEmpty()) {\n            response.sendError(400, \"Missing client version header\");\n            return;\n        }\n        \n        // Only legacy clients (< v3.0) use serialized sessions\n        if (!isLegacyClient(clientVersion)) {\n            response.sendError(400, \"Use /api/v2/session for modern clients\");\n            return;\n        }\n        \n        String encodedSession = request.getParameter(\"session_data\");\n        if (encodedSession == null || encodedSession.length() > MAX_PAYLOAD_SIZE) {\n            response.sendError(400, \"Invalid session data\");\n            return;\n        }\n        \n        try {\n            byte[] sessionBytes = Base64.getDecoder().decode(encodedSession);\n            Object sessionObj = deserializeSession(sessionBytes);\n            \n            if (sessionObj instanceof SessionData) {\n                SessionData session = (SessionData) sessionObj;\n                // Validate session hasn't expired\n                if (System.currentTimeMillis() - session.getTimestamp() > 86400000) {\n                    response.sendError(401, \"Session expired\");\n                    return;\n                }\n                request.getSession().setAttribute(\"user\", session.getUserId());\n                request.getSession().setAttribute(\"roles\", session.getRoles());\n                response.setStatus(200);\n                response.getWriter().write(\"{\\\"status\\\":\\\"restored\\\"}\");\n            } else {\n                response.sendError(400, \"Invalid session object type\");\n            }\n        } catch (ClassNotFoundException e) {\n            response.sendError(500, \"Session class not found\");\n        } catch (IllegalArgumentException e) {\n            response.sendError(400, \"Malformed base64 data\");\n        }\n    }\n    \n    private Object deserializeSession(byte[] data) \n            throws IOException, ClassNotFoundException {\n        ByteArrayInputStream bais = new ByteArrayInputStream(data);\n        ObjectInputStream ois = new ObjectInputStream(bais);\n        // Deserialize the session object - trusts client input\n        Object obj = ois.readObject();\n        ois.close();\n        return obj;\n    }\n    \n    private boolean isLegacyClient(String version) {\n        try {\n            String[] parts = version.split(\"\\\\.\");\n            int major = Integer.parseInt(parts[0]);\n            return major < 3;\n        } catch (Exception e) {\n            return false;\n        }\n    }\n}\n\nclass SessionData implements Serializable {\n    private static final long serialVersionUID = 2L;\n    private String userId;\n    private String[] roles;\n    private long timestamp;\n    \n    public String getUserId() { return userId; }\n    public String[] getRoles() { return roles; }\n    public long getTimestamp() { return timestamp; }\n}\n",
+  "environment": {
+    "description": "Same EC2 instance and application code deployed via legacy migration pipeline. Process is launched inside a pivot_root namespace where the effective root is /opt/chroot/app-cage. The chroot directory tree contains only: JRE runtime jars (rt.jar, etc.), application WAR contents, a minimal /tmp (noexec,nosuid mounted tmpfs, 10MB), and /dev/null + /dev/urandom. No shell binaries exist within the namespace (/bin/sh, /bin/bash, /usr/bin/python, etc. are absent). /proc is mounted read-only with hidepid=2. The process runs under a dedicated UID (65534) with supplementary group membership restricted via setgroups deny in the user namespace. Additionally, a seccomp-bpf profile is attached at process start that allows only: read, write, open, close, stat, fstat, mmap, mprotect, munmap, brk, ioctl, access, pipe, select, sched_yield, dup2, getpid, socket, connect, sendto, recvfrom, bind, listen, accept, clone (CLONE_VM|CLONE_FS only), futex, epoll_create, epoll_ctl, epoll_wait, and exit_group. Notably, execve/execveat are NOT in the allowlist. Network egress from the instance is restricted by a VPC security group that permits only outbound TCP 443 to a prefix list (pl-02cd2c6b) corresponding to S3 gateway endpoints and the DynamoDB gateway endpoint in us-east-1.",
+    "config": {
+      "chroot_root": "/opt/chroot/app-cage",
+      "chroot_contents": [
+        "jre/lib/",
+        "app/WEB-INF/",
+        "tmp/ (noexec,nosuid,10MB tmpfs)",
+        "/dev/null",
+        "/dev/urandom"
+      ],
+      "shell_binaries_present": false,
+      "proc_mount": "ro,hidepid=2",
+      "process_uid": 65534,
+      "user_namespace": "setgroups deny",
+      "seccomp_profile": "allowlist: read,write,open,close,stat,fstat,mmap,mprotect,munmap,brk,ioctl,access,pipe,select,sched_yield,dup2,getpid,socket,connect,sendto,recvfrom,bind,listen,accept,clone(CLONE_VM|CLONE_FS),futex,epoll_create,epoll_ctl,epoll_wait,exit_group",
+      "execve_allowed": false,
+      "network_egress": "TCP 443 to pl-02cd2c6b (S3/DynamoDB VPC endpoints only)",
+      "instance_type": "m5.large",
+      "jdk": "1.8.0_232",
+      "tomcat": "9.0.31",
+      "classpath_includes": [
+        "commons-collections-3.2.1.jar",
+        "spring-core-4.3.25.jar"
+      ]
+    }
+  }
+}

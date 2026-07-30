@@ -1,0 +1,38 @@
+{
+  "id": "3dc3b6bf",
+  "language": "javascript",
+  "code": "const express = require('express');\nconst libxmljs = require('libxmljs2');\nconst app = express();\n\n// Middleware to parse raw XML bodies\napp.use('/api/import', express.text({ type: ['application/xml', 'text/xml'], limit: '5mb' }));\n\n// Health check endpoint\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok', timestamp: new Date().toISOString() });\n});\n\n// XML document import endpoint for partner integrations\n// Accepts XML invoices/purchase orders from B2B partners\napp.post('/api/import', (req, res) => {\n  const contentType = req.headers['content-type'] || '';\n  if (!contentType.includes('xml')) {\n    return res.status(415).json({ error: 'Content-Type must be application/xml or text/xml' });\n  }\n\n  const xmlBody = req.body;\n  if (!xmlBody || typeof xmlBody !== 'string') {\n    return res.status(400).json({ error: 'Empty or invalid XML body' });\n  }\n\n  // Basic size check\n  if (xmlBody.length > 5 * 1024 * 1024) {\n    return res.status(413).json({ error: 'Payload too large' });\n  }\n\n  try {\n    // Parse XML with default options - processes external entities\n    const doc = libxmljs2.parseXml(xmlBody, {\n      noent: true,\n      dtdload: true,\n      dtdvalid: false,\n      nocdata: false\n    });\n\n    // Extract invoice data from parsed XML\n    const root = doc.root();\n    if (!root) {\n      return res.status(400).json({ error: 'No root element found' });\n    }\n\n    const invoiceId = root.get('//InvoiceId');\n    const vendorName = root.get('//VendorName');\n    const amount = root.get('//Amount');\n    const description = root.get('//Description');\n\n    const result = {\n      invoiceId: invoiceId ? invoiceId.text() : null,\n      vendorName: vendorName ? vendorName.text() : null,\n      amount: amount ? parseFloat(amount.text()) : null,\n      description: description ? description.text() : null,\n      importedAt: new Date().toISOString()\n    };\n\n    // Log for audit trail\n    console.log(`[IMPORT] Invoice ${result.invoiceId} from ${result.vendorName} - $${result.amount}`);\n\n    res.json({ success: true, data: result });\n  } catch (err) {\n    console.error('[IMPORT ERROR]', err.message);\n    res.status(400).json({ error: 'XML parsing failed', details: err.message });\n  }\n});\n\n// Webhook callback endpoint (JSON)\napp.post('/api/webhook', express.json(), (req, res) => {\n  const { event, payload } = req.body;\n  console.log(`[WEBHOOK] Event: ${event}`);\n  res.json({ received: true });\n});\n\nconst PORT = process.env.PORT || 3000;\napp.listen(PORT, () => {\n  console.log(`B2B Import Service running on port ${PORT}`);\n});",
+  "environment": {
+    "description": "Same Node.js 18 Express application deployed on EC2 behind an Application Load Balancer (ALB) in the same VPC. The ALB has an associated AWS WAFv2 Web ACL (arn:aws:wafv2:us-east-1:123456789012:regional/webacl/b2b-import-acl/a1b2c3d4) with the following rule groups evaluated in priority order: Priority 1 - AWS managed rule group 'AWSManagedRulesKnownBadInputsRuleSet' with all rules in default action (BLOCK), which includes the 'ExploitablePaths_URIPATH' and 'Host_localhost_HEADER' rules; Priority 2 - Custom rule 'size-constraint-body' limiting body to 8KB with BLOCK action; Priority 3 - AWS managed rule group 'AWSManagedRulesCommonRuleSet' with SizeRestrictions_BODY overridden to COUNT. The Web ACL default action is ALLOW. CloudWatch metrics confirm the WAF is receiving and evaluating traffic. Note: The AWSManagedRulesKnownBadInputsRuleSet includes rule 'Log4JRCE' and general bad input patterns but its XXE coverage relies on detecting DOCTYPE declarations with ENTITY/SYSTEM keywords in request bodies via the 'JavaDeserializationRCE_BODY' and related inspection rules that scan for serialization attack patterns.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 Web ACL attached",
+      "waf_acl": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/b2b-import-acl/a1b2c3d4",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "action": "BLOCK (default for all rules)",
+          "vendor": "AWS"
+        },
+        {
+          "priority": 2,
+          "name": "size-constraint-body",
+          "type": "custom",
+          "action": "BLOCK",
+          "condition": "body size > 8192 bytes"
+        },
+        {
+          "priority": 3,
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "action": "BLOCK (SizeRestrictions_BODY overridden to COUNT)",
+          "vendor": "AWS"
+        }
+      ],
+      "waf_default_action": "ALLOW",
+      "compute": "EC2 t3.medium, Amazon Linux 2023",
+      "imds": "IMDSv2 required (hop limit 1)",
+      "node_version": "18.19.0",
+      "libxmljs2_version": "0.33.0"
+    }
+  }
+}

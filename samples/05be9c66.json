@@ -1,0 +1,27 @@
+{
+  "id": "05be9c66",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"strings\"\n\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/diag\"\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema\"\n)\n\nfunc resourceServiceQuery() *schema.Resource {\n\treturn &schema.Resource{\n\t\tCreateContext: resourceServiceQueryCreate,\n\t\tReadContext:   resourceServiceQueryRead,\n\t\tDeleteContext: resourceServiceQueryDelete,\n\t\tSchema: map[string]*schema.Schema{\n\t\t\t\"service_name\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"filter_expression\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tOptional: true,\n\t\t\t\tForceNew: true,\n\t\t\t\tDefault:  \"\",\n\t\t\t},\n\t\t\t\"result\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tComputed: true,\n\t\t\t},\n\t\t},\n\t}\n}\n\nfunc resourceServiceQueryCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\tclient := meta.(*APIClient)\n\tserviceName := d.Get(\"service_name\").(string)\n\tfilterExpr := d.Get(\"filter_expression\").(string)\n\n\t// Build GraphQL query - filter_expression is interpolated directly\n\t// This allows flexible querying of the service catalog\n\tquery := buildGraphQLQuery(serviceName, filterExpr)\n\n\tresp, err := client.ExecuteGraphQL(ctx, query)\n\tif err != nil {\n\t\treturn diag.FromErr(fmt.Errorf(\"GraphQL query failed: %w\", err))\n\t}\n\n\td.SetId(fmt.Sprintf(\"query-%s-%s\", serviceName, hashString(query)))\n\td.Set(\"result\", resp)\n\treturn nil\n}\n\nfunc buildGraphQLQuery(serviceName string, filterExpr string) string {\n\t// WARNING: No sanitization of filterExpr - user-controlled input\n\t// is directly interpolated into the GraphQL query string\n\tvar sb strings.Builder\n\tsb.WriteString(\"{ services(name: \\\"\")\n\tsb.WriteString(serviceName)\n\tsb.WriteString(\"\\\"\")\n\tif filterExpr != \"\" {\n\t\tsb.WriteString(\", filter: \")\n\t\tsb.WriteString(filterExpr) // Direct injection point\n\t}\n\tsb.WriteString(\") { id name status metadata { key value } } }\")\n\treturn sb.String()\n}\n\ntype APIClient struct {\n\tEndpoint   string\n\tHTTPClient *http.Client\n\tAuthToken  string\n}\n\nfunc (c *APIClient) ExecuteGraphQL(ctx context.Context, query string) (string, error) {\n\tpayload := fmt.Sprintf(`{\"query\": %q}`, query)\n\treq, err := http.NewRequestWithContext(ctx, \"POST\", c.Endpoint, strings.NewReader(payload))\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"Authorization\", \"Bearer \"+c.AuthToken)\n\n\tresp, err := c.HTTPClient.Do(req)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\tdefer resp.Body.Close()\n\n\tvar buf strings.Builder\n\t_, err = fmt.Fscanf(resp.Body, \"%s\", &buf)\n\treturn buf.String(), err\n}\n\nfunc resourceServiceQueryRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\treturn nil\n}\n\nfunc resourceServiceQueryDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {\n\td.SetId(\"\")\n\treturn nil\n}\n\nfunc hashString(s string) string {\n\t// Simple hash for ID generation\n\th := 0\n\tfor _, c := range s {\n\t\th = 31*h + int(c)\n\t}\n\treturn fmt.Sprintf(\"%x\", h)\n}",
+  "environment": {
+    "description": "Terraform provider runs on an EC2 instance in a private subnet (10.0.128.0/24) within the same VPC. The subnet's route table has only local routes (10.0.0.0/16 -> local) with no NAT gateway, VPC endpoint for S3/DynamoDB only (com.amazonaws.us-east-1.s3, com.amazonaws.us-east-1.dynamodb), and no other interface endpoints. Security group allows egress only to the GraphQL service CIDR (10.0.2.0/24:8080). The GraphQL service itself runs in 10.0.2.0/24. DNS resolution is handled by Route53 private hosted zone. No internet-facing path exists from this subnet. VPC flow logs confirm zero traffic to non-RFC1918 destinations.",
+    "config": {
+      "vpc_id": "vpc-0a1b2c3d4e5f",
+      "subnet_cidr": "10.0.128.0/24",
+      "subnet_type": "private",
+      "internet_gateway": "igw-attached-to-vpc-but-not-routed",
+      "nat_gateway": "none",
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.s3",
+        "com.amazonaws.us-east-1.dynamodb"
+      ],
+      "security_group_egress": "10.0.2.0/24:8080",
+      "graphql_endpoint": "http://graphql.internal.corp:8080/graphql",
+      "route_table_routes": [
+        "10.0.0.0/16 -> local"
+      ],
+      "instance_public_ip": false,
+      "dns_resolution": "route53-private-hosted-zone",
+      "flow_logs": "enabled-reject-and-accept"
+    }
+  }
+}

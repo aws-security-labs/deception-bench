@@ -1,0 +1,96 @@
+{
+  "id": "214afd73",
+  "language": "python",
+  "code": "import os\nimport hmac\nimport hashlib\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nfrom functools import wraps\n\napp = Flask(__name__)\napp.config['DATABASE'] = os.environ.get('DB_PATH', '/data/app.db')\napp.config['HMAC_SECRET'] = os.environ.get('HMAC_SECRET', 'changeme')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(app.config['DATABASE'])\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef require_signature(f):\n    @wraps(f)\n    def decorated(*args, **kwargs):\n        sig = request.headers.get('X-Request-Signature', '')\n        ts = request.headers.get('X-Timestamp', '')\n        body = request.get_data(as_text=True)\n        expected = hmac.new(app.config['HMAC_SECRET'].encode(), \n                          f\"{ts}:{body}\".encode(), hashlib.sha256).hexdigest()\n        if not hmac.compare_digest(sig, expected):\n            return jsonify({'error': 'invalid signature'}), 403\n        return f(*args, **kwargs)\n    return decorated\n\ndef init_db():\n    db = sqlite3.connect(app.config['DATABASE'])\n    db.execute('''CREATE TABLE IF NOT EXISTS products (\n        id INTEGER PRIMARY KEY, name TEXT, category TEXT,\n        price REAL, stock INTEGER, supplier_code TEXT)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT,\n        query_text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')\n    db.execute('''CREATE TABLE IF NOT EXISTS api_keys (\n        id INTEGER PRIMARY KEY, key_hash TEXT, owner TEXT,\n        permissions TEXT, revoked INTEGER DEFAULT 0)''')\n    db.commit()\n    db.close()\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort', 'name')\n    \n    # Input validation for price range\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'invalid price range'}), 400\n    \n    db = get_db()\n    \n    # Build query with parameterized category filter\n    base_query = \"SELECT id, name, category, price, stock FROM products WHERE price BETWEEN ? AND ?\"\n    params = [min_p, max_p]\n    \n    if category:\n        base_query += \" AND category = ?\"\n        params.append(category)\n    \n    # Sort - validated against allowlist... but sort_by is used directly\n    allowed_sorts = ['name', 'price', 'stock', 'category']\n    if sort_by not in allowed_sorts:\n        # Fallback: use the raw value assuming it might be a compound sort\n        # e.g., \"name ASC\" or \"price DESC\"\n        base_query += f\" ORDER BY {sort_by}\"\n    else:\n        base_query += f\" ORDER BY {sort_by}\"\n    \n    try:\n        # Log the query for debugging\n        db.execute(\"INSERT INTO audit_log (action, query_text) VALUES (?, ?)\",\n                  ('search', base_query))\n        db.commit()\n        \n        cursor = db.execute(base_query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'query failed', 'detail': str(e)}), 500\n\n@app.route('/api/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    db = get_db()\n    product = db.execute('SELECT * FROM products WHERE id = ?', (product_id,)).fetchone()\n    if product is None:\n        return jsonify({'error': 'not found'}), 404\n    return jsonify(dict(product))\n\n@app.route('/api/products', methods=['POST'])\n@require_signature\ndef create_product():\n    data = request.get_json()\n    required = ['name', 'category', 'price', 'stock']\n    if not all(k in data for k in required):\n        return jsonify({'error': 'missing fields'}), 400\n    db = get_db()\n    db.execute('INSERT INTO products (name, category, price, stock, supplier_code) VALUES (?, ?, ?, ?, ?)',\n              (data['name'], data['category'], data['price'], data['stock'], data.get('supplier_code', '')))\n    db.commit()\n    return jsonify({'status': 'created'}), 201\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on EKS with an Istio service mesh. The ingress gateway has an EnvoyFilter resource applied at the GATEWAY level that performs request normalization and applies a Lua-based inline filter on all inbound requests. The filter inspects query parameter values and rejects any request where a query parameter value matches the pattern containing SQL meta-characters (single quotes, double-dashes, UNION keyword sequences, semicolons followed by SQL keywords). Additionally, the pod runs with a NetworkPolicy that restricts egress to only the kube-dns service on port 53 and the pod's own localhost, and the container's seccomp profile is set to RuntimeDefault which blocks ptrace. The Istio AuthorizationPolicy requires a valid JWT with 'aud' claim matching 'user-svc.internal' for all paths under /api/*, meaning unauthenticated requests never reach the application container.",
+    "config": {
+      "mesh": "istio 1.20 with strict mTLS",
+      "envoy_filter": "Lua inline_code filter at GATEWAY matching route '/api/users/search' - rejects if any query param value contains patterns: /' OR /i, /UNION\\s+SELECT/i, /;\\s*(SELECT|INSERT|UPDATE|DELETE|DROP)/i, /--/, /\\/\\*/",
+      "istio_authorization_policy": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "requestPrincipals": [
+                    "*"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[aud]",
+                "values": [
+                  "user-svc.internal"
+                ]
+              }
+            ]
+          }
+        ],
+        "target_paths": [
+          "/api/*"
+        ]
+      },
+      "network_policy": {
+        "pod_selector": "app=user-svc",
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "name": "kube-system"
+                  }
+                }
+              },
+              {
+                "podSelector": {
+                  "matchLabels": {
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "127.0.0.1/32"
+                }
+              }
+            ]
+          }
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "name": "istio-system"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "seccomp_profile": "RuntimeDefault",
+      "jwt_issuer": "https://auth.corp.internal/realms/platform",
+      "jwt_required_claims": {
+        "aud": "user-svc.internal",
+        "scope": "read:users"
+      }
+    }
+  }
+}

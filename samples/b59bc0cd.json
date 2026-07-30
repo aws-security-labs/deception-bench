@@ -1,0 +1,25 @@
+{
+  "id": "b59bc0cd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype SearchResult struct {\n\tID       int    `json:\"id\"`\n\tName     string `json:\"name\"`\n\tEmail    string `json:\"email\"`\n\tRole     string `json:\"role\"`\n\tDeptCode string `json:\"dept_code\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchHandler allows searching employees by department and name\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != http.MethodGet {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\tdept := r.URL.Query().Get(\"dept\")\n\tname := r.URL.Query().Get(\"name\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\tif dept == \"\" {\n\t\thttp.Error(w, \"dept parameter required\", 400)\n\t\treturn\n\t}\n\n\t// Build query with parameterized dept but dynamic sort\n\tbaseQuery := \"SELECT id, name, email, role, dept_code FROM employees WHERE dept_code = $1\"\n\n\tif name != \"\" {\n\t\t// Developer note: name is also parameterized, safe\n\t\tbaseQuery += \" AND name ILIKE $2\"\n\t}\n\n\t// Sort column - validated against allowlist... or so we think\n\tif sortCol != \"\" {\n\t\t// BUG: validation is case-sensitive but PostgreSQL identifiers are case-insensitive\n\t\tallowedSorts := map[string]bool{\"name\": true, \"email\": true, \"role\": true, \"id\": true}\n\t\tif allowedSorts[sortCol] {\n\t\t\tbaseQuery += \" ORDER BY \" + sortCol\n\t\t} else {\n\t\t\t// Fallback: still appends user input for \"advanced\" sort expressions\n\t\t\t// This was meant to support \"name DESC\" but is actually injectable\n\t\t\tif len(sortCol) <= 64 && !strings.Contains(sortCol, \";\") {\n\t\t\t\tbaseQuery += \" ORDER BY \" + sortCol\n\t\t\t}\n\t\t}\n\t}\n\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif name != \"\" {\n\t\trows, err = db.Query(baseQuery, dept, \"%\"+name+\"%\")\n\t} else {\n\t\trows, err = db.Query(baseQuery, dept)\n\t}\n\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", 500)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []SearchResult\n\tfor rows.Next() {\n\t\tvar sr SearchResult\n\t\tif err := rows.Scan(&sr.ID, &sr.Name, &sr.Email, &sr.Role, &sr.DeptCode); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, sr)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(results)\n}\n\n// healthHandler for LB health checks\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", 503)\n\t\treturn\n\t}\n\tfmt.Fprint(w, \"ok\")\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/employees/search\", searchHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Println(\"Starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Rails application deployed on ECS Fargate tasks in private subnets (no IGW, no NAT for inbound). Service is fronted by a Network Load Balancer (NLB) registered as an AWS PrivateLink endpoint service (com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890). The NLB has no public IP and resides in private subnets only. Consumers must create an interface VPC endpoint in their own VPC to reach the service. The endpoint service has 'Acceptance Required' enabled, meaning the service owner must manually approve each VPC endpoint connection request. Additionally, the endpoint service has an allowed-principals list restricted to specific AWS account IDs (arn:aws:iam::111222333444:root, arn:aws:iam::555666777888:root). The ECS tasks' security group only allows inbound traffic from the NLB's ENIs within the same VPC CIDR (10.0.0.0/16). There is no internet gateway, no NAT gateway for inbound, and no public route table entry in the VPC hosting the service.",
+    "config": {
+      "deployment": "AWS ECS Fargate in private subnets",
+      "nlb_scheme": "internal",
+      "privatelink_service": "com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890",
+      "acceptance_required": true,
+      "allowed_principals": [
+        "arn:aws:iam::111222333444:root",
+        "arn:aws:iam::555666777888:root"
+      ],
+      "vpc_cidr": "10.0.0.0/16",
+      "internet_gateway": "none",
+      "nat_gateway": "egress-only, no inbound path",
+      "security_group_inbound": "10.0.0.0/16:443 (NLB ENIs only)",
+      "public_route": "none",
+      "ruby_version": "3.1.4",
+      "rails_version": "7.0.8"
+    }
+  }
+}

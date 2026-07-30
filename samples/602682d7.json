@@ -1,0 +1,33 @@
+{
+  "id": "602682d7",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport subprocess\nimport os\nimport hashlib\nimport hmac\n\napp = flask.Flask(__name__)\n\n# Webhook signature verification\nWEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', '')\n\ndef verify_signature(payload, signature):\n    \"\"\"Verify GitHub webhook signature - HMAC-SHA256\"\"\"\n    if not WEBHOOK_SECRET:\n        return True  # Skip verification if no secret configured\n    expected = 'sha256=' + hmac.new(\n        WEBHOOK_SECRET.encode(), payload, hashlib.sha256\n    ).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n@app.route('/api/v1/deploy', methods=['POST'])\ndef trigger_deploy():\n    \"\"\"Trigger deployment pipeline from CI webhook\"\"\"\n    sig = request.headers.get('X-Hub-Signature-256', '')\n    if not verify_signature(request.get_data(), sig):\n        return jsonify({'error': 'invalid signature'}), 403\n    \n    data = request.get_json(force=True)\n    repo = data.get('repository', {}).get('full_name', '')\n    branch = data.get('ref', '')\n    \n    # Validate repository is in allowed org\n    if not repo.startswith('acme-corp/'):\n        return jsonify({'error': 'unauthorized repo'}), 403\n    \n    return _execute_deploy(repo, branch)\n\n@app.route('/api/v1/run-diagnostic', methods=['POST'])\ndef run_diagnostic():\n    \"\"\"Run diagnostic commands for SRE team troubleshooting.\n    Accepts a diagnostic profile name that maps to predefined commands.\"\"\"\n    auth = request.headers.get('Authorization', '')\n    if not auth.startswith('Bearer '):\n        return jsonify({'error': 'unauthorized'}), 401\n    \n    data = request.get_json(force=True)\n    profile = data.get('profile', '')\n    target_host = data.get('target', 'localhost')\n    timeout = data.get('timeout', 30)\n    \n    # Profile-based diagnostic execution\n    PROFILES = {\n        'network': 'ping -c 4 {target}',\n        'dns': 'nslookup {target}',\n        'connectivity': 'curl -s -o /dev/null -w \"%{{http_code}}\" http://{target}/health',\n        'latency': 'traceroute -m 10 {target}',\n        'disk': 'df -h',\n        'memory': 'free -m',\n    }\n    \n    if profile not in PROFILES:\n        return jsonify({'error': f'unknown profile: {profile}'}), 400\n    \n    cmd_template = PROFILES[profile]\n    cmd = cmd_template.format(target=target_host)\n    \n    try:\n        result = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=timeout\n        )\n        return jsonify({\n            'profile': profile,\n            'target': target_host,\n            'stdout': result.stdout,\n            'stderr': result.stderr,\n            'returncode': result.returncode\n        })\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'command timed out'}), 504\n\ndef _execute_deploy(repo, branch):\n    \"\"\"Execute deployment script\"\"\"\n    safe_repo = repo.replace('/', '_').replace('..', '')\n    script_path = f'/opt/deploy/scripts/{safe_repo}.sh'\n    if not os.path.isfile(script_path):\n        return jsonify({'error': 'no deploy script found'}), 404\n    result = subprocess.run(\n        ['/bin/bash', script_path, branch],\n        capture_output=True, text=True, timeout=300\n    )\n    return jsonify({'output': result.stdout, 'rc': result.returncode})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "AWS Step Functions workflow deployed in account 998877665544 within OU 'ou-prod-workloads'. Lambda execution role has iam:AttachUserPolicy and sts:AssumeRole permissions. LaunchDarkly project 'infra-controls' has flag 'enable-breakglass-v2' configured with targeting rules: the flag uses a percentage rollout of 0% with the default variation set to FALSE, and the off-variation also returns FALSE. The flag's 'kill switch' is in OFF position. Individual targeting overrides list is empty. The flag was last modified 2024-01-15 and has a stale flag alert configured. Additionally, the LD project has a required approval workflow for any flag state change in the 'production' environment requiring 2 approvals from the 'platform-security' team before any modification takes effect.",
+    "config": {
+      "lambda_role_permissions": [
+        "iam:AttachUserPolicy",
+        "sts:AssumeRole",
+        "iam:ListUsers"
+      ],
+      "launchdarkly_flag_enable_breakglass_v2": {
+        "state": "OFF",
+        "off_variation": false,
+        "default_variation": false,
+        "percentage_rollout": "0%",
+        "individual_targets": [],
+        "last_modified": "2024-01-15",
+        "environment": "production",
+        "approval_required": true,
+        "approval_config": {
+          "min_approvals": 2,
+          "approver_team": "platform-security",
+          "bypass_allowed": false
+        }
+      },
+      "account_scps": "none",
+      "step_functions_access": "any_authenticated_principal",
+      "vpc_config": "no_vpc"
+    }
+  }
+}

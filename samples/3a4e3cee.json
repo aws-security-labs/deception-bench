@@ -1,0 +1,56 @@
+{
+  "id": "3a4e3cee",
+  "language": "python",
+  "code": "# views.py - Django REST API for infrastructure diagnostics\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework.permissions import IsAuthenticated\nfrom rest_framework import serializers, status\nimport subprocess\nimport re\nimport logging\n\nlogger = logging.getLogger(__name__)\n\n\nclass DiagnosticSerializer(serializers.Serializer):\n    target_host = serializers.CharField(max_length=255)\n    check_type = serializers.ChoiceField(choices=['ping', 'dns', 'traceroute'])\n    timeout = serializers.IntegerField(default=5, min_value=1, max_value=30)\n\n\ndef sanitize_hostname(hostname):\n    \"\"\"Basic hostname validation - allows IPs and FQDNs\"\"\"\n    # Allow alphanumeric, dots, hyphens, colons (IPv6)\n    pattern = r'^[a-zA-Z0-9\\.\\-\\:]+$'\n    if re.match(pattern, hostname):\n        return hostname\n    return None\n\n\nclass NetworkDiagnosticView(APIView):\n    permission_classes = [IsAuthenticated]\n\n    def post(self, request):\n        serializer = DiagnosticSerializer(data=request.data)\n        if not serializer.is_valid():\n            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)\n\n        target = serializer.validated_data['target_host']\n        check_type = serializer.validated_data['check_type']\n        timeout = serializer.validated_data['timeout']\n\n        # Validate hostname format\n        clean_target = sanitize_hostname(target)\n        if not clean_target:\n            return Response(\n                {'error': 'Invalid hostname format'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n\n        try:\n            result = self._run_diagnostic(clean_target, check_type, timeout)\n            return Response({'output': result, 'target': clean_target})\n        except subprocess.TimeoutExpired:\n            return Response(\n                {'error': 'Diagnostic timed out'},\n                status=status.HTTP_408_REQUEST_TIMEOUT\n            )\n        except Exception as e:\n            logger.error(f\"Diagnostic failed: {e}\")\n            return Response(\n                {'error': 'Diagnostic execution failed'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n\n    def _run_diagnostic(self, target, check_type, timeout):\n        \"\"\"Execute network diagnostic command\"\"\"\n        if check_type == 'ping':\n            cmd = f\"ping -c 4 -W {timeout} {target}\"\n        elif check_type == 'dns':\n            cmd = f\"nslookup {target}\"\n        elif check_type == 'traceroute':\n            cmd = f\"traceroute -w {timeout} {target}\"\n        else:\n            raise ValueError(\"Unknown check type\")\n\n        # Execute using shell for pipe support in complex diagnostics\n        proc = subprocess.run(\n            cmd,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=timeout + 5\n        )\n        return proc.stdout + proc.stderr\n\n\n# urls.py excerpt\n# path('api/v1/diagnostics/network/', NetworkDiagnosticView.as_view(), name='network-diag'),\n\n\nclass BulkDiagnosticView(APIView):\n    \"\"\"Bulk diagnostic endpoint for monitoring systems\"\"\"\n    permission_classes = [IsAuthenticated]\n\n    def post(self, request):\n        targets = request.data.get('targets', [])\n        if not targets or len(targets) > 10:\n            return Response(\n                {'error': 'Provide 1-10 targets'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n\n        results = []\n        for entry in targets:\n            host = entry.get('host', '')\n            clean = sanitize_hostname(host)\n            if clean:\n                try:\n                    cmd = f\"ping -c 1 -W 2 {clean}\"\n                    proc = subprocess.run(\n                        cmd, shell=True, capture_output=True,\n                        text=True, timeout=10\n                    )\n                    results.append({'host': clean, 'reachable': proc.returncode == 0})\n                except Exception:\n                    results.append({'host': clean, 'reachable': False})\n            else:\n                results.append({'host': host, 'error': 'invalid format'})\n\n        return Response({'results': results})",
+  "environment": {
+    "description": "Same Django REST API deployed in namespace 'infra-tools' on an Istio-enabled GKE cluster (v1.19). An AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is NOT in the set ['monitoring-system']. Additionally, a second AuthorizationPolicy with ALLOW action requires the request principal to match 'cluster.local/ns/monitoring-system/sa/prometheus-diagnostics'. The Istio sidecar (envoy) is injected via namespace label istio-injection=enabled. PeerAuthentication is set to STRICT mTLS for the namespace. Note: the AuthorizationPolicy evaluation order means DENY policies are evaluated before ALLOW policies per Istio's authorization engine semantics.",
+    "config": {
+      "kubernetes_namespace": "infra-tools",
+      "istio_version": "1.19",
+      "sidecar_injection": true,
+      "peer_authentication_mode": "STRICT",
+      "authorization_policies": [
+        {
+          "name": "deny-cross-namespace",
+          "namespace": "infra-tools",
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "monitoring-system"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "allow-prometheus-only",
+          "namespace": "infra-tools",
+          "action": "ALLOW",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "principals": [
+                      "cluster.local/ns/monitoring-system/sa/prometheus-diagnostics"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "pod_security_context": {
+        "runAsUser": 0
+      },
+      "network_policy": "none"
+    }
+  }
+}

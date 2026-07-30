@@ -1,0 +1,48 @@
+{
+  "id": "e2ebe097",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('HMAC_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        actor TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department. Requires valid session.\"\"\"\n    department = request.args.get('department', '')\n    sort_field = request.args.get('sort', 'username')\n    include_email = request.args.get('include_email', 'false')\n    \n    # Validate sort field against allowlist\n    allowed_sorts = ['username', 'department', 'role', 'id']\n    if sort_field not in allowed_sorts:\n        sort_field = 'username'\n    \n    # Build query - department filter uses parameterized query\n    # but we add an optional raw filter for advanced search\n    raw_filter = request.args.get('filter', '')\n    \n    base_query = \"SELECT id, username, department, role FROM users WHERE department = ?\"\n    params = [department]\n    \n    if raw_filter:\n        # Advanced filter: allows expressions like \"role='admin'\" \n        # Intended for internal tooling use only\n        base_query += \" AND \" + raw_filter\n    \n    base_query += f\" ORDER BY {sort_field}\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        if include_email.lower() == 'true':\n            for r in results:\n                email_row = db.execute(\n                    \"SELECT email FROM users WHERE id = ?\", (r['id'],)\n                ).fetchone()\n                if email_row:\n                    r['email'] = email_row['email']\n        \n        # Log the search action\n        actor = request.headers.get('X-Authenticated-User', 'anonymous')\n        db.execute(\n            \"INSERT INTO audit_log (action, actor) VALUES (?, ?)\",\n            (f\"search:{department}\", actor)\n        )\n        db.commit()\n        \n        return jsonify({'results': results, 'count': len(results)})\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 400\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user by ID.\"\"\"\n    db = get_db()\n    user = db.execute(\n        \"SELECT id, username, department, role FROM users WHERE id = ?\",\n        (user_id,)\n    ).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAF WebACL with three rule groups evaluated in priority order: (1) Priority 100 - AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action override set to COUNT (not BLOCK) to allow long department names; (2) Priority 200 - AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default BLOCK action, inspecting QueryString, Body, and SingleHeader 'cookie' field match scope; (3) Priority 300 - custom rate-based rule limiting to 100 requests per 5 minutes per source IP. The WebACL default action is ALLOW. Additionally, the ECS task role has an IAM permission boundary that prevents any network egress except to the VPC endpoint for CloudWatch Logs, and the Fargate platform version is 1.4.0 with the task running in awsvpc mode within a private subnet with no internet gateway route. The SQLite database is mounted from an EFS volume with encryption at rest enabled.",
+    "config": {
+      "infrastructure": "AWS ALB -> ECS Fargate (awsvpc, private subnet)",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 100,
+            "name": "CommonRuleSet",
+            "managed_rule_group": "AWSManagedRulesCommonRuleSet",
+            "overrides": [
+              {
+                "rule": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 200,
+            "name": "SQLiRuleSet",
+            "managed_rule_group": "AWSManagedRulesSQLiRuleSet",
+            "action": "BLOCK",
+            "scope": [
+              "QueryString",
+              "Body",
+              "SingleHeader:cookie"
+            ]
+          },
+          {
+            "priority": 300,
+            "name": "RateLimit",
+            "type": "rate-based",
+            "limit": 100,
+            "window": 300
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": "private subnet, no IGW, NAT only to VPC endpoints",
+      "task_role_permission_boundary": "deny all except logs:PutLogEvents to VPC endpoint",
+      "efs_encryption": "AES-256 at rest"
+    }
+  }
+}

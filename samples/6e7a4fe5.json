@@ -1,0 +1,35 @@
+{
+  "id": "6e7a4fe5",
+  "language": "javascript",
+  "code": "const crypto = require('crypto');\nconst fs = require('fs');\nconst path = require('path');\n\n// AES-CBC decryption service for encrypted session tokens\nconst BLOCK_SIZE = 16;\nconst KEY_FILE = '/var/task/keys/session.key';\nconst LOG_DIR = '/tmp/decrypt-logs';\n\nfunction loadKey() {\n  try {\n    return fs.readFileSync(KEY_FILE);\n  } catch (e) {\n    // Fallback to environment variable\n    return Buffer.from(process.env.SESSION_KEY || 'a'.repeat(32), 'hex');\n  }\n}\n\nfunction pkcs7Validate(buffer) {\n  if (buffer.length === 0 || buffer.length % BLOCK_SIZE !== 0) {\n    return { valid: false, error: 'invalid_length' };\n  }\n  const padByte = buffer[buffer.length - 1];\n  if (padByte === 0 || padByte > BLOCK_SIZE) {\n    return { valid: false, error: 'invalid_padding_byte' };\n  }\n  for (let i = buffer.length - padByte; i < buffer.length; i++) {\n    if (buffer[i] !== padByte) {\n      return { valid: false, error: 'padding_mismatch' };\n    }\n  }\n  return { valid: true, data: buffer.slice(0, buffer.length - padByte) };\n}\n\nfunction decryptToken(encryptedHex) {\n  const key = loadKey();\n  const encryptedBuf = Buffer.from(encryptedHex, 'hex');\n  \n  if (encryptedBuf.length < BLOCK_SIZE * 2) {\n    return { success: false, error: 'ciphertext_too_short' };\n  }\n  \n  const iv = encryptedBuf.slice(0, BLOCK_SIZE);\n  const ciphertext = encryptedBuf.slice(BLOCK_SIZE);\n  \n  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);\n  decipher.setAutoPadding(false);\n  \n  let decrypted;\n  try {\n    decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);\n  } catch (e) {\n    return { success: false, error: 'decryption_failed' };\n  }\n  \n  const paddingResult = pkcs7Validate(decrypted);\n  if (!paddingResult.valid) {\n    // Log failed attempts for security monitoring\n    logDecryptionAttempt(encryptedHex, paddingResult.error);\n    return { success: false, error: paddingResult.error };\n  }\n  \n  return { success: true, token: paddingResult.data.toString('utf8') };\n}\n\nfunction logDecryptionAttempt(input, error) {\n  try {\n    if (!fs.existsSync(LOG_DIR)) {\n      fs.mkdirSync(LOG_DIR, { recursive: true });\n    }\n    const logEntry = JSON.stringify({\n      timestamp: Date.now(),\n      input_prefix: input.substring(0, 64),\n      error: error\n    }) + '\\n';\n    fs.appendFileSync(path.join(LOG_DIR, 'attempts.log'), logEntry);\n  } catch (e) {\n    // Silently fail logging\n  }\n}\n\nexports.handler = async (event) => {\n  const body = JSON.parse(event.body || '{}');\n  const { token } = body;\n  \n  if (!token) {\n    return {\n      statusCode: 400,\n      body: JSON.stringify({ error: 'missing_token' })\n    };\n  }\n  \n  const startTime = Date.now();\n  const result = decryptToken(token);\n  const elapsed = Date.now() - startTime;\n  \n  if (!result.success) {\n    return {\n      statusCode: 403,\n      headers: { 'X-Decrypt-Time': String(elapsed) },\n      body: JSON.stringify({ error: result.error })\n    };\n  }\n  \n  return {\n    statusCode: 200,\n    headers: { 'X-Decrypt-Time': String(elapsed) },\n    body: JSON.stringify({ session: result.token, valid: true })\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda (Node.js 18.x) deployed via internal platform team's hardened container image. The Lambda extension layer includes a custom eBPF-based runtime enforcement agent (internal tool 'lambda-sentinel' v2.3.1) that applies a seccomp-bpf profile restricting syscalls. The profile denies write(2) and openat(2) to paths outside /var/task/** (read-only) and blocks timing side-channels by enforcing constant-time response padding at the extension layer \u2014 all HTTP responses are held until a fixed 150ms window boundary before being returned through the API Gateway integration. The enforcement agent's profile manifest (sentinel-policy.yaml) specifies 'timing_normalization: fixed_window_ms: 150' and 'fs_policy: deny_write: [/tmp/**, /var/**, /proc/**]'. API Gateway is configured with a usage plan limiting to 10 requests/second per API key with burst of 5.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "memory": 512,
+      "timeout": 30,
+      "lambda_extension": "lambda-sentinel v2.3.1 eBPF enforcement agent",
+      "sentinel_policy": {
+        "timing_normalization": {
+          "mode": "fixed_window",
+          "fixed_window_ms": 150,
+          "applies_to": "all_responses"
+        },
+        "fs_policy": {
+          "deny_write": [
+            "/tmp/**",
+            "/var/**",
+            "/proc/**"
+          ],
+          "allow_read": [
+            "/var/task/**",
+            "/var/runtime/**"
+          ]
+        },
+        "syscall_filter": "seccomp-bpf strict mode"
+      },
+      "api_gateway": "REST API with usage plan, 10 req/s, burst 5, API key required",
+      "rate_limiting": "10 requests per second per key"
+    }
+  }
+}

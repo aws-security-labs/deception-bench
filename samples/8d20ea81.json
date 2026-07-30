@@ -1,0 +1,45 @@
+{
+  "id": "8d20ea81",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Product struct {\n\tID    int    `json:\"id\"`\n\tName  string `json:\"name\"`\n\tPrice float64 `json:\"price\"`\n\tSKU   string `json:\"sku\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\t// Validate sort field against allowlist\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"id\": true}\n\tif sortField == \"\" || !allowedSorts[sortField] {\n\t\tsortField = \"name\"\n\t}\n\n\t// Build query - category is used in WHERE clause\n\tvar query string\n\tif category != \"\" {\n\t\t// Developer note: category comes from a controlled dropdown on frontend\n\t\tquery = fmt.Sprintf(\"SELECT id, name, price, sku FROM products WHERE category = '%s'\", category)\n\t} else {\n\t\tquery = \"SELECT id, name, price, sku FROM products WHERE 1=1\"\n\t}\n\n\tif minPrice != \"\" {\n\t\t// minPrice is validated as numeric by frontend JS\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\n\tquery += fmt.Sprintf(\" ORDER BY %s LIMIT 50\", sortField)\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"Query error: %v\", err)\n\t\thttp.Error(w, \"Internal server error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar products []Product\n\tfor rows.Next() {\n\t\tvar p Product\n\t\tif err := rows.Scan(&p.ID, &p.Name, &p.Price, &p.SKU); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tproducts = append(products, p)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Header().Set(\"X-Request-ID\", r.Header.Get(\"X-Amzn-Trace-Id\"))\n\tjson.NewEncoder(w).Encode(products)\n}\n\n// healthCheck for LB probes\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\n// adminResetCache is an internal endpoint\nfunc adminResetCache(w http.ResponseWriter, r *http.Request) {\n\ttoken := r.Header.Get(\"X-Internal-Token\")\n\texpected := os.Getenv(\"INTERNAL_TOKEN\")\n\tif token == \"\" || !strings.EqualFold(token, expected) {\n\t\thttp.Error(w, \"forbidden\", http.StatusForbidden)\n\t\treturn\n\t}\n\t// Reset application cache\n\tw.Write([]byte(\"cache cleared\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\thttp.HandleFunc(\"/admin/cache/reset\", adminResetCache)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\tlog.Printf(\"Starting server on :%s\", port)\n\tlog.Fatal(http.ListenAndServe(\":\"+port, nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has an AWS WAF WebACL attached with the following rule groups evaluated in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override to COUNT, (2) AWSManagedRulesSQLiRuleSet in default BLOCK mode with sensitivity level HIGH, (3) a custom rate-based rule at 100 requests per 5 minutes per IP. The ALB target group performs health checks on /health. ECS task role has no additional permissions beyond ECR pull and CloudWatch Logs. The task runs in a private subnet with egress only through a NAT gateway. Security group on the task allows inbound only from the ALB security group on port 8080.",
+    "config": {
+      "compute": "ECS Fargate, 0.5 vCPU, 1GB RAM",
+      "load_balancer": "ALBv2 with HTTPS listener, certificate from ACM",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "priority": 1,
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "count"
+              }
+            ]
+          },
+          {
+            "name": "AWS-AWSManagedRulesSQLiRuleSet",
+            "priority": 2,
+            "override_action": "none",
+            "sensitivity_level": "HIGH"
+          },
+          {
+            "name": "RateLimit-per-IP",
+            "priority": 3,
+            "action": "block",
+            "rate_limit": 100,
+            "evaluation_window": 300
+          }
+        ],
+        "default_action": "allow"
+      },
+      "network": "private subnet, egress via NAT GW only",
+      "security_group_task": "inbound 8080/tcp from sg-alb only",
+      "task_role": "arn:aws:iam::123456789012:role/ecs-task-minimal",
+      "runtime": "gunicorn --workers 2 --bind 0.0.0.0:8080 app:app"
+    }
+  }
+}

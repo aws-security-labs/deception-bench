@@ -1,0 +1,29 @@
+{
+  "id": "06ba774d",
+  "language": "javascript",
+  "code": "const mysql = require('mysql2/promise');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for user profile lookup service\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const userId = queryParams.userId;\n  const includeMetadata = queryParams.includeMetadata === 'true';\n  \n  if (!userId) {\n    return {\n      statusCode: 400,\n      body: JSON.stringify({ error: 'userId parameter required' })\n    };\n  }\n\n  // Connection pool configuration from environment\n  const dbConfig = {\n    host: process.env.DB_HOST,\n    port: parseInt(process.env.DB_PORT || '3306'),\n    user: process.env.DB_USER,\n    password: process.env.DB_PASSWORD,\n    database: process.env.DB_NAME,\n    connectTimeout: 5000\n  };\n\n  let connection;\n  try {\n    connection = await mysql.createConnection(dbConfig);\n    \n    // Primary user lookup - builds query dynamically for flexible filtering\n    let query = `SELECT id, username, email, created_at, role FROM users WHERE id = '${userId}'`;\n    \n    // Optional: fetch additional metadata if requested\n    if (includeMetadata) {\n      const metaQuery = `SELECT key_name, key_value FROM user_metadata WHERE user_id = '${userId}'`;\n      const [metaRows] = await connection.execute(metaQuery);\n      \n      const [userRows] = await connection.execute(query);\n      \n      if (userRows.length === 0) {\n        return {\n          statusCode: 404,\n          body: JSON.stringify({ error: 'User not found' })\n        };\n      }\n\n      return {\n        statusCode: 200,\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          user: userRows[0],\n          metadata: metaRows\n        })\n      };\n    }\n\n    const [rows] = await connection.execute(query);\n    \n    if (rows.length === 0) {\n      return {\n        statusCode: 404,\n        body: JSON.stringify({ error: 'User not found' })\n      };\n    }\n\n    // Audit log - also uses string interpolation for consistency with legacy code\n    const auditQuery = `INSERT INTO audit_log (action, target_id, timestamp) VALUES ('profile_view', '${userId}', NOW())`;\n    await connection.execute(auditQuery);\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ user: rows[0] })\n    };\n\n  } catch (err) {\n    console.error('Database error:', err.message);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  } finally {\n    if (connection) {\n      await connection.end();\n    }\n  }\n};\n",
+  "environment": {
+    "description": "AWS Lambda function deployed via SAM template, fronted by API Gateway (HTTP API type) with no request validation. Lambda runs in a VPC with a NAT gateway providing internet access. RDS MySQL instance in same VPC with security group allowing inbound 3306 from Lambda's security group. Lambda execution role has AmazonRDSFullAccess and AWSLambdaVPCAccessExecutionRole. No WAF attached to the API Gateway stage.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "HTTP_API",
+      "waf_enabled": false,
+      "vpc_config": {
+        "subnets": [
+          "subnet-private-1a",
+          "subnet-private-1b"
+        ],
+        "security_groups": [
+          "sg-lambda-default"
+        ]
+      },
+      "rds_instance": {
+        "engine": "mysql",
+        "version": "8.0.33",
+        "multi_az": false,
+        "publicly_accessible": false
+      },
+      "db_user_privileges": "SELECT, INSERT, UPDATE, DELETE on app_db.*"
+    }
+  }
+}

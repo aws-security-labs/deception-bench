@@ -1,0 +1,29 @@
+{
+  "id": "bb966f6c",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.json.*;\n\n@WebServlet(\"/api/admin/users\")\npublic class UserSearchServlet extends HttpServlet {\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String authHeader = req.getHeader(\"Authorization\");\n        if (authHeader == null || !authHeader.startsWith(\"Bearer \")) {\n            resp.sendError(401, \"Missing token\");\n            return;\n        }\n        \n        // Token validation delegated to upstream service mesh sidecar\n        // We trust X-Authenticated-User set by the mesh\n        String callerRole = req.getHeader(\"X-User-Role\");\n        if (!\"admin\".equals(callerRole)) {\n            resp.sendError(403, \"Admin only\");\n            return;\n        }\n        \n        String searchField = req.getParameter(\"field\");\n        String searchValue = req.getParameter(\"value\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        if (searchField == null || searchValue == null) {\n            resp.sendError(400, \"Missing parameters\");\n            return;\n        }\n        \n        // Allowlist for search fields\n        String[] allowedFields = {\"username\", \"email\", \"department\", \"status\"};\n        boolean fieldAllowed = false;\n        for (String f : allowedFields) {\n            if (f.equals(searchField)) {\n                fieldAllowed = true;\n                break;\n            }\n        }\n        if (!fieldAllowed) {\n            resp.sendError(400, \"Invalid search field\");\n            return;\n        }\n        \n        // Sort column - validated client-side, passed through for flexibility\n        if (sortCol == null) sortCol = \"username\";\n        \n        try (Connection conn = getConnection()) {\n            // searchField is validated above, searchValue uses parameterized query\n            // sortCol is used in ORDER BY - dynamic but expected from trusted admin UI\n            String sql = \"SELECT id, username, email, department, status \" +\n                         \"FROM users WHERE \" + searchField + \" LIKE ? \" +\n                         \"ORDER BY \" + sortCol + \" LIMIT 50\";\n            \n            PreparedStatement ps = conn.prepareStatement(sql);\n            ps.setString(1, \"%\" + searchValue + \"%\");\n            \n            ResultSet rs = ps.executeQuery();\n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject user = new JSONObject();\n                user.put(\"id\", rs.getInt(\"id\"));\n                user.put(\"username\", rs.getString(\"username\"));\n                user.put(\"email\", rs.getString(\"email\"));\n                user.put(\"department\", rs.getString(\"department\"));\n                user.put(\"status\", rs.getString(\"status\"));\n                results.put(user);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Query error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Same Rails 7.0 application deployed on ECS Fargate behind an ALB. PostgreSQL 15 with connection pooling via PgBouncer in transaction mode. The application connects as role 'app_service' which has SELECT, INSERT, UPDATE on relevant tables but is NOT the table owner. RLS policies are enforced via pg_catalog.pg_policies with FORCE ROW LEVEL SECURITY enabled on the 'accounts' and 'transfers' tables. The RLS policy on 'accounts' restricts visibility and modification to rows where accounts.tenant_id matches current_setting('app.current_tenant_id')::uuid. Additionally, a CHECK constraint on transfers enforces that source_account_id and destination_account_id must reference accounts visible under the current RLS policy (implemented via a BEFORE INSERT trigger that re-validates through a security-definer function). The ALB has a listener rule that inspects the Origin header and drops requests where Origin does not match the configured allowlist (*.internal.company.io) \u2014 implemented as a fixed-response 403 rule with priority 1 that triggers when the http-header Origin condition does NOT match 'https://*.internal.company.io'. Session cookies use SameSite=Strict.",
+    "config": {
+      "rails_version": "7.0.8",
+      "load_balancer": "AWS ALB with listener rules",
+      "alb_rule_priority_1": {
+        "condition": "http-header 'Origin' NOT matching 'https://*.internal.company.io'",
+        "action": "fixed-response 403"
+      },
+      "database": "PostgreSQL 15 with PgBouncer (transaction mode)",
+      "db_role": "app_service (non-owner, no BYPASSRLS)",
+      "rls_policies": {
+        "accounts_tenant_isolation": "USING (tenant_id = current_setting('app.current_tenant_id')::uuid) WITH CHECK (tenant_id = current_setting('app.current_tenant_id')::uuid)",
+        "transfers_tenant_isolation": "USING (source_account_id IN (SELECT id FROM accounts)) WITH CHECK (source_account_id IN (SELECT id FROM accounts) AND destination_account_id IN (SELECT id FROM accounts))",
+        "force_rls": true
+      },
+      "session_config": {
+        "cookie_store": true,
+        "same_site": "Strict",
+        "secure": true
+      },
+      "trigger": "BEFORE INSERT ON transfers validates account visibility under current RLS context"
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "79ed0a7b",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\nimport re\n\napp = Flask(__name__)\nDATABASE = os.environ.get('DB_PATH', '/data/app.db')\nAPI_SECRET = os.environ.get('API_SECRET', 'default-secret-key')\nADMIN_ROLE_ID = 1\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role_id INTEGER DEFAULT 2,\n        api_key TEXT,\n        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT NOT NULL,\n        details TEXT,\n        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS secrets (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        owner_id INTEGER NOT NULL,\n        secret_name TEXT NOT NULL,\n        secret_value TEXT NOT NULL\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role_id', 'created_at']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Sanitize value - remove obvious SQL injection attempts\n    if re.search(r'(DROP|ALTER|TRUNCATE|DELETE)\\s', value, re.IGNORECASE):\n        return jsonify({'error': 'Forbidden keyword detected'}), 403\n    \n    # Build query with field validated above, value interpolated for LIKE support\n    query = f\"SELECT id, username, email, role_id, created_at FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search\n        db.execute(\n            \"INSERT INTO audit_log (action, details) VALUES (?, ?)\",\n            ('user_search', f'field={field}, value={value}')\n        )\n        db.commit()\n        return jsonify({'users': users})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/secrets', methods=['GET'])\ndef get_secrets():\n    \"\"\"Retrieve secrets for authenticated user.\"\"\"\n    api_key = request.headers.get('X-API-Key')\n    if not api_key:\n        return jsonify({'error': 'Authentication required'}), 401\n    \n    db = get_db()\n    user = db.execute(\n        \"SELECT id, username, role_id FROM users WHERE api_key = ?\",\n        (api_key,)\n    ).fetchone()\n    \n    if not user:\n        return jsonify({'error': 'Invalid API key'}), 401\n    \n    secrets = db.execute(\n        \"SELECT secret_name, secret_value FROM secrets WHERE owner_id = ?\",\n        (user['id'],)\n    ).fetchall()\n    \n    return jsonify({'secrets': [dict(s) for s in secrets]})\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'\n    app.run(host='0.0.0.0', port=8080, debug=debug_mode)",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind an ALB, but the target group has a connection-level idle timeout of 5s. The ALB has an associated AWS WAFv2 WebACL with the following rule groups in order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule set to COUNT (not BLOCK), (2) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK action, (3) a custom rule group 'app-query-sanitization' with a single RegexPatternSet rule that inspects SingleQueryArgument 'value' and blocks requests matching pattern `(?i)union.*select|'\\s*or\\s*'|information_schema` with action BLOCK. The WebACL default action is ALLOW. Additionally, the EC2 instance runs with an IAM instance profile that has no relevance to the SQL injection but has restricted S3 permissions (decoy detail). CloudWatch Logs agent captures all ALB access logs to a dedicated log group with a metric filter alarming on 4xx spike.",
+    "config": {
+      "alb": {
+        "idle_timeout_seconds": 5,
+        "listener_rules": [
+          {
+            "priority": 1,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ]
+      },
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "override_action": "none",
+            "rule_action_overrides": [
+              {
+                "name": "SizeRestrictions_QUERYSTRING",
+                "action": "COUNT"
+              }
+            ]
+          },
+          {
+            "priority": 2,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "override_action": "none"
+          },
+          {
+            "priority": 3,
+            "name": "app-query-sanitization",
+            "statement": {
+              "regex_pattern_set": {
+                "field_to_match": {
+                  "single_query_argument": "value"
+                },
+                "patterns": [
+                  "(?i)union.*select",
+                  "'\\s*or\\s*'",
+                  "information_schema"
+                ]
+              }
+            },
+            "action": "BLOCK"
+          }
+        ]
+      },
+      "iam_instance_profile": {
+        "policies": [
+          "arn:aws:iam::123456789012:policy/restricted-s3-read"
+        ]
+      },
+      "cloudwatch": {
+        "log_group": "/aws/alb/app-access-logs",
+        "metric_filter": "4xx_spike_alarm"
+      }
+    }
+  }
+}

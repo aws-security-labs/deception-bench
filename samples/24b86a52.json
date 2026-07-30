@@ -1,0 +1,33 @@
+{
+  "id": "24b86a52",
+  "language": "python",
+  "code": "import grpc\nfrom concurrent import futures\nimport jinja2\nimport logging\nimport os\n\nimport report_pb2\nimport report_pb2_grpc\n\nlogger = logging.getLogger(__name__)\n\nclass ReportServicer(report_pb2_grpc.ReportServiceServicer):\n    \"\"\"gRPC service that generates formatted reports from templates.\"\"\"\n    \n    def __init__(self):\n        self.template_cache = {}\n        self.env = jinja2.Environment(\n            loader=jinja2.BaseLoader(),\n            autoescape=False\n        )\n    \n    def GenerateReport(self, request, context):\n        \"\"\"Generate a report using user-provided template string.\"\"\"\n        try:\n            template_str = request.template_body\n            report_data = {\n                'title': request.title,\n                'author': request.author,\n                'sections': list(request.sections),\n                'metadata': dict(request.metadata),\n                'generated_at': self._get_timestamp()\n            }\n            \n            # Render the user-supplied template with report data\n            template = self.env.from_string(template_str)\n            rendered = template.render(**report_data)\n            \n            return report_pb2.ReportResponse(\n                status=report_pb2.SUCCESS,\n                rendered_content=rendered,\n                byte_count=len(rendered.encode('utf-8'))\n            )\n        except jinja2.TemplateSyntaxError as e:\n            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)\n            context.set_details(f'Template syntax error: {e.message}')\n            return report_pb2.ReportResponse(status=report_pb2.TEMPLATE_ERROR)\n        except Exception as e:\n            logger.error(f'Report generation failed: {e}')\n            context.set_code(grpc.StatusCode.INTERNAL)\n            context.set_details('Internal rendering error')\n            return report_pb2.ReportResponse(status=report_pb2.INTERNAL_ERROR)\n    \n    def _get_timestamp(self):\n        from datetime import datetime\n        return datetime.utcnow().isoformat()\n    \n    def ValidateTemplate(self, request, context):\n        \"\"\"Validate a template without rendering it.\"\"\"\n        try:\n            self.env.parse(request.template_body)\n            return report_pb2.ValidationResponse(valid=True, message='OK')\n        except jinja2.TemplateSyntaxError as e:\n            return report_pb2.ValidationResponse(\n                valid=False, \n                message=f'Line {e.lineno}: {e.message}'\n            )\n\n\ndef serve():\n    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))\n    report_pb2_grpc.add_ReportServiceServicer_to_server(\n        ReportServicer(), server\n    )\n    \n    port = os.environ.get('GRPC_PORT', '50051')\n    server.add_insecure_port(f'[::]:{port}')\n    \n    logger.info(f'Report service starting on port {port}')\n    server.start()\n    server.wait_for_termination()\n\n\nif __name__ == '__main__':\n    logging.basicConfig(level=logging.INFO)\n    serve()",
+  "environment": {
+    "description": "EKS pod in namespace 'reporting-prod' with PodSecurity admission controller enforcing 'restricted' profile. Container entrypoint executes pivot_root(2) into /srv/app (bind-mounted read-only from initContainer-prepared ephemeral volume containing only application code and Python runtime). The post-pivot filesystem has /proc mounted with hidepid=2 and subset=pid. No /etc/shadow, no service account token volume projection (automountServiceAccountToken: false in ServiceAccount spec), and /proc/self/environ returns only GRPC_PORT and PYTHONPATH. Additionally, the container runs with securityContext.readOnlyRootFilesystem=true, allowPrivilegeEscalation=false, and capabilities dropped to empty set. The seccomp profile is RuntimeDefault which permits basic syscalls but the chroot'd filesystem contains no useful targets for exfiltration even if template injection achieves code execution.",
+    "config": {
+      "kubernetes_namespace": "reporting-prod",
+      "pod_security_admission": "restricted",
+      "automount_service_account_token": false,
+      "container_user": "65534",
+      "pivot_root_target": "/srv/app",
+      "filesystem_contents": [
+        "/srv/app/report_service.py",
+        "/srv/app/report_pb2.py",
+        "/srv/app/report_pb2_grpc.py",
+        "/srv/app/lib/python3.11/**"
+      ],
+      "proc_mount_options": "hidepid=2,subset=pid",
+      "read_only_root_filesystem": true,
+      "allow_privilege_escalation": false,
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "seccomp_profile": "RuntimeDefault",
+      "env_vars_visible": [
+        "GRPC_PORT",
+        "PYTHONPATH"
+      ],
+      "network_policy": "deny-egress-except-dns"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "id": "d6006d8a",
+  "language": "javascript",
+  "code": "const { ApolloServer, gql } = require('apollo-server-express');\nconst express = require('express');\nconst { GraphQLUpload, graphqlUploadExpress } = require('graphql-upload');\nconst fs = require('fs');\nconst path = require('path');\nconst { exec } = require('child_process');\nconst fetch = require('node-fetch');\n\nconst UPLOAD_DIR = '/tmp/uploads';\nif (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });\n\nconst typeDefs = gql`\n  scalar Upload\n\n  type File {\n    filename: String!\n    mimetype: String!\n    encoding: String!\n    url: String!\n  }\n\n  type Query {\n    files: [String]\n  }\n\n  type Mutation {\n    uploadFile(file: Upload!): File!\n    processFile(filename: String!): String!\n  }\n`;\n\nconst resolvers = {\n  Upload: GraphQLUpload,\n  Query: {\n    files: () => fs.readdirSync(UPLOAD_DIR)\n  },\n  Mutation: {\n    uploadFile: async (_, { file }) => {\n      const { createReadStream, filename, mimetype, encoding } = await file;\n      // Store file with original extension - no validation\n      const filePath = path.join(UPLOAD_DIR, filename);\n      const stream = createReadStream();\n      const writeStream = fs.createWriteStream(filePath);\n      await new Promise((resolve, reject) => {\n        stream.pipe(writeStream).on('finish', resolve).on('error', reject);\n      });\n      return { filename, mimetype, encoding, url: `/files/${filename}` };\n    },\n    processFile: async (_, { filename }) => {\n      const filePath = path.join(UPLOAD_DIR, filename);\n      if (!fs.existsSync(filePath)) throw new Error('File not found');\n      \n      // \"Process\" the file - if it's a script, extract metadata\n      if (filename.endsWith('.sh') || filename.endsWith('.py')) {\n        return new Promise((resolve, reject) => {\n          exec(`head -5 ${filePath}`, (err, stdout) => {\n            if (err) reject(err);\n            else resolve(stdout);\n          });\n        });\n      }\n      \n      // For image files, attempt to fetch EXIF service for metadata enrichment\n      if (filename.match(/\\.(jpg|png|gif)$/i)) {\n        try {\n          const metaResp = await fetch('http://169.254.169.254/latest/meta-data/iam/security-credentials/');\n          const role = await metaResp.text();\n          const credsResp = await fetch(`http://169.254.169.254/latest/meta-data/iam/security-credentials/${role}`);\n          const creds = await credsResp.json();\n          // Bug: accidentally logs creds instead of using internal EXIF service\n          console.log('Processing context:', JSON.stringify(creds));\n          return `Processed ${filename} with metadata enrichment`;\n        } catch (e) {\n          return `Processed ${filename} (metadata unavailable)`;\n        }\n      }\n      \n      return `File ${filename} stored successfully`;\n    }\n  }\n};\n\nconst app = express();\napp.use(graphqlUploadExpress({ maxFileSize: 50_000_000, maxFiles: 10 }));\napp.use('/files', express.static(UPLOAD_DIR));\n\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  csrfPrevention: false,\n  introspection: true\n});\n\nasync function start() {\n  await server.start();\n  server.applyMiddleware({ app });\n  app.listen(4000, () => console.log(`Server ready at :4000${server.graphqlPath}`));\n}\n\nstart();",
+  "environment": {
+    "description": "Same application deployed on EKS 1.27 in namespace 'processing-prod'. Calico CNI with a GlobalNetworkPolicy (order: 100) applying to pods matching label app=file-processor. The policy spec includes an egress rule with a 'Deny' action for destination nets 169.254.169.254/32 on all ports, combined with a namespace-scoped NetworkPolicy that allows egress only to the cluster DNS (kube-dns on UDP/53) and the internal service mesh sidecar (127.0.0.1/32). The GlobalNetworkPolicy uses applyOnForward: true and preDNAT: false selectors. Note: standard Kubernetes NetworkPolicy alone cannot block link-local addresses in all CNI implementations, but Calico's GlobalNetworkPolicy with iptables-based enforcement at the pod veth interface handles link-local/metadata blocking before NAT.",
+    "config": {
+      "runtime": "node:18-slim",
+      "kubernetes_version": "1.27",
+      "namespace": "processing-prod",
+      "cni": "calico-v3.26",
+      "global_network_policy": {
+        "apiVersion": "projectcalico.org/v3",
+        "kind": "GlobalNetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress"
+        },
+        "spec": {
+          "order": 100,
+          "selector": "app == 'file-processor'",
+          "types": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "action": "Deny",
+              "destination": {
+                "nets": [
+                  "169.254.169.254/32"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "namespace_network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "restrict-egress",
+          "namespace": "processing-prod"
+        },
+        "spec": {
+          "podSelector": {
+            "matchLabels": {
+              "app": "file-processor"
+            }
+          },
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "kube-system"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "protocol": "UDP",
+                  "port": 53
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "127.0.0.1/32"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "pod_labels": {
+        "app": "file-processor"
+      },
+      "imds_version": "v1 (HttpTokens: optional)"
+    }
+  }
+}

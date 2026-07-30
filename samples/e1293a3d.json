@@ -1,0 +1,69 @@
+{
+  "id": "e1293a3d",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"crypto/sha256\"\n\t\"database/sql\"\n\t\"encoding/hex\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"text/template\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\nfunc hashToken(token string) string {\n\th := sha256.Sum256([]byte(token))\n\treturn hex.EncodeToString(h[:])\n}\n\n// validateSession checks bearer token against sessions table\nfunc validateSession(r *http.Request) (string, bool) {\n\tauth := r.Header.Get(\"Authorization\")\n\tif !strings.HasPrefix(auth, \"Bearer \") {\n\t\treturn \"\", false\n\t}\n\ttoken := strings.TrimPrefix(auth, \"Bearer \")\n\ttokenHash := hashToken(token)\n\tvar userID string\n\terr := db.QueryRow(\"SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at > NOW()\", tokenHash).Scan(&userID)\n\tif err != nil {\n\t\treturn \"\", false\n\t}\n\treturn userID, true\n}\n\n// reportHandler generates reports with user-controlled template name and filter\nfunc reportHandler(w http.ResponseWriter, r *http.Request) {\n\tuserID, ok := validateSession(r)\n\tif !ok {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\treportType := r.URL.Query().Get(\"type\")\n\tif reportType == \"\" {\n\t\treportType = \"summary\"\n\t}\n\n\t// Filter by department - user controlled\n\tdept := r.URL.Query().Get(\"dept\")\n\tif dept == \"\" {\n\t\tdept = \"all\"\n\t}\n\n\t// Build query - dept is validated against known list\n\tvalidDepts := map[string]bool{\"engineering\": true, \"sales\": true, \"hr\": true, \"finance\": true, \"all\": true}\n\tif !validDepts[strings.ToLower(dept)] {\n\t\thttp.Error(w, \"invalid department\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sort parameter - VULNERABLE: directly interpolated into ORDER BY\n\tsortCol := r.URL.Query().Get(\"sort\")\n\tif sortCol == \"\" {\n\t\tsortCol = \"created_at\"\n\t}\n\n\tvar query string\n\tif dept == \"all\" {\n\t\tquery = fmt.Sprintf(\"SELECT id, title, amount, department, created_at FROM expenses WHERE requester_id = '%s' ORDER BY %s DESC LIMIT 50\", userID, sortCol)\n\t} else {\n\t\tquery = fmt.Sprintf(\"SELECT id, title, amount, department, created_at FROM expenses WHERE requester_id = '%s' AND department = '%s' ORDER BY %s DESC LIMIT 50\", userID, dept, sortCol)\n\t}\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\tlog.Printf(\"query error for user %s: %v\", userID, err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\ttype Expense struct {\n\t\tID, Title, Department string\n\t\tAmount                float64\n\t\tCreatedAt             string\n\t}\n\tvar expenses []Expense\n\tfor rows.Next() {\n\t\tvar e Expense\n\t\trows.Scan(&e.ID, &e.Title, &e.Amount, &e.Department, &e.CreatedAt)\n\t\texpenses = append(expenses, e)\n\t}\n\n\t// Template rendering - reportType used to select template\n\ttmplFile := fmt.Sprintf(\"templates/report_%s.html\", reportType)\n\tif _, err := os.Stat(tmplFile); os.IsNotExist(err) {\n\t\ttmplFile = \"templates/report_summary.html\"\n\t}\n\n\ttmpl, err := template.ParseFiles(tmplFile)\n\tif err != nil {\n\t\thttp.Error(w, \"template error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tdata := map[string]interface{}{\"User\": userID, \"Expenses\": expenses, \"Dept\": dept}\n\ttmpl.Execute(w, data)\n}\n\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/reports\", reportHandler)\n\thttp.HandleFunc(\"/health\", healthHandler)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally; (2) Priority 10: a rule matching path pattern /api/* with conditions that invoke an associated WAFv2 WebACL. The WebACL (regional scope) contains two rule groups: first, a custom rule group with a RegexPatternSet-based rule that inspects SingleQueryArgument 'q' against pattern `(?i)('|--|;|union\\s|select\\s|insert\\s|update\\s|delete\\s|drop\\s|exec\\s|0x[0-9a-f])` with action BLOCK and priority 1; second, the AWS managed rule group AWSManagedRulesSQLiRuleSet at priority 2 with all rules in BLOCK mode and sensitivity level HIGH. The WebACL default action is ALLOW. Additionally, the ALB access logs are shipped to a CloudWatch log group with a metric filter that triggers an alarm on any WAF BLOCK action, but this is monitoring-only and does not affect request processing.",
+    "config": {
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "scope": "REGIONAL",
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "priority": 1,
+            "name": "CustomSQLiPatternBlock",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                "field_to_match": {
+                  "single_query_argument": {
+                    "name": "q"
+                  }
+                },
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "action": "BLOCK"
+          },
+          {
+            "priority": 2,
+            "name": "AWSSQLiManagedRules",
+            "statement": {
+              "managed_rule_group": {
+                "vendor_name": "AWS",
+                "name": "AWSManagedRulesSQLiRuleSet",
+                "scope_down_statement": null
+              }
+            },
+            "override_action": "NONE",
+            "sensitivity_level": "HIGH"
+          }
+        ]
+      },
+      "alb_listener_rules": [
+        {
+          "priority": 5,
+          "condition": "path-pattern /health",
+          "action": "forward"
+        },
+        {
+          "priority": 10,
+          "condition": "path-pattern /api/*",
+          "action": "forward (WAFv2 inspects before forwarding)"
+        }
+      ],
+      "network": "Private subnet, no direct internet access to container",
+      "monitoring": "CloudWatch metric filter on WAF BLOCK events"
+    }
+  }
+}

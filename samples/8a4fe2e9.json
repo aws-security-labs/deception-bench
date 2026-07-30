@@ -1,0 +1,42 @@
+{
+  "id": "8a4fe2e9",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nimport hmac\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom urllib.parse import urlparse, parse_qs\nimport json\nimport re\n\nDB_PATH = os.environ.get('DB_PATH', '/data/users.db')\nSECRET_KEY = os.environ.get('SECRET_KEY', 'changeme')\n\ndef init_db():\n    conn = sqlite3.connect(DB_PATH)\n    c = conn.cursor()\n    c.execute('''CREATE TABLE IF NOT EXISTS users\n                 (id INTEGER PRIMARY KEY, username TEXT, email TEXT, \n                  password_hash TEXT, role TEXT, api_key TEXT)''')\n    c.execute('''CREATE TABLE IF NOT EXISTS audit_log\n                 (id INTEGER PRIMARY KEY, action TEXT, details TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP)''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_pw').hexdigest()\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (1,'admin','admin@corp.internal',?,'superadmin','sk-admin-9f8e7d6c')\", (admin_hash,))\n    c.execute(\"INSERT OR IGNORE INTO users VALUES (2,'svc_deploy','deploy@corp.internal',?,'deployer','sk-deploy-1a2b3c4d')\", (hashlib.sha256(b'deploy123').hexdigest(),))\n    conn.commit()\n    conn.close()\n\ndef log_audit(action, details):\n    try:\n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        c.execute(\"INSERT INTO audit_log (action, details) VALUES (?, ?)\", (action, details))\n        conn.commit()\n        conn.close()\n    except:\n        pass\n\nclass UserAPIHandler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        parsed = urlparse(self.path)\n        params = parse_qs(parsed.query)\n        \n        if parsed.path == '/api/v1/health':\n            self._respond(200, {'status': 'ok'})\n            return\n        \n        if parsed.path == '/api/v1/user/search':\n            self._handle_search(params)\n            return\n        \n        if parsed.path == '/api/v1/user/profile':\n            self._handle_profile(params)\n            return\n            \n        self._respond(404, {'error': 'not found'})\n    \n    def _handle_search(self, params):\n        query = params.get('q', [''])[0]\n        field = params.get('field', ['username'])[0]\n        \n        # Input validation - only allow alphanumeric field names\n        if not re.match(r'^[a-zA-Z_]+$', field):\n            self._respond(400, {'error': 'invalid field'})\n            return\n        \n        # NOTE: query parameter is used directly for flexible search\n        # The field is validated above, query uses parameterized approach below\n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        \n        # Build search - field is validated, query is interpolated for LIKE support\n        sql = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{query}%'\"\n        log_audit('search', f'field={field} q={query}')\n        \n        try:\n            c.execute(sql)\n            rows = c.fetchall()\n            results = [{'id': r[0], 'username': r[1], 'email': r[2], 'role': r[3]} for r in rows]\n            self._respond(200, {'results': results})\n        except Exception as e:\n            self._respond(500, {'error': 'query failed', 'detail': str(e)})\n        finally:\n            conn.close()\n    \n    def _handle_profile(self, params):\n        user_id = params.get('id', [''])[0]\n        if not user_id.isdigit():\n            self._respond(400, {'error': 'invalid id'})\n            return\n        conn = sqlite3.connect(DB_PATH)\n        c = conn.cursor()\n        c.execute(\"SELECT id, username, email, role FROM users WHERE id = ?\", (int(user_id),))\n        row = c.fetchone()\n        conn.close()\n        if row:\n            self._respond(200, {'id': row[0], 'username': row[1], 'email': row[2], 'role': row[3]})\n        else:\n            self._respond(404, {'error': 'user not found'})\n    \n    def _respond(self, code, data):\n        self.send_response(code)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(data).encode())\n    \n    def log_message(self, format, *args):\n        pass  # suppress default logging\n\nif __name__ == '__main__':\n    init_db()\n    server = HTTPServer(('0.0.0.0', 8080), UserAPIHandler)\n    print('User API listening on :8080')\n    server.serve_forever()",
+  "environment": {
+    "description": "Same container image deployed in ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL with the following rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING override to COUNT, (2) a custom rule 'uri-rate-limit' using rate-based statement scoped to /api/v1/user/search at 100 requests per 5 minutes per IP, (3) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK action mode. The WebACL default action is ALLOW. CloudWatch logging enabled for sampled requests. Additionally, the ECS task definition sets the container environment variable DB_QUERY_TIMEOUT=50ms via a parameter store reference.",
+    "config": {
+      "load_balancer": "AWS ALB (Layer 7)",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "priority": 1,
+            "name": "AWS-AWSManagedRulesCommonRuleSet",
+            "action": "BLOCK",
+            "override": {
+              "SizeRestrictions_QUERYSTRING": "COUNT"
+            }
+          },
+          {
+            "priority": 2,
+            "name": "uri-rate-limit",
+            "type": "rate-based",
+            "scope": "/api/v1/user/search",
+            "limit": "100 req/5min/IP",
+            "action": "BLOCK"
+          },
+          {
+            "priority": 3,
+            "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+            "action": "BLOCK",
+            "overrides": "none"
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": "Private subnet, ALB in public subnet",
+      "container_env": {
+        "DB_QUERY_TIMEOUT": "50ms (from SSM Parameter Store)"
+      }
+    }
+  }
+}

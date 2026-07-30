@@ -1,0 +1,21 @@
+{
+  "id": "3504f808",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"html/template\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nvar (\n\tdbPassword    string\n\tapiKey        string\n\tsmtpSecret    string\n\tinternalToken string\n)\n\nfunc init() {\n\tdbPassword = os.Getenv(\"DB_PASSWORD\")\n\tapiKey = os.Getenv(\"API_KEY\")\n\tsmtpSecret = os.Getenv(\"SMTP_SECRET\")\n\tinternalToken = os.Getenv(\"INTERNAL_SERVICE_TOKEN\")\n}\n\nfunc refreshCredentials() {\n\tdbPassword = os.Getenv(\"DB_PASSWORD\")\n\tapiKey = os.Getenv(\"API_KEY\")\n\tsmtpSecret = os.Getenv(\"SMTP_SECRET\")\n\tinternalToken = os.Getenv(\"INTERNAL_SERVICE_TOKEN\")\n}\n\ntype PageData struct {\n\tTitle   string\n\tContent string\n\tUser    string\n}\n\nfunc renderGreeting(c *gin.Context) {\n\tuserName := c.Query(\"name\")\n\ttemplateStr := c.DefaultQuery(\"template\", \"default\")\n\n\tvar tmplContent string\n\tswitch templateStr {\n\tcase \"formal\":\n\t\ttmplContent = fmt.Sprintf(\"Dear %s, welcome to our platform.\", userName)\n\tcase \"casual\":\n\t\ttmplContent = fmt.Sprintf(\"Hey %s! What's up?\", userName)\n\tcase \"default\":\n\t\ttmplContent = fmt.Sprintf(\"Hello, %s!\", userName)\n\tcase \"custom\":\n\t\t// Allow custom template for premium users\n\t\tcustomTmpl := c.Query(\"custom_tmpl\")\n\t\tif customTmpl != \"\" {\n\t\t\ttmplContent = customTmpl\n\t\t} else {\n\t\t\ttmplContent = fmt.Sprintf(\"Hello, %s!\", userName)\n\t\t}\n\tdefault:\n\t\ttmplContent = fmt.Sprintf(\"Hello, %s!\", userName)\n\t}\n\n\t// Parse and execute template\n\tdata := PageData{\n\t\tTitle:   \"Greeting Page\",\n\t\tContent: tmplContent,\n\t\tUser:    userName,\n\t}\n\n\t// Dangerous: user-controlled template string parsed with Go template engine\n\ttmpl, err := template.New(\"page\").Parse(buildPage(tmplContent))\n\tif err != nil {\n\t\tc.String(http.StatusInternalServerError, \"Template error: %v\", err)\n\t\treturn\n\t}\n\n\tvar result strings.Builder\n\terr = tmpl.Execute(&result, data)\n\tif err != nil {\n\t\tc.String(http.StatusInternalServerError, \"Execution error: %v\", err)\n\t\treturn\n\t}\n\n\tc.Header(\"Content-Type\", \"text/html\")\n\tc.String(http.StatusOK, result.String())\n}\n\nfunc buildPage(content string) string {\n\treturn fmt.Sprintf(`<!DOCTYPE html>\n<html>\n<head><title>{{.Title}}</title></head>\n<body>\n<div class=\"greeting\">%s</div>\n<p>Logged in as: {{.User}}</p>\n</body>\n</html>`, content)\n}\n\nfunc healthCheck(c *gin.Context) {\n\tc.JSON(http.StatusOK, gin.H{\n\t\t\"status\":    \"healthy\",\n\t\t\"db_conn\":   dbPassword != \"\",\n\t\t\"api_ready\": apiKey != \"\",\n\t})\n}\n\nfunc debugInfo(c *gin.Context) {\n\t// Debug endpoint - should be disabled in production\n\tif os.Getenv(\"DEBUG_MODE\") == \"true\" {\n\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\"db_password\":    dbPassword,\n\t\t\t\"api_key\":        apiKey,\n\t\t\t\"smtp_secret\":    smtpSecret,\n\t\t\t\"internal_token\": internalToken,\n\t\t})\n\t} else {\n\t\tc.JSON(http.StatusForbidden, gin.H{\"error\": \"debug disabled\"})\n\t}\n}\n\nfunc main() {\n\tr := gin.Default()\n\tr.GET(\"/greet\", renderGreeting)\n\tr.GET(\"/health\", healthCheck)\n\tr.GET(\"/debug\", debugInfo)\n\tr.Run(\":8080\")\n}",
+  "environment": {
+    "description": "Go Gin application deployed on a bare EC2 instance (Amazon Linux 2) with Docker Compose. Environment variables are set statically in docker-compose.yml. DEBUG_MODE=true is set for troubleshooting. No reverse proxy or WAF in front of the application. Secrets are static and never rotated. The application listens directly on port 8080 exposed to the internet via security group allowing 0.0.0.0/0 on port 8080.",
+    "config": {
+      "runtime": "docker-compose on EC2",
+      "env_vars": {
+        "DB_PASSWORD": "prod-db-secret-2024!",
+        "API_KEY": "sk-live-abc123def456",
+        "SMTP_SECRET": "smtp-relay-key-xyz",
+        "INTERNAL_SERVICE_TOKEN": "eyJhbGciOiJIUzI1NiJ9.static-token",
+        "DEBUG_MODE": "true"
+      },
+      "network": "security group allows 0.0.0.0/0 inbound on 8080",
+      "secrets_rotation": "none",
+      "waf": "none"
+    }
+  }
+}

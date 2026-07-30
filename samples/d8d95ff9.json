@@ -1,0 +1,22 @@
+{
+  "id": "d8d95ff9",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.IOException;\nimport java.util.logging.Logger;\n\npublic class AccountLookupServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(AccountLookupServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String accountId = req.getParameter(\"id\");\n        String fields = req.getParameter(\"fields\");\n        \n        // Basic null check\n        if (accountId == null || accountId.isEmpty()) {\n            resp.sendError(400, \"Missing account id\");\n            return;\n        }\n        \n        // Validate accountId is numeric\n        if (!accountId.matches(\"^[0-9]+$\")) {\n            resp.sendError(400, \"Invalid account id format\");\n            return;\n        }\n        \n        // Fields parameter allows selecting which columns to return\n        // Default to safe subset if not specified\n        String columns = \"account_id, display_name, created_at\";\n        if (fields != null && !fields.isEmpty()) {\n            // Allow caller to specify comma-separated field names\n            // We trust that the DB user only has SELECT on specific columns\n            columns = fields;\n        }\n        \n        String query = \"SELECT \" + columns + \" FROM accounts WHERE account_id = \" + accountId;\n        log.info(\"Executing query for account: \" + accountId);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            \n            // Set query timeout to prevent long-running queries\n            stmt.setQueryTimeout(5);\n            \n            ResultSet rs = stmt.executeQuery(query);\n            resp.setContentType(\"application/json\");\n            StringBuilder json = new StringBuilder(\"{\\\"results\\\":[\");\n            ResultSetMetaData meta = rs.getMetaData();\n            boolean first = true;\n            \n            while (rs.next()) {\n                if (!first) json.append(\",\");\n                json.append(\"{\");\n                for (int i = 1; i <= meta.getColumnCount(); i++) {\n                    if (i > 1) json.append(\",\");\n                    json.append(\"\\\"\").append(meta.getColumnLabel(i)).append(\"\\\":\");\n                    json.append(\"\\\"\").append(rs.getString(i)).append(\"\\\"\");\n                }\n                json.append(\"}\");\n                first = false;\n            }\n            json.append(\"]}\");\n            resp.getWriter().write(json.toString());\n            \n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "IoT message handler running as 'iot-service' user on Ubuntu 22.04 LTS in a Docker container with --privileged flag. Container runs with default security profile (unconfined). IOT_UPLOAD_DIR set to /var/iot/uploads. The service user has write access to /etc/cron.d and /var/spool/cron via group membership in 'iot-admin' group. No MAC (Mandatory Access Control) policy is active. Container filesystem is writable.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS",
+      "container": "Docker with --privileged --security-opt=unconfined",
+      "user": "iot-service (uid=1001, groups=iot-admin)",
+      "mac_policy": "none (AppArmor disabled via aa-teardown)",
+      "filesystem": "read-write, no mount restrictions",
+      "upload_dir": "/var/iot/uploads",
+      "writable_paths": [
+        "/etc/cron.d",
+        "/var/spool/cron",
+        "/tmp",
+        "/var/iot"
+      ]
+    }
+  }
+}

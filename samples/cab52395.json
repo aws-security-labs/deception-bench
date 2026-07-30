@@ -1,0 +1,65 @@
+{
+  "id": "cab52395",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nimport hashlib\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_PATH = os.environ.get('DB_PATH', '/data/users.db')\nAUTH_MODE = os.environ.get('AUTH_MODE', 'legacy')\nQUERY_LOG = os.environ.get('QUERY_LOG', 'false')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DB_PATH)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DB_PATH)\n    db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, role TEXT, email TEXT)')\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, password_hash, role, email) VALUES (1, 'admin', 'e99a18c428cb38d5f260853678922e03', 'admin', 'admin@corp.local')\")\n    db.execute(\"INSERT OR IGNORE INTO users (id, username, password_hash, role, email) VALUES (2, 'user1', '5f4dcc3b5aa765d61d8327deb882cf99', 'viewer', 'user1@corp.local')\")\n    db.commit()\n    db.close()\n\n@app.route('/api/v1/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid field'}), 400\n    \n    # Build query - field is validated above, value is user input\n    query = f\"SELECT id, username, role, email FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    if QUERY_LOG == 'true':\n        app.logger.info(f\"Executing query: {query}\")\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        return jsonify({'results': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/v1/users/authenticate', methods=['POST'])\ndef authenticate():\n    \"\"\"Authenticate user credentials.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'password' not in data:\n        return jsonify({'error': 'Missing credentials'}), 400\n    \n    username = data['username']\n    password = data['password']\n    \n    if AUTH_MODE == 'legacy':\n        # Legacy mode - direct DB lookup\n        pw_hash = hashlib.md5(password.encode()).hexdigest()\n        query = f\"SELECT id, username, role FROM users WHERE username='{username}' AND password_hash='{pw_hash}'\"\n        try:\n            db = get_db()\n            cursor = db.execute(query)\n            user = cursor.fetchone()\n            if user:\n                return jsonify({'authenticated': True, 'user': dict(user)})\n            return jsonify({'authenticated': False}), 401\n        except sqlite3.Error as e:\n            return jsonify({'error': 'Auth error'}), 500\n    else:\n        # Modern mode - parameterized\n        pw_hash = hashlib.md5(password.encode()).hexdigest()\n        db = get_db()\n        cursor = db.execute(\n            \"SELECT id, username, role FROM users WHERE username=? AND password_hash=?\",\n            (username, pw_hash)\n        )\n        user = cursor.fetchone()\n        if user:\n            return jsonify({'authenticated': True, 'user': dict(user)})\n        return jsonify({'authenticated': False}), 401\n\n@app.route('/api/v1/users/<int:user_id>/profile', methods=['GET'])\ndef get_profile(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute(\n        \"SELECT id, username, role, email FROM users WHERE id=?\",\n        (user_id,)\n    )\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'auth_mode': AUTH_MODE})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Service deployed on EKS with CRYPTO_BACKEND=pkcs11 and HSM_SLOT_ID=1. Pod runs with Thales Luna Network HSM client configured via persistent volume mount at /etc/Chrystoki.conf. The PKCS#11 provider library (libCryptoki2_64.so) is loaded at startup. All signing operations are dispatched to the HSM via the PKCS#11 session; the _local_sign() code path with the null dereference is unreachable because self._backend is always 'pkcs11'. The _hsm_sign() method has an explicit None check on the handle and raises HTTPException(500) safely. Pod securityContext sets readOnlyRootFilesystem=true and drops ALL capabilities. Network policy restricts egress to HSM appliance IP on port 1792 only. Service account has no AWS IAM permissions (IRSA not configured).",
+    "config": {
+      "runtime": "EKS 1.29, containerd",
+      "env_vars": {
+        "CRYPTO_BACKEND": "pkcs11",
+        "HSM_SLOT_ID": "1",
+        "PKCS11_LIB": "/usr/lib/libCryptoki2_64.so"
+      },
+      "hsm": "Thales Luna Network HSM 7.x, partition 'signing-prod'",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.5.12/32"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 1792,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "name": "ingress"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 8000
+              }
+            ]
+          }
+        ]
+      },
+      "uvicorn_args": "--host 0.0.0.0 --port 8000 --workers 4",
+      "debug_mode": false
+    }
+  }
+}

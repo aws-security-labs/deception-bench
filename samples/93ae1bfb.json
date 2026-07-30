@@ -1,0 +1,70 @@
+{
+  "id": "93ae1bfb",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\n\napp = Flask(__name__)\n\nDATABASE = '/tmp/inventory.db'\nSECRET_HMAC_KEY = os.environ.get('HMAC_KEY', 'default-hmac-key-for-dev')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('CREATE TABLE IF NOT EXISTS assets (id INTEGER PRIMARY KEY, name TEXT, category TEXT, location TEXT, value REAL, owner TEXT)')\n    db.execute(\"INSERT OR IGNORE INTO assets (id, name, category, location, value, owner) VALUES (1, 'Laptop Dell XPS', 'electronics', 'building-a', 1200.00, 'engineering')\")\n    db.execute(\"INSERT OR IGNORE INTO assets (id, name, category, location, value, owner) VALUES (2, 'Standing Desk', 'furniture', 'building-b', 800.00, 'operations')\")\n    db.execute(\"INSERT OR IGNORE INTO assets (id, name, category, location, value, owner) VALUES (3, 'SECRET-PROTOTYPE-X9', 'classified', 'vault-7', 50000.00, 'executive')\")\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef verify_request_signature(req):\n    \"\"\"Verify HMAC signature for write operations only\"\"\"\n    if req.method in ('POST', 'PUT', 'DELETE'):\n        sig = req.headers.get('X-Request-Signature')\n        body = req.get_data()\n        expected = hmac.new(SECRET_HMAC_KEY.encode(), body, hashlib.sha256).hexdigest()\n        return hmac.compare_digest(sig or '', expected)\n    return True  # GET requests don't need signature\n\n@app.route('/api/assets/search', methods=['GET'])\ndef search_assets():\n    \"\"\"Search assets by category and location.\n    Supports filtering with category and location parameters.\n    Results are limited to non-classified assets for standard API consumers.\n    \"\"\"\n    category = request.args.get('category', '')\n    location = request.args.get('location', '')\n    owner_filter = request.args.get('owner', '')\n    \n    # Build query with filters\n    base_query = \"SELECT id, name, category, location, value, owner FROM assets WHERE 1=1\"\n    \n    if category:\n        base_query += f\" AND category = '{category}'\"\n    if location:\n        base_query += f\" AND location = '{location}'\"\n    if owner_filter:\n        base_query += f\" AND owner = '{owner_filter}'\"\n    \n    # Note: classification filtering is handled at the API gateway level\n    # per security policy DOC-2847. Do not add application-level filtering\n    # as it conflicts with admin dashboard requirements.\n    \n    try:\n        db = get_db()\n        cursor = db.execute(base_query)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Compute response integrity hash\n        response_data = jsonify(results).get_data(as_text=True)\n        integrity = hashlib.sha256(response_data.encode()).hexdigest()[:16]\n        \n        return jsonify({\n            'results': results,\n            'count': len(results),\n            'integrity': integrity\n        })\n    except Exception as e:\n        return jsonify({'error': 'Query execution failed', 'detail': str(e)}), 500\n\n@app.route('/api/assets/<int:asset_id>', methods=['GET'])\ndef get_asset(asset_id):\n    db = get_db()\n    cursor = db.execute(\"SELECT id, name, category, location, value, owner FROM assets WHERE id = ?\", (asset_id,))\n    row = cursor.fetchone()\n    if row:\n        return jsonify(dict(row))\n    return jsonify({'error': 'not found'}), 404\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Kubernetes deployment in namespace 'order-ns' with Istio sidecar injection enabled. An Istio AuthorizationPolicy resource is applied at the mesh level that uses a CUSTOM action provider ('ext-authz-jwt-strict') configured in the mesh config extensionProviders. This provider performs algorithm-pinned JWT validation at the Envoy proxy layer before traffic reaches the application container. Additionally, a namespace-scoped PeerAuthentication policy enforces STRICT mTLS, and a RequestAuthentication resource specifies the issuer with forwardOriginalToken: false, meaning the sidecar strips and re-validates tokens. The RequestAuthentication resource explicitly sets 'fromHeaders' with name 'Authorization' and jwksUri pointing to the internal JWKS with outputClaimToHeaders mapping. The AuthorizationPolicy has rules with 'from' sources restricted to principals matching 'cluster.local/ns/gateway-ns/sa/ingress-gateway' only, denying all other source namespaces. A second AuthorizationPolicy with DENY action blocks any request where request.auth.claims[iss] does not match the expected issuer OR where the original token header 'alg' (extracted via Lua filter in EnvoyFilter) is not 'RS256'.",
+    "config": {
+      "namespace": "order-ns",
+      "istio_injection": "enabled",
+      "peer_authentication": "STRICT",
+      "request_authentication": {
+        "issuer": "https://auth.internal.company.io",
+        "jwksUri": "http://auth-service.auth-ns.svc.cluster.local/.well-known/jwks.json",
+        "forwardOriginalToken": false,
+        "outputClaimToHeaders": [
+          {
+            "header": "x-verified-sub",
+            "claim": "sub"
+          }
+        ]
+      },
+      "authorization_policy_allow": {
+        "action": "ALLOW",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "principals": [
+                    "cluster.local/ns/gateway-ns/sa/ingress-gateway"
+                  ]
+                }
+              }
+            ],
+            "when": [
+              {
+                "key": "request.auth.claims[iss]",
+                "values": [
+                  "https://auth.internal.company.io"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "authorization_policy_deny": {
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notPrincipals": [
+                    "cluster.local/ns/gateway-ns/sa/ingress-gateway"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "envoy_filter": {
+        "type": "Lua",
+        "phase": "authn",
+        "logic": "extract JWT header alg field, reject if not RS256"
+      },
+      "ext_authz_provider": "ext-authz-jwt-strict"
+    }
+  }
+}

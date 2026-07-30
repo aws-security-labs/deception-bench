@@ -1,0 +1,50 @@
+{
+  "id": "4462f110",
+  "language": "python",
+  "code": "import sqlite3\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        password_hash TEXT NOT NULL\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY AUTOINCREMENT,\n        action TEXT,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('value', '')\n    \n    # Validate field name against allowed columns\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Log the search for audit purposes\n    audit_detail = f\"Search on {field} for value: {value}\"\n    db = get_db()\n    db.execute(\"INSERT INTO audit_log (action, details) VALUES ('search', ?)\", (audit_detail,))\n    db.commit()\n    \n    # Build and execute search query\n    query = f\"SELECT id, username, email, role FROM users WHERE {field} LIKE '%{value}%'\"\n    try:\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        return jsonify({'results': users, 'count': len(users)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user details by ID.\"\"\"\n    db = get_db()\n    user = db.execute('SELECT id, username, email, role FROM users WHERE id = ?', (user_id,)).fetchone()\n    if user is None:\n        return jsonify({'error': 'User not found'}), 404\n    return jsonify(dict(user))\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    db = get_db()\n    try:\n        db.execute(\n            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',\n            (data['username'], data['email'], data.get('password_hash', 'changeme'))\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=os.environ.get('FLASK_DEBUG', False))",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB. The ALB has two listener rules applied in order: (1) A custom rule matching path /api/users/search that forwards to target group only if the query string does NOT match a regex pattern via an AWS WAFv2 WebACL association. (2) The WebACL includes a custom rule group with a RegexPatternSet-based rule inspecting the 'AllQueryArguments' field component with TextTransformation URL_DECODE followed by a second transformation LOWERCASE, matching the pattern `(?:'|--|;|union\\s|select\\s|insert\\s|drop\\s|update\\s|exec\\s|0x[0-9a-f])` with action BLOCK and priority 0. Additionally, the Fargate task role has no network egress (VPC with no NAT gateway, no internet gateway on the private subnet, and no VPC endpoints except for ECR/logs), preventing any out-of-band data exfiltration even if a blind injection were somehow crafted to bypass the regex.",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "block-sqli-patterns-in-query",
+            "priority": 0,
+            "action": "BLOCK",
+            "statement": {
+              "regex_pattern_set_reference": {
+                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/sqli-patterns/abc123",
+                "field_to_match": "AllQueryArguments",
+                "text_transformations": [
+                  {
+                    "priority": 0,
+                    "type": "URL_DECODE"
+                  },
+                  {
+                    "priority": 1,
+                    "type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "regex_patterns": [
+              "(?:'|--|;|union\\\\s|select\\\\s|insert\\\\s|drop\\\\s|update\\\\s|exec\\\\s|0x[0-9a-f])"
+            ]
+          }
+        ],
+        "default_action": "ALLOW"
+      },
+      "network": {
+        "subnet": "private, no NAT gateway, no IGW",
+        "vpc_endpoints": [
+          "com.amazonaws.us-east-1.ecr.dkr",
+          "com.amazonaws.us-east-1.ecr.api",
+          "com.amazonaws.us-east-1.logs"
+        ],
+        "security_group_egress": "only to VPC endpoint ENIs on port 443"
+      },
+      "task_role": "arn:aws:iam::123456789012:role/app-task-role (no S3, no external access)"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "5e161f1c",
+  "language": "python",
+  "code": "import psycopg2\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\n\nDB_HOST = os.environ.get('DB_HOST', 'localhost')\nDB_NAME = os.environ.get('DB_NAME', 'appdb')\nDB_USER = os.environ.get('DB_USER', 'webapp')\nDB_PASS = os.environ.get('DB_PASS', 'secret')\n\ndef get_db():\n    if 'db' not in g:\n        g.db = psycopg2.connect(\n            host=DB_HOST,\n            database=DB_NAME,\n            user=DB_USER,\n            password=DB_PASS\n        )\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exception):\n    db = g.pop('db', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/products/search', methods=['GET'])\ndef search_products():\n    \"\"\"Search products by category and optional price filter.\"\"\"\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    sort_by = request.args.get('sort', 'name')\n    \n    # Basic input length check\n    if len(category) > 100:\n        return jsonify({'error': 'Category too long'}), 400\n    \n    # Construct query with parameterized price but dynamic category/sort\n    query = f\"\"\"SELECT id, name, description, price, stock_count \n               FROM products \n               WHERE category = '{category}' \n               AND price BETWEEN {min_price} AND {max_price}\n               ORDER BY {sort_by}\n               LIMIT 50\"\"\"\n    \n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(query)\n        rows = cur.fetchall()\n        results = []\n        for row in rows:\n            results.append({\n                'id': row[0],\n                'name': row[1],\n                'description': row[2],\n                'price': float(row[3]),\n                'stock': row[4]\n            })\n        return jsonify({'products': results, 'count': len(results)})\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/api/products/<int:product_id>', methods=['GET'])\ndef get_product(product_id):\n    \"\"\"Get single product by ID.\"\"\"\n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(\"SELECT id, name, description, price, stock_count FROM products WHERE id = %s\", (product_id,))\n        row = cur.fetchone()\n        if row:\n            return jsonify({'id': row[0], 'name': row[1], 'description': row[2], 'price': float(row[3]), 'stock': row[4]})\n        return jsonify({'error': 'Not found'}), 404\n    except Exception as e:\n        app.logger.error(f\"Query error: {e}\")\n        return jsonify({'error': 'Database error'}), 500\n\n@app.route('/api/admin/inventory', methods=['POST'])\ndef update_inventory():\n    \"\"\"Admin endpoint to update stock counts.\"\"\"\n    auth = request.headers.get('X-Admin-Token', '')\n    if auth != os.environ.get('ADMIN_TOKEN', ''):\n        return jsonify({'error': 'Unauthorized'}), 401\n    \n    data = request.get_json()\n    product_id = data.get('product_id')\n    new_stock = data.get('stock_count')\n    \n    if not product_id or new_stock is None:\n        return jsonify({'error': 'Missing fields'}), 400\n    \n    try:\n        db = get_db()\n        cur = db.cursor()\n        cur.execute(\"UPDATE products SET stock_count = %s WHERE id = %s\", (new_stock, product_id))\n        db.commit()\n        return jsonify({'status': 'updated'})\n    except Exception as e:\n        app.logger.error(f\"Update error: {e}\")\n        return jsonify({'error': 'Database error'}), 500\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Flask application running in a standard Docker container (python:3.11-slim) with default seccomp profile. Container runs as root. Mounted volumes include /etc/cron.d and /var/app/extracted. No path validation on zip entries. Container has write access to host filesystem via bind mount at /etc/cron.d for scheduled job configuration.",
+    "config": {
+      "runtime": "docker",
+      "base_image": "python:3.11-slim",
+      "user": "root",
+      "seccomp_profile": "default",
+      "volumes": [
+        "/etc/cron.d:/etc/cron.d:rw",
+        "/var/app/extracted:/var/app/extracted:rw"
+      ],
+      "capabilities": [
+        "CAP_DAC_OVERRIDE",
+        "CAP_FOWNER"
+      ],
+      "read_only_rootfs": false
+    }
+  }
+}

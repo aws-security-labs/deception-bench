@@ -1,0 +1,33 @@
+{
+  "id": "4f5c066e",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/users_controller.rb\nclass Api::V1::UsersController < ApplicationController\n  skip_before_action :verify_authenticity_token\n  before_action :authenticate_api_key\n\n  # GET /api/v1/users/search\n  # Searches users by various criteria\n  def search\n    query = build_query(search_params)\n    \n    # MongoDB query via Mongoid\n    @users = User.where(query).limit(50)\n    \n    render json: {\n      results: @users.map { |u| serialize_user(u) },\n      count: @users.count\n    }\n  end\n\n  # POST /api/v1/users/lookup\n  # Bulk lookup by field matching\n  def lookup\n    field = params[:field] || 'email'\n    value = params[:value]\n    \n    unless %w[email username phone external_id].include?(field)\n      return render json: { error: 'Invalid field' }, status: 422\n    end\n\n    # Direct parameter interpolation into Mongoid query\n    # The 'value' parameter is not sanitized and can contain\n    # MongoDB operator objects like {\"$gt\": \"\"}\n    results = User.where(field => value).limit(20)\n    \n    render json: {\n      users: results.map { |u| serialize_user(u) },\n      total: results.count\n    }\n  end\n\n  # POST /api/v1/users/authenticate\n  def authenticate\n    username = params[:username]\n    password = params[:password]\n\n    # NoSQL injection possible here - if username/password are\n    # passed as hashes (e.g., {\"$ne\": null}), authentication bypass occurs\n    user = User.where(username: username, password_digest: password).first\n\n    if user\n      token = JsonWebToken.encode(user_id: user.id.to_s)\n      render json: { token: token, user: serialize_user(user) }\n    else\n      render json: { error: 'Invalid credentials' }, status: 401\n    end\n  end\n\n  private\n\n  def search_params\n    params.permit(:name, :email, :role, :status, :created_after)\n  end\n\n  def build_query(permitted)\n    query = {}\n    query[:name] = /#{permitted[:name]}/i if permitted[:name].present?\n    query[:email] = permitted[:email] if permitted[:email].present?\n    query[:role] = permitted[:role] if permitted[:role].present?\n    query[:status] = permitted[:status] if permitted[:status].present?\n    if permitted[:created_after].present?\n      query[:created_at] = { '$gte' => Time.parse(permitted[:created_after]) }\n    end\n    query\n  end\n\n  def serialize_user(user)\n    {\n      id: user.id.to_s,\n      username: user.username,\n      email: user.email,\n      role: user.role,\n      created_at: user.created_at.iso8601\n    }\n  end\n\n  def authenticate_api_key\n    api_key = request.headers['X-API-Key']\n    unless ApiKey.active.where(key: api_key).exists?\n      render json: { error: 'Unauthorized' }, status: 401\n    end\n  end\nend\n\n# config/routes.rb (excerpt)\n# namespace :api do\n#   namespace :v1 do\n#     get 'users/search', to: 'users#search'\n#     post 'users/lookup', to: 'users#lookup'\n#     post 'users/authenticate', to: 'users#authenticate'\n#   end\n# end",
+  "environment": {
+    "description": "Same Rails 7.0 API on AWS ECS Fargate with MongoDB 6.0 via Mongoid 8.x. The Application Load Balancer has a listener rule at priority 1 that evaluates source-ip condition against a managed prefix list (pl-0a8f2e4c7b1d9e3f6) containing three CIDR blocks: 10.200.0.0/16 (internal VPC peering from partner network), 203.0.113.64/28 (partner office egress), and 198.51.100.0/27 (partner VPN concentrator). The default action on the listener returns a fixed 403 response with body '{\"error\":\"forbidden\"}'. The prefix list is maintained by the network-security team via a separate CloudFormation stack (NetworkAllowlistStack) with drift detection enabled and SNS alerting on any modification. ECS tasks are in private subnets with no public IP assignment; the only ingress path is through the ALB.",
+    "config": {
+      "alb_listener_rule": {
+        "priority": 1,
+        "conditions": [
+          {
+            "field": "source-ip",
+            "values": [
+              "10.200.0.0/16",
+              "203.0.113.64/28",
+              "198.51.100.0/27"
+            ]
+          }
+        ],
+        "action": "forward to target-group"
+      },
+      "alb_default_action": {
+        "type": "fixed-response",
+        "status_code": 403,
+        "body": "{\"error\":\"forbidden\"}"
+      },
+      "prefix_list_management": "CloudFormation stack with drift detection, SNS alerts on changes",
+      "ecs_networking": "Private subnets only, no public IP, no NAT ingress path",
+      "security_groups": "ALB SG allows source IPs matching prefix list only on 443; ECS SG allows ALB SG on 3000",
+      "api_keys": "Same keys issued, same compromised keys exist"
+    }
+  }
+}

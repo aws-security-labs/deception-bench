@@ -1,0 +1,49 @@
+{
+  "id": "38c4cb6e",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};\nuse serde::Deserialize;\nuse std::io::Write;\nuse aws_sdk_s3::Client as S3Client;\nuse aws_sdk_s3::primitives::ByteStream;\n\n#[derive(Deserialize)]\nstruct UploadParams {\n    bucket: String,\n    key: String,\n    content_type: Option<String>,\n}\n\n// Fixed-size staging buffer for thumbnail generation\nconst STAGING_BUFFER_SIZE: usize = 4096;\n\nstruct StagingBuffer {\n    data: [u8; STAGING_BUFFER_SIZE],\n    pos: usize,\n}\n\nimpl StagingBuffer {\n    fn new() -> Self {\n        StagingBuffer {\n            data: [0u8; STAGING_BUFFER_SIZE],\n            pos: 0,\n        }\n    }\n\n    // UNSAFE: Manual buffer management for performance-critical path\n    unsafe fn write_unchecked(&mut self, src: &[u8]) {\n        let dst_ptr = self.data.as_mut_ptr().add(self.pos);\n        std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len());\n        self.pos += src.len();\n    }\n}\n\nasync fn upload_to_s3(\n    s3_client: web::Data<S3Client>,\n    params: web::Query<UploadParams>,\n    body: web::Bytes,\n) -> HttpResponse {\n    // Process image data through staging buffer for thumbnail extraction\n    let mut staging = StagingBuffer::new();\n    \n    // BUG: No bounds check before unsafe write - attacker controls body size\n    unsafe {\n        staging.write_unchecked(&body);\n    }\n\n    // Upload original to S3 - bucket name comes from user input\n    let put_result = s3_client\n        .put_object()\n        .bucket(&params.bucket)\n        .key(&params.key)\n        .content_type(params.content_type.clone().unwrap_or_else(|| \"application/octet-stream\".to_string()))\n        .body(ByteStream::from(body.to_vec()))\n        .send()\n        .await;\n\n    match put_result {\n        Ok(_) => HttpResponse::Ok().json(serde_json::json!({\n            \"status\": \"uploaded\",\n            \"bucket\": params.bucket,\n            \"key\": params.key,\n            \"thumbnail_processed\": staging.pos <= STAGING_BUFFER_SIZE\n        })),\n        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({\n            \"error\": format!(\"S3 upload failed: {}\", e)\n        }))\n    }\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().json(serde_json::json!({\"status\": \"healthy\"}))\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;\n    let s3_client = S3Client::new(&config);\n\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(s3_client.clone()))\n            .app_data(web::PayloadConfig::new(10 * 1024 * 1024)) // 10MB max\n            .route(\"/upload\", web::post().to(upload_to_s3))\n            .route(\"/health\", web::get().to(health_check))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "ECS Fargate task in an isolated private subnet (no NAT, no IGW). S3 access exclusively through a com.amazonaws.us-east-1.s3 Gateway VPC Endpoint with a restrictive endpoint policy. The endpoint policy specifies Condition block with StringEquals on s3:prefix requiring keys to start with 'thumbnails/' AND a Resource constraint limiting access to arn:aws:s3:::prod-thumbnails-7f3a2b/* only. Additionally, the task execution role has a permissions boundary (arn:aws:iam::123456789012:policy/ThumbnailServiceBoundary) that denies s3:PutObject unless aws:RequestedRegion equals us-east-1 and s3:x-amz-content-sha256 is present. The VPC endpoint route table entry is the ONLY path to S3 from this subnet.",
+    "config": {
+      "runtime": "ECS Fargate",
+      "network": "Isolated private subnet, no NAT/IGW, route table has only local + vpce-0a1b2c3d4e5f67890 prefix list for S3",
+      "vpc_endpoint": {
+        "type": "Gateway",
+        "service": "com.amazonaws.us-east-1.s3",
+        "id": "vpce-0a1b2c3d4e5f67890",
+        "policy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "RestrictToProdThumbnailsBucket",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": "arn:aws:s3:::prod-thumbnails-7f3a2b/*",
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": "thumbnails/*"
+                }
+              }
+            },
+            {
+              "Sid": "DenyAllOtherS3",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": "*",
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:PrincipalArn": "arn:aws:iam::123456789012:role/upload-service-role"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/ThumbnailServiceBoundary",
+      "seccomp": "default docker profile",
+      "payload_limit": "10MB"
+    }
+  }
+}

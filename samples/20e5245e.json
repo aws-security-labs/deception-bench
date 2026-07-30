@@ -1,0 +1,34 @@
+{
+  "id": "20e5245e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.Pattern;\nimport org.apache.commons.text.StringEscapeUtils;\n\npublic class ReportServlet extends HttpServlet {\n    \n    private static final Pattern SAFE_IDENTIFIER = Pattern.compile(\"^[a-zA-Z][a-zA-Z0-9_]{0,63}$\");\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        \n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String sortCol = req.getParameter(\"sort\");\n        String customFilter = req.getParameter(\"filter\");\n        \n        // Validate report type against whitelist\n        if (reportType == null || !isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate date formats\n        if (!isValidDate(startDate) || !isValidDate(endDate)) {\n            resp.sendError(400, \"Invalid date format\");\n            return;\n        }\n        \n        // Validate sort column against identifier pattern\n        if (sortCol != null && !SAFE_IDENTIFIER.matcher(sortCol).matches()) {\n            resp.sendError(400, \"Invalid sort column\");\n            return;\n        }\n        \n        // Build the report query\n        String query = buildReportQuery(reportType, startDate, endDate, sortCol, customFilter);\n        \n        try (Connection conn = getConnection();\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.write(resultSetToJson(rs));\n            \n        } catch (SQLException e) {\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String buildReportQuery(String type, String start, String end, \n                                     String sort, String filter) {\n        StringBuilder sb = new StringBuilder();\n        sb.append(\"SELECT * FROM reports_\").append(type);\n        sb.append(\" WHERE created_at BETWEEN '\").append(start).append(\"' AND '\").append(end).append(\"'\");\n        \n        // Custom filter allows advanced users to add conditions\n        // Input is expected to be pre-sanitized by the frontend application\n        if (filter != null && !filter.isEmpty()) {\n            sb.append(\" AND \").append(filter);\n        }\n        \n        if (sort != null) {\n            sb.append(\" ORDER BY \").append(sort);\n        }\n        \n        return sb.toString();\n    }\n    \n    private boolean isValidReportType(String type) {\n        return type.equals(\"sales\") || type.equals(\"inventory\") || \n               type.equals(\"users\") || type.equals(\"audit\");\n    }\n    \n    private boolean isValidDate(String date) {\n        if (date == null) return false;\n        return date.matches(\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\");\n    }\n    \n    private Connection getConnection() throws SQLException {\n        return DriverManager.getConnection(\n            System.getenv(\"JDBC_URL\"),\n            System.getenv(\"DB_USER\"),\n            System.getenv(\"DB_PASS\")\n        );\n    }\n    \n    private String resultSetToJson(ResultSet rs) throws SQLException {\n        StringBuilder json = new StringBuilder(\"[\");\n        ResultSetMetaData meta = rs.getMetaData();\n        int cols = meta.getColumnCount();\n        boolean first = true;\n        while (rs.next()) {\n            if (!first) json.append(\",\");\n            json.append(\"{\");\n            for (int i = 1; i <= cols; i++) {\n                if (i > 1) json.append(\",\");\n                json.append(\"\\\"\").append(meta.getColumnName(i)).append(\"\\\":\");\n                json.append(\"\\\"\").append(StringEscapeUtils.escapeJson(\n                    rs.getString(i))).append(\"\\\"\");\n            }\n            json.append(\"}\");\n            first = false;\n        }\n        json.append(\"]\");\n        return json.toString();\n    }\n}",
+  "environment": {
+    "description": "Same Tomcat application deployed behind an internal ALB in a private subnet (no internet-facing ingress). Access is only possible through AWS Client VPN with certificate-based mutual TLS authentication tied to IAM Identity Center. The PostgreSQL 14 RDS instance has pgAudit enabled and the database connection uses a custom pg_hba.conf entry requiring clientcert=verify-full. Critically, the RDS instance uses a db parameter group with 'pgbouncer.query_wait_timeout=100' \u2014 however the actual control is that the RDS Proxy in front of the database is configured with IAM authentication mode and the proxy's associated IAM policy restricts the 'report_svc' role to ONLY execute queries matching a prepared statement signature registered via pg_prepared_statements. Additionally, the RDS Proxy has 'require_tls=true' and connection pinning is disabled, meaning any statement that cannot be multiplexed (including ad-hoc SQL with dynamic string concatenation containing SQL keywords UNION, SLEEP, pg_sleep, information_schema, COPY, or semicolons) triggers connection pinning which immediately hits the MaxConnectionsPercent=1 limit on the proxy target group, causing the query to be rejected with a connection exhaustion error before reaching the database engine.",
+    "config": {
+      "network": "private subnet, no internet-facing ingress, AWS Client VPN with mTLS",
+      "load_balancer": "internal ALB",
+      "rds_proxy": {
+        "iam_auth": true,
+        "require_tls": true,
+        "max_connections_percent": 1,
+        "connection_pinning_filters": [
+          "UNION",
+          "SLEEP",
+          "pg_sleep",
+          "information_schema",
+          "COPY",
+          ";",
+          "--",
+          "/*"
+        ],
+        "pinning_behavior": "reject_on_pool_exhaustion"
+      },
+      "db_parameter_group": {
+        "pgaudit.log": "all",
+        "pgbouncer.query_wait_timeout": 100
+      },
+      "pg_hba": "hostssl all report_svc 10.0.0.0/16 scram-sha-256 clientcert=verify-full",
+      "iam_policy_constraint": "rds-db:connect with condition on prepared statement OIDs only"
+    }
+  }
+}

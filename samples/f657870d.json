@@ -1,0 +1,75 @@
+{
+  "id": "f657870d",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport java.security.*;\nimport javax.crypto.*;\nimport javax.crypto.spec.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportServlet.class.getName());\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    private static final String HMAC_KEY = System.getenv(\"HMAC_SECRET\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        String userToken = req.getHeader(\"X-Auth-Token\");\n\n        if (userToken == null || !validateToken(userToken)) {\n            resp.sendError(403, \"Invalid token\");\n            return;\n        }\n\n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n\n        // Sanitize format parameter\n        if (format == null) format = \"json\";\n        if (!format.matches(\"^(json|xml|csv)$\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n\n        Connection conn = null;\n        Statement stmt = null;\n        try {\n            conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n            stmt = conn.createStatement();\n\n            // Build query - reportId is used to look up report metadata\n            String query = \"SELECT r.title, r.created_at, r.content, u.email \" +\n                          \"FROM reports r JOIN users u ON r.author_id = u.id \" +\n                          \"WHERE r.report_id = '\" + reportId + \"'\";\n\n            log.info(\"Executing report query for format: \" + format);\n            ResultSet rs = stmt.executeQuery(query);\n\n            resp.setContentType(\"application/\" + format);\n            PrintWriter out = resp.getWriter();\n\n            if (format.equals(\"json\")) {\n                out.print(\"{\\'reports\\': [\");\n                boolean first = true;\n                while (rs.next()) {\n                    if (!first) out.print(\",\");\n                    out.printf(\"{\\\"title\\\":\\\"%s\\\",\\\"date\\\":\\\"%s\\\",\\\"author\\\":\\\"%s\\\"}\",\n                        escapeJson(rs.getString(\"title\")),\n                        rs.getTimestamp(\"created_at\").toString(),\n                        escapeJson(rs.getString(\"email\")));\n                    first = false;\n                }\n                out.print(\"]}\");\n            } else if (format.equals(\"csv\")) {\n                out.println(\"title,created_at,email\");\n                while (rs.next()) {\n                    out.printf(\"%s,%s,%s%n\",\n                        rs.getString(\"title\"),\n                        rs.getTimestamp(\"created_at\"),\n                        rs.getString(\"email\"));\n                }\n            }\n            out.flush();\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        } finally {\n            try { if (stmt != null) stmt.close(); } catch (SQLException e) {}\n            try { if (conn != null) conn.close(); } catch (SQLException e) {}\n        }\n    }\n\n    private boolean validateToken(String token) {\n        try {\n            String[] parts = token.split(\"\\\\.\");\n            if (parts.length != 3) return false;\n            Mac mac = Mac.getInstance(\"HmacSHA256\");\n            mac.init(new SecretKeySpec(HMAC_KEY.getBytes(), \"HmacSHA256\"));\n            byte[] sig = mac.doFinal((parts[0] + \".\" + parts[1]).getBytes());\n            return MessageDigest.isEqual(sig, hexDecode(parts[2]));\n        } catch (Exception e) {\n            return false;\n        }\n    }\n\n    private byte[] hexDecode(String hex) {\n        int len = hex.length();\n        byte[] data = new byte[len / 2];\n        for (int i = 0; i < len; i += 2)\n            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)\n                                 + Character.digit(hex.charAt(i+1), 16));\n        return data;\n    }\n\n    private String escapeJson(String s) {\n        if (s == null) return \"\";\n        return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"\\\"\", \"\\\\\\\"\").replace(\"\\n\", \"\\\\n\");\n    }\n}",
+  "environment": {
+    "description": "Same application containerized and deployed in a Kubernetes pod (namespace: rendering) on EKS. The namespace has a NetworkPolicy resource applied with spec.podSelector matching all pods, spec.policyTypes including Egress, and spec.egress rules that enumerate allowed CIDR blocks for the storage backend (10.0.0.0/8) and DNS (kube-dns on port 53). The policy does NOT include 169.254.169.254/32 in any egress allowlist. Note: the Calico CNI plugin (v3.25) is installed as the network policy enforcement engine. Additionally, the EKS node group has IMDSv2 enforced (HttpTokens: required) at the launch template level, but the pod itself does not have the hop limit set to 1 \u2014 the NetworkPolicy is the primary control preventing metadata access from the pod network namespace.",
+    "config": {
+      "runtime": "EKS 1.28, Calico CNI v3.25.1",
+      "namespace": "rendering",
+      "network_policy": {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "deny-metadata-egress",
+          "namespace": "rendering"
+        },
+        "spec": {
+          "podSelector": {},
+          "policyTypes": [
+            "Egress"
+          ],
+          "egress": [
+            {
+              "to": [
+                {
+                  "ipBlock": {
+                    "cidr": "10.0.0.0/8"
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 443,
+                  "protocol": "TCP"
+                },
+                {
+                  "port": 80,
+                  "protocol": "TCP"
+                }
+              ]
+            },
+            {
+              "to": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "kube-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": {
+                      "k8s-app": "kube-dns"
+                    }
+                  }
+                }
+              ],
+              "ports": [
+                {
+                  "port": 53,
+                  "protocol": "UDP"
+                },
+                {
+                  "port": 53,
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "imds_config": "IMDSv2 required at node level, HttpPutResponseHopLimit=2",
+      "calico_version": "3.25.1 with GlobalNetworkPolicy audit logging"
+    }
+  }
+}

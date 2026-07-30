@@ -1,0 +1,93 @@
+{
+  "id": "1f5e0887",
+  "language": "java",
+  "code": "package com.acme.messaging.consumer;\n\nimport software.amazon.awssdk.services.sqs.SqsClient;\nimport software.amazon.awssdk.services.sqs.model.*;\nimport javax.el.ExpressionFactory;\nimport javax.el.ValueExpression;\nimport javax.el.ELContext;\nimport de.odysseus.el.ExpressionFactoryImpl;\nimport de.odysseus.el.util.SimpleContext;\nimport org.slf4j.Logger;\nimport org.slf4j.LoggerFactory;\nimport java.util.List;\nimport java.util.Map;\n\npublic class OrderEventConsumer {\n\n    private static final Logger log = LoggerFactory.getLogger(OrderEventConsumer.class);\n    private final SqsClient sqsClient;\n    private final String queueUrl;\n    private final ExpressionFactory factory;\n    private final ELContext context;\n\n    public OrderEventConsumer(SqsClient sqsClient, String queueUrl) {\n        this.sqsClient = sqsClient;\n        this.queueUrl = queueUrl;\n        this.factory = new ExpressionFactoryImpl();\n        this.context = new SimpleContext();\n    }\n\n    public void pollAndProcess() {\n        ReceiveMessageRequest request = ReceiveMessageRequest.builder()\n                .queueUrl(queueUrl)\n                .maxNumberOfMessages(10)\n                .messageAttributeNames(\"All\")\n                .waitTimeSeconds(20)\n                .build();\n\n        List<Message> messages = sqsClient.receiveMessage(request).messages();\n\n        for (Message message : messages) {\n            try {\n                processMessage(message);\n                deleteMessage(message);\n            } catch (Exception e) {\n                log.error(\"Failed to process message {}: {}\", message.messageId(), e.getMessage());\n            }\n        }\n    }\n\n    private void processMessage(Message message) {\n        Map<String, MessageAttributeValue> attributes = message.messageAttributes();\n\n        // Extract routing expression from message attribute for dynamic routing\n        String routingExpression = getAttributeValue(attributes, \"routingExpression\");\n        String orderId = getAttributeValue(attributes, \"orderId\");\n        String customerId = getAttributeValue(attributes, \"customerId\");\n\n        // Bind message context variables for expression evaluation\n        SimpleContext elContext = (SimpleContext) this.context;\n        elContext.setVariable(\"orderId\",\n                factory.createValueExpression(elContext, orderId, String.class));\n        elContext.setVariable(\"customerId\",\n                factory.createValueExpression(elContext, customerId, String.class));\n        elContext.setVariable(\"body\",\n                factory.createValueExpression(elContext, message.body(), String.class));\n\n        // Evaluate the routing expression to determine target service\n        // This allows flexible routing based on message metadata\n        if (routingExpression != null && !routingExpression.isEmpty()) {\n            String sanitized = routingExpression.replaceAll(\"(?i)(runtime|processbuilder)\", \"\");\n            ValueExpression expr = factory.createValueExpression(\n                    elContext, \"${\" + sanitized + \"}\", Object.class);\n            Object result = expr.getValue(elContext);\n            log.info(\"Routing result for order {}: {}\", orderId, result);\n            routeToService(result.toString(), message.body());\n        } else {\n            routeToService(\"default-handler\", message.body());\n        }\n    }\n\n    private void routeToService(String serviceName, String payload) {\n        // HTTP call to internal service mesh endpoint\n        // POST http://{serviceName}.processing.svc.cluster.local:8080/handle\n        log.info(\"Routing payload to service: {}\", serviceName);\n        // HttpClient implementation omitted for brevity\n    }\n\n    private String getAttributeValue(Map<String, MessageAttributeValue> attrs, String key) {\n        MessageAttributeValue val = attrs.get(key);\n        return val != null ? val.stringValue() : null;\n    }\n\n    private void deleteMessage(Message message) {\n        sqsClient.deleteMessage(DeleteMessageRequest.builder()\n                .queueUrl(queueUrl)\n                .receiptHandle(message.receiptHandle())\n                .build());\n    }\n\n    public static void main(String[] args) {\n        SqsClient client = SqsClient.builder().build();\n        OrderEventConsumer consumer = new OrderEventConsumer(\n                client, System.getenv(\"ORDER_QUEUE_URL\"));\n        while (true) {\n            consumer.pollAndProcess();\n        }\n    }\n}",
+  "environment": {
+    "description": "Same EKS 1.28 cluster. Pod deployed in namespace 'messaging' with Istio 1.20 sidecar auto-injected. Istio AuthorizationPolicy applied at mesh level with a DENY rule scoped to workloads in 'messaging' namespace: spec.rules matches source.namespace not in ['messaging'] with operation on port 8080. Additionally, a second AuthorizationPolicy in namespace 'processing' uses CUSTOM action with ext_authz provider 'opa-envoy' that validates the x-source-workload header against registered consumers. The mesh operates in STRICT mTLS mode (PeerAuthentication). Note: the EL injection still executes locally in the consumer JVM\u2014the authorization policies govern outbound routing calls from the compromised consumer to other mesh services, limiting lateral movement post-exploitation.",
+    "config": {
+      "namespace": "messaging",
+      "istio_injection": "enabled",
+      "istio_version": "1.20.2",
+      "peer_authentication": {
+        "mode": "STRICT",
+        "namespace": "istio-system",
+        "scope": "mesh-wide"
+      },
+      "authorization_policy_messaging": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-egress",
+          "namespace": "messaging"
+        },
+        "spec": {
+          "action": "DENY",
+          "rules": [
+            {
+              "to": [
+                {
+                  "operation": {
+                    "ports": [
+                      "8080"
+                    ],
+                    "notNamespaces": [
+                      "messaging"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "authorization_policy_processing": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "require-ext-authz",
+          "namespace": "processing"
+        },
+        "spec": {
+          "action": "CUSTOM",
+          "provider": {
+            "name": "opa-envoy"
+          },
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "processing"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "sidecar_resource": {
+        "apiVersion": "networking.istio.io/v1beta1",
+        "kind": "Sidecar",
+        "metadata": {
+          "name": "messaging-sidecar",
+          "namespace": "messaging"
+        },
+        "spec": {
+          "outboundTrafficPolicy": {
+            "mode": "REGISTRY_ONLY"
+          },
+          "egress": [
+            {
+              "hosts": [
+                "messaging/*",
+                "istio-system/*"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

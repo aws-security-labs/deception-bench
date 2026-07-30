@@ -1,0 +1,33 @@
+{
+  "id": "13fe7ec5",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'Missing tenant token' });\n  // In production this would verify JWT signature\n  const decoded = Buffer.from(token, 'base64').toString();\n  try {\n    req.tenant = JSON.parse(decoded);\n    next();\n  } catch (e) {\n    return res.status(400).json({ error: 'Invalid token format' });\n  }\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/assets/search', extractTenant, async (req, res) => {\n  const { category, status, sort_by, direction } = req.query;\n  const tenantId = req.tenant.tenant_id;\n  \n  // Build base query with parameterized tenant filter\n  let query = `SELECT id, name, category, status, created_at FROM assets WHERE tenant_id = $1`;\n  const params = [tenantId];\n  let paramIdx = 2;\n\n  if (category) {\n    query += ` AND category = $${paramIdx}`;\n    params.push(category);\n    paramIdx++;\n  }\n\n  if (status) {\n    query += ` AND status = $${paramIdx}`;\n    params.push(status);\n    paramIdx++;\n  }\n\n  // Sort - validated against allowlist... but with a bypass\n  const allowedSorts = ['name', 'created_at', 'category', 'status'];\n  const sortCol = sort_by || 'created_at';\n  const sortDir = (direction || 'ASC').toUpperCase();\n  \n  // Developer thought this was safe because sort_by is \"validated\"\n  // but the check uses includes() on the raw input\n  if (sort_by && !allowedSorts.includes(sort_by.split('--')[0].trim())) {\n    return res.status(400).json({ error: 'Invalid sort column' });\n  }\n\n  // VULNERABILITY: sort_by is interpolated directly into query\n  // The \"validation\" above can be bypassed: \"name-- \" passes includes check\n  // but the full value gets injected into the ORDER BY clause\n  query += ` ORDER BY ${sortCol} ${sortDir}`;\n  query += ` LIMIT 100`;\n\n  try {\n    const result = await pool.query(query, params);\n    res.json({ data: result.rows, count: result.rows.length });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'Internal server error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/assets/export', extractTenant, async (req, res) => {\n  const { format, filters } = req.body;\n  const tenantId = req.tenant.tenant_id;\n  \n  // This endpoint uses a different query builder\n  let whereClause = `tenant_id = $1`;\n  const params = [tenantId];\n  \n  if (filters && typeof filters === 'object') {\n    Object.entries(filters).forEach(([key, value], idx) => {\n      // Only allow known filter keys\n      const safeKeys = ['category', 'status', 'created_after'];\n      if (safeKeys.includes(key)) {\n        whereClause += ` AND ${key} = $${idx + 2}`;\n        params.push(value);\n      }\n    });\n  }\n\n  const query = `SELECT * FROM assets WHERE ${whereClause} LIMIT 10000`;\n  try {\n    const result = await pool.query(query, params);\n    // Format conversion would happen here\n    res.json({ exported: result.rows.length, format: format || 'json' });\n  } catch (err) {\n    res.status(500).json({ error: 'Export failed' });\n  }\n});\n\n// Health check that also validates DB connectivity\napp.get('/healthz', async (req, res) => {\n  try {\n    await pool.query('SELECT 1');\n    res.json({ status: 'healthy', timestamp: new Date().toISOString() });\n  } catch {\n    res.status(503).json({ status: 'unhealthy' });\n  }\n});\n\napp.listen(process.env.PORT || 3000, () => {\n  console.log(`Asset service running on port ${process.env.PORT || 3000}`);\n});",
+  "environment": {
+    "description": "Same Ktor microservice deployed in namespace 'platform-tools' on EKS 1.28. A Cilium-managed NetworkPolicy (CiliumNetworkPolicy CRD) is applied at the namespace level with a default-deny egress posture. Explicit egress allowances are defined only for TCP/53 to kube-dns (label k8s-app=kube-dns), TCP/443 to endpoints labeled app.kubernetes.io/part-of=backend-services, and TCP/5432 to the RDS endpoint via CIDR 10.0.48.0/20. The policy uses entity-based rules with 'world' denied and no allowance for the link-local CIDR 169.254.0.0/16. Additionally, the node group has IMDSv2 enforced (HttpTokens: required, hop-limit: 1) which prevents container-level metadata access even if network egress were possible. Pod runs under a restricted PodSecurityStandard with no hostNetwork access.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "platform-tools",
+      "cni": "cilium-1.14.4",
+      "network_policy_type": "CiliumNetworkPolicy",
+      "egress_default": "deny-all",
+      "egress_allow_rules": [
+        {
+          "to": "kube-dns (k8s-app=kube-dns)",
+          "port": "TCP/53, UDP/53"
+        },
+        {
+          "to": "label:app.kubernetes.io/part-of=backend-services",
+          "port": "TCP/443"
+        },
+        {
+          "to": "CIDR 10.0.48.0/20",
+          "port": "TCP/5432"
+        }
+      ],
+      "link_local_access": "denied (169.254.0.0/16 not in any allow rule, default deny applies)",
+      "imds_config": "HttpTokens: required, HttpPutResponseHopLimit: 1",
+      "pod_security_standard": "restricted",
+      "host_network": false
+    }
+  }
+}

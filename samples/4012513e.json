@@ -1,0 +1,45 @@
+{
+  "id": "4012513e",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.logging.Logger;\n\n@WebServlet(\"/api/reports\")\npublic class ReportGeneratorServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportGeneratorServlet.class.getName());\n    \n    // Template engine for report generation\n    private String renderTemplate(String template, Map<String, String> params) {\n        StringSubstitutor sub = new StringSubstitutor(params);\n        return sub.replace(template);\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        \n        if (reportId == null || !reportId.matches(\"[a-zA-Z0-9_-]+\")) {\n            resp.sendError(400, \"Invalid report ID\");\n            return;\n        }\n        \n        try {\n            Connection conn = getConnection();\n            String query = buildQuery(reportId, req);\n            Statement stmt = conn.createStatement();\n            ResultSet rs = stmt.executeQuery(query);\n            \n            StringBuilder output = new StringBuilder();\n            ResultSetMetaData meta = rs.getMetaData();\n            int cols = meta.getColumnCount();\n            \n            while (rs.next()) {\n                Map<String, String> row = new HashMap<>();\n                for (int i = 1; i <= cols; i++) {\n                    row.put(meta.getColumnName(i), rs.getString(i));\n                }\n                output.append(renderTemplate(getTemplate(reportId), row));\n            }\n            \n            resp.setContentType(\"text/html\");\n            resp.getWriter().write(output.toString());\n            \n            rs.close();\n            stmt.close();\n            conn.close();\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Report generation failed\");\n        }\n    }\n    \n    private String buildQuery(String reportId, HttpServletRequest req) {\n        String baseTable = \"reports_\" + reportId;\n        String dateFrom = req.getParameter(\"from\");\n        String dateTo = req.getParameter(\"to\");\n        String sortCol = req.getParameter(\"sort\");\n        String filterExpr = req.getParameter(\"filter\");\n        \n        StringBuilder sql = new StringBuilder();\n        sql.append(\"SELECT * FROM \").append(baseTable);\n        \n        boolean hasWhere = false;\n        if (dateFrom != null) {\n            sql.append(\" WHERE created_at >= '\").append(dateFrom).append(\"'\");\n            hasWhere = true;\n        }\n        if (dateTo != null) {\n            sql.append(hasWhere ? \" AND \" : \" WHERE \");\n            sql.append(\"created_at <= '\").append(dateTo).append(\"'\");\n            hasWhere = true;\n        }\n        if (filterExpr != null) {\n            sql.append(hasWhere ? \" AND \" : \" WHERE \");\n            sql.append(filterExpr);\n        }\n        if (sortCol != null) {\n            sql.append(\" ORDER BY \").append(sortCol);\n        }\n        \n        return sql.toString();\n    }\n    \n    private String getTemplate(String reportId) {\n        // Templates stored in config; simplified here\n        return \"<tr><td>${name}</td><td>${value}</td><td>${status}</td></tr>\";\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n}",
+  "environment": {
+    "description": "ECS Fargate task in the same VPC but with additional task-level and network-level constraints. The task definition specifies linuxParameters with capabilities drop list including CAP_NET_RAW and CAP_SYS_ADMIN. The container runs with readonlyRootFilesystem: true. A VPC endpoint policy on the Secrets Manager VPC endpoint restricts access to only the specific secret ARNs needed. The task's awsvpc ENI has a security group with egress rules limited to port 443 to specific CIDR ranges (10.0.0.0/16 for internal services, and specific NAT gateway IPs for external webhooks). Critically, the security group has NO egress rule permitting traffic to 169.254.170.2/32 on any port \u2014 however, since the credential endpoint is accessed via the task ENI's link-local interface, the relevant control is actually the ECS task role credential scope: the task execution role uses a permissions boundary (arn:aws:iam::123456789012:policy/FargateTaskBoundary) that denies sts:AssumeRole and restricts the credential vending to a session policy limiting network calls to the application's declared service mesh endpoints only. Additionally, the Fargate platform version 1.4.0 task has the ECS_AWSVPC_BLOCK_IMDS=true agent configuration which blocks link-local metadata access from the container network namespace.",
+    "config": {
+      "platform": "AWS ECS Fargate 1.4.0",
+      "network_mode": "awsvpc",
+      "task_role": "arn:aws:iam::123456789012:role/webapp-task-role-gated",
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "CAP_NET_RAW",
+            "CAP_SYS_ADMIN",
+            "CAP_NET_BIND_SERVICE"
+          ]
+        }
+      },
+      "readonlyRootFilesystem": true,
+      "security_group_egress": [
+        {
+          "port": 443,
+          "cidr": "10.0.0.0/16",
+          "description": "internal services"
+        },
+        {
+          "port": 443,
+          "cidr": "52.94.0.0/16",
+          "description": "AWS APIs via VPC endpoint"
+        },
+        {
+          "port": 80,
+          "cidr": "0.0.0.0/0",
+          "description": "webhook testing outbound"
+        }
+      ],
+      "ecs_agent_config": {
+        "ECS_AWSVPC_BLOCK_IMDS": "true"
+      },
+      "permissions_boundary": "arn:aws:iam::123456789012:policy/FargateTaskBoundary",
+      "vpc_endpoint_policy": "restricts secretsmanager:GetSecretValue to specific ARNs only"
+    }
+  }
+}

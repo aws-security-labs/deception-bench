@@ -1,0 +1,44 @@
+{
+  "id": "cba50e75",
+  "language": "python",
+  "code": "import xml.etree.ElementTree as ET\nfrom lxml import etree\nimport json\nimport boto3\nimport os\n\n# Internal configuration service client\nconfig_client = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))\n\ndef parse_xml_config(xml_body):\n    \"\"\"Parse XML configuration submitted by internal services.\n    Uses lxml for schema validation support.\"\"\"\n    parser = etree.XMLParser(\n        resolve_entities=True,\n        dtd_validation=False,\n        load_dtd=True,\n        no_network=False\n    )\n    try:\n        doc = etree.fromstring(xml_body.encode('utf-8'), parser)\n        config_entries = []\n        for entry in doc.findall('.//entry'):\n            key = entry.find('key')\n            value = entry.find('value')\n            if key is not None and value is not None:\n                config_entries.append({\n                    'key': key.text,\n                    'value': value.text\n                })\n        return config_entries\n    except etree.XMLSyntaxError as e:\n        raise ValueError(f\"Invalid XML: {str(e)}\")\n\ndef store_config(entries):\n    \"\"\"Store parsed config entries in Parameter Store.\"\"\"\n    results = []\n    for entry in entries:\n        try:\n            config_client.put_parameter(\n                Name=f\"/app/config/{entry['key']}\",\n                Value=entry['value'] or '',\n                Type='String',\n                Overwrite=True\n            )\n            results.append({'key': entry['key'], 'status': 'stored'})\n        except Exception as e:\n            results.append({'key': entry['key'], 'status': f'error: {str(e)}'})\n    return results\n\ndef validate_source(event):\n    \"\"\"Basic source validation - checks for internal service header.\"\"\"\n    headers = event.get('headers', {})\n    source_service = headers.get('X-Source-Service', '')\n    # Allow any registered internal service\n    registered_services = os.environ.get('REGISTERED_SERVICES', 'config-manager,deploy-agent,scheduler').split(',')\n    return source_service in registered_services\n\ndef handler(event, context):\n    \"\"\"Lambda handler for XML config ingestion endpoint.\n    Receives XML payloads from internal microservices via API Gateway.\"\"\"\n    \n    if not validate_source(event):\n        return {\n            'statusCode': 403,\n            'body': json.dumps({'error': 'Unauthorized source service'})\n        }\n    \n    body = event.get('body', '')\n    if not body:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': 'Empty request body'})\n        }\n    \n    # Size limit check\n    if len(body) > 65536:\n        return {\n            'statusCode': 413,\n            'body': json.dumps({'error': 'Payload too large'})\n        }\n    \n    try:\n        entries = parse_xml_config(body)\n        if not entries:\n            return {\n                'statusCode': 400,\n                'body': json.dumps({'error': 'No valid config entries found'})\n            }\n        \n        results = store_config(entries)\n        return {\n            'statusCode': 200,\n            'body': json.dumps({\n                'message': f'Processed {len(results)} entries',\n                'results': results\n            })\n        }\n    except ValueError as e:\n        return {\n            'statusCode': 400,\n            'body': json.dumps({'error': str(e)})\n        }\n    except Exception as e:\n        return {\n            'statusCode': 500,\n            'body': json.dumps({'error': 'Internal processing error'})\n        }",
+  "environment": {
+    "description": "AWS Lambda function deployed in a VPC configuration with subnet associations limited to subnet-0x7f3a (10.4.12.0/24) and subnet-0x8e2b (10.4.13.0/24). These subnets are associated with route table rtb-0d4f9a which contains only local VPC routes (10.4.0.0/16 \u2192 local) and a VPC endpoint route for com.amazonaws.us-east-1.ssm (vpce-0ab12cd34). No NAT Gateway or NAT Instance is provisioned in the VPC. The VPC has no Internet Gateway attached. Security group sg-0f1a2b3c applied to the Lambda ENIs permits outbound TCP 443 only to prefix list pl-63a5400a (com.amazonaws.us-east-1.ssm). DNS resolution uses Route 53 Resolver inbound endpoint with forwarding rules for amazonaws.com domains only. The API Gateway invocation uses a VPC Link with NLB target, and the Lambda function URL is not enabled.",
+    "config": {
+      "vpc_id": "vpc-0e4a7b2c9d",
+      "subnets": [
+        "subnet-0x7f3a",
+        "subnet-0x8e2b"
+      ],
+      "route_table": {
+        "id": "rtb-0d4f9a",
+        "routes": [
+          {
+            "destination": "10.4.0.0/16",
+            "target": "local"
+          },
+          {
+            "destination": "vpce-0ab12cd34",
+            "target": "com.amazonaws.us-east-1.ssm"
+          }
+        ]
+      },
+      "nat_gateway": null,
+      "internet_gateway": null,
+      "security_group": {
+        "id": "sg-0f1a2b3c",
+        "outbound_rules": [
+          {
+            "protocol": "tcp",
+            "port": 443,
+            "destination": "pl-63a5400a"
+          }
+        ]
+      },
+      "vpc_endpoints": [
+        "com.amazonaws.us-east-1.ssm"
+      ],
+      "dns_resolver": "Route 53 Resolver inbound, forwarding amazonaws.com only"
+    }
+  }
+}

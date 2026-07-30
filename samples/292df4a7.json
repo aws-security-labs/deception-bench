@@ -1,0 +1,34 @@
+{
+  "id": "292df4a7",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.logging.*;\nimport org.json.*;\n\npublic class AssetInventoryServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(\"AssetInventory\");\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String action = req.getParameter(\"action\");\n        if (\"search\".equals(action)) {\n            handleSearch(req, resp);\n        } else if (\"export\".equals(action)) {\n            handleExport(req, resp);\n        } else {\n            resp.sendError(400, \"Unknown action\");\n        }\n    }\n\n    private void handleSearch(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String category = req.getParameter(\"category\");\n        String owner = req.getParameter(\"owner\");\n        String sortCol = req.getParameter(\"sort\");\n        \n        // Validate sort column against allowlist\n        if (sortCol != null && !sortCol.matches(\"^(name|created_at|value|location)$\")) {\n            sortCol = \"name\";\n        }\n        \n        StringBuilder query = new StringBuilder(\n            \"SELECT id, name, category, owner, value, location FROM assets WHERE 1=1\");\n        \n        if (category != null && !category.isEmpty()) {\n            query.append(\" AND category = '\" + category + \"'\");\n        }\n        if (owner != null && !owner.isEmpty()) {\n            query.append(\" AND owner = '\" + owner + \"'\");\n        }\n        if (sortCol != null) {\n            query.append(\" ORDER BY \" + sortCol);\n        }\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query.toString())) {\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"id\", rs.getInt(\"id\"));\n                row.put(\"name\", rs.getString(\"name\"));\n                row.put(\"category\", rs.getString(\"category\"));\n                row.put(\"owner\", rs.getString(\"owner\"));\n                row.put(\"value\", rs.getDouble(\"value\"));\n                row.put(\"location\", rs.getString(\"location\"));\n                results.put(row);\n            }\n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            log.warning(\"Query failed: \" + e.getMessage());\n            resp.sendError(500, \"Database error\");\n        }\n    }\n\n    private void handleExport(HttpServletRequest req, HttpServletResponse resp)\n            throws IOException {\n        String format = req.getParameter(\"format\");\n        String ids = req.getParameter(\"ids\");\n        \n        if (ids == null || !ids.matches(\"^[0-9,]+$\")) {\n            resp.sendError(400, \"Invalid IDs\");\n            return;\n        }\n        \n        String query = \"SELECT * FROM assets WHERE id IN (\" + ids + \")\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement();\n             ResultSet rs = stmt.executeQuery(query)) {\n            \n            resp.setContentType(\"text/csv\");\n            PrintWriter out = resp.getWriter();\n            out.println(\"id,name,category,owner,value,location\");\n            while (rs.next()) {\n                out.printf(\"%d,%s,%s,%s,%.2f,%s%n\",\n                    rs.getInt(\"id\"), rs.getString(\"name\"),\n                    rs.getString(\"category\"), rs.getString(\"owner\"),\n                    rs.getDouble(\"value\"), rs.getString(\"location\"));\n            }\n        } catch (SQLException e) {\n            log.warning(\"Export failed: \" + e.getMessage());\n            resp.sendError(500, \"Export error\");\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // Bulk update endpoint\n        BufferedReader reader = req.getReader();\n        StringBuilder body = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) body.append(line);\n        \n        JSONObject payload = new JSONObject(body.toString());\n        String table = payload.optString(\"table\", \"assets\");\n        String field = payload.getString(\"field\");\n        String value = payload.getString(\"value\");\n        String condition = payload.getString(\"where\");\n        \n        // Only allow updates to assets table\n        if (!\"assets\".equals(table)) {\n            resp.sendError(403, \"Forbidden\");\n            return;\n        }\n        \n        String update = String.format(\"UPDATE %s SET %s = '%s' WHERE %s\",\n            table, field, value, condition);\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             Statement stmt = conn.createStatement()) {\n            int rows = stmt.executeUpdate(update);\n            resp.getWriter().write(\"{\\\"updated\\\": \" + rows + \"}\");\n        } catch (SQLException e) {\n            log.warning(\"Update failed: \" + e.getMessage());\n            resp.sendError(500, \"Update error\");\n        }\n    }\n}",
+  "environment": {
+    "description": "Kubernetes 1.26 cluster on EKS with default namespace. Pod runs as root (UID 0) with no security context restrictions. Container image based on amazonlinux:2 with full filesystem. No PodSecurityPolicy or Pod Security Standards enforced. Pod spec includes hostPath volume mount of / to /host-root. Kafka topic accepts messages from any authenticated producer.",
+    "config": {
+      "kubernetes_version": "1.26",
+      "pod_security_admission": "disabled",
+      "pod_spec": {
+        "securityContext": {
+          "runAsUser": 0,
+          "privileged": true
+        },
+        "volumes": [
+          {
+            "name": "host-fs",
+            "hostPath": {
+              "path": "/"
+            }
+          }
+        ],
+        "volumeMounts": [
+          {
+            "name": "host-fs",
+            "mountPath": "/host-root"
+          }
+        ]
+      },
+      "network_policy": "none",
+      "service_account": "default"
+    }
+  }
+}

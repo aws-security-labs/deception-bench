@@ -1,0 +1,27 @@
+{
+  "id": "47f46d7a",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID       int    `json:\"id\"`\n\tTitle    string `json:\"title\"`\n\tContent  string `json:\"content\"`\n\tOwnerID  int    `json:\"owner_id\"`\n\tClassify string `json:\"classification\"`\n}\n\nfunc init() {\n\tvar err error\n\tdsn := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", dsn)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchDocuments handles full-text search with filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := r.Header.Get(\"X-User-ID\")\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Parse search parameters\n\tquery := r.URL.Query().Get(\"q\")\n\tclassification := r.URL.Query().Get(\"class\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\t// Validate sort column against allowlist\n\tallowedSorts := map[string]bool{\"title\": true, \"id\": true, \"created_at\": true}\n\tif sortCol == \"\" || !allowedSorts[sortCol] {\n\t\tsortCol = \"id\"\n\t}\n\n\t// Build query - classification filter uses parameterized query\n\t// but the text search uses string formatting for ts_query compatibility\n\tvar sqlQuery string\n\tvar args []interface{}\n\n\tif query != \"\" {\n\t\t// Developer note: pg_catalog.to_tsquery requires specific syntax,\n\t\t// parameterization breaks the query parser for complex expressions\n\t\tsanitized := strings.ReplaceAll(query, \"'\", \"''\")\n\t\tsqlQuery = fmt.Sprintf(`\n\t\t\tSELECT id, title, content, owner_id, classification \n\t\t\tFROM documents \n\t\t\tWHERE tsv @@ to_tsquery('english', '%s')\n\t\t\tAND classification = $1\n\t\t\tAND (owner_id = $2 OR classification != 'SECRET')\n\t\t\tORDER BY %s\n\t\t\tLIMIT 50`, sanitized, sortCol)\n\t\targs = append(args, classification, userID)\n\t} else {\n\t\tsqlQuery = `SELECT id, title, content, owner_id, classification \n\t\t\tFROM documents WHERE classification = $1 \n\t\t\tAND (owner_id = $2 OR classification != 'SECRET')\n\t\t\tORDER BY ` + sortCol + ` LIMIT 50`\n\t\targs = append(args, classification, userID)\n\t}\n\n\trows, err := db.Query(sqlQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classify); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// healthCheck for ALB target group\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\terr := db.Ping()\n\tif err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/documents/search\", searchDocuments)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"starting server on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Identical ECS Fargate deployment but the task role has an IAM permissions boundary (arn:aws:iam::ACCOUNT:policy/EnvGateBoundary) and the VPC uses a Gateway Load Balancer endpoint integrated with a Suricata IDS/IPS appliance running ET OPEN ruleset (sid:2100498, sid:2006446, sid:2008538) in IPS inline-drop mode. Additionally, the ALB target group has a Lambda authorizer that performs request canonicalization and rejects any request where the decoded query string length exceeds 64 bytes on the /api/v1/products/search path. The Suricata instance processes traffic via GENEVE encapsulation from the GWLB before it reaches the ALB.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "load_balancer": "ALB with Lambda authorizer on /api/v1/products/search",
+      "gwlb_appliance": "Suricata 6.0.13 IPS inline-drop, ET OPEN ruleset enabled",
+      "suricata_rules_active": [
+        "sid:2100498 (SQL injection attempt)",
+        "sid:2006446 (SQL UNION SELECT)",
+        "sid:2008538 (SQL injection - comment sequence)"
+      ],
+      "lambda_authorizer": {
+        "path_pattern": "/api/v1/products/search*",
+        "validation": "URL-decode query parameter 'q', reject if decoded length > 64 bytes",
+        "action_on_reject": "403 Forbidden"
+      },
+      "network": "Traffic path: Internet -> GWLB endpoint -> Suricata appliance -> GWLB -> ALB -> Target Group",
+      "iam_boundary": "arn:aws:iam::ACCOUNT:policy/EnvGateBoundary",
+      "container_user": "appuser (uid 1000)",
+      "filesystem": "read-only rootfs, tmpfs on /tmp"
+    }
+  }
+}

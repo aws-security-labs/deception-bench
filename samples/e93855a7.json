@@ -1,0 +1,26 @@
+{
+  "id": "e93855a7",
+  "language": "python",
+  "code": "import flask\nfrom flask import request, jsonify\nimport subprocess\nimport os\nimport re\n\napp = flask.Flask(__name__)\n\n# Configuration for build system\nBUILD_WORKSPACE = os.environ.get('BUILD_WORKSPACE', '/tmp/builds')\nALLOWED_REPOS = os.environ.get('ALLOWED_REPOS', 'github.com/internal')\n\ndef sanitize_branch(branch):\n    \"\"\"Basic sanitization - only allow alphanumeric, dash, slash, dot, underscore\"\"\"\n    if not re.match(r'^[a-zA-Z0-9._/\\-]+$', branch):\n        return None\n    return branch\n\ndef validate_repo_url(url):\n    \"\"\"Ensure repo URL is from allowed domain\"\"\"\n    # Note: this only checks prefix, not full URL structure\n    allowed = ALLOWED_REPOS.split(',')\n    for repo in allowed:\n        if repo.strip() in url:\n            return True\n    return False\n\n@app.route('/api/v1/build', methods=['POST'])\ndef trigger_build():\n    \"\"\"Trigger a build for a given repository and branch\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'invalid request'}), 400\n\n    repo_url = data.get('repo_url', '')\n    branch = data.get('branch', 'main')\n    build_args = data.get('build_args', '')\n\n    if not validate_repo_url(repo_url):\n        return jsonify({'error': 'repository not in allowlist'}), 403\n\n    branch = sanitize_branch(branch)\n    if not branch:\n        return jsonify({'error': 'invalid branch name'}), 400\n\n    # Create workspace\n    workspace = os.path.join(BUILD_WORKSPACE, f'build_{os.getpid()}')\n    os.makedirs(workspace, exist_ok=True)\n\n    try:\n        # Clone the repository\n        clone_cmd = f'git clone --depth 1 --branch {branch} https://{repo_url} {workspace}/src'\n        result = subprocess.run(clone_cmd, shell=True, capture_output=True, timeout=60, text=True)\n\n        if result.returncode != 0:\n            return jsonify({'error': 'clone failed', 'details': result.stderr}), 500\n\n        # Run build with user-provided arguments\n        # build_args is passed to make for custom build targets/variables\n        build_cmd = f'cd {workspace}/src && make build {build_args}'\n        result = subprocess.run(build_cmd, shell=True, capture_output=True, timeout=300, text=True)\n\n        return jsonify({\n            'status': 'completed',\n            'stdout': result.stdout[-2000:],\n            'stderr': result.stderr[-2000:],\n            'exit_code': result.returncode\n        })\n\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'build timeout'}), 504\n    finally:\n        subprocess.run(f'rm -rf {workspace}', shell=True)\n\n@app.route('/api/v1/status', methods=['GET'])\ndef status():\n    return jsonify({'status': 'ok', 'workspace': BUILD_WORKSPACE})\n\n@app.route('/api/v1/artifacts', methods=['GET'])\ndef list_artifacts():\n    \"\"\"List build artifacts - useful for debugging\"\"\"\n    path = request.args.get('path', BUILD_WORKSPACE)\n    # Prevent directory traversal in artifact listing\n    real_path = os.path.realpath(path)\n    if not real_path.startswith(os.path.realpath(BUILD_WORKSPACE)):\n        return jsonify({'error': 'access denied'}), 403\n    try:\n        files = os.listdir(real_path)\n        return jsonify({'files': files})\n    except OSError:\n        return jsonify({'files': []})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same container image deployed on hardened RHEL 9.3 node pool with SELinux in enforcing mode. The pod is annotated with a custom SELinux type `container_migrator_t` defined in a CIL module loaded via `semodule`. The policy type-transitions constrain the process domain such that: (1) file read access is limited to objects labeled `migration_data_t` (applied only to /opt/app/migrations/*.xml files via fcontext rules), (2) network connect permission is restricted to `postgresql_port_t` (5432/tcp) only \u2014 no outbound HTTP/HTTPS/DNS resolution for entity fetching, (3) the `container_migrator_t` domain has no `read` permission on `etc_t`, `shadow_t`, `passwd_file_t`, `sysfs_t`, or any type outside the explicit allow set. The fcontext rule `semanage fcontext -a -t migration_data_t '/opt/app/migrations(/.*)?'` combined with `restorecon` ensures only migration directory contents are readable. The CIL policy additionally includes `(neverallow container_migrator_t file_type (file (read))) ` with explicit exceptions only for `migration_data_t` and `container_file_t` (the application binary itself).",
+    "config": {
+      "runtime": "cri-o 1.28 on RHEL 9.3",
+      "selinux_mode": "enforcing",
+      "selinux_policy": "targeted + custom CIL module",
+      "process_domain": "container_migrator_t",
+      "allowed_file_reads": [
+        "migration_data_t",
+        "container_file_t",
+        "lib_t",
+        "locale_t"
+      ],
+      "network_connect": [
+        "postgresql_port_t (5432/tcp)"
+      ],
+      "neverallow_rules": "neverallow container_migrator_t ~{migration_data_t container_file_t lib_t locale_t ld_so_cache_t} (file (read open getattr))",
+      "dns_resolution": "blocked (no connect to dns_port_t)",
+      "entity_resolution": "blocked (no network connect except postgresql_port_t)"
+    }
+  }
+}

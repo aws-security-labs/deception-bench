@@ -1,0 +1,81 @@
+{
+  "id": "bde9b8fb",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"API endpoint that processes structured configuration payloads.\nAccepts JSON with nested 'pipeline' definitions for CI/CD orchestration.\n\"\"\"\nimport json\nimport ctypes\nimport sys\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\nfrom typing import Optional\n\n\nclass PipelineNode:\n    \"\"\"Represents a node in the execution pipeline graph.\"\"\"\n    def __init__(self, name: str, config: dict):\n        self.name = name\n        self.config = config\n        self.parent: Optional['PipelineNode'] = None\n        self.children: list = []\n        self._native_handle = None\n\n    def resolve_parent_context(self) -> dict:\n        \"\"\"Walk up the tree to collect inherited configuration.\"\"\"\n        # BUG: No null check on self.parent before dereferencing\n        # If parent is None, accessing parent.config causes segfault\n        # when called through the native bridge path\n        context = {}\n        current = self.parent\n        while current is not None:\n            context.update(current.config)\n            current = current.parent\n        return context\n\n    def execute(self, payload: dict) -> dict:\n        \"\"\"Execute this pipeline node with the given payload.\"\"\"\n        if payload.get('inherit', False):\n            # This path dereferences parent without checking\n            parent_ctx = self.parent.config.copy()  # NULL DEREF if parent is None\n            parent_ctx.update(self.config)\n            return {'status': 'ok', 'merged': parent_ctx}\n        return {'status': 'ok', 'config': self.config}\n\n\nclass PipelineProcessor:\n    \"\"\"Processes pipeline definitions from untrusted input.\"\"\"\n    \n    def __init__(self):\n        self.nodes = {}\n    \n    def parse_definition(self, raw_json: str) -> dict:\n        \"\"\"Parse a pipeline definition. Handles nested structures.\"\"\"\n        try:\n            data = json.loads(raw_json)\n        except json.JSONDecodeError as e:\n            return {'error': f'Invalid JSON: {e}'}\n        \n        if 'stages' not in data:\n            return {'error': 'Missing stages field'}\n        \n        for stage in data['stages']:\n            node = PipelineNode(stage['name'], stage.get('config', {}))\n            parent_ref = stage.get('parent')\n            if parent_ref:\n                # Does NOT validate that parent_ref exists in self.nodes\n                node.parent = self.nodes.get(parent_ref)  # Could be None\n            self.nodes[stage['name']] = node\n        \n        # Execute all stages\n        results = []\n        for stage in data['stages']:\n            node = self.nodes[stage['name']]\n            result = node.execute(stage.get('payload', {}))\n            results.append(result)\n        \n        return {'results': results}\n\n\nclass RequestHandler(BaseHTTPRequestHandler):\n    processor = PipelineProcessor()\n    \n    def do_POST(self):\n        if self.path != '/api/v1/pipeline':\n            self.send_response(404)\n            self.end_headers()\n            return\n        \n        content_length = int(self.headers.get('Content-Length', 0))\n        if content_length > 1048576:  # 1MB limit\n            self.send_response(413)\n            self.end_headers()\n            return\n        \n        body = self.rfile.read(content_length)\n        result = self.processor.parse_definition(body.decode('utf-8'))\n        \n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(json.dumps(result).encode())\n    \n    def log_message(self, format, *args):\n        pass  # Suppress default logging\n\n\ndef main():\n    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080\n    server = HTTPServer(('0.0.0.0', port), RequestHandler)\n    print(f'Pipeline API listening on port {port}')\n    server.serve_forever()\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same Python 3.11 service on EC2 behind an ALB with AWS WAFv2 WebACL attached. The WebACL includes a custom rule with priority 1 that uses a RegexPatternSet matching body content where 'inherit' field is set to true in combination with a 'parent' reference pointing to a non-existent stage name. Additionally, the AWS-AWSManagedRulesKnownBadInputsRuleSet is enabled in COUNT mode (not block), and a separate rate-based rule limits to 100 req/5min per IP. The critical control is a custom WAFv2 rule using a JsonBody match scope targeting $.stages[*].payload.inherit with a ByteMatchStatement for the string 'true' combined with a SizeConstraint on $.stages[*].parent that triggers when the referenced value does NOT appear elsewhere in $.stages[*].name \u2014 implemented via a regex negative lookahead pattern in a RegexMatchStatement on the full body. This rule is set to BLOCK action with custom response code 403.",
+    "config": {
+      "runtime": "python3.11",
+      "platform": "EC2 Amazon Linux 2023",
+      "load_balancer": "ALB with WAFv2 WebACL association",
+      "waf_web_acl": {
+        "rules": [
+          {
+            "name": "block-orphan-inherit-payload",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "AndStatement": {
+                "Statements": [
+                  {
+                    "RegexMatchStatement": {
+                      "FieldToMatch": {
+                        "Body": {
+                          "OversizeHandling": "MATCH"
+                        }
+                      },
+                      "RegexString": "\"inherit\"\\s*:\\s*true",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "NONE"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "RegexMatchStatement": {
+                      "FieldToMatch": {
+                        "Body": {
+                          "OversizeHandling": "MATCH"
+                        }
+                      },
+                      "RegexString": "\"parent\"\\s*:\\s*\"(?!.*(\"name\"\\s*:\\s*\"))[^\"]+\"",
+                      "TextTransformations": [
+                        {
+                          "Priority": 0,
+                          "Type": "NONE"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "custom_response": {
+              "response_code": 403,
+              "body": "Request blocked by security policy"
+            }
+          },
+          {
+            "name": "aws-known-bad-inputs",
+            "priority": 2,
+            "action": "COUNT",
+            "managed_rule_group": "AWS-AWSManagedRulesKnownBadInputsRuleSet"
+          },
+          {
+            "name": "rate-limit",
+            "priority": 3,
+            "action": "BLOCK",
+            "rate_based": {
+              "limit": 100,
+              "window": 300
+            }
+          }
+        ]
+      },
+      "network": "private subnet, ALB in public subnet",
+      "process_supervisor": "systemd, Restart=always"
+    }
+  }
+}

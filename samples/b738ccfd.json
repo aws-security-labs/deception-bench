@@ -1,0 +1,44 @@
+{
+  "id": "b738ccfd",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=localhost dbname=inventory sslmode=disable\")\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// searchProducts handles product search with category filtering\nfunc searchProducts(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tsortField := r.URL.Query().Get(\"sort\")\n\n\tif category == \"\" {\n\t\tcategory = \"all\"\n\t}\n\tif minPrice == \"\" {\n\t\tminPrice = \"0\"\n\t}\n\tif sortField == \"\" {\n\t\tsortField = \"name\"\n\t}\n\n\t// Validate sort field against allowlist\n\tallowedSorts := map[string]bool{\"name\": true, \"price\": true, \"created_at\": true}\n\tif !allowedSorts[sortField] {\n\t\tsortField = \"name\"\n\t}\n\n\t// Build query - category uses parameterized approach\n\tvar query string\n\tvar rows *sql.Rows\n\tvar err error\n\n\tif category == \"all\" {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, stock FROM products WHERE price >= %s AND active = true ORDER BY %s\",\n\t\t\tminPrice, sortField,\n\t\t)\n\t\trows, err = db.Query(query)\n\t} else {\n\t\tquery = fmt.Sprintf(\n\t\t\t\"SELECT id, name, price, stock FROM products WHERE category = $1 AND price >= %s AND active = true ORDER BY %s\",\n\t\t\tminPrice, sortField,\n\t\t)\n\t\trows, err = db.Query(query, category)\n\t}\n\n\tif err != nil {\n\t\thttp.Error(w, \"Query error\", http.StatusInternalServerError)\n\t\tlog.Printf(\"Query error: %v | query: %s\", err, query)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar results []string\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name string\n\t\tvar price float64\n\t\tvar stock int\n\t\tif err := rows.Scan(&id, &name, &price, &stock); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tresults = append(results, fmt.Sprintf(\"{\\\"id\\\":%d,\\\"name\\\":\\\"%s\\\",\\\"price\\\":%.2f,\\\"stock\\\":%d}\", id, name, price, stock))\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprintf(w, \"[%s]\", strings.Join(results, \",\"))\n}\n\n// healthCheck for load balancer\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/products/search\", searchProducts)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\tlog.Println(\"Starting inventory service on :8080\")\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "Same Go binary deployed on ECS Fargate behind an ALB. The ALB has AWS WAFv2 WebACL attached with two rule groups: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING action override set to BLOCK at threshold 2048 bytes, and (2) a custom rule group 'inventory-api-input-validation' with a RegexPatternSet match condition on the query string component that uses the pattern '(?i)(\\\\d+\\\\s*(;|--|\\\\/\\\\*|union|select|pg_sleep|extract|cast|chr\\\\())' with action BLOCK and priority 1. The WebACL default action is ALLOW. Additionally, the RDS PostgreSQL instance has a restricted search_path set via parameter group (search_path='\"$user\",public' with rds.restrict_privileged_commands=1) and the application database role has NOSUPERUSER, NOCREATEDB, and is granted SELECT-only on the products table via: GRANT SELECT ON products TO app_reader; REVOKE ALL ON ALL TABLES IN SCHEMA public FROM app_reader; GRANT SELECT ON products TO app_reader;",
+    "config": {
+      "load_balancer": "ALB with WAFv2 WebACL 'inventory-waf-acl'",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "override_action": "none",
+          "priority": 10
+        },
+        {
+          "name": "inventory-api-input-validation",
+          "type": "custom",
+          "priority": 1,
+          "statements": [
+            {
+              "regex_match": {
+                "field": "QUERY_STRING",
+                "pattern_set": "(?i)(\\d+\\s*(;|--|/\\*|union|select|pg_sleep|extract|cast|chr\\())",
+                "text_transformation": [
+                  "URL_DECODE",
+                  "LOWERCASE"
+                ],
+                "action": "BLOCK"
+              }
+            }
+          ]
+        }
+      ],
+      "database": {
+        "engine": "RDS PostgreSQL 14",
+        "parameter_group": "custom-pg14-restricted",
+        "app_role": "app_reader",
+        "permissions": "SELECT-only on products table",
+        "search_path": "\"$user\",public"
+      },
+      "network": "Private subnet, ALB in public subnet, SG allows only ALB->8080"
+    }
+  }
+}

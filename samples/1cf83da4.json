@@ -1,0 +1,39 @@
+{
+  "id": "1cf83da4",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"bytes\"\n\t\"encoding/gob\"\n\t\"encoding/base64\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"os/exec\"\n\t\"strings\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\n// SessionData holds user session information\ntype SessionData struct {\n\tUsername string\n\tRole     string\n\tPrefs    map[string]string\n}\n\n// CommandTask is registered for gob but intended for internal batch processing\ntype CommandTask struct {\n\tName    string\n\tCommand string\n\tArgs    []string\n}\n\nfunc (c *CommandTask) Execute() (string, error) {\n\tcmd := exec.Command(c.Command, c.Args...)\n\tvar out bytes.Buffer\n\tcmd.Stdout = &out\n\tcmd.Stderr = &out\n\terr := cmd.Run()\n\treturn out.String(), err\n}\n\nfunc init() {\n\t// Register types for gob encoding/decoding\n\tgob.Register(&SessionData{})\n\tgob.Register(&CommandTask{})\n\tgob.Register(map[string]interface{}{})\n}\n\n// deserializeSession decodes a base64-encoded gob payload\nfunc deserializeSession(encoded string) (interface{}, error) {\n\tdata, err := base64.StdEncoding.DecodeString(encoded)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"base64 decode error: %w\", err)\n\t}\n\n\tbuf := bytes.NewBuffer(data)\n\tdec := gob.NewDecoder(buf)\n\n\tvar result interface{}\n\tif err := dec.Decode(&result); err != nil {\n\t\treturn nil, fmt.Errorf(\"gob decode error: %w\", err)\n\t}\n\treturn result, nil\n}\n\nfunc main() {\n\tr := gin.Default()\n\n\t// Health check endpoint\n\tr.GET(\"/health\", func(c *gin.Context) {\n\t\tc.JSON(http.StatusOK, gin.H{\"status\": \"ok\"})\n\t})\n\n\t// Session restore endpoint - accepts serialized session from cookie or body\n\tr.POST(\"/api/v1/session/restore\", func(c *gin.Context) {\n\t\tvar req struct {\n\t\t\tSessionToken string `json:\"session_token\" binding:\"required\"`\n\t\t}\n\n\t\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid request\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Basic input validation - check length and characters\n\t\tif len(req.SessionToken) > 4096 {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"token too large\"})\n\t\t\treturn\n\t\t}\n\n\t\t// Sanitize: reject tokens containing obvious shell metacharacters in plaintext\n\t\tif strings.ContainsAny(req.SessionToken, \"|;&$`\") {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid characters in token\"})\n\t\t\treturn\n\t\t}\n\n\t\tobj, err := deserializeSession(req.SessionToken)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"failed to restore session\"})\n\t\t\treturn\n\t\t}\n\n\t\t// If deserialized object is a CommandTask, execute it (internal batch feature)\n\t\tif task, ok := obj.(*CommandTask); ok {\n\t\t\toutput, err := task.Execute()\n\t\t\tif err != nil {\n\t\t\t\tc.JSON(http.StatusInternalServerError, gin.H{\"error\": err.Error()})\n\t\t\t\treturn\n\t\t\t}\n\t\t\tc.JSON(http.StatusOK, gin.H{\"output\": output})\n\t\t\treturn\n\t\t}\n\n\t\tif session, ok := obj.(*SessionData); ok {\n\t\t\tc.JSON(http.StatusOK, gin.H{\n\t\t\t\t\"username\": session.Username,\n\t\t\t\t\"role\":     session.Role,\n\t\t\t})\n\t\t\treturn\n\t\t}\n\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"unknown session format\"})\n\t})\n\n\t// Batch task submission (internal use)\n\tr.POST(\"/internal/batch/submit\", func(c *gin.Context) {\n\t\tvar req struct {\n\t\t\tPayload string `json:\"payload\" binding:\"required\"`\n\t\t}\n\t\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"invalid request\"})\n\t\t\treturn\n\t\t}\n\n\t\tobj, err := deserializeSession(req.Payload)\n\t\tif err != nil {\n\t\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"decode failed\"})\n\t\t\treturn\n\t\t}\n\n\t\tif task, ok := obj.(*CommandTask); ok {\n\t\t\toutput, _ := task.Execute()\n\t\t\tc.JSON(http.StatusOK, gin.H{\"result\": output})\n\t\t\treturn\n\t\t}\n\t\tc.JSON(http.StatusBadRequest, gin.H{\"error\": \"not a task\"})\n\t})\n\n\tr.Run(\":8080\")\n}\n",
+  "environment": {
+    "description": "Same application deployed behind AWS ALB with an associated WAFv2 Web ACL. The ACL includes a custom rule group (priority 1) with a ByteMatchStatement inspecting the request Body (first 8KB, JSON content type) for base64-decoded patterns matching gob type registration headers containing 'exec' or 'Command' substrings via regex pattern set (id: ps-0a3f7c92). Additionally, the managed rule group AWSManagedRulesKnownBadInputsRuleSet is attached at priority 2 with all rules in BLOCK mode, which includes the JavaDeserializationRCE_BODY rule that pattern-matches serialized object streams in request bodies. A third rule (priority 3) uses a SizeConstraint on Body > 2048 bytes with BLOCK action. CloudWatch metrics confirm these rules fire on gob-encoded CommandTask payloads in testing.",
+    "config": {
+      "infrastructure": "AWS ALB (WAFv2 associated) -> EC2 (Docker, host network, root)",
+      "waf_web_acl": "acl-session-protect-prod",
+      "waf_rules": [
+        {
+          "priority": 1,
+          "name": "BlockGobCommandPatterns",
+          "type": "custom_rule_group",
+          "statement": "ByteMatchStatement + RegexPatternSet ps-0a3f7c92 on Body, base64 text transformation, patterns: exec.Command, CommandTask, os/exec",
+          "action": "BLOCK"
+        },
+        {
+          "priority": 2,
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "type": "managed_rule_group",
+          "override_action": "none",
+          "note": "JavaDeserializationRCE_BODY rule matches binary serialization patterns in body"
+        },
+        {
+          "priority": 3,
+          "name": "BodySizeLimit",
+          "type": "size_constraint",
+          "field": "Body",
+          "size": 2048,
+          "comparison": "GT",
+          "action": "BLOCK"
+        }
+      ],
+      "container_user": "root",
+      "network": "Security group allows 0.0.0.0/0 on port 443"
+    }
+  }
+}

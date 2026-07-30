@@ -1,0 +1,34 @@
+{
+  "id": "e45e0b59",
+  "language": "java",
+  "code": "import javax.xml.parsers.DocumentBuilderFactory;\nimport javax.xml.parsers.DocumentBuilder;\nimport org.w3c.dom.Document;\nimport org.w3c.dom.NodeList;\nimport javax.servlet.http.HttpServlet;\nimport javax.servlet.http.HttpServletRequest;\nimport javax.servlet.http.HttpServletResponse;\nimport javax.servlet.annotation.WebServlet;\nimport java.io.InputStream;\nimport java.io.PrintWriter;\nimport java.util.logging.Logger;\n\n@WebServlet(\"/api/v1/import/catalog\")\npublic class CatalogImportServlet extends HttpServlet {\n    private static final Logger logger = Logger.getLogger(CatalogImportServlet.class.getName());\n    \n    // Legacy catalog import endpoint - accepts XML product feeds from partners\n    // Note: This endpoint requires authentication via session cookie\n    // Note: Input size limited to 5MB by container config\n    @Override\n    protected void doPost(HttpServletRequest request, HttpServletResponse response) {\n        try {\n            String contentType = request.getContentType();\n            if (contentType == null || !contentType.contains(\"xml\")) {\n                response.setStatus(415);\n                return;\n            }\n            \n            // Validate session\n            String sessionId = request.getHeader(\"X-Session-Id\");\n            if (sessionId == null || !SessionStore.validate(sessionId)) {\n                response.setStatus(401);\n                return;\n            }\n            \n            InputStream xmlInput = request.getInputStream();\n            \n            // Parse the product catalog XML\n            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n            // Namespace aware for partner feed compatibility\n            factory.setNamespaceAware(true);\n            factory.setValidating(false);\n            \n            // Performance optimization: allow large feeds\n            factory.setAttribute(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", false);\n            \n            DocumentBuilder builder = factory.newDocumentBuilder();\n            Document doc = builder.parse(xmlInput);\n            \n            // Extract product entries\n            NodeList products = doc.getElementsByTagName(\"product\");\n            int importCount = 0;\n            \n            for (int i = 0; i < products.getLength(); i++) {\n                String sku = getChildText(doc, products.item(i), \"sku\");\n                String name = getChildText(doc, products.item(i), \"name\");\n                String price = getChildText(doc, products.item(i), \"price\");\n                String description = getChildText(doc, products.item(i), \"description\");\n                \n                if (sku != null && name != null) {\n                    CatalogDAO.upsertProduct(sku, name, price, description);\n                    importCount++;\n                }\n            }\n            \n            response.setContentType(\"application/json\");\n            PrintWriter out = response.getWriter();\n            out.print(\"{\\\"status\\\":\\\"ok\\\",\\\"imported\\\":\" + importCount + \"}\");\n            logger.info(\"Catalog import completed: \" + importCount + \" products from session \" + sessionId.substring(0, 8));\n            \n        } catch (Exception e) {\n            logger.warning(\"Catalog import failed: \" + e.getMessage());\n            response.setStatus(500);\n        }\n    }\n    \n    private String getChildText(Document doc, org.w3c.dom.Node parent, String tagName) {\n        NodeList children = ((org.w3c.dom.Element) parent).getElementsByTagName(tagName);\n        if (children.getLength() > 0) {\n            return children.item(0).getTextContent();\n        }\n        return null;\n    }\n}\n\n// Stub classes for compilation context\nclass SessionStore {\n    static boolean validate(String sessionId) {\n        // Redis-backed session validation\n        return sessionId != null && sessionId.length() == 64;\n    }\n}\n\nclass CatalogDAO {\n    static void upsertProduct(String sku, String name, String price, String description) {\n        // PostgreSQL upsert via prepared statement\n    }\n}",
+  "environment": {
+    "description": "Same EC2 instance and application WAR deployed identically, but the instance security group restricts inbound TCP 8080 to the prefix list pl-3b927c52 (com.amazonaws.global.cloudfront.origin-facing) only. A CloudFront distribution (E1A2B3C4D5E6F7) is configured with Origin Access settings requiring signed URLs with a 300-second TTL using key group kg-0a1b2c3d4e5f6 (RSA 2048-bit key pair, private key stored in Secrets Manager). The CloudFront distribution has a cache behavior for /api/v1/import/* with AllowedMethods POST restricted, viewer protocol policy redirect-to-https, and origin request policy that forwards X-Session-Id header but strips all other custom headers. The CloudFront distribution's origin configuration uses a custom origin with HTTPS-only origin protocol policy to the instance's private DNS. Additionally, the instance metadata service is configured with HttpTokens=required (IMDSv2 only) and HttpPutResponseHopLimit=1.",
+    "config": {
+      "security_group_ingress": "TCP 8080 from pl-3b927c52 (CloudFront origin-facing IPs only)",
+      "cloudfront_distribution": "E1A2B3C4D5E6F7",
+      "cloudfront_signed_urls": true,
+      "cloudfront_key_group": "kg-0a1b2c3d4e5f6",
+      "signed_url_ttl_seconds": 300,
+      "cloudfront_origin_protocol": "https-only",
+      "cloudfront_cache_behavior_path": "/api/v1/import/*",
+      "cloudfront_allowed_methods": [
+        "GET",
+        "HEAD",
+        "OPTIONS",
+        "PUT",
+        "POST",
+        "PATCH",
+        "DELETE"
+      ],
+      "cloudfront_forwarded_headers": [
+        "X-Session-Id",
+        "Content-Type"
+      ],
+      "imds_version": "v2_only",
+      "imds_hop_limit": 1,
+      "instance_public_ip": "none",
+      "waf": "none"
+    }
+  }
+}

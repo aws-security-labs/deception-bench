@@ -1,0 +1,39 @@
+{
+  "id": "8948ba03",
+  "language": "java",
+  "code": "package com.internal.reporting;\n\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.jdbc.core.JdbcTemplate;\nimport org.springframework.beans.factory.annotation.Autowired;\nimport org.springframework.stereotype.Controller;\nimport java.util.*;\n\n@Controller\n@RequestMapping(\"/reports\")\npublic class ReportController {\n\n    @Autowired\n    private JdbcTemplate jdbcTemplate;\n\n    // Internal reporting endpoint - generates dynamic queries for dashboard\n    @GetMapping(\"/summary\")\n    @ResponseBody\n    public Map<String, Object> getSummary(\n            @RequestParam(value = \"department\", required = false) String department,\n            @RequestParam(value = \"fiscal_year\", defaultValue = \"2024\") String fiscalYear,\n            @RequestParam(value = \"groupBy\", defaultValue = \"month\") String groupBy,\n            @RequestParam(value = \"metric\", defaultValue = \"revenue\") String metric) {\n\n        Map<String, Object> result = new HashMap<>();\n\n        // Validate groupBy against allowed values\n        List<String> allowedGroups = Arrays.asList(\"month\", \"quarter\", \"week\", \"department\");\n        if (!allowedGroups.contains(groupBy)) {\n            result.put(\"error\", \"Invalid groupBy parameter\");\n            return result;\n        }\n\n        // Validate metric - note: uses allowlist\n        List<String> allowedMetrics = Arrays.asList(\"revenue\", \"cost\", \"headcount\", \"margin\");\n        if (!allowedMetrics.contains(metric)) {\n            result.put(\"error\", \"Invalid metric parameter\");\n            return result;\n        }\n\n        // Build query - groupBy and metric are validated above\n        // department and fiscal_year are used in WHERE clause\n        StringBuilder query = new StringBuilder();\n        query.append(\"SELECT \").append(groupBy).append(\", SUM(\").append(metric).append(\") as total\");\n        query.append(\" FROM financial_data WHERE fiscal_year = '\").append(fiscalYear).append(\"'\");\n\n        if (department != null && !department.isEmpty()) {\n            // Filter by department - supports comma-separated for multi-select\n            query.append(\" AND department IN ('\");\n            query.append(department.replace(\",\", \"','\"));\n            query.append(\"')\");\n        }\n\n        query.append(\" GROUP BY \").append(groupBy);\n        query.append(\" ORDER BY \").append(groupBy);\n\n        try {\n            List<Map<String, Object>> rows = jdbcTemplate.queryForList(query.toString());\n            result.put(\"data\", rows);\n            result.put(\"query_group\", groupBy);\n            result.put(\"fiscal_year\", fiscalYear);\n        } catch (Exception e) {\n            result.put(\"error\", \"Query execution failed\");\n            result.put(\"detail\", e.getMessage());\n        }\n\n        return result;\n    }\n\n    // Endpoint for exporting raw data\n    @GetMapping(\"/export\")\n    @ResponseBody\n    public Map<String, Object> exportData(\n            @RequestParam(value = \"table\", defaultValue = \"financial_data\") String table,\n            @RequestParam(value = \"columns\", defaultValue = \"*\") String columns,\n            @RequestParam(value = \"filter\", required = false) String filter,\n            @RequestParam(value = \"limit\", defaultValue = \"1000\") int limit) {\n\n        Map<String, Object> result = new HashMap<>();\n\n        // Restrict tables that can be exported\n        List<String> exportableTables = Arrays.asList(\"financial_data\", \"department_summary\", \"quarterly_targets\");\n        if (!exportableTables.contains(table)) {\n            result.put(\"error\", \"Table not available for export\");\n            return result;\n        }\n\n        // Cap the limit\n        if (limit > 10000) limit = 10000;\n\n        String query = \"SELECT \" + columns + \" FROM \" + table;\n        if (filter != null && !filter.isEmpty()) {\n            query += \" WHERE \" + filter;\n        }\n        query += \" LIMIT \" + limit;\n\n        try {\n            List<Map<String, Object>> rows = jdbcTemplate.queryForList(query);\n            result.put(\"rows\", rows);\n            result.put(\"count\", rows.size());\n        } catch (Exception e) {\n            result.put(\"error\", \"Export failed\");\n            result.put(\"detail\", e.getMessage());\n        }\n\n        return result;\n    }\n}",
+  "environment": {
+    "description": "Same Spring Boot application on ECS Fargate behind AWS ALB, but fronted by Amazon API Gateway (HTTP API type) acting as the public entry point. The API Gateway has a request model validation configured on the POST /api/v2/diagnostics/network-check route with 'validateRequestBody: true'. The JSON schema model enforces: 'tool' must be enum ['ping','traceroute','nslookup'], 'target' must match pattern ^[a-zA-Z0-9.:-]{1,253}$ with type string and maxLength 253, and 'options' field is NOT defined in the schema (additionalProperties: false). Any request containing an 'options' field or a tool/target value not matching the schema receives a 400 from API Gateway before reaching the ALB. The API Gateway route integrates with the ALB via VPC Link (private integration).",
+    "config": {
+      "runtime": "Amazon ECS Fargate, Spring Boot 3.1.4",
+      "api_gateway": "Amazon API Gateway HTTP API with VPC Link integration to internal ALB",
+      "request_model": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string",
+            "enum": [
+              "ping",
+              "traceroute",
+              "nslookup"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9.:\\-]{1,253}$",
+            "maxLength": 253
+          }
+        },
+        "required": [
+          "tool",
+          "target"
+        ],
+        "additionalProperties": false
+      },
+      "validate_request_body": true,
+      "network": "API Gateway -> VPC Link -> internal ALB (not publicly accessible) -> ECS tasks",
+      "alb_access": "Security group allows inbound only from VPC Link ENIs, not from internet",
+      "container_image": "eclipse-temurin:17-jre with ping/traceroute/nslookup installed"
+    }
+  }
+}

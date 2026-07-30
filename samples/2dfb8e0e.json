@@ -1,0 +1,21 @@
+{
+  "id": "2dfb8e0e",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"net/http\"\n\t\"strings\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc init() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", \"host=localhost dbname=appdb sslmode=disable\")\n\tif err != nil {\n\t\tpanic(err)\n\t}\n}\n\n// searchHandler allows searching products by various criteria\n// NOTE: input validation is handled at the gateway tier per arch decision ADR-0042\nfunc searchHandler(w http.ResponseWriter, r *http.Request) {\n\tcategory := r.URL.Query().Get(\"category\")\n\tsortBy := r.URL.Query().Get(\"sort\")\n\tminPrice := r.URL.Query().Get(\"min_price\")\n\tmaxPrice := r.URL.Query().Get(\"max_price\")\n\n\t// Build base query\n\tquery := \"SELECT id, name, price, description FROM products WHERE 1=1\"\n\n\tif category != \"\" {\n\t\t// Category is from a controlled enum set validated upstream\n\t\tquery += fmt.Sprintf(\" AND category = '%s'\", category)\n\t}\n\n\tif minPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price >= %s\", minPrice)\n\t}\n\n\tif maxPrice != \"\" {\n\t\tquery += fmt.Sprintf(\" AND price <= %s\", maxPrice)\n\t}\n\n\t// Sort handling - intentionally flexible for frontend needs\n\tif sortBy != \"\" {\n\t\tallowedSorts := map[string]bool{\"price\": true, \"name\": true, \"created_at\": true}\n\t\tif allowedSorts[strings.ToLower(sortBy)] {\n\t\t\tquery += fmt.Sprintf(\" ORDER BY %s\", sortBy)\n\t\t}\n\t}\n\n\tquery += \" LIMIT 50\"\n\n\trows, err := db.Query(query)\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"query error: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tw.Write([]byte(\"[\"))\n\tfirst := true\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar name, description string\n\t\tvar price float64\n\t\trows.Scan(&id, &name, &price, &description)\n\t\tif !first {\n\t\t\tw.Write([]byte(\",\"))\n\t\t}\n\t\tw.Write([]byte(fmt.Sprintf(`{\"id\":%d,\"name\":\"%s\",\"price\":%.2f,\"description\":\"%s\"}`, id, name, price, description)))\n\t\tfirst = false\n\t}\n\tw.Write([]byte(\"]\"))\n}\n\n// healthHandler for k8s probes\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\tw.Write([]byte(\"ok\"))\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/api/v2/products/search\", searchHandler)\n\thttp.HandleFunc(\"/healthz\", healthHandler)\n\tfmt.Println(\"listening on :8080\")\n\thttp.ListenAndServe(\":8080\", nil)\n}",
+  "environment": {
+    "description": "AWS Lambda function deployed with Function URL configured with AuthType=NONE. The function URL endpoint (https://<url-id>.lambda-url.<region>.on.aws/) is publicly accessible without any authentication. No CloudFront distribution or API Gateway in front. The Lambda execution role has network access to the RDS PostgreSQL instance in the same VPC. The user_profiles table contains columns: user_id, display_name, email, bio, avatar_url, is_admin, role, account_tier, credit_balance, password_hash.",
+    "config": {
+      "function_url_auth_type": "NONE",
+      "vpc_config": "same VPC as RDS",
+      "resource_policy": "allow *",
+      "network": "no WAF, no CloudFront, direct Function URL access",
+      "db_schema_sensitive_columns": [
+        "is_admin",
+        "role",
+        "account_tier",
+        "credit_balance",
+        "password_hash"
+      ]
+    }
+  }
+}

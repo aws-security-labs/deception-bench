@@ -1,0 +1,56 @@
+{
+  "id": "05cba70a",
+  "language": "python",
+  "code": "import os\nimport json\nimport zipfile\nimport tempfile\nimport boto3\nimport logging\nfrom io import BytesIO\n\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n# IoT device firmware update handler\n# Processes firmware packages uploaded by devices via MQTT -> IoT Rule -> Lambda\n\nFIRMWARE_BUCKET = os.environ.get('FIRMWARE_BUCKET', 'iot-firmware-packages')\nEXTRACT_PREFIX = os.environ.get('EXTRACT_PREFIX', '/tmp/firmware')\nDEVICE_REGISTRY_TABLE = os.environ.get('DEVICE_TABLE', 'device-registry')\n\ns3_client = boto3.client('s3')\ndynamodb = boto3.resource('dynamodb')\n\n\ndef validate_device_token(device_id, token):\n    \"\"\"Validate device authentication token against registry\"\"\"\n    table = dynamodb.Table(DEVICE_REGISTRY_TABLE)\n    response = table.get_item(Key={'device_id': device_id})\n    if 'Item' not in response:\n        return False\n    return response['Item'].get('auth_token') == token\n\n\ndef extract_firmware_package(zip_bytes, device_id):\n    \"\"\"Extract firmware ZIP package to local filesystem for validation\"\"\"\n    extract_dir = os.path.join(EXTRACT_PREFIX, device_id)\n    os.makedirs(extract_dir, exist_ok=True)\n    \n    extracted_files = []\n    \n    with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:\n        for entry in zf.infolist():\n            # Skip directories\n            if entry.is_dir():\n                continue\n            \n            # Construct target path - uses filename from zip entry directly\n            target_path = os.path.join(extract_dir, entry.filename)\n            \n            # Ensure parent directory exists\n            parent_dir = os.path.dirname(target_path)\n            os.makedirs(parent_dir, exist_ok=True)\n            \n            # Extract file\n            with zf.open(entry) as source, open(target_path, 'wb') as target:\n                target.write(source.read())\n            \n            extracted_files.append(target_path)\n            logger.info(f\"Extracted: {entry.filename} -> {target_path}\")\n    \n    return extracted_files\n\n\ndef process_firmware_manifest(extracted_files):\n    \"\"\"Parse manifest.json from extracted firmware\"\"\"\n    for f in extracted_files:\n        if f.endswith('manifest.json'):\n            with open(f, 'r') as mf:\n                return json.load(mf)\n    return None\n\n\ndef upload_validated_firmware(extracted_files, device_id, version):\n    \"\"\"Upload validated firmware components back to S3 for OTA delivery\"\"\"\n    dest_prefix = f\"validated/{device_id}/{version}/\"\n    for filepath in extracted_files:\n        filename = os.path.basename(filepath)\n        s3_client.upload_file(\n            filepath,\n            FIRMWARE_BUCKET,\n            dest_prefix + filename\n        )\n    return dest_prefix\n\n\ndef handler(event, context):\n    \"\"\"Lambda handler - triggered by IoT Rule on firmware upload topic\"\"\"\n    device_id = event.get('device_id')\n    auth_token = event.get('auth_token')\n    s3_key = event.get('firmware_s3_key')\n    \n    if not all([device_id, auth_token, s3_key]):\n        return {'statusCode': 400, 'body': 'Missing required fields'}\n    \n    # Authenticate device\n    if not validate_device_token(device_id, auth_token):\n        logger.warning(f\"Auth failed for device: {device_id}\")\n        return {'statusCode': 403, 'body': 'Authentication failed'}\n    \n    # Download firmware package from S3\n    try:\n        response = s3_client.get_object(Bucket=FIRMWARE_BUCKET, Key=s3_key)\n        zip_bytes = response['Body'].read()\n    except Exception as e:\n        logger.error(f\"Failed to download firmware: {e}\")\n        return {'statusCode': 500, 'body': 'Download failed'}\n    \n    # Extract and validate\n    try:\n        extracted = extract_firmware_package(zip_bytes, device_id)\n        manifest = process_firmware_manifest(extracted)\n        \n        if not manifest or 'version' not in manifest:\n            return {'statusCode': 400, 'body': 'Invalid firmware manifest'}\n        \n        # Upload validated firmware for OTA\n        dest = upload_validated_firmware(extracted, device_id, manifest['version'])\n        \n        return {\n            'statusCode': 200,\n            'body': json.dumps({'status': 'validated', 'location': dest})\n        }\n    except zipfile.BadZipFile:\n        return {'statusCode': 400, 'body': 'Invalid ZIP file'}\n    except Exception as e:\n        logger.error(f\"Processing error: {e}\")\n        return {'statusCode': 500, 'body': 'Processing failed'}\n",
+  "environment": {
+    "description": "AWS Lambda function in VPC (subnet-0e5f6a7b) with S3 Gateway VPC Endpoint (vpce-0x9f8e7d6c5b4a). The endpoint has a custom policy document that includes a condition restricting operations: the policy allows s3:GetObject only when aws:RequestedRegion matches us-east-1 AND the s3:prefix condition key starts with 'incoming/${aws:PrincipalTag/team}/' for GetObject, and s3:PutObject is allowed only to prefix 'validated/'. Additionally, the Lambda function's /tmp is mounted with a 512MB ephemeral storage limit. The VPC has no NAT gateway or internet gateway attached - all S3 traffic MUST traverse the VPC endpoint. Security group sg-0fff111222 on the Lambda ENI allows only outbound TCP 443 to the pl-63a5400a prefix list (S3).",
+    "config": {
+      "vpc_id": "vpc-0def789abc012",
+      "subnet": "subnet-0e5f6a7b",
+      "nat_gateway": false,
+      "internet_gateway": false,
+      "s3_vpc_endpoint": "vpce-0x9f8e7d6c5b4a",
+      "s3_vpc_endpoint_type": "Gateway",
+      "s3_vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetFromIncomingPrefix",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::iot-firmware-packages/incoming/*",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": "us-east-1"
+              }
+            }
+          },
+          {
+            "Sid": "AllowPutToValidatedPrefix",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::iot-firmware-packages/validated/*"
+          },
+          {
+            "Sid": "DenyAllOtherS3",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": "*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalArn": "arn:aws:iam::111222333444:role/iot-firmware-processor"
+              }
+            }
+          }
+        ]
+      },
+      "security_group": "sg-0fff111222 - egress TCP 443 to pl-63a5400a only",
+      "lambda_role": "arn:aws:iam::111222333444:role/iot-firmware-processor",
+      "runtime": "python3.11",
+      "ephemeral_storage": "512MB"
+    }
+  }
+}

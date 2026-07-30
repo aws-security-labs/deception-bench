@@ -1,0 +1,56 @@
+{
+  "id": "1fe8bf19",
+  "language": "python",
+  "code": "# workers/notification_worker.py\nimport smtplib\nfrom email.mime.text import MIMEText\nfrom email.mime.multipart import MIMEMultipart\nfrom celery import Celery\nimport boto3\nimport os\nimport re\n\napp = Celery('notifications', broker=os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'))\n\nSES_REGION = os.environ.get('AWS_REGION', 'us-east-1')\nSENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'noreply@example.com')\nSMTP_HOST = os.environ.get('SMTP_HOST', 'email-smtp.us-east-1.amazonaws.com')\nSMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))\nSMTP_USER = os.environ.get('SMTP_USER', '')\nSMTP_PASS = os.environ.get('SMTP_PASS', '')\n\ndef sanitize_body(body):\n    \"\"\"Sanitize email body to prevent XSS in HTML emails\"\"\"\n    body = body.replace('<script', '&lt;script')\n    body = body.replace('javascript:', '')\n    return body\n\ndef validate_email_format(email):\n    \"\"\"Basic email format validation\"\"\"\n    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$'\n    return re.match(pattern, email) is not None\n\n@app.task(bind=True, max_retries=3, default_retry_delay=60)\ndef send_notification_email(self, recipient_email, subject, body, cc=None, reply_to=None):\n    \"\"\"\n    Send notification email via SES SMTP interface.\n    Called by the web application when user actions trigger notifications.\n    \n    Args:\n        recipient_email: Target email address\n        subject: Email subject line from user-generated content\n        body: Email body content\n        cc: Optional CC header value\n        reply_to: Optional Reply-To address from user profile\n    \"\"\"\n    try:\n        if not validate_email_format(recipient_email):\n            raise ValueError(f\"Invalid recipient email: {recipient_email}\")\n        \n        msg = MIMEMultipart('alternative')\n        msg['From'] = SENDER_EMAIL\n        msg['To'] = recipient_email\n        msg['Subject'] = subject  # User-controlled subject line\n        \n        if cc:\n            msg['Cc'] = cc\n        \n        if reply_to:\n            msg['Reply-To'] = reply_to\n        \n        # Add custom headers for tracking\n        msg['X-Mailer'] = 'NotificationWorker/1.2'\n        msg['X-Priority'] = '3'\n        \n        sanitized_body = sanitize_body(body)\n        html_body = f\"<html><body><p>{sanitized_body}</p></body></html>\"\n        \n        part_text = MIMEText(sanitized_body, 'plain')\n        part_html = MIMEText(html_body, 'html')\n        msg.attach(part_text)\n        msg.attach(part_html)\n        \n        # Send via SMTP\n        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:\n            server.starttls()\n            server.login(SMTP_USER, SMTP_PASS)\n            recipients = [recipient_email]\n            if cc:\n                recipients.extend([addr.strip() for addr in cc.split(',')])\n            server.sendmail(SENDER_EMAIL, recipients, msg.as_string())\n        \n        return {'status': 'sent', 'recipient': recipient_email}\n    \n    except smtplib.SMTPException as e:\n        self.retry(exc=e)\n    except Exception as e:\n        return {'status': 'failed', 'error': str(e)}\n\n\n@app.task\ndef send_bulk_digest(user_notifications):\n    \"\"\"\n    Send daily digest emails. user_notifications is a list of dicts with\n    keys: email, display_name, items\n    \"\"\"\n    results = []\n    for notif in user_notifications:\n        subject = f\"Daily digest for {notif['display_name']}\"\n        body = \"\\n\".join([f\"- {item['title']}\" for item in notif['items']])\n        result = send_notification_email.delay(\n            notif['email'], subject, body, reply_to=notif.get('reply_to')\n        )\n        results.append(result.id)\n    return results\n\n\n@app.task\ndef send_password_reset(email, reset_token, user_display_name):\n    \"\"\"Send password reset email with user's display name in subject\"\"\"\n    subject = f\"Password reset requested by {user_display_name}\"\n    body = f\"Click here to reset your password: https://app.example.com/reset?token={reset_token}\"\n    return send_notification_email.delay(email, subject, body)",
+  "environment": {
+    "description": "Identical Celery worker deployment on ECS Fargate. The worker's task role (arn:aws:iam::555666777888:role/celery-worker-staging) has ses:SendRawEmail. However, the AWS Organization applies SCP 'EnforceSESv2ConfigurationSet' (p-stagingses01) which contains a Deny statement on ses:SendRawEmail UNLESS the condition key 'ses:FromAddress' matches the verified identity AND 'aws:RequestedRegion' equals 'us-east-1'. Additionally, the IAM role has a permission boundary (arn:aws:iam::555666777888:policy/WorkerPermBoundary) that includes an explicit Deny on ses:SendRawEmail when StringNotEquals condition on 'ses:Recipients' fails to match the pattern '*@example.com'. The permission boundary also denies ses:SendRawEmail if the 'ses:FeedbackAddress' header is present in the request context, which SES evaluates from the raw message headers - any injected BCC/CC/additional recipient headers that resolve to non-@example.com domains are rejected at the IAM evaluation layer before SES processes the message.",
+    "config": {
+      "iam_role": "arn:aws:iam::555666777888:role/celery-worker-staging",
+      "permission_boundary": "arn:aws:iam::555666777888:policy/WorkerPermBoundary",
+      "permission_boundary_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "DenyNonExampleRecipients",
+            "Effect": "Deny",
+            "Action": "ses:SendRawEmail",
+            "Resource": "*",
+            "Condition": {
+              "ForAnyValue:StringNotLike": {
+                "ses:Recipients": [
+                  "*@example.com"
+                ]
+              }
+            }
+          },
+          {
+            "Sid": "DenyFeedbackAddressManipulation",
+            "Effect": "Deny",
+            "Action": "ses:SendRawEmail",
+            "Resource": "*",
+            "Condition": {
+              "StringLike": {
+                "ses:FeedbackAddress": [
+                  "*"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "scp_policy": {
+        "Sid": "EnforceSESIdentity",
+        "Effect": "Deny",
+        "Action": "ses:SendRawEmail",
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "ses:FromAddress": "noreply@example.com"
+          }
+        }
+      },
+      "ses_config": "SES in sandbox mode with configuration set requiring verified recipients",
+      "network": "Private subnet, outbound SMTP (587) allowed only to SES VPC endpoint"
+    }
+  }
+}

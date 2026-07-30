@@ -1,0 +1,59 @@
+{
+  "id": "e7f89e15",
+  "language": "python",
+  "code": "import sqlite3\nimport hashlib\nimport os\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/data/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        department TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        details TEXT,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    # seed admin\n    admin_hash = hashlib.sha256(b'admin_secret_2024').hexdigest()\n    db.execute(\"INSERT OR IGNORE INTO users (username, password_hash, role, api_key, department) VALUES (?, ?, ?, ?, ?)\",\n               ('admin', admin_hash, 'admin', 'ak_' + os.urandom(16).hex(), 'engineering'))\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by department - internal API for HR dashboard\"\"\"\n    api_key = request.headers.get('X-API-Key', '')\n    db = get_db()\n    \n    # verify api key belongs to a valid user\n    key_check = db.execute(\"SELECT id, role FROM users WHERE api_key = ?\", (api_key,)).fetchone()\n    if not key_check:\n        return jsonify({\"error\": \"unauthorized\"}), 401\n    \n    department = request.args.get('dept', '')\n    sort_field = request.args.get('sort', 'username')\n    \n    # Filter by department with parameterized query\n    # Sort field is validated against allowed columns\n    allowed_sorts = ['username', 'department', 'role', 'id']\n    \n    # NOTE: sort_field validation uses 'in' check on the string\n    # This checks if sort_field is a substring of any allowed sort, not membership\n    if not any(sort_field in allowed for allowed in allowed_sorts):\n        sort_field = 'username'\n    \n    # Build query - department is parameterized but sort is interpolated\n    query = f\"SELECT id, username, role, department FROM users WHERE department = ? ORDER BY {sort_field}\"\n    \n    try:\n        results = db.execute(query, (department,)).fetchall()\n        users = [{\"id\": r[\"id\"], \"username\": r[\"username\"], \"role\": r[\"role\"], \"department\": r[\"department\"]} for r in results]\n        \n        # Log the search\n        db.execute(\"INSERT INTO audit_log (action, user_id, details) VALUES (?, ?, ?)\",\n                   ('user_search', key_check['id'], f'dept={department}'))\n        db.commit()\n        \n        return jsonify({\"users\": users, \"count\": len(users)})\n    except Exception as e:\n        return jsonify({\"error\": \"query failed\", \"detail\": str(e)}), 500\n\n@app.route('/api/users/export', methods=['POST'])\ndef export_users():\n    \"\"\"Export user data - admin only\"\"\"\n    api_key = request.headers.get('X-API-Key', '')\n    db = get_db()\n    \n    key_check = db.execute(\"SELECT id, role FROM users WHERE api_key = ?\", (api_key,)).fetchone()\n    if not key_check or key_check['role'] != 'admin':\n        return jsonify({\"error\": \"admin required\"}), 403\n    \n    format_type = request.json.get('format', 'json')\n    include_fields = request.json.get('fields', ['username', 'department'])\n    \n    # Validate fields\n    safe_fields = [f for f in include_fields if f in ('id', 'username', 'role', 'department')]\n    if not safe_fields:\n        safe_fields = ['username']\n    \n    cols = ', '.join(safe_fields)\n    results = db.execute(f\"SELECT {cols} FROM users\").fetchall()\n    \n    return jsonify({\"data\": [dict(r) for r in results], \"format\": format_type})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=5000, debug=False)",
+  "environment": {
+    "description": "Same EKS cluster with Istio 1.20 service mesh. An AuthorizationPolicy resource is applied in the 'payments' namespace with spec.action DENY for requests where source.namespace is not in ['payments', 'settlements']. The policy uses a workloadSelector matching the transfer-service deployment labels (app: transfer-service). Additionally, a PeerAuthentication resource in the payments namespace enforces STRICT mTLS mode, meaning only mesh-enrolled workloads with valid SPIFFE identities can communicate. The approvals namespace workloads have Istio sidecar injection enabled but the AuthorizationPolicy explicitly excludes 'approvals' from allowed source namespaces via a notValues list on source.namespace. RequestAuthentication is NOT configured (no JWT validation), and the Istio proxy operates in ALLOW_ANY for outbound from approvals namespace (only inbound to payments is restricted).",
+    "config": {
+      "cluster": "eks-prod-us-east-1",
+      "namespace": "approvals",
+      "service_mesh": "istio-1.20.2",
+      "istio_sidecar_injection": "enabled",
+      "payments_namespace_policies": {
+        "PeerAuthentication": {
+          "metadata": {
+            "name": "default",
+            "namespace": "payments"
+          },
+          "spec": {
+            "mtls": {
+              "mode": "STRICT"
+            }
+          }
+        },
+        "AuthorizationPolicy": {
+          "metadata": {
+            "name": "deny-cross-namespace-transfer",
+            "namespace": "payments"
+          },
+          "spec": {
+            "selector": {
+              "matchLabels": {
+                "app": "transfer-service"
+              }
+            },
+            "action": "DENY",
+            "rules": [
+              {
+                "from": [
+                  {
+                    "source": {
+                      "notNamespaces": [
+                        "payments",
+                        "settlements"
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "approvals_namespace_policies": {
+        "sidecar_injection": "istio-injection=enabled",
+        "outbound_policy": "ALLOW_ANY"
+      }
+    }
+  }
+}

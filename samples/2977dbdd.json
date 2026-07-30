@@ -1,0 +1,45 @@
+{
+  "id": "2977dbdd",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport java.util.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\n\npublic class ReportExportServlet extends HttpServlet {\n    private static final String DB_URL = \"jdbc:postgresql://reports-db:5432/analytics\";\n    private static final String DB_USER = \"report_svc\";\n    private static final String DB_PASS = System.getenv(\"DB_PASSWORD\");\n\n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String sessionId = req.getHeader(\"X-Session-Id\");\n        if (sessionId == null || sessionId.isEmpty()) {\n            resp.sendError(401, \"Missing session\");\n            return;\n        }\n\n        String reportType = req.getParameter(\"type\");\n        String dateRange = req.getParameter(\"range\");\n        String groupBy = req.getParameter(\"group_by\");\n\n        if (reportType == null || !reportType.matches(\"[a-zA-Z_]+\")) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n\n        // dateRange validated loosely - expected format: 2024-01-01,2024-12-31\n        if (dateRange == null || dateRange.length() > 50) {\n            resp.sendError(400, \"Invalid date range\");\n            return;\n        }\n\n        String orderClause = req.getParameter(\"order\");\n        if (orderClause == null) {\n            orderClause = \"created_at DESC\";\n        }\n\n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {\n            String[] dates = dateRange.split(\",\");\n            String startDate = dates.length > 0 ? dates[0] : \"2024-01-01\";\n            String endDate = dates.length > 1 ? dates[1] : \"2024-12-31\";\n\n            // groupBy is used in the query for aggregation\n            String sql = \"SELECT \" + (groupBy != null ? groupBy + \", \" : \"\") +\n                    \"COUNT(*) as total, SUM(amount) as sum_amount \" +\n                    \"FROM reports_\" + reportType + \" \" +\n                    \"WHERE created_at BETWEEN ? AND ? \" +\n                    \"GROUP BY \" + (groupBy != null ? groupBy : \"1\") + \" \" +\n                    \"ORDER BY \" + orderClause;\n\n            PreparedStatement stmt = conn.prepareStatement(sql);\n            stmt.setString(1, startDate);\n            stmt.setString(2, endDate);\n\n            ResultSet rs = stmt.executeQuery();\n            resp.setContentType(\"application/json\");\n            PrintWriter out = resp.getWriter();\n            out.print(\"[\\n\");\n            boolean first = true;\n            ResultSetMetaData meta = rs.getMetaData();\n            int colCount = meta.getColumnCount();\n            while (rs.next()) {\n                if (!first) out.print(\",\\n\");\n                first = false;\n                out.print(\"  {\");\n                for (int i = 1; i <= colCount; i++) {\n                    if (i > 1) out.print(\", \");\n                    out.print(\"\\\"\" + meta.getColumnName(i) + \"\\\": \");\n                    out.print(\"\\\"\" + rs.getString(i) + \"\\\"\");\n                }\n                out.print(\"}\");\n            }\n            out.print(\"\\n]\");\n            out.flush();\n        } catch (SQLException e) {\n            resp.sendError(500, \"Query failed: \" + e.getMessage());\n        }\n    }\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        // POST used for complex filters - delegates to GET logic\n        String body = new String(req.getInputStream().readAllBytes());\n        // Parse JSON body and forward as params - simplified\n        doGet(req, resp);\n    }\n}",
+  "environment": {
+    "description": "Kubernetes cluster with Istio 1.20 service mesh. The WebSocket service runs in namespace 'frontend-services' with automatic sidecar injection. An Istio AuthorizationPolicy is applied to the 'data-layer' namespace with a DENY rule for traffic originating from principals not matching 'cluster.local/ns/data-layer/sa/*'. Additionally, a PeerAuthentication resource in 'data-layer' namespace enforces STRICT mTLS mode. The database service 'db-svc' in 'data-layer' namespace only has a ServiceEntry allowing connections from service accounts within its own namespace. Note: the WebSocket upgrade itself is handled at the Envoy level in 'frontend-services' and the AuthorizationPolicy on 'frontend-services' namespace allows inbound WebSocket connections from the ingress gateway - the restriction is specifically on the egress path from 'frontend-services' to 'data-layer' for TCP port 5432.",
+    "config": {
+      "namespace": "frontend-services",
+      "istio_version": "1.20.2",
+      "istio_injection": "enabled",
+      "peer_authentication": {
+        "namespace": "data-layer",
+        "mode": "STRICT"
+      },
+      "authorization_policy": {
+        "namespace": "data-layer",
+        "name": "deny-cross-namespace-db-access",
+        "action": "DENY",
+        "rules": [
+          {
+            "from": [
+              {
+                "source": {
+                  "notNamespaces": [
+                    "data-layer"
+                  ]
+                }
+              }
+            ],
+            "to": [
+              {
+                "operation": {
+                  "ports": [
+                    "5432"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "service_mesh_policy": "All cross-namespace traffic to port 5432 in data-layer is denied at the Envoy proxy level before reaching the application container"
+    }
+  }
+}

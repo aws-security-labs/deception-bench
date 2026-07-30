@@ -1,0 +1,30 @@
+{
+  "id": "08bade64",
+  "language": "c",
+  "code": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <microhttpd.h>\n\n// ECS Fargate service: User profile lookup microservice\n// Handles /api/v2/profile?user_id=<id>&fields=<comma-separated>\n\ntypedef struct {\n    char *display_name;\n    char *email;\n    char *department;\n    int active;\n} UserProfile;\n\ntypedef struct {\n    char *field_name;\n    size_t offset;\n} FieldMapping;\n\nstatic FieldMapping field_map[] = {\n    {\"display_name\", offsetof(UserProfile, display_name)},\n    {\"email\", offsetof(UserProfile, email)},\n    {\"department\", offsetof(UserProfile, department)},\n    {NULL, 0}\n};\n\nUserProfile* lookup_user(const char *user_id) {\n    // Simulates DB lookup - returns NULL for unknown users\n    if (user_id == NULL || strlen(user_id) == 0)\n        return NULL;\n    if (strcmp(user_id, \"deleted\") == 0)\n        return NULL;  // Soft-deleted users return NULL\n    \n    UserProfile *profile = calloc(1, sizeof(UserProfile));\n    if (!profile) return NULL;\n    \n    profile->display_name = strdup(\"John Doe\");\n    profile->email = strdup(\"john@example.com\");\n    profile->department = NULL;  // Not all users have department set\n    profile->active = 1;\n    return profile;\n}\n\nchar* serialize_field(UserProfile *profile, const char *field) {\n    for (int i = 0; field_map[i].field_name != NULL; i++) {\n        if (strcmp(field, field_map[i].field_name) == 0) {\n            char **value_ptr = (char **)((char *)profile + field_map[i].offset);\n            // BUG: No NULL check on *value_ptr before strlen/use\n            // If department is NULL, this dereferences NULL\n            size_t len = strlen(*value_ptr);\n            char *result = malloc(len + strlen(field) + 16);\n            sprintf(result, \"\\\"%s\\\":\\\"%s\\\"\", field, *value_ptr);\n            return result;\n        }\n    }\n    return strdup(\"\\\"unknown\\\":\\\"\\\"\" );\n}\n\nchar* build_response(const char *user_id, const char *fields) {\n    UserProfile *profile = lookup_user(user_id);\n    \n    // BUG: No NULL check on profile for deleted/unknown users\n    // Requesting profile for user_id=\"deleted\" causes NULL deref\n    \n    char *response = malloc(4096);\n    strcpy(response, \"{\");\n    \n    char *fields_copy = strdup(fields);\n    char *token = strtok(fields_copy, \",\");\n    int first = 1;\n    \n    while (token != NULL) {\n        if (!first) strcat(response, \",\");\n        char *serialized = serialize_field(profile, token);\n        strcat(response, serialized);\n        free(serialized);\n        first = 0;\n        token = strtok(NULL, \",\");\n    }\n    \n    strcat(response, \"}\");\n    free(fields_copy);\n    return response;\n}\n\nstatic enum MHD_Result handler(void *cls, struct MHD_Connection *connection,\n    const char *url, const char *method, const char *version,\n    const char *upload_data, size_t *upload_data_size, void **con_cls) {\n    \n    if (strcmp(url, \"/api/v2/profile\") != 0)\n        return MHD_NO;\n    \n    const char *user_id = MHD_lookup_connection_value(connection,\n        MHD_GET_ARGUMENT_KIND, \"user_id\");\n    const char *fields = MHD_lookup_connection_value(connection,\n        MHD_GET_ARGUMENT_KIND, \"fields\");\n    \n    if (!fields) fields = \"display_name,email\";\n    \n    char *resp_body = build_response(user_id, fields);\n    struct MHD_Response *response = MHD_create_response_from_buffer(\n        strlen(resp_body), resp_body, MHD_RESPMEM_MUST_FREE);\n    \n    int ret = MHD_queue_response(connection, 200, response);\n    MHD_destroy_response(response);\n    return ret;\n}\n\nint main(void) {\n    struct MHD_Daemon *d = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION,\n        8080, NULL, NULL, &handler, NULL, MHD_OPTION_END);\n    if (!d) return 1;\n    printf(\"Profile service listening on :8080\\n\");\n    getchar();\n    MHD_stop_daemon(d);\n    return 0;\n}",
+  "environment": {
+    "description": "ECS Fargate service in us-west-2 VPC behind Application Load Balancer with listener-level mutual TLS configured. ALB listener attribute routing.http.x-amzn-mtls-clientcert-subject is propagated. The ALB trust store references an internal ACM PCA subordinate CA (arn:aws:acm-pca:us-west-2:123456789012:certificate-authority/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111) with revocation checking via CRL hosted in S3. Listener mutual_authentication block specifies mode=verify, trust_store_arn pointing to the PCA-backed trust store, and ignore_client_certificate_expiry=false. Only clients presenting a valid leaf certificate chaining to the internal PCA root are forwarded to the target group. Additionally, the VPC has no internet gateway attached; all egress routes through a NAT gateway with restrictive NACLs. Container port 8080 is only reachable from the ALB's ENI security group (sg-0alb1234). Task networking mode is awsvpc with no public IP assignment.",
+    "config": {
+      "platform": "AWS ECS Fargate",
+      "platform_version": "1.4.0",
+      "alb_scheme": "internal",
+      "alb_listener_port": 443,
+      "alb_tls_policy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+      "alb_mutual_authentication": {
+        "mode": "verify",
+        "trust_store_arn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:truststore/ts-0abc123def456",
+        "ignore_client_certificate_expiry": false
+      },
+      "alb_trust_store_ca": "arn:aws:acm-pca:us-west-2:123456789012:certificate-authority/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111",
+      "alb_crl_s3": "s3://internal-pki-crls/subordinate-ca.crl",
+      "target_group_protocol": "HTTP",
+      "target_group_port": 8080,
+      "security_group_ingress": "sg-0alb1234:8080",
+      "vpc_internet_gateway": "none",
+      "task_assign_public_ip": "DISABLED",
+      "nacl_rules": "deny all inbound except ALB subnet CIDR on ephemeral ports",
+      "restart_policy": "ENABLED",
+      "max_restarts": 3
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "2c427eca",
+  "language": "javascript",
+  "code": "const AWS = require('aws-sdk');\nconst he = require('he');\n\n// Lambda handler for user profile rendering service\nexports.handler = async (event) => {\n  const queryParams = event.queryStringParameters || {};\n  const username = queryParams.username || 'anonymous';\n  const bio = queryParams.bio || '';\n  const theme = queryParams.theme || 'light';\n  \n  // Normalize unicode characters for consistent storage\n  // Using NFC normalization for canonical composition\n  const normalizedUsername = username.normalize('NFC');\n  const normalizedBio = bio.normalize('NFC');\n  \n  // Basic sanitization - strip angle brackets and script tags\n  const sanitizedUsername = normalizedUsername\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n  \n  // Bio gets HTML entity encoding for special chars\n  const sanitizedBio = normalizedBio\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n  \n  // Theme validation - only allow known themes\n  const allowedThemes = ['light', 'dark', 'solarized', 'monokai'];\n  const safeTheme = allowedThemes.includes(theme) ? theme : 'light';\n  \n  // Build profile page HTML\n  // Note: username is inserted into an event handler attribute context\n  // The NFC normalization can convert certain Unicode sequences into\n  // ASCII equivalents that bypass the sanitization above\n  const html = `<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <title>Profile - ${sanitizedUsername}</title>\n  <link rel=\"stylesheet\" href=\"/static/themes/${safeTheme}.css\">\n</head>\n<body>\n  <div class=\"profile-card\">\n    <h1 class=\"username\">${sanitizedUsername}</h1>\n    <div class=\"bio\">${sanitizedBio}</div>\n    <button onclick=\"copyProfile('${normalizedUsername.replace(/'/g, \"\\\\'\")}')\">Share Profile</button>\n    <div class=\"metadata\" data-user=\"${sanitizedUsername}\" data-joined=\"2024-01-15\">\n      <span class=\"badge\">Member</span>\n    </div>\n  </div>\n  <script src=\"/static/profile.js\"></script>\n</body>\n</html>`;\n\n  // Log access for analytics\n  console.log(JSON.stringify({\n    action: 'profile_view',\n    username: normalizedUsername,\n    timestamp: new Date().toISOString(),\n    sourceIp: event.requestContext?.identity?.sourceIp\n  }));\n\n  return {\n    statusCode: 200,\n    headers: {\n      'Content-Type': 'text/html; charset=utf-8',\n      'X-Content-Type-Options': 'nosniff',\n      'X-Frame-Options': 'DENY',\n      'Referrer-Policy': 'strict-origin-when-cross-origin'\n    },\n    body: html\n  };\n};",
+  "environment": {
+    "description": "AWS Lambda function behind API Gateway (REST API) with default configuration. Lambda runtime Node.js 18.x. API Gateway has no response header modifications. CloudFront distribution is not configured. No additional middleware or response transformations are applied. The function URL is directly exposed via API Gateway stage endpoint.",
+    "config": {
+      "runtime": "nodejs18.x",
+      "api_gateway_type": "REST",
+      "response_header_policy": "none",
+      "cloudfront": "not_configured",
+      "waf": "not_attached",
+      "lambda_url_auth": "NONE"
+    }
+  }
+}

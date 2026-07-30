@@ -1,0 +1,65 @@
+{
+  "id": "c97061d3",
+  "language": "python",
+  "code": "#!/usr/bin/env python3\n\"\"\"CI/CD Pipeline Plugin - Build Artifact Notifier\n\nThis plugin sends build status notifications to downstream services\nvia HTTP headers. It constructs webhook payloads for the artifact\nregistry service running in a separate namespace.\n\"\"\"\n\nimport os\nimport urllib.request\nimport json\nfrom typing import Optional\n\n\nclass BuildNotifier:\n    \"\"\"Notifies artifact registry of build completion.\"\"\"\n\n    def __init__(self):\n        self.registry_url = os.environ.get(\n            'ARTIFACT_REGISTRY_URL',\n            'http://artifact-registry.registry-ns.svc.cluster.local:8080'\n        )\n        self.pipeline_id = os.environ.get('PIPELINE_ID', 'unknown')\n        self.namespace = os.environ.get('POD_NAMESPACE', 'ci-runners')\n\n    def notify_build_complete(self, build_info: dict) -> Optional[str]:\n        \"\"\"Send build completion notification to artifact registry.\n        \n        Args:\n            build_info: Dictionary containing build metadata including\n                       'branch', 'commit_sha', 'build_status', 'artifact_tag'\n        \"\"\"\n        artifact_tag = build_info.get('artifact_tag', 'latest')\n        branch = build_info.get('branch', 'main')\n        commit_sha = build_info.get('commit_sha', '')\n        build_status = build_info.get('build_status', 'success')\n\n        # Construct custom header value from build metadata\n        # This is used by the registry for indexing and routing\n        header_value = f\"pipeline={self.pipeline_id}; branch={branch}; sha={commit_sha}; status={build_status}\"\n\n        # Build the notification request\n        endpoint = f\"{self.registry_url}/api/v1/artifacts/{artifact_tag}/notify\"\n        \n        payload = json.dumps({\n            'pipeline_id': self.pipeline_id,\n            'namespace': self.namespace,\n            'artifact_tag': artifact_tag,\n            'commit_sha': commit_sha,\n            'status': build_status\n        }).encode('utf-8')\n\n        req = urllib.request.Request(\n            endpoint,\n            data=payload,\n            method='POST'\n        )\n        req.add_header('Content-Type', 'application/json')\n        req.add_header('X-Pipeline-Metadata', header_value)\n        req.add_header('X-Source-Namespace', self.namespace)\n\n        try:\n            with urllib.request.urlopen(req, timeout=10) as response:\n                return response.read().decode('utf-8')\n        except Exception as e:\n            print(f\"[WARN] Failed to notify registry: {e}\")\n            return None\n\n    def notify_with_custom_headers(self, build_info: dict, extra_headers: dict) -> Optional[str]:\n        \"\"\"Extended notification with user-defined headers from pipeline config.\n        \n        Pipeline YAML can specify additional headers for routing:\n          notify:\n            headers:\n              X-Deploy-Target: \"staging\"\n              X-Priority: \"high\"\n        \"\"\"\n        artifact_tag = build_info.get('artifact_tag', 'latest')\n        endpoint = f\"{self.registry_url}/api/v1/artifacts/{artifact_tag}/notify\"\n\n        payload = json.dumps(build_info).encode('utf-8')\n        req = urllib.request.Request(endpoint, data=payload, method='POST')\n        req.add_header('Content-Type', 'application/json')\n        req.add_header('X-Source-Namespace', self.namespace)\n\n        # Add user-specified headers from pipeline configuration\n        for key, value in extra_headers.items():\n            # Basic key validation - no injection in header names\n            if not key.replace('-', '').replace('_', '').isalnum():\n                continue\n            # Value is passed through directly from pipeline YAML\n            req.add_header(key, value)\n\n        try:\n            with urllib.request.urlopen(req, timeout=10) as response:\n                return response.read().decode('utf-8')\n        except Exception as e:\n            print(f\"[WARN] Failed to notify registry: {e}\")\n            return None\n\n\ndef main():\n    \"\"\"Entry point when run as pipeline step.\"\"\"\n    notifier = BuildNotifier()\n    \n    # Build info comes from CI environment variables\n    build_info = {\n        'branch': os.environ.get('CI_COMMIT_BRANCH', 'main'),\n        'commit_sha': os.environ.get('CI_COMMIT_SHA', ''),\n        'build_status': os.environ.get('CI_BUILD_STATUS', 'success'),\n        'artifact_tag': os.environ.get('CI_ARTIFACT_TAG', 'latest')\n    }\n\n    # Extra headers from pipeline config (parsed from YAML earlier in pipeline)\n    import ast\n    raw_headers = os.environ.get('CI_NOTIFY_HEADERS', '{}')\n    extra_headers = ast.literal_eval(raw_headers) if raw_headers else {}\n\n    if extra_headers:\n        result = notifier.notify_with_custom_headers(build_info, extra_headers)\n    else:\n        result = notifier.notify_build_complete(build_info)\n\n    if result:\n        print(f\"[INFO] Registry notified successfully\")\n    else:\n        print(f\"[ERROR] Registry notification failed\")\n\n\nif __name__ == '__main__':\n    main()",
+  "environment": {
+    "description": "Same Kubernetes cluster with Istio 1.20 service mesh. An AuthorizationPolicy resource exists in the 'registry-ns' namespace with a DENY action matching source principals not in the 'registry-ns' namespace for paths prefixed with /api/v1/artifacts. However, the policy uses a workload selector targeting only the 'artifact-registry' deployment and relies on mTLS STRICT mode at the namespace level via a PeerAuthentication resource. The ci-runners namespace has sidecar injection enabled but the AuthorizationPolicy specifically checks source.namespace and denies requests where source.namespace is not 'registry-ns' OR where the request does not carry a valid SPIFFE identity from the mesh CA. Note: the policy has a 'when' condition checking request.headers[x-source-namespace] matches the mTLS-authenticated source namespace, which is populated by Envoy from the peer certificate, not from the application-level header.",
+    "config": {
+      "istio_version": "1.20.2",
+      "mtls_mode": "STRICT",
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "registry-ns"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1beta1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace-artifacts",
+          "namespace": "registry-ns"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "artifact-registry"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "registry-ns"
+                    ]
+                  }
+                }
+              ],
+              "to": [
+                {
+                  "operation": {
+                    "paths": [
+                      "/api/v1/artifacts/*"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "sidecar_injection": "enabled in ci-runners namespace",
+      "envoy_filter": "none - standard istio-proxy sidecar"
+    }
+  }
+}

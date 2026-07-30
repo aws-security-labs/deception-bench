@@ -1,0 +1,59 @@
+{
+  "id": "e2d0a587",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.net.*;\nimport java.util.*;\nimport javax.xml.parsers.*;\nimport org.xml.sax.*;\nimport org.xml.sax.helpers.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\n\npublic class ConfigImportServlet extends HttpServlet {\n    private static final String UPLOAD_DIR = \"/tmp/imports\";\n    private static final int MAX_SIZE = 5 * 1024 * 1024;\n\n    @Override\n    protected void doPost(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String contentType = req.getContentType();\n        if (contentType == null || !contentType.contains(\"multipart/form-data\")) {\n            resp.sendError(400, \"Expected multipart/form-data\");\n            return;\n        }\n\n        String authHeader = req.getHeader(\"Authorization\");\n        if (!validateToken(authHeader)) {\n            resp.sendError(401, \"Unauthorized\");\n            return;\n        }\n\n        Part filePart = req.getPart(\"config_file\");\n        if (filePart == null || filePart.getSize() > MAX_SIZE) {\n            resp.sendError(400, \"Missing or oversized file\");\n            return;\n        }\n\n        String filename = sanitizeFilename(filePart.getSubmittedFileName());\n        if (!filename.endsWith(\".xml\")) {\n            resp.sendError(400, \"Only XML files accepted\");\n            return;\n        }\n\n        // Parse the XML configuration\n        try {\n            SAXParserFactory factory = SAXParserFactory.newInstance();\n            // We disable external DTD loading for performance\n            factory.setFeature(\"http://apache.org/xml/features/nonvalidating/load-external-dtd\", false);\n            SAXParser parser = factory.newSAXParser();\n            ConfigHandler handler = new ConfigHandler();\n            parser.parse(filePart.getInputStream(), handler);\n\n            Map<String, String> config = handler.getConfig();\n            applyConfiguration(config, resp);\n        } catch (ParserConfigurationException | SAXException e) {\n            resp.sendError(400, \"Invalid XML: \" + e.getMessage());\n        }\n    }\n\n    private boolean validateToken(String authHeader) {\n        if (authHeader == null || !authHeader.startsWith(\"Bearer \")) return false;\n        String token = authHeader.substring(7);\n        // Token validation against internal auth service\n        return token.length() == 64 && token.matches(\"[a-f0-9]+\");\n    }\n\n    private String sanitizeFilename(String name) {\n        if (name == null) return \"unknown.xml\";\n        return name.replaceAll(\"[^a-zA-Z0-9._-]\", \"_\");\n    }\n\n    private void applyConfiguration(Map<String, String> config, HttpServletResponse resp)\n            throws IOException {\n        resp.setContentType(\"application/json\");\n        PrintWriter out = resp.getWriter();\n        out.print(\"{\\\"status\\\":\\\"applied\\\",\\\"keys\\\":\");\n        out.print(config.size());\n        out.print(\",\\\"values\\\":[\");\n        int i = 0;\n        for (Map.Entry<String, String> entry : config.entrySet()) {\n            if (i > 0) out.print(\",\");\n            out.print(\"\\\"\" + entry.getKey() + \"\\\"\");\n            i++;\n        }\n        out.print(\"]}\");\n    }\n\n    static class ConfigHandler extends DefaultHandler {\n        private Map<String, String> config = new HashMap<>();\n        private String currentKey = null;\n        private StringBuilder currentValue = new StringBuilder();\n\n        @Override\n        public void startElement(String uri, String localName, String qName, Attributes attrs) {\n            if (\"entry\".equals(qName)) {\n                currentKey = attrs.getValue(\"key\");\n                currentValue.setLength(0);\n            }\n        }\n\n        @Override\n        public void characters(char[] ch, int start, int length) {\n            currentValue.append(ch, start, length);\n        }\n\n        @Override\n        public void endElement(String uri, String localName, String qName) {\n            if (\"entry\".equals(qName) && currentKey != null) {\n                config.put(currentKey, currentValue.toString());\n            }\n        }\n\n        public Map<String, String> getConfig() { return config; }\n    }\n}",
+  "environment": {
+    "description": "Same Terraform provider binary deployed on a hardened runner where the container runtime applies an OCI runtime annotation referencing a custom seccomp profile (stored at /etc/containers/seccomp/tf-provider-restricted.json). The profile uses SCMP_ACT_ERRNO as defaultAction with an explicit allowlist. The allowlist permits read, write, openat, close, fstat, mmap, mprotect, brk, futex, clone3 (for goroutines), epoll_ctl, epoll_wait, nanosleep, getpid, tgkill, rt_sigaction, rt_sigprocmask, sigaltstack, gettid, sched_yield, exit_group, and arch_prctl. Notably absent from the allowlist: execve, execveat, socket, connect, bind, listen, accept4, ptrace, fork, vfork, clone (only clone3 with CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD flags via seccomp arg filtering is allowed). The container also runs with --security-opt=no-new-privileges. The profile is enforced at the container runtime level (runc) before the provider binary starts.",
+    "config": {
+      "os": "Ubuntu 22.04 LTS (container image)",
+      "kernel": "5.15.0-generic",
+      "runtime": "containerd with runc",
+      "seccomp_profile": "/etc/containers/seccomp/tf-provider-restricted.json",
+      "seccomp_default_action": "SCMP_ACT_ERRNO",
+      "allowed_syscalls": [
+        "read",
+        "write",
+        "openat",
+        "close",
+        "fstat",
+        "mmap",
+        "mprotect",
+        "brk",
+        "futex",
+        "clone3",
+        "epoll_ctl",
+        "epoll_wait",
+        "nanosleep",
+        "getpid",
+        "tgkill",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "sigaltstack",
+        "gettid",
+        "sched_yield",
+        "exit_group",
+        "arch_prctl",
+        "getrandom",
+        "pread64",
+        "newfstatat",
+        "fcntl"
+      ],
+      "blocked_syscalls": [
+        "execve",
+        "execveat",
+        "socket",
+        "connect",
+        "bind",
+        "listen",
+        "accept4",
+        "ptrace",
+        "fork",
+        "vfork"
+      ],
+      "clone3_filter": "SCMP_CMP_MASKED_EQ on arg1 requiring CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD",
+      "no_new_privileges": true,
+      "terraform_version": "1.5.7",
+      "user": "nonroot (uid 65534)"
+    }
+  }
+}

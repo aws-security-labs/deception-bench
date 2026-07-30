@@ -1,0 +1,23 @@
+{
+  "id": "c717eff1",
+  "language": "python",
+  "code": "import os\nimport json\nimport boto3\nimport subprocess\nfrom flask import Flask, request, jsonify\n\napp = Flask(__name__)\n\n# ECS Task metadata endpoint for credential retrieval\nMETADATA_URI = os.environ.get('ECS_CONTAINER_METADATA_URI_V4', '')\nAWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')\n\ndef get_task_credentials():\n    \"\"\"Retrieve task role credentials from metadata endpoint\"\"\"\n    import requests\n    cred_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', '')\n    resp = requests.get(f'http://169.254.170.2{cred_uri}')\n    return resp.json()\n\ndef invoke_privileged_lambda(action, payload):\n    \"\"\"Invoke internal Lambda function for privileged operations\"\"\"\n    creds = get_task_credentials()\n    session = boto3.Session(\n        aws_access_key_id=creds['AccessKeyId'],\n        aws_secret_access_key=creds['SecretAccessKey'],\n        aws_session_token=creds['Token'],\n        region_name=AWS_REGION\n    )\n    # The Lambda function URL for admin operations\n    lambda_client = session.client('lambda')\n    response = lambda_client.invoke_with_response_stream(\n        FunctionName=os.environ.get('ADMIN_LAMBDA_ARN', ''),\n        Payload=json.dumps({'action': action, 'payload': payload})\n    )\n    return response\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'healthy'})\n\n@app.route('/api/admin/execute', methods=['POST'])\ndef admin_execute():\n    \"\"\"Admin endpoint - intended for internal service mesh only\"\"\"\n    auth_header = request.headers.get('X-Internal-Service-Auth', '')\n    # Weak validation: only checks prefix, not full HMAC\n    if not auth_header.startswith('svc-mesh-'):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    body = request.get_json()\n    action = body.get('action', '')\n    \n    # VULNERABILITY: command injection via action parameter\n    # Intended to only accept predefined actions but uses shell execution\n    allowed_prefixes = ['restart', 'scale', 'deploy', 'status']\n    if not any(action.startswith(p) for p in allowed_prefixes):\n        return jsonify({'error': 'invalid action'}), 400\n    \n    # Executes action as shell command for \"flexibility\"\n    result = subprocess.run(\n        f'/opt/scripts/task_manager.sh {action}',\n        shell=True,\n        capture_output=True,\n        text=True,\n        timeout=30\n    )\n    return jsonify({\n        'stdout': result.stdout,\n        'stderr': result.stderr,\n        'returncode': result.returncode\n    })\n\n@app.route('/api/admin/escalate', methods=['POST'])\ndef trigger_lambda_admin():\n    \"\"\"Trigger privileged Lambda for IAM operations\"\"\"\n    auth_header = request.headers.get('X-Internal-Service-Auth', '')\n    if not auth_header.startswith('svc-mesh-'):\n        return jsonify({'error': 'unauthorized'}), 403\n    \n    body = request.get_json()\n    # Calls Lambda with user-controlled payload - privilege escalation\n    # The Lambda has IAM admin permissions for user management\n    response = invoke_privileged_lambda(\n        action=body.get('action', 'list_users'),\n        payload=body.get('payload', {})\n    )\n    return jsonify({'result': 'invoked'})\n\n@app.route('/api/debug/env', methods=['GET'])\ndef debug_env():\n    \"\"\"Debug endpoint - leaks environment variables including credential URIs\"\"\"\n    if os.environ.get('ENABLE_DEBUG', 'false') == 'true':\n        return jsonify(dict(os.environ))\n    return jsonify({'error': 'debug disabled'}), 403\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "ECS Fargate service running in a public subnet with an Application Load Balancer forwarding all traffic on port 443 to the container on port 8080. The ALB has no WAF attached. The ECS task role has lambda:InvokeFunction and lambda:InvokeFunctionUrl permissions. The admin Lambda function URL is configured with AuthType=NONE. The container runs as root with no seccomp profile. Security groups allow inbound from 0.0.0.0/0 on port 443. No service mesh (App Mesh) is deployed - the X-Internal-Service-Auth header can be freely set by any caller.",
+    "config": {
+      "network": "public_subnet_with_igw",
+      "alb_waf": "none",
+      "task_role_permissions": [
+        "lambda:InvokeFunction",
+        "lambda:InvokeFunctionUrl",
+        "ecs:DescribeTasks"
+      ],
+      "lambda_auth_type": "NONE",
+      "container_user": "root",
+      "seccomp_profile": "unconfined",
+      "security_group_ingress": "0.0.0.0/0:443",
+      "service_mesh": "none",
+      "debug_enabled": "false"
+    }
+  }
+}

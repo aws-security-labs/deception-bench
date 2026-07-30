@@ -1,0 +1,66 @@
+{
+  "id": "888d953b",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\t\"time\"\n\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\ntype Document struct {\n\tID        int       `json:\"id\"`\n\tTitle     string    `json:\"title\"`\n\tContent   string    `json:\"content\"`\n\tOwnerID   int       `json:\"owner_id\"`\n\tClassification string `json:\"classification\"`\n\tCreatedAt time.Time `json:\"created_at\"`\n}\n\nfunc init() {\n\tvar err error\n\tconnStr := os.Getenv(\"DATABASE_URL\")\n\tdb, err = sql.Open(\"postgres\", connStr)\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n\n// extractUserID gets user from X-User-ID header (set by upstream auth proxy)\nfunc extractUserID(r *http.Request) string {\n\treturn r.Header.Get(\"X-User-ID\")\n}\n\n// searchDocuments allows searching documents with flexible filtering\nfunc searchDocuments(w http.ResponseWriter, r *http.Request) {\n\tuserID := extractUserID(r)\n\tif userID == \"\" {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\ttitleFilter := r.URL.Query().Get(\"title\")\n\tclassification := r.URL.Query().Get(\"class\")\n\tsortCol := r.URL.Query().Get(\"sort\")\n\n\t// Validate sort column against allowlist\n\tallowedSorts := map[string]bool{\"title\": true, \"created_at\": true, \"id\": true}\n\tif sortCol == \"\" || !allowedSorts[sortCol] {\n\t\tsortCol = \"created_at\"\n\t}\n\n\t// Build query - classification filter uses parameterized query\n\tbaseQuery := \"SELECT id, title, content, owner_id, classification, created_at FROM documents WHERE owner_id = $1\"\n\targs := []interface{}{userID}\n\targIdx := 2\n\n\tif classification != \"\" {\n\t\tbaseQuery += fmt.Sprintf(\" AND classification = $%d\", argIdx)\n\t\targs = append(args, classification)\n\t\targIdx++\n\t}\n\n\t// Title search - uses ILIKE for flexible matching\n\t// Developer note: parameterized to prevent injection\n\tif titleFilter != \"\" {\n\t\t// BUG: string concatenation instead of parameterization\n\t\tbaseQuery += \" AND title ILIKE '%\" + titleFilter + \"%'\"\n\t}\n\n\tbaseQuery += \" ORDER BY \" + sortCol + \" DESC LIMIT 50\"\n\n\trows, err := db.Query(baseQuery, args...)\n\tif err != nil {\n\t\tlog.Printf(\"query error: %v\", err)\n\t\thttp.Error(w, \"internal error\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tdefer rows.Close()\n\n\tvar docs []Document\n\tfor rows.Next() {\n\t\tvar d Document\n\t\tif err := rows.Scan(&d.ID, &d.Title, &d.Content, &d.OwnerID, &d.Classification, &d.CreatedAt); err != nil {\n\t\t\tcontinue\n\t\t}\n\t\tdocs = append(docs, d)\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(docs)\n}\n\n// updateDocumentTitle - PATCH endpoint for title updates\nfunc updateDocumentTitle(w http.ResponseWriter, r *http.Request) {\n\tuserID := extractUserID(r)\n\tvar req struct {\n\t\tDocID    int    `json:\"doc_id\"`\n\t\tNewTitle string `json:\"new_title\"`\n\t}\n\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n\t\thttp.Error(w, \"bad request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Looks unsafe but title is properly parameterized here\n\t_, err := db.Exec(\"UPDATE documents SET title = $1 WHERE id = $2 AND owner_id = $3\",\n\t\treq.NewTitle, req.DocID, userID)\n\tif err != nil {\n\t\thttp.Error(w, \"update failed\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusOK)\n}\n\n// healthCheck includes DB connectivity test\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tif err := db.Ping(); err != nil {\n\t\thttp.Error(w, \"unhealthy\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\t// Intentionally verbose for debugging - includes connection pool stats\n\tstats := db.Stats()\n\tresp := fmt.Sprintf(`{\"status\":\"ok\",\"open_connections\":%d,\"in_use\":%d}`, stats.OpenConnections, stats.InUse)\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tfmt.Fprint(w, resp)\n}\n\nfunc loggingMiddleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\t// Log request details including query params for audit\n\t\tlog.Printf(\"%s %s?%s from %s ua=%s\",\n\t\t\tr.Method, r.URL.Path, r.URL.RawQuery,\n\t\t\tr.Header.Get(\"X-Forwarded-For\"),\n\t\t\tstrings.Replace(r.UserAgent(), \"\\n\", \"\", -1))\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/documents/search\", searchDocuments)\n\tmux.HandleFunc(\"/api/documents/update\", updateDocumentTitle)\n\tmux.HandleFunc(\"/health\", healthCheck)\n\n\tserver := &http.Server{\n\t\tAddr:         \":8080\",\n\t\tHandler:      loggingMiddleware(mux),\n\t\tReadTimeout:  10 * time.Second,\n\t\tWriteTimeout: 10 * time.Second,\n\t}\n\tlog.Fatal(server.ListenAndServe())\n}",
+  "environment": {
+    "description": "Same application deployed on ECS Fargate behind an ALB. The ALB has three listener rules evaluated in priority order: (1) Priority 5: forward /health to target group unconditionally, (2) Priority 10: a rule with conditions path-pattern=/api/* that routes through an associated WAFv2 WebACL. The WebACL contains a single rule group reference: a custom rule group 'app-input-validation' with capacity 700. This rule group has two rules: Rule A (priority 1) inspects QUERY_STRING with a RegexPatternSet containing patterns for common SQL metacharacters including the sequence \"' OR\", \"UNION SELECT\", \"--\", and \"%27\" with action BLOCK; Rule B (priority 2) uses a SizeConstraint on QUERY_STRING with max 128 bytes, action BLOCK. The WebACL default action is ALLOW. Additionally, the ECS task role has no network egress except to the VPC endpoint for CloudWatch Logs, enforced by the task's awsvpc security group (egress only to pl-xxxxx prefix list for com.amazonaws.us-east-1.logs on port 443).",
+    "config": {
+      "compute": "ECS Fargate 1.4.0",
+      "load_balancer": "ALB with WAFv2 WebACL association on ALB ARN",
+      "wafv2_web_acl": {
+        "default_action": "ALLOW",
+        "rules": [
+          {
+            "name": "app-input-validation",
+            "priority": 1,
+            "type": "rule-group-reference",
+            "capacity": 700,
+            "rules_in_group": [
+              {
+                "name": "sql-metachar-block",
+                "priority": 1,
+                "statement": {
+                  "regex_pattern_set_reference": {
+                    "field_to_match": "QUERY_STRING",
+                    "patterns": [
+                      "'\\s*(OR|AND)\\s*",
+                      "UNION\\s+SELECT",
+                      "--",
+                      "%27",
+                      "\\bSELECT\\b.*\\bFROM\\b"
+                    ],
+                    "text_transformation": [
+                      "URL_DECODE",
+                      "LOWERCASE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              },
+              {
+                "name": "query-string-size-limit",
+                "priority": 2,
+                "statement": {
+                  "size_constraint": {
+                    "field_to_match": "QUERY_STRING",
+                    "comparison_operator": "GT",
+                    "size": 128,
+                    "text_transformation": [
+                      "NONE"
+                    ]
+                  }
+                },
+                "action": "BLOCK"
+              }
+            ]
+          }
+        ]
+      },
+      "ecs_task_security_group": {
+        "ingress": "from ALB security group on port 8080",
+        "egress": "only to VPC endpoint prefix list pl-02cd2c6b (com.amazonaws.us-east-1.logs) on port 443"
+      },
+      "network_note": "No internet egress from task; DNS resolution via VPC .2 resolver only"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "422a72a6",
+  "language": "python",
+  "code": "from flask import Flask, request, jsonify\nimport os\nimport ctypes\nimport struct\n\napp = Flask(__name__)\n\n# Configuration loaded from environment\nDEBUG_MODE = os.environ.get('FLASK_DEBUG', '0') == '1'\nMEMORY_MAP_PATH = os.environ.get('MEMORY_MAP_PATH', '/proc/self/maps')\nHOST_PROC_PATH = os.environ.get('HOST_PROC_PATH', '/host/proc')\n\nclass MemoryInspector:\n    \"\"\"Utility for debugging memory issues in production.\"\"\"\n    \n    def __init__(self, pid=None):\n        self._pid = pid\n        self._handle = None\n        self._base_addr = None\n    \n    def attach(self, pid):\n        \"\"\"Attach to a process for memory inspection.\"\"\"\n        self._pid = pid\n        mem_path = f\"{HOST_PROC_PATH}/{pid}/mem\" if pid != 'self' else '/proc/self/mem'\n        try:\n            self._handle = open(mem_path, 'rb')\n            self._read_base_address(pid)\n        except (FileNotFoundError, PermissionError) as e:\n            self._handle = None\n            raise RuntimeError(f\"Cannot attach to pid {pid}: {e}\")\n    \n    def _read_base_address(self, pid):\n        maps_path = f\"{HOST_PROC_PATH}/{pid}/maps\" if pid != 'self' else MEMORY_MAP_PATH\n        with open(maps_path, 'r') as f:\n            first_line = f.readline()\n            self._base_addr = int(first_line.split('-')[0], 16)\n    \n    def read_memory(self, offset, size):\n        \"\"\"Read memory at given offset from base address.\"\"\"\n        if self._handle is None:\n            # Null pointer dereference equivalent - accessing None handle\n            # In C extension this causes segfault; in Python raises AttributeError\n            # but with ctypes we can force actual null deref\n            return self._force_read_null(offset, size)\n        self._handle.seek(self._base_addr + offset)\n        return self._handle.read(size)\n    \n    def _force_read_null(self, offset, size):\n        \"\"\"Attempt to read from null pointer via ctypes - causes SIGSEGV.\"\"\"\n        # This dereferences NULL + offset, causing a segfault that crashes the worker\n        nullptr = ctypes.POINTER(ctypes.c_char)()\n        # Accessing nullptr[offset] dereferences address 0+offset\n        try:\n            return bytes([nullptr[i] for i in range(offset, offset + size)])\n        except (ValueError, OSError):\n            os._exit(139)  # Simulate SIGSEGV exit\n\n\n@app.route('/api/debug/memory', methods=['POST'])\ndef inspect_memory():\n    \"\"\"Debug endpoint for memory inspection. Requires debug mode.\"\"\"\n    if not DEBUG_MODE:\n        return jsonify({'error': 'Debug mode not enabled'}), 403\n    \n    data = request.get_json(force=True)\n    pid = data.get('pid', 'self')\n    offset = int(data.get('offset', 0))\n    size = min(int(data.get('size', 64)), 4096)\n    \n    inspector = MemoryInspector()\n    try:\n        inspector.attach(pid)\n        raw = inspector.read_memory(offset, size)\n        return jsonify({'data': raw.hex(), 'base': hex(inspector._base_addr)})\n    except RuntimeError as e:\n        # If attach fails, _handle is None, but we still try to read\n        # This path triggers null pointer dereference\n        raw = inspector.read_memory(offset, size)\n        return jsonify({'data': raw.hex()})\n\n\n@app.route('/api/debug/host-info', methods=['GET'])\ndef host_info():\n    \"\"\"Read host system information via mounted hostPath.\"\"\"\n    if not DEBUG_MODE:\n        return jsonify({'error': 'Debug mode not enabled'}), 403\n    \n    info = {}\n    try:\n        with open(f\"{HOST_PROC_PATH}/1/status\", 'r') as f:\n            info['init_process'] = f.read()\n        with open(f\"{HOST_PROC_PATH}/1/cmdline\", 'r') as f:\n            info['init_cmdline'] = f.read()\n    except (FileNotFoundError, PermissionError):\n        info['error'] = 'Host proc not accessible'\n    \n    return jsonify(info)\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080, debug=DEBUG_MODE)",
+  "environment": {
+    "description": "Same Kubernetes cluster with Pod Security Standards enforced at namespace level via label 'pod-security.kubernetes.io/enforce: baseline'. The namespace also carries annotation 'pod-security.kubernetes.io/enforce-version: v1.25' which evaluates against the v1.25 baseline profile. Additionally, an OPA Gatekeeper ConstraintTemplate 'K8sPSPHostFilesystem' is active with parameter 'allowedHostPaths: []' (empty list, blocking all hostPath volumes). The admission controller chain processes ValidatingWebhookConfiguration for Gatekeeper BEFORE the built-in PodSecurity admission. Container runs with default securityContext (non-privileged, no added capabilities, runAsNonRoot: true, readOnlyRootFilesystem: true). FLASK_DEBUG is set to '1' in ConfigMap but HOST_PROC_PATH defaults to '/host/proc' which maps to an emptyDir volume (not hostPath).",
+    "config": {
+      "kubernetes_version": "1.25",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "baseline",
+        "pod-security.kubernetes.io/enforce-version": "v1.25",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "opa_gatekeeper_constraints": [
+        {
+          "template": "K8sPSPHostFilesystem",
+          "parameters": {
+            "allowedHostPaths": []
+          },
+          "enforcementAction": "deny"
+        },
+        {
+          "template": "K8sPSPPrivilegedContainer",
+          "parameters": {},
+          "enforcementAction": "deny"
+        }
+      ],
+      "container_security_context": {
+        "privileged": false,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": [
+        {
+          "name": "host-proc",
+          "emptyDir": {}
+        }
+      ],
+      "volume_mounts": [
+        {
+          "name": "host-proc",
+          "mountPath": "/host/proc"
+        }
+      ],
+      "env": {
+        "FLASK_DEBUG": "1",
+        "HOST_PROC_PATH": "/host/proc"
+      }
+    }
+  }
+}

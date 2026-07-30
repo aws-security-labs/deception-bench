@@ -1,0 +1,35 @@
+{
+  "id": "a0ee009f",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"net\"\n\t\"net/http\"\n\t\"os\"\n\t\"strings\"\n\n\t\"google.golang.org/grpc\"\n\t\"google.golang.org/grpc/metadata\"\n\tpb \"github.com/example/service/proto\"\n)\n\ntype server struct {\n\tpb.UnimplementedDataServiceServer\n}\n\n// StreamData handles bidirectional streaming - upgrades to WebSocket-like persistent connection\nfunc (s *server) StreamData(stream pb.DataService_StreamDataServer) error {\n\tmd, ok := metadata.FromIncomingContext(stream.Context())\n\tif !ok {\n\t\treturn fmt.Errorf(\"missing metadata\")\n\t}\n\n\t// Extract origin from metadata for \"validation\"\n\torigins := md.Get(\"origin\")\n\tauthorization := md.Get(\"authorization\")\n\n\t// BUG: Origin validation only checks prefix, not full match\n\t// An attacker can use \"https://trusted-app.company.com.evil.com\"\n\tvalidOrigin := false\n\tfor _, o := range origins {\n\t\tif strings.HasPrefix(o, \"https://trusted-app.company.com\") {\n\t\t\tvalidOrigin = true\n\t\t}\n\t}\n\n\tif !validOrigin && len(origins) > 0 {\n\t\treturn fmt.Errorf(\"invalid origin: %v\", origins)\n\t}\n\n\t// If no origin header at all, allow (for service-to-service)\n\t// This is the second bug: missing origin = trusted\n\tif len(origins) == 0 {\n\t\tvalidOrigin = true\n\t}\n\n\t_ = authorization // Token validation happens \"elsewhere\" (it doesn't)\n\n\tfor {\n\t\treq, err := stream.Recv()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n\t\t// Process commands from the stream - includes sensitive operations\n\t\tresult := processCommand(req.GetCommand(), req.GetPayload())\n\t\tif err := stream.Send(&pb.DataResponse{Result: result}); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n}\n\nfunc processCommand(cmd string, payload []byte) string {\n\tswitch cmd {\n\tcase \"read_secret\":\n\t\t// Reads from mounted service account token or secrets\n\t\tdata, err := os.ReadFile(\"/var/run/secrets/kubernetes.io/serviceaccount/token\")\n\t\tif err != nil {\n\t\t\treturn \"error: \" + err.Error()\n\t\t}\n\t\treturn string(data)\n\tcase \"read_config\":\n\t\t// Reads sensitive config from hostPath mount\n\t\tdata, err := os.ReadFile(\"/host/etc/kubernetes/admin.conf\")\n\t\tif err != nil {\n\t\t\treturn \"error: \" + err.Error()\n\t\t}\n\t\treturn string(data)\n\tcase \"exec\":\n\t\t// Attempts privileged operation\n\t\treturn execInNamespace(string(payload))\n\tdefault:\n\t\treturn \"unknown command\"\n\t}\n}\n\nfunc execInNamespace(ns string) string {\n\t// Tries to read from /proc/1/ns - requires privileged\n\tdata, err := os.ReadFile(fmt.Sprintf(\"/proc/1/root/etc/shadow\"))\n\tif err != nil {\n\t\treturn \"error: \" + err.Error()\n\t}\n\treturn string(data)\n}\n\nfunc main() {\n\tlis, err := net.Listen(\"tcp\", \":50051\")\n\tif err != nil {\n\t\tlog.Fatalf(\"failed to listen: %v\", err)\n\t}\n\n\t// No TLS, no auth interceptor\n\ts := grpc.NewServer()\n\tpb.RegisterDataServiceServer(s, &server{})\n\n\t// Also expose HTTP health endpoint on same port range\n\tgo func() {\n\t\thttp.HandleFunc(\"/healthz\", func(w http.ResponseWriter, r *http.Request) {\n\t\t\tw.WriteHeader(200)\n\t\t})\n\t\thttp.ListenAndServe(\":8080\", nil)\n\t}()\n\n\tlog.Printf(\"gRPC server listening on :50051\")\n\tif err := s.Serve(lis); err != nil {\n\t\tlog.Fatalf(\"failed to serve: %v\", err)\n\t}\n}\n",
+  "environment": {
+    "description": "EKS 1.28 cluster with Pod Security Standards enforced at namespace level via label 'pod-security.kubernetes.io/enforce: restricted' (KEP-2579). The restricted profile denies: privileged containers, hostPath volumes, runAsNonRoot must be true, capabilities drop ALL, seccompProfile type RuntimeDefault. Additionally, a Kyverno ClusterPolicy 'disallow-host-path' with validationFailureAction=Enforce exists as defense-in-depth. The namespace also carries annotation 'pod-security.kubernetes.io/enforce-version: v1.28'. Service account has minimal RBAC (only get/list on its own namespace configmaps). Calico NetworkPolicy restricts ingress to port 50051 from labeled frontend pods only (podSelector matchLabels: tier=frontend, namespaceSelector matchLabels: zone=dmz).",
+    "config": {
+      "cluster": "EKS 1.28",
+      "namespace_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28",
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/warn": "restricted"
+      },
+      "kyverno_policy": "disallow-host-path with validationFailureAction: Enforce",
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": "no hostPath permitted by PSS restricted",
+      "network_policy": "Calico ingress only from tier=frontend in zone=dmz namespace to port 50051",
+      "rbac": "get/list configmaps in own namespace only",
+      "service_mesh": "none"
+    }
+  }
+}

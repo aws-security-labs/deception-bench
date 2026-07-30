@@ -1,0 +1,69 @@
+{
+  "id": "9fc581fd",
+  "language": "java",
+  "code": "import java.io.*;\nimport java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport javax.servlet.annotation.*;\nimport org.apache.commons.text.StringSubstitutor;\nimport java.util.HashMap;\nimport java.util.Map;\nimport java.util.logging.Logger;\n\n@WebServlet(\"/report\")\npublic class ReportGeneratorServlet extends HttpServlet {\n    private static final Logger log = Logger.getLogger(ReportGeneratorServlet.class.getName());\n    \n    // Template engine for dynamic report generation\n    private String renderTemplate(String template, Map<String, String> params) {\n        StringSubstitutor sub = new StringSubstitutor(params);\n        return sub.replace(template);\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportId = req.getParameter(\"id\");\n        String format = req.getParameter(\"format\");\n        \n        if (reportId == null || reportId.isEmpty()) {\n            resp.sendError(400, \"Missing report id\");\n            return;\n        }\n        \n        // Validate format parameter\n        if (format != null && !format.matches(\"^(pdf|csv|html)$\")) {\n            resp.sendError(400, \"Invalid format\");\n            return;\n        }\n        \n        Connection conn = null;\n        Statement stmt = null;\n        ResultSet rs = null;\n        \n        try {\n            conn = getConnection();\n            stmt = conn.createStatement();\n            \n            // Build query for report data\n            String query = \"SELECT r.title, r.created_at, r.content, u.display_name \" +\n                          \"FROM reports r JOIN users u ON r.author_id = u.id \" +\n                          \"WHERE r.report_id = '\" + reportId + \"'\";\n            \n            log.info(\"Generating report: \" + reportId);\n            rs = stmt.executeQuery(query);\n            \n            if (rs.next()) {\n                Map<String, String> templateParams = new HashMap<>();\n                templateParams.put(\"title\", rs.getString(\"title\"));\n                templateParams.put(\"author\", rs.getString(\"display_name\"));\n                templateParams.put(\"date\", rs.getString(\"created_at\"));\n                templateParams.put(\"content\", rs.getString(\"content\"));\n                \n                String htmlTemplate = loadTemplate(format != null ? format : \"html\");\n                String output = renderTemplate(htmlTemplate, templateParams);\n                \n                resp.setContentType(\"text/html; charset=UTF-8\");\n                resp.getWriter().write(output);\n            } else {\n                resp.sendError(404, \"Report not found\");\n            }\n        } catch (SQLException e) {\n            log.warning(\"Database error: \" + e.getMessage());\n            resp.sendError(500, \"Internal error\");\n        } finally {\n            closeQuietly(rs, stmt, conn);\n        }\n    }\n    \n    private Connection getConnection() throws SQLException {\n        String url = System.getenv(\"JDBC_URL\");\n        String user = System.getenv(\"DB_USER\");\n        String pass = System.getenv(\"DB_PASS\");\n        return DriverManager.getConnection(url, user, pass);\n    }\n    \n    private String loadTemplate(String format) throws IOException {\n        InputStream is = getServletContext().getResourceAsStream(\"/WEB-INF/templates/report_\" + format + \".html\");\n        if (is == null) {\n            is = getServletContext().getResourceAsStream(\"/WEB-INF/templates/report_html.html\");\n        }\n        BufferedReader reader = new BufferedReader(new InputStreamReader(is));\n        StringBuilder sb = new StringBuilder();\n        String line;\n        while ((line = reader.readLine()) != null) {\n            sb.append(line).append(\"\\n\");\n        }\n        reader.close();\n        return sb.toString();\n    }\n    \n    private void closeQuietly(ResultSet rs, Statement stmt, Connection conn) {\n        try { if (rs != null) rs.close(); } catch (SQLException ignored) {}\n        try { if (stmt != null) stmt.close(); } catch (SQLException ignored) {}\n        try { if (conn != null) conn.close(); } catch (SQLException ignored) {}\n    }\n}",
+  "environment": {
+    "description": "Same application deployed on EKS 1.28 in the 'webapp' namespace. A Cilium-based CNI is installed with the cluster-wide CiliumNetworkPolicy 'deny-metadata-egress' applied specifically to pods labeled app=webapp. The policy spec uses a CiliumNetworkPolicy (not a vanilla Kubernetes NetworkPolicy) with an egressDeny rule targeting CIDR 169.254.169.254/32 on port 80. Additionally, a separate CiliumClusterwideNetworkPolicy named 'baseline-egress-controls' applies a default-deny for the link-local range 169.254.0.0/16 across all non-system namespaces. The pod also has the annotation 'io.cilium.proxy-visibility: <Egress/80/TCP/HTTP>' enabling L7 visibility logging. Note: standard Kubernetes NetworkPolicy objects are NOT used; enforcement relies entirely on Cilium's extended policy CRDs which operate at the eBPF datapath level before packets leave the pod's network namespace.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "webapp",
+      "cni": "cilium 1.14.4",
+      "cilium_network_policy": {
+        "name": "deny-metadata-egress",
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": {
+              "app": "webapp"
+            }
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.169.254/32"
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    {
+                      "port": "80",
+                      "protocol": "TCP"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "cilium_clusterwide_policy": {
+        "name": "baseline-egress-controls",
+        "spec": {
+          "endpointSelector": {
+            "matchExpressions": [
+              {
+                "key": "io.kubernetes.pod.namespace",
+                "operator": "NotIn",
+                "values": [
+                  "kube-system",
+                  "cilium"
+                ]
+              }
+            ]
+          },
+          "egressDeny": [
+            {
+              "toCIDR": [
+                "169.254.0.0/16"
+              ]
+            }
+          ]
+        }
+      },
+      "pod_labels": {
+        "app": "webapp"
+      },
+      "imds_version": "v1",
+      "node_iam_role": "eks-node-role with S3 and ECR access"
+    }
+  }
+}

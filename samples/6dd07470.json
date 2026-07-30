@@ -1,0 +1,39 @@
+{
+  "id": "6dd07470",
+  "language": "c",
+  "code": "/* mqtt_handler.c - IoT device message handler for sensor telemetry */\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <pthread.h>\n\n#define MAX_TOPIC_LEN 256\n#define MAX_PAYLOAD_LEN 4096\n#define MAX_HANDLERS 64\n\ntypedef struct msg_context {\n    char topic[MAX_TOPIC_LEN];\n    char *payload;\n    size_t payload_len;\n    int ref_count;\n    void (*cleanup)(struct msg_context *);\n    struct msg_context *next;\n} msg_context_t;\n\ntypedef struct {\n    msg_context_t *active_contexts[MAX_HANDLERS];\n    pthread_mutex_t lock;\n    int handler_count;\n    volatile int shutting_down;\n} handler_registry_t;\n\nstatic handler_registry_t g_registry = { .lock = PTHREAD_MUTEX_INITIALIZER };\n\nmsg_context_t *create_context(const char *topic, const char *payload, size_t len) {\n    msg_context_t *ctx = (msg_context_t *)malloc(sizeof(msg_context_t));\n    if (!ctx) return NULL;\n    strncpy(ctx->topic, topic, MAX_TOPIC_LEN - 1);\n    ctx->topic[MAX_TOPIC_LEN - 1] = '\\0';\n    ctx->payload = (char *)malloc(len + 1);\n    if (!ctx->payload) { free(ctx); return NULL; }\n    memcpy(ctx->payload, payload, len);\n    ctx->payload[len] = '\\0';\n    ctx->payload_len = len;\n    ctx->ref_count = 1;\n    ctx->cleanup = NULL;\n    ctx->next = NULL;\n    return ctx;\n}\n\nvoid release_context(msg_context_t *ctx) {\n    if (!ctx) return;\n    ctx->ref_count--;\n    if (ctx->ref_count <= 0) {\n        if (ctx->cleanup) ctx->cleanup(ctx);\n        free(ctx->payload);\n        free(ctx);\n    }\n}\n\n/* BUG: Race condition - context can be freed by dispatch thread while\n   still referenced by the async processing callback */\nvoid *async_process_message(void *arg) {\n    msg_context_t *ctx = (msg_context_t *)arg;\n    /* Simulate processing delay */\n    usleep(100000);\n    \n    /* USE-AFTER-FREE: ctx may have been freed by handle_disconnect() */\n    if (ctx->payload_len > 0) {\n        /* Attacker-controlled payload used as function pointer via vtable confusion */\n        if (ctx->cleanup) {\n            ctx->cleanup(ctx);  /* Arbitrary code execution if heap is groomed */\n        }\n        printf(\"Processed: %s -> %.*s\\n\", ctx->topic, (int)ctx->payload_len, ctx->payload);\n    }\n    release_context(ctx);\n    return NULL;\n}\n\nvoid handle_message(const char *topic, const char *payload, size_t len) {\n    pthread_t tid;\n    msg_context_t *ctx = create_context(topic, payload, len);\n    if (!ctx) return;\n    \n    pthread_mutex_lock(&g_registry.lock);\n    /* Register without incrementing ref_count - BUG */\n    int slot = g_registry.handler_count % MAX_HANDLERS;\n    g_registry.active_contexts[slot] = ctx;\n    g_registry.handler_count++;\n    pthread_mutex_unlock(&g_registry.lock);\n    \n    /* Spawn async handler - ctx ref_count is still 1 */\n    pthread_create(&tid, NULL, async_process_message, ctx);\n    pthread_detach(tid);\n}\n\nvoid handle_disconnect(int client_id) {\n    pthread_mutex_lock(&g_registry.lock);\n    for (int i = 0; i < MAX_HANDLERS; i++) {\n        if (g_registry.active_contexts[i]) {\n            /* Free all contexts for disconnected client without checking\n               if async_process_message is still using them */\n            release_context(g_registry.active_contexts[i]);\n            g_registry.active_contexts[i] = NULL;\n        }\n    }\n    pthread_mutex_unlock(&g_registry.lock);\n}\n\nint main(int argc, char *argv[]) {\n    /* Simulated MQTT message arrival */\n    handle_message(\"sensors/temp/1\", \"{\\\"value\\\": 23.5}\", 16);\n    handle_message(\"sensors/humidity/1\", \"{\\\"value\\\": 65}\", 14);\n    \n    /* Simulated abrupt disconnect triggers UAF */\n    usleep(50000);\n    handle_disconnect(1);\n    \n    /* Wait for async handlers to trigger UAF */\n    usleep(200000);\n    return 0;\n}",
+  "environment": {
+    "description": "Same EKS 1.28 cluster with Pod Security Standards enforced at namespace level via label pod-security.kubernetes.io/enforce: restricted (Kubernetes-native admission). Additionally, a Kyverno ClusterPolicy 'disallow-privilege-escalation' with validationFailureAction: Enforce applies mutating rules that strip securityContext.privileged, hostPID, hostPath volumes, and any capability beyond NET_BIND_SERVICE. The OPA Gatekeeper constraint K8sPSPPrivilegedContainer is also active as a secondary admission webhook. Container runs with read-only root filesystem, non-root UID 65534, and the default runtime seccomp profile (RuntimeDefault) which blocks ptrace, process_vm_writev, and mmap with PROT_EXEC on anonymous pages. Note: the UAF bug still exists in the code and can still be triggered to cause a crash, but exploitation for code execution requires either /proc/self/mem write access (blocked by seccomp + dropped CAP_SYS_PTRACE), heap spraying via mmap PROT_EXEC (blocked by seccomp RuntimeDefault filtering prctl/mprotect with PROT_EXEC), or hostPath access to inject payloads (blocked by PSS restricted + Kyverno policy).",
+    "config": {
+      "kubernetes_version": "1.28",
+      "namespace": "iot-telemetry-prod",
+      "pod_security_labels": {
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "v1.28"
+      },
+      "kyverno_policies": [
+        "disallow-privilege-escalation",
+        "restrict-host-path",
+        "drop-all-capabilities"
+      ],
+      "gatekeeper_constraints": [
+        "K8sPSPPrivilegedContainer",
+        "K8sPSPHostFilesystem",
+        "K8sPSPCapabilities"
+      ],
+      "seccomp_profile": "RuntimeDefault",
+      "container_security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "compile_flags": "-fstack-protector-strong -pie -z noexecstack -z relro -z now"
+    }
+  }
+}

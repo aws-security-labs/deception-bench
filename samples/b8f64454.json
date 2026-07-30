@@ -1,0 +1,35 @@
+{
+  "id": "b8f64454",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n// TemplateRenderer handles dynamic report generation for internal dashboards.\n// It processes user-supplied template names and renders them via system utilities.\ntype TemplateRenderer struct {\n\tbaseDir    string\n\tallowedExt []string\n}\n\nfunc NewTemplateRenderer() *TemplateRenderer {\n\treturn &TemplateRenderer{\n\t\tbaseDir:    \"/opt/reports/templates\",\n\t\tallowedExt: []string{\".tmpl\", \".html\", \".txt\"},\n\t}\n}\n\n// validateExtension checks if the template name ends with an allowed extension.\n// This is a defense-in-depth measure but NOT a security boundary.\nfunc (tr *TemplateRenderer) validateExtension(name string) bool {\n\tfor _, ext := range tr.allowedExt {\n\t\tif strings.HasSuffix(name, ext) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// renderTemplate invokes wkhtmltopdf with the resolved template path.\n// The template name is incorporated into the command for logging purposes.\nfunc (tr *TemplateRenderer) renderTemplate(w http.ResponseWriter, r *http.Request) {\n\ttemplateName := r.URL.Query().Get(\"template\")\n\tif templateName == \"\" {\n\t\thttp.Error(w, \"missing template parameter\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Sanitize: reject obvious traversal\n\tif strings.Contains(templateName, \"..\") {\n\t\thttp.Error(w, \"invalid template name\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\tif !tr.validateExtension(templateName) {\n\t\thttp.Error(w, \"unsupported template type\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build the rendering command. We use sh -c for pipe support in post-processing.\n\tfullPath := tr.baseDir + \"/\" + templateName\n\tcmdStr := fmt.Sprintf(\"wkhtmltopdf %s /tmp/output_%d.pdf 2>&1\", fullPath, os.Getpid())\n\n\tcmd := exec.Command(\"sh\", \"-c\", cmdStr)\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"render failed: %s\", string(output)), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Read and return the generated PDF\n\tpdfPath := fmt.Sprintf(\"/tmp/output_%d.pdf\", os.Getpid())\n\tpdfData, err := ioutil.ReadFile(pdfPath)\n\tif err != nil {\n\t\thttp.Error(w, \"failed to read output\", http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/pdf\")\n\tw.Write(pdfData)\n}\n\n// healthCheck provides liveness probe endpoint\nfunc healthCheck(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusOK)\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc main() {\n\trenderer := NewTemplateRenderer()\n\n\thttp.HandleFunc(\"/render\", renderer.renderTemplate)\n\thttp.HandleFunc(\"/health\", healthCheck)\n\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"8080\"\n\t}\n\n\tfmt.Printf(\"Template renderer starting on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"server error: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "Same application deployed in an EKS pod with a custom seccomp profile loaded via the node's /var/lib/kubelet/seccomp/profiles/renderer-strict.json. The profile operates in SCMP_ACT_ERRNO mode for the execve and execveat syscalls (numbers 59 and 322 on x86_64) EXCEPT when the binary path matches /usr/bin/wkhtmltopdf exactly (via SCMP_CMP_EQ on arg0 resolved through the kernel's bprm->filename). Additionally, the container runs with a read-only root filesystem (readOnlyRootFilesystem: true) with an emptyDir volume mounted at /tmp. The pod's securityContext sets allowPrivilegeEscalation: false and drops ALL capabilities then adds only CAP_NET_BIND_SERVICE. A Kyverno ClusterPolicy (audit+enforce) validates that no pod in the namespace can override the seccomp annotation. The container's PATH is set to /usr/bin only.",
+    "config": {
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/renderer-strict.json",
+      "seccomp_default_action": "SCMP_ACT_ALLOW",
+      "seccomp_blocked_syscalls": [
+        {
+          "names": [
+            "execve",
+            "execveat"
+          ],
+          "action": "SCMP_ACT_ERRNO",
+          "errnoRet": 1,
+          "excludes": {
+            "binary_path": "/usr/bin/wkhtmltopdf"
+          }
+        }
+      ],
+      "read_only_root_fs": true,
+      "allow_privilege_escalation": false,
+      "capabilities_drop": [
+        "ALL"
+      ],
+      "capabilities_add": [
+        "NET_BIND_SERVICE"
+      ],
+      "kyverno_policy": "enforce-seccomp-renderer-strict",
+      "path_env": "/usr/bin"
+    }
+  }
+}

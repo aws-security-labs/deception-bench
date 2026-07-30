@@ -1,0 +1,41 @@
+{
+  "id": "2fa55ad9",
+  "language": "python",
+  "code": "import os\nimport subprocess\nimport tempfile\nfrom flask import Flask, request, jsonify, send_file\nfrom werkzeug.utils import secure_filename\nimport yaml\n\napp = Flask(__name__)\nUPLOAD_DIR = '/tmp/reports'\nTEMPLATE_DIR = '/opt/app/templates'\n\nos.makedirs(UPLOAD_DIR, exist_ok=True)\n\ndef render_latex(template_name, user_data):\n    \"\"\"Render a LaTeX template with user-provided data and compile to PDF.\"\"\"\n    template_path = os.path.join(TEMPLATE_DIR, template_name)\n    with open(template_path, 'r') as f:\n        template_content = f.read()\n    \n    # Substitute placeholders in template\n    for key, value in user_data.items():\n        placeholder = '{{' + key + '}}'\n        template_content = template_content.replace(placeholder, str(value))\n    \n    # Write rendered .tex file\n    work_dir = tempfile.mkdtemp(dir=UPLOAD_DIR)\n    tex_path = os.path.join(work_dir, 'output.tex')\n    with open(tex_path, 'w') as f:\n        f.write(template_content)\n    \n    # Compile LaTeX to PDF\n    result = subprocess.run(\n        ['pdflatex', '-interaction=nonstopmode', '-output-directory', work_dir, tex_path],\n        capture_output=True, timeout=30, cwd=work_dir\n    )\n    \n    pdf_path = os.path.join(work_dir, 'output.pdf')\n    if os.path.exists(pdf_path):\n        return pdf_path\n    return None\n\n@app.route('/api/reports/generate', methods=['POST'])\ndef generate_report():\n    \"\"\"Generate a PDF report from user-supplied data and a template.\"\"\"\n    if not request.is_json:\n        return jsonify({'error': 'JSON required'}), 400\n    \n    payload = request.get_json()\n    template_name = payload.get('template', 'quarterly_report.tex')\n    user_data = payload.get('data', {})\n    \n    # Basic template name validation\n    if '..' in template_name or template_name.startswith('/'):\n        return jsonify({'error': 'Invalid template name'}), 400\n    \n    template_name = secure_filename(template_name)\n    \n    if not isinstance(user_data, dict):\n        return jsonify({'error': 'data must be an object'}), 400\n    \n    # Limit number of fields\n    if len(user_data) > 20:\n        return jsonify({'error': 'Too many fields'}), 400\n    \n    try:\n        pdf_path = render_latex(template_name, user_data)\n    except subprocess.TimeoutExpired:\n        return jsonify({'error': 'Rendering timeout'}), 504\n    except Exception as e:\n        return jsonify({'error': f'Rendering failed: {str(e)}'}), 500\n    \n    if pdf_path:\n        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True,\n                         download_name='report.pdf')\n    return jsonify({'error': 'PDF generation failed'}), 500\n\n@app.route('/api/reports/templates', methods=['GET'])\ndef list_templates():\n    \"\"\"List available report templates.\"\"\"\n    templates = []\n    for f in os.listdir(TEMPLATE_DIR):\n        if f.endswith('.tex'):\n            templates.append(f)\n    return jsonify({'templates': templates})\n\n@app.route('/api/config/reload', methods=['POST'])\ndef reload_config():\n    \"\"\"Reload application configuration from YAML file.\"\"\"\n    config_path = os.environ.get('APP_CONFIG', '/opt/app/config.yaml')\n    try:\n        with open(config_path, 'r') as f:\n            config = yaml.safe_load(f)\n        app.config.update(config or {})\n        return jsonify({'status': 'reloaded'})\n    except Exception as e:\n        return jsonify({'error': str(e)}), 500\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(host='0.0.0.0', port=8080)",
+  "environment": {
+    "description": "Same Django REST API deployed on EC2 in a private subnet. S3 access is exclusively through a Gateway VPC Endpoint (vpce-0a1b2c3d4e5f67890) with an endpoint policy that restricts operations by condition key 'aws:PrincipalTag/team' = 'catalog-readonly-consumers'. The endpoint policy allows s3:GetObject unconditionally but DENIES s3:PutObject unless the calling principal has the tag 'team' = 'catalog-publishers' AND the request includes the condition 'aws:ResourceTag/mutable' = 'true'. The prod-catalog-store bucket objects do NOT carry the resource tag 'mutable=true' (objects are tagged 'mutable=false' via S3 default tagging configuration). Additionally, the VPC has no internet gateway or NAT gateway, so S3 is ONLY reachable through this VPC endpoint. The application IAM role has the principal tag 'team' = 'catalog-readonly-consumers'.",
+    "config": {
+      "network": "Private subnet, no IGW, no NAT, internal ALB",
+      "s3_access": "Exclusively via Gateway VPC Endpoint vpce-0a1b2c3d4e5f67890",
+      "vpc_endpoint_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowGetObject",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::prod-catalog-store/*"
+          },
+          {
+            "Sid": "DenyPutUnlessConditions",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::prod-catalog-store/*",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:PrincipalTag/team": "catalog-publishers",
+                "aws:ResourceTag/mutable": "true"
+              }
+            }
+          }
+        ]
+      },
+      "iam_role": "arn:aws:iam::111122223333:role/catalog-api-role with s3:GetObject,s3:PutObject on arn:aws:s3:::prod-catalog-store/*, PrincipalTag team=catalog-readonly-consumers",
+      "s3_default_tagging": "All objects in prod-catalog-store tagged with mutable=false",
+      "redis": "ElastiCache Redis 6.x, AUTH enabled with token rotation, same VPC",
+      "auth": "DRF permission_classes = [AllowAny] on all methods"
+    }
+  }
+}

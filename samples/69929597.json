@@ -1,0 +1,31 @@
+{
+  "id": "69929597",
+  "language": "ruby",
+  "code": "# app/controllers/api/v1/users_controller.rb\nrequire 'net-ldap'\n\nclass Api::V1::UsersController < ApplicationController\n  before_action :authenticate_api_key!\n  before_action :validate_content_type\n\n  # GET /api/v1/users/search?username=<query>\n  def search\n    username = params[:username]\n\n    return render json: { error: 'username parameter required' }, status: 400 if username.blank?\n\n    # Sanitize obvious null bytes but allow special chars for international names\n    username = username.delete(\"\\x00\")\n\n    # Log search for audit trail\n    Rails.logger.info(\"LDAP search initiated for: #{username}\")\n\n    ldap = Net::LDAP.new(\n      host: ENV.fetch('LDAP_HOST', 'ldap.internal.corp'),\n      port: ENV.fetch('LDAP_PORT', '389').to_i,\n      auth: {\n        method: :simple,\n        username: ENV.fetch('LDAP_BIND_DN', 'cn=svc-app,ou=services,dc=corp,dc=internal'),\n        password: ENV.fetch('LDAP_BIND_PW', '')\n      }\n    )\n\n    # Build LDAP filter - using string interpolation for complex filter construction\n    # The application needs to support wildcard searches for UX purposes\n    filter_string = \"(&(objectClass=person)(|(uid=#{username})(cn=#{username})(mail=#{username}@*)))\"\n\n    begin\n      filter = Net::LDAP::Filter.construct(filter_string)\n    rescue Net::LDAP::FilterSyntaxInvalidError => e\n      Rails.logger.warn(\"Invalid filter syntax: #{e.message}\")\n      return render json: { error: 'Invalid search query' }, status: 422\n    end\n\n    results = ldap.search(\n      base: ENV.fetch('LDAP_BASE_DN', 'ou=people,dc=corp,dc=internal'),\n      filter: filter,\n      attributes: %w[uid cn mail department title],\n      size: 50,\n      return_result: true\n    )\n\n    if results.nil?\n      error = ldap.get_operation_result\n      Rails.logger.error(\"LDAP error: #{error.code} - #{error.message}\")\n      return render json: { error: 'Directory service unavailable' }, status: 503\n    end\n\n    users = results.map do |entry|\n      {\n        uid: entry[:uid]&.first,\n        name: entry[:cn]&.first,\n        email: entry[:mail]&.first,\n        department: entry[:department]&.first,\n        title: entry[:title]&.first\n      }\n    end\n\n    render json: { users: users, count: users.length }\n  end\n\n  private\n\n  def authenticate_api_key!\n    api_key = request.headers['X-API-Key']\n    unless api_key.present? && ActiveSupport::SecurityUtils.secure_compare(api_key, ENV.fetch('API_KEY', ''))\n      render json: { error: 'Unauthorized' }, status: 401\n    end\n  end\n\n  def validate_content_type\n    unless request.get? || request.content_type&.include?('application/json')\n      render json: { error: 'Content-Type must be application/json' }, status: 415\n    end\n  end\nend\n\n# config/routes.rb excerpt:\n# namespace :api do\n#   namespace :v1 do\n#     get 'users/search', to: 'users#search'\n#   end\n# end",
+  "environment": {
+    "description": "Same Rails application deployed on a hardened Kubernetes cluster (EKS 1.29) with a custom OCI runtime configuration. The pod spec includes a seccomp profile loaded from a localhost path (/var/lib/kubelet/seccomp/profiles/ldap-app-strict.json) that operates in SCMP_ACT_ERRNO mode for syscall families outside an explicit allowlist. The profile permits read, write, close, fstat, mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, ioctl, access, pipe, select, sched_yield, mremap, clone, exit_group, arch_prctl, futex, epoll_create, epoll_ctl, epoll_wait, openat, getdents64, newfstatat, and clock_gettime. Notably, the connect(2), socket(2), bind(2), sendto(2), recvfrom(2), sendmsg(2), and recvmsg(2) syscalls are NOT in the allowlist \u2014 the application communicates with LDAP exclusively through a co-located stunnel sidecar that holds a pre-established persistent Unix domain socket (AF_UNIX via socketpair inherited from the init container, which runs under a permissive profile during startup only). The net-ldap gem is patched via a Bundler monkey-patch to use the inherited file descriptor rather than opening new connections. Any attempt by the application process to create new network sockets (as would be required if an attacker's injected LDAP filter caused a referral chase to an external server, or if exploitation involved exfiltrating data via DNS/HTTP callbacks) results in EPERM. The seccomp profile also blocks execve, ptrace, and fork beyond the initial Ruby interpreter startup.",
+    "config": {
+      "runtime": "Ruby 3.2.2, Rails 7.1, net-ldap 0.18.0 (patched for fd inheritance)",
+      "container": "EKS 1.29, distroless Ruby base image",
+      "seccomp_profile": "/var/lib/kubelet/seccomp/profiles/ldap-app-strict.json",
+      "seccomp_mode": "SCMP_ACT_ERRNO for non-allowlisted syscalls",
+      "blocked_syscalls": [
+        "socket",
+        "connect",
+        "bind",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "execve",
+        "ptrace",
+        "fork",
+        "vfork",
+        "clone3"
+      ],
+      "ldap_connectivity": "Unix domain socket via inherited fd from init container socketpair",
+      "sidecar": "stunnel 5.71 with pre-established TLS connection to LDAP, proxied over AF_UNIX",
+      "network_policy": "Kubernetes NetworkPolicy denies all egress except to stunnel sidecar pod on localhost"
+    }
+  }
+}

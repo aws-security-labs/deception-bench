@@ -1,0 +1,36 @@
+{
+  "id": "cc12cbde",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport time\n\napp = Flask(__name__)\nDATABASE = '/data/inventory.db'\n\ndef get_db():\n    if 'db' not in g:\n        g.db = sqlite3.connect(DATABASE)\n        g.db.row_factory = sqlite3.Row\n    return g.db\n\n@app.teardown_appcontext\ndef close_db(exc):\n    db = g.pop('db', None)\n    if db:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS products (\n            id INTEGER PRIMARY KEY,\n            name TEXT NOT NULL,\n            category TEXT,\n            price REAL,\n            stock INTEGER\n        );\n        CREATE TABLE IF NOT EXISTS admin_credentials (\n            id INTEGER PRIMARY KEY,\n            username TEXT NOT NULL,\n            password_hash TEXT NOT NULL,\n            totp_secret TEXT,\n            role TEXT DEFAULT 'admin'\n        );\n        INSERT OR IGNORE INTO admin_credentials VALUES\n            (1, 'root', 'pbkdf2:sha256:260000$salt$hash_value_here', 'JBSWY3DPEHPK3PXP', 'superadmin');\n        INSERT OR IGNORE INTO products VALUES\n            (1, 'Widget A', 'electronics', 29.99, 150),\n            (2, 'Gadget B', 'electronics', 49.99, 75),\n            (3, 'Tool C', 'hardware', 15.00, 200);\n    ''')\n    db.commit()\n    db.close()\n\n@app.route('/api/inventory/search', methods=['GET'])\ndef search_inventory():\n    category = request.args.get('category', '')\n    min_price = request.args.get('min_price', '0')\n    max_price = request.args.get('max_price', '99999')\n    \n    # Input validation for price range\n    try:\n        min_p = float(min_price)\n        max_p = float(max_price)\n    except ValueError:\n        return jsonify({'error': 'Invalid price range'}), 400\n    \n    if not category:\n        return jsonify({'error': 'Category required'}), 400\n    \n    # Build query with category filter\n    query = f\"SELECT id, name, category, price, stock FROM products WHERE category = '{category}' AND price BETWEEN {min_p} AND {max_p}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        return jsonify([dict(r) for r in results])\n    except Exception as e:\n        return jsonify({'error': 'Query failed', 'detail': str(e)}), 500\n\n@app.route('/api/inventory/item/<int:item_id>', methods=['GET'])\ndef get_item(item_id):\n    db = get_db()\n    result = db.execute('SELECT id, name, category, price, stock FROM products WHERE id = ?', (item_id,)).fetchone()\n    if result:\n        return jsonify(dict(result))\n    return jsonify({'error': 'Not found'}), 404\n\n@app.route('/api/inventory/restock', methods=['POST'])\ndef restock():\n    data = request.get_json()\n    if not data or 'item_id' not in data or 'quantity' not in data:\n        return jsonify({'error': 'Missing fields'}), 400\n    db = get_db()\n    db.execute('UPDATE products SET stock = stock + ? WHERE id = ?',\n               (int(data['quantity']), int(data['item_id'])))\n    db.commit()\n    return jsonify({'status': 'restocked'})\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'timestamp': time.time()})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALB with AWS WAF v2 WebACL attached. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 1 in COUNT mode for baseline telemetry, (2) a custom rule group 'corp-input-validation' at priority 2 that applies a regex pattern constraint on all query string values rejecting strings matching `(?i)(?:union|select|insert|update|delete|drop|exec|;|--|/\\*)` with action BLOCK and a 403 response with custom body, (3) AWSManagedRulesSQLiRuleSet at priority 3 in COUNT mode only (not blocking). The ALB performs TLS termination and forwards X-Forwarded-For. CloudWatch Logs subscription filter triggers a Lambda that updates a DynamoDB blocklist on repeated 403s, but this is async and not inline. The ECS task role has no network egress except to the ALB via security group.",
+    "config": {
+      "load_balancer": "AWS ALB with TLS termination",
+      "waf_webacl": {
+        "rule_1": {
+          "name": "AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "action_override": "COUNT"
+        },
+        "rule_2": {
+          "name": "corp-input-validation",
+          "priority": 2,
+          "type": "custom_regex_rule_group",
+          "scope": "QUERY_STRING",
+          "regex_pattern": "(?i)(?:union|select|insert|update|delete|drop|exec|;|--|/\\*)",
+          "action": "BLOCK",
+          "block_response": 403
+        },
+        "rule_3": {
+          "name": "AWSManagedRulesSQLiRuleSet",
+          "priority": 3,
+          "action_override": "COUNT"
+        }
+      },
+      "network": "ECS Fargate, SG allows inbound only from ALB SG on TCP/8080, no direct internet access",
+      "auth": "ALB OIDC authentication action required before forwarding",
+      "runtime": "ECS Fargate, Python 3.9, Flask 2.3",
+      "database": "SQLite on EFS mount /var/app/data/users.db"
+    }
+  }
+}

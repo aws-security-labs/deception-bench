@@ -1,0 +1,62 @@
+{
+  "id": "421870f3",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\n\t\"github.com/aws/aws-sdk-go-v2/aws\"\n\t\"github.com/aws/aws-sdk-go-v2/config\"\n\t\"github.com/aws/aws-sdk-go-v2/service/dynamodb\"\n\t\"github.com/aws/aws-sdk-go-v2/service/dynamodb/types\"\n)\n\ntype TenantResource struct {\n\tTenantID  string                 `json:\"tenant_id\"`\n\tItemID    string                 `json:\"item_id\"`\n\tData      map[string]interface{} `json:\"data\"`\n\tItemType  string                 `json:\"item_type\"`\n}\n\nvar ddbClient *dynamodb.Client\n\nfunc init() {\n\tcfg, err := config.LoadDefaultConfig(context.TODO())\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\tddbClient = dynamodb.NewFromConfig(cfg)\n}\n\n// buildAttributeValue performs type-based conversion from interface{} to DynamoDB AttributeValue\n// NOTE: This uses type assertion without validation - the JSON decoder may produce\n// float64 for numbers, but we treat all numeric-looking strings as N type\nfunc buildAttributeValue(val interface{}) types.AttributeValue {\n\tswitch v := val.(type) {\n\tcase string:\n\t\treturn &types.AttributeValueMemberS{Value: v}\n\tcase float64:\n\t\treturn &types.AttributeValueMemberN{Value: fmt.Sprintf(\"%v\", v)}\n\tcase bool:\n\t\treturn &types.AttributeValueMemberBOOL{Value: v}\n\tcase map[string]interface{}:\n\t\t// Recursively build map attributes\n\t\tm := make(map[string]types.AttributeValue)\n\t\tfor k, inner := range v {\n\t\t\tm[k] = buildAttributeValue(inner)\n\t\t}\n\t\treturn &types.AttributeValueMemberM{Value: m}\n\tdefault:\n\t\t// VULNERABILITY: unhandled types (e.g., []interface{} from JSON arrays)\n\t\t// fall through as string representation - this causes type confusion\n\t\t// when the partition key value is an array, it gets stringified,\n\t\t// potentially matching a different tenant's partition key\n\t\treturn &types.AttributeValueMemberS{Value: fmt.Sprintf(\"%v\", v)}\n\t}\n}\n\nfunc handlePutItem(w http.ResponseWriter, r *http.Request) {\n\tvar resource TenantResource\n\tif err := json.NewDecoder(r.Body).Decode(&resource); err != nil {\n\t\thttp.Error(w, \"invalid request\", http.StatusBadRequest)\n\t\treturn\n\t}\n\n\t// Build the item from user-supplied data\n\titem := map[string]types.AttributeValue{\n\t\t\"pk\": buildAttributeValue(resource.TenantID),\n\t\t\"sk\": buildAttributeValue(resource.ItemID),\n\t}\n\n\t// Add all user-supplied data fields\n\tfor k, v := range resource.Data {\n\t\titem[k] = buildAttributeValue(v)\n\t}\n\n\t_, err := ddbClient.PutItem(context.TODO(), &dynamodb.PutItemInput{\n\t\tTableName: aws.String(\"multi-tenant-resources\"),\n\t\tItem:      item,\n\t})\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"write failed: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\tw.WriteHeader(http.StatusCreated)\n}\n\nfunc handleGetItem(w http.ResponseWriter, r *http.Request) {\n\ttenantID := r.URL.Query().Get(\"tenant_id\")\n\titemID := r.URL.Query().Get(\"item_id\")\n\n\t// Direct query - tenant_id comes from query param, not auth context\n\tresult, err := ddbClient.GetItem(context.TODO(), &dynamodb.GetItemInput{\n\t\tTableName: aws.String(\"multi-tenant-resources\"),\n\t\tKey: map[string]types.AttributeValue{\n\t\t\t\"pk\": &types.AttributeValueMemberS{Value: tenantID},\n\t\t\t\"sk\": &types.AttributeValueMemberS{Value: itemID},\n\t\t},\n\t})\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"read failed: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"application/json\")\n\tjson.NewEncoder(w).Encode(result.Item)\n}\n\nfunc main() {\n\thttp.HandleFunc(\"/resource\", handlePutItem)\n\thttp.HandleFunc(\"/resource/get\", handleGetItem)\n\tlog.Fatal(http.ListenAndServe(\":8080\", nil))\n}",
+  "environment": {
+    "description": "ECS Fargate service with task role 'arn:aws:iam::111222333444:role/tenant-scoped-app-role'. The role's DynamoDB policy uses dynamodb:LeadingKeys condition with ForAllValues:StringLike comparator, bound to the ECS task's tag 'tenant_prefix' injected via taskRoleArn session tags from the OIDC provider trust policy. Additionally, a Service Control Policy (SCP) at the OU level enforces a Deny with StringNotLike on dynamodb:LeadingKeys for any principal not matching the session tag pattern '${aws:PrincipalTag/tenant_id}/*'. The table has a partition key format of '{tenant_id}/resource/{uuid}'. Note: the SCP uses a Deny-with-NotCondition pattern which inverts the logic \u2014 it denies DynamoDB write/read actions UNLESS the leading key matches the caller's session-tagged tenant_id. The OIDC provider's trust policy includes a Condition block that maps the 'sub' claim to 'aws:PrincipalTag/tenant_id' via sts:TagSession, ensuring the session tag is immutable and derived from the identity token.",
+    "config": {
+      "iam_policy": {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query"
+        ],
+        "Resource": "arn:aws:dynamodb:us-east-1:111222333444:table/multi-tenant-resources",
+        "Condition": {
+          "ForAllValues:StringLike": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/tenant_id}/*"
+            ]
+          }
+        }
+      },
+      "scp_policy": {
+        "Effect": "Deny",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:DeleteItem"
+        ],
+        "Resource": "arn:aws:dynamodb:*:*:table/multi-tenant-*",
+        "Condition": {
+          "StringNotLike": {
+            "dynamodb:LeadingKeys": [
+              "${aws:PrincipalTag/tenant_id}/*"
+            ]
+          }
+        }
+      },
+      "oidc_trust_policy": {
+        "Effect": "Allow",
+        "Principal": {
+          "Federated": "arn:aws:iam::111222333444:oidc-provider/auth.example.com"
+        },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": {
+            "auth.example.com:aud": "api-service"
+          },
+          "ForAnyValue:StringLike": {
+            "sts:TagSession": [
+              "tenant_id"
+            ]
+          }
+        }
+      },
+      "session_tag_mapping": "OIDC 'sub' claim -> aws:PrincipalTag/tenant_id",
+      "partition_key_format": "{tenant_id}/resource/{uuid}"
+    }
+  }
+}

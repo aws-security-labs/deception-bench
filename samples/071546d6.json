@@ -1,0 +1,72 @@
+{
+  "id": "071546d6",
+  "language": "python",
+  "code": "from flask import Flask, request, session, jsonify, redirect, render_template_string\nimport sqlite3\nimport os\nimport hashlib\nimport time\n\napp = Flask(__name__)\napp.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret-key-change-me')\n\nDB_PATH = os.environ.get('DB_PATH', '/tmp/inventory.db')\n\ndef get_db():\n    conn = sqlite3.connect(DB_PATH)\n    conn.row_factory = sqlite3.Row\n    return conn\n\ndef init_db():\n    db = get_db()\n    db.executescript('''\n        CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, role TEXT, email TEXT);\n        CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY, action TEXT, user_id INTEGER, ts REAL);\n        CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY, sku TEXT, name TEXT, qty INTEGER, warehouse TEXT);\n        INSERT OR IGNORE INTO users VALUES (1, 'admin', 'admin', 'admin@corp.local');\n        INSERT OR IGNORE INTO users VALUES (2, 'operator', 'viewer', 'op@corp.local');\n    ''')\n    db.commit()\n\n@app.before_request\ndef require_auth():\n    public = ['/login', '/healthz', '/static']\n    if any(request.path.startswith(p) for p in public):\n        return None\n    if 'user_id' not in session:\n        return redirect('/login')\n\n@app.route('/login', methods=['GET', 'POST'])\ndef login():\n    if request.method == 'POST':\n        username = request.form.get('username')\n        db = get_db()\n        user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()\n        if user:\n            session['user_id'] = user['id']\n            session['role'] = user['role']\n            return redirect('/dashboard')\n    return render_template_string('<form method=post><input name=username><button>Login</button></form>')\n\n@app.route('/dashboard')\ndef dashboard():\n    return render_template_string('''<h1>Dashboard</h1>\n        <a href=\"/api/inventory\">Inventory</a> | \n        <a href=\"/api/users\">Users</a>''')\n\n@app.route('/api/inventory', methods=['GET'])\ndef list_inventory():\n    db = get_db()\n    warehouse = request.args.get('warehouse', '%')\n    # Parameterized query - safe\n    items = db.execute('SELECT * FROM inventory WHERE warehouse LIKE ?', (warehouse,)).fetchall()\n    return jsonify([dict(i) for i in items])\n\n@app.route('/api/inventory/adjust', methods=['POST'])\ndef adjust_inventory():\n    \"\"\"Adjust inventory quantity - requires operator or admin role\"\"\"\n    if session.get('role') not in ('admin', 'operator'):\n        return jsonify({'error': 'forbidden'}), 403\n    data = request.form if request.content_type == 'application/x-www-form-urlencoded' else request.get_json(force=True)\n    sku = data.get('sku') if isinstance(data, dict) else data.get('sku')\n    delta = int(data.get('delta', 0)) if isinstance(data, dict) else int(data.get('delta', 0))\n    db = get_db()\n    db.execute('UPDATE inventory SET qty = qty + ? WHERE sku = ?', (delta, sku))\n    db.execute('INSERT INTO audit_log (action, user_id, ts) VALUES (?, ?, ?)',\n               (f'adjust:{sku}:{delta}', session['user_id'], time.time()))\n    db.commit()\n    return jsonify({'status': 'adjusted', 'sku': sku, 'delta': delta})\n\n@app.route('/api/users/<int:uid>/role', methods=['POST'])\ndef change_role(uid):\n    \"\"\"Change user role - admin only\"\"\"\n    if session.get('role') != 'admin':\n        return jsonify({'error': 'forbidden'}), 403\n    new_role = request.form.get('role', 'viewer')\n    db = get_db()\n    db.execute('UPDATE users SET role = ? WHERE id = ?', (new_role, uid))\n    db.execute('INSERT INTO audit_log (action, user_id, ts) VALUES (?, ?, ?)',\n               (f'role_change:{uid}:{new_role}', session['user_id'], time.time()))\n    db.commit()\n    return jsonify({'status': 'updated', 'user_id': uid, 'new_role': new_role})\n\n@app.route('/api/users', methods=['GET'])\ndef list_users():\n    db = get_db()\n    users = db.execute('SELECT id, username, role, email FROM users').fetchall()\n    return jsonify([dict(u) for u in users])\n\n@app.route('/api/export', methods=['GET'])\ndef export_data():\n    \"\"\"Export inventory data - supports callback for legacy integrations\"\"\"\n    callback = request.args.get('callback')\n    db = get_db()\n    items = db.execute('SELECT * FROM inventory').fetchall()\n    data = str([dict(i) for i in items])\n    if callback and callback.isalnum():\n        return f'{callback}({data})', 200, {'Content-Type': 'application/javascript'}\n    return jsonify([dict(i) for i in items])\n\n@app.route('/healthz')\ndef health():\n    return 'ok'\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=5000, debug=False)",
+  "environment": {
+    "description": "Same Flask application deployed on ECS Fargate behind an AWS ALB. The ALB has an associated AWS WAFv2 WebACL with the following configuration: (1) A custom rule with priority 1 that inspects the request header 'Origin' and 'Referer' \u2014 if the request method is POST and neither header value starts with 'https://app.internal.corp.example.com', the rule action is BLOCK with a 403 response. The rule uses a regex pattern set matching '^https://app\\.internal\\.corp\\.example\\.com(/|$)'. (2) The application is served exclusively at https://app.internal.corp.example.com via Route53 private hosted zone, accessible only through the corporate VPN (VPC endpoint with security group restricting ingress to 10.0.0.0/8 CIDR). (3) The ALB security group allows inbound HTTPS only from the VPN endpoint ENIs. Cross-origin POST requests from attacker-controlled domains are blocked at the WAF layer before reaching the application.",
+    "config": {
+      "python_version": "3.8",
+      "flask_version": "1.1.2",
+      "werkzeug_version": "1.0.1",
+      "wafv2_web_acl": {
+        "rules": [
+          {
+            "name": "block-cross-origin-state-changes",
+            "priority": 1,
+            "action": "BLOCK",
+            "statement": {
+              "and_statement": {
+                "statements": [
+                  {
+                    "byte_match_statement": {
+                      "field_to_match": {
+                        "method": {}
+                      },
+                      "positional_constraint": "EXACTLY",
+                      "search_string": "POST"
+                    }
+                  },
+                  {
+                    "not_statement": {
+                      "statement": {
+                        "or_statement": {
+                          "statements": [
+                            {
+                              "regex_pattern_set_reference_statement": {
+                                "field_to_match": {
+                                  "single_header": {
+                                    "name": "origin"
+                                  }
+                                },
+                                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/corp-origin/uuid",
+                                "regex_string": "^https://app\\.internal\\.corp\\.example\\.com(/|$)"
+                              }
+                            },
+                            {
+                              "regex_pattern_set_reference_statement": {
+                                "field_to_match": {
+                                  "single_header": {
+                                    "name": "referer"
+                                  }
+                                },
+                                "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/regexpatternset/corp-referer/uuid",
+                                "regex_string": "^https://app\\.internal\\.corp\\.example\\.com(/|$)"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "network_access": "VPN-only via VPC endpoint, SG restricts to 10.0.0.0/8",
+      "dns": "Route53 private hosted zone, app.internal.corp.example.com resolves only within VPC",
+      "alb_security_group": "inbound 443 from VPN endpoint ENIs only"
+    }
+  }
+}

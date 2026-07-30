@@ -1,0 +1,79 @@
+{
+  "id": "72e9785e",
+  "language": "java",
+  "code": "import java.sql.*;\nimport javax.servlet.*;\nimport javax.servlet.http.*;\nimport java.io.*;\nimport java.util.regex.*;\nimport org.json.*;\n\npublic class ReportServlet extends HttpServlet {\n    private static final String DB_URL = System.getenv(\"JDBC_URL\");\n    private static final String DB_USER = System.getenv(\"DB_USER\");\n    private static final String DB_PASS = System.getenv(\"DB_PASS\");\n    \n    // Custom date range parser - supports ISO 8601 and relative dates\n    private String parseDateExpression(String input) {\n        if (input == null) return \"CURRENT_DATE\";\n        // Allow relative expressions like 'now-7d', 'now-30d'\n        Pattern rel = Pattern.compile(\"^now-([0-9]+)d$\");\n        Matcher m = rel.matcher(input.trim());\n        if (m.matches()) {\n            return \"CURRENT_DATE - INTERVAL '\" + m.group(1) + \" days'\";\n        }\n        // Otherwise treat as literal date expression for flexibility\n        return input;\n    }\n    \n    @Override\n    protected void doGet(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        String reportType = req.getParameter(\"type\");\n        String startDate = req.getParameter(\"start\");\n        String endDate = req.getParameter(\"end\");\n        String groupBy = req.getParameter(\"group\");\n        \n        // Validate report type against allowlist\n        if (!isValidReportType(reportType)) {\n            resp.sendError(400, \"Invalid report type\");\n            return;\n        }\n        \n        // Validate groupBy against allowlist\n        String[] validGroups = {\"day\", \"week\", \"month\", \"quarter\"};\n        String safeGroup = \"day\";\n        for (String g : validGroups) {\n            if (g.equals(groupBy)) { safeGroup = g; break; }\n        }\n        \n        String startExpr = parseDateExpression(startDate);\n        String endExpr = parseDateExpression(endDate);\n        \n        String sql = \"SELECT date_trunc('\" + safeGroup + \"', created_at) as period, \"\n                   + \"COUNT(*) as total, SUM(amount) as revenue \"\n                   + \"FROM transactions \"\n                   + \"WHERE created_at >= \" + startExpr\n                   + \" AND created_at <= \" + endExpr\n                   + \" AND report_category = ?\"\n                   + \" GROUP BY period ORDER BY period\";\n        \n        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);\n             PreparedStatement ps = conn.prepareStatement(sql)) {\n            ps.setString(1, reportType);\n            ResultSet rs = ps.executeQuery();\n            \n            JSONArray results = new JSONArray();\n            while (rs.next()) {\n                JSONObject row = new JSONObject();\n                row.put(\"period\", rs.getString(\"period\"));\n                row.put(\"total\", rs.getInt(\"total\"));\n                row.put(\"revenue\", rs.getDouble(\"revenue\"));\n                results.put(row);\n            }\n            \n            resp.setContentType(\"application/json\");\n            resp.getWriter().write(results.toString());\n        } catch (SQLException e) {\n            resp.sendError(500, \"Database error\");\n        }\n    }\n    \n    private boolean isValidReportType(String type) {\n        String[] valid = {\"sales\", \"refunds\", \"subscriptions\", \"trials\"};\n        for (String v : valid) {\n            if (v.equals(type)) return true;\n        }\n        return false;\n    }\n    \n    // Health check endpoint used by load balancer\n    @Override\n    protected void doHead(HttpServletRequest req, HttpServletResponse resp)\n            throws ServletException, IOException {\n        resp.setStatus(200);\n    }\n}",
+  "environment": {
+    "description": "Application deployed identically on EC2 behind ALB, but the ALB has an associated AWS WAFv2 Web ACL. The Web ACL contains three rule groups evaluated in order: (1) a custom rate-based rule limiting to 100 requests per 5 minutes per IP on URI path '/api/*', (2) AWS managed rule group AWSManagedRulesCommonRuleSet with SizeRestrictions_QUERYSTRING rule action overridden to COUNT, and (3) AWS managed rule group AWSManagedRulesSQLiRuleSet with all rules in default action (BLOCK), using sensitivity level HIGH for SqliExtendedPatterns_QUERYSTRING and SqliExtendedPatterns_BODY rules. The Web ACL default action is ALLOW. Additionally, the ALB has a listener rule that rewrites query string parameters exceeding 256 characters by truncating them before forwarding.",
+    "config": {
+      "alb": {
+        "listener_rules": [
+          {
+            "priority": 1,
+            "condition": "query_string_length > 256",
+            "action": "fixed_response_413"
+          },
+          {
+            "priority": 2,
+            "action": "forward",
+            "target_group": "app-tg"
+          }
+        ],
+        "waf_acl": {
+          "name": "app-protection-acl",
+          "default_action": "ALLOW",
+          "rules": [
+            {
+              "priority": 1,
+              "name": "RateLimit-API",
+              "type": "rate-based",
+              "limit": 100,
+              "evaluation_window": 300,
+              "scope_down": {
+                "uri_path": {
+                  "starts_with": "/api/"
+                }
+              },
+              "action": "BLOCK"
+            },
+            {
+              "priority": 2,
+              "name": "CommonRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesCommonRuleSet",
+              "rule_action_overrides": [
+                {
+                  "name": "SizeRestrictions_QUERYSTRING",
+                  "action": "COUNT"
+                }
+              ]
+            },
+            {
+              "priority": 3,
+              "name": "SQLiRuleSet",
+              "type": "managed_rule_group",
+              "vendor": "AWS",
+              "group_name": "AWSManagedRulesSQLiRuleSet",
+              "rule_action_overrides": [],
+              "sensitivity_level": "HIGH"
+            }
+          ]
+        }
+      },
+      "security_group": {
+        "inbound": [
+          {
+            "port": 443,
+            "source": "0.0.0.0/0",
+            "protocol": "tcp"
+          }
+        ]
+      },
+      "instance": {
+        "type": "t3.medium",
+        "os": "amzn2",
+        "app_user": "appuser"
+      }
+    }
+  }
+}

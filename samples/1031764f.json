@@ -1,0 +1,75 @@
+{
+  "id": "1031764f",
+  "language": "python",
+  "code": "import os\nimport subprocess\nfrom flask import Flask, request, jsonify\nimport yaml\n\napp = Flask(__name__)\n\nDATA_DIR = os.environ.get('DATA_DIR', '/tmp/configs')\n\ndef load_config(config_text):\n    \"\"\"Parse user-provided YAML configuration.\"\"\"\n    # Using yaml.load for backward compatibility with legacy configs\n    # that use custom Python tags for environment variable expansion\n    parsed = yaml.load(config_text, Loader=yaml.FullLoader)\n    return parsed\n\ndef validate_keys(config):\n    \"\"\"Ensure required keys are present.\"\"\"\n    required = ['name', 'version', 'settings']\n    for key in required:\n        if key not in config:\n            raise ValueError(f\"Missing required key: {key}\")\n    return True\n\ndef apply_config(config):\n    \"\"\"Apply configuration settings to the system.\"\"\"\n    name = config.get('name', 'default')\n    version = config.get('version', '1.0')\n    settings = config.get('settings', {})\n    \n    # Write config summary\n    summary_path = os.path.join(DATA_DIR, f\"{name}_v{version}.summary\")\n    os.makedirs(DATA_DIR, exist_ok=True)\n    \n    with open(summary_path, 'w') as f:\n        f.write(f\"Config: {name}\\nVersion: {version}\\n\")\n        for k, v in settings.items():\n            f.write(f\"  {k}: {v}\\n\")\n    \n    return summary_path\n\ndef get_system_info():\n    \"\"\"Gather system info for config validation context.\"\"\"\n    info = {\n        'hostname': os.uname().nodename,\n        'platform': os.uname().sysname,\n        'data_dir': DATA_DIR\n    }\n    return info\n\n@app.route('/api/config/upload', methods=['POST'])\ndef upload_config():\n    \"\"\"Upload and apply a YAML configuration.\"\"\"\n    content_type = request.content_type or ''\n    \n    if 'yaml' not in content_type and 'text/plain' not in content_type:\n        return jsonify({'error': 'Content-Type must be application/x-yaml or text/plain'}), 400\n    \n    config_text = request.get_data(as_text=True)\n    \n    if not config_text or len(config_text) > 65536:\n        return jsonify({'error': 'Invalid payload size'}), 400\n    \n    try:\n        config = load_config(config_text)\n    except yaml.YAMLError as e:\n        return jsonify({'error': f'YAML parse error: {str(e)}'}), 400\n    \n    try:\n        validate_keys(config)\n    except ValueError as e:\n        return jsonify({'error': str(e)}), 400\n    \n    summary_path = apply_config(config)\n    sys_info = get_system_info()\n    \n    return jsonify({\n        'status': 'applied',\n        'summary_file': summary_path,\n        'system': sys_info\n    })\n\n@app.route('/api/config/list', methods=['GET'])\ndef list_configs():\n    \"\"\"List applied configurations.\"\"\"\n    os.makedirs(DATA_DIR, exist_ok=True)\n    files = os.listdir(DATA_DIR)\n    return jsonify({'configs': files})\n\n@app.route('/api/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    port = int(os.environ.get('PORT', 8080))\n    app.run(host='0.0.0.0', port=port)",
+  "environment": {
+    "description": "Application deployed on EKS (Kubernetes 1.28) with the pod running under a restricted SecurityContext. The container uses a distroless Python base image (gcr.io/distroless/python3-debian12). Pod spec enforces: securityContext.seccompProfile.type=RuntimeDefault, capabilities dropped ALL (no cap_add), readOnlyRootFilesystem=true (with an emptyDir volume mounted at /tmp/configs only). Additionally, the node runs with a gVisor (runsc) runtime class configured via RuntimeClass 'gvisor' applied to the pod, which intercepts all syscalls through its application kernel. The Kubernetes NetworkPolicy restricts pod egress to only the cluster DNS (kube-dns on port 53/UDP) and the S3 VPC endpoint (port 443) \u2014 all other egress is denied.",
+    "config": {
+      "platform": "EKS 1.28, gVisor runtime (runsc)",
+      "runtime_class": "gvisor",
+      "container_image": "gcr.io/distroless/python3-debian12 (no shell, no coreutils)",
+      "security_context": {
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "readOnlyRootFilesystem": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "emptyDir": {},
+          "mountPath": "/tmp/configs"
+        }
+      ],
+      "network_policy": {
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "10.0.0.0/16"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 443,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "policyTypes": [
+          "Egress"
+        ]
+      },
+      "pyyaml_version": "5.4.1",
+      "python_version": "3.9"
+    }
+  }
+}

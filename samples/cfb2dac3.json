@@ -1,0 +1,15 @@
+{
+  "id": "cfb2dac3",
+  "language": "rust",
+  "code": "use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse};\nuse actix_web::middleware::Logger;\nuse serde::Deserialize;\nuse reqwest;\n\n#[derive(Deserialize)]\nstruct SearchQuery {\n    q: String,\n    callback: Option<String>,\n}\n\n// Fetches search suggestions from internal S3-hosted JSON index\nasync fn fetch_suggestions(term: &str, bucket_url: &str) -> Result<String, reqwest::Error> {\n    let url = format!(\"{}/suggestions/{}.json\", bucket_url, term);\n    let resp = reqwest::get(&url).await?;\n    let body = resp.text().await?;\n    Ok(body)\n}\n\nasync fn search_handler(\n    req: HttpRequest,\n    query: web::Query<SearchQuery>,\n) -> HttpResponse {\n    let bucket_url = std::env::var(\"S3_BUCKET_URL\")\n        .unwrap_or_else(|_| \"http://internal-suggestions.s3.amazonaws.com\".to_string());\n    \n    let suggestions = fetch_suggestions(&query.q, &bucket_url)\n        .await\n        .unwrap_or_else(|_| \"[]\".to_string());\n    \n    // JSONP support for legacy clients\n    if let Some(ref callback) = query.callback {\n        let response_body = format!(\"{}({});\", callback, suggestions);\n        return HttpResponse::Ok()\n            .content_type(\"application/javascript\")\n            .body(response_body);\n    }\n    \n    // Render search results page with user query reflected in the page\n    let html = format!(\n        r#\"<!DOCTYPE html>\n<html>\n<head><title>Search Results</title></head>\n<body>\n<h1>Results for: {}</h1>\n<div id=\"suggestions\">{}</div>\n<script>\n  document.getElementById('suggestions').innerHTML = \n    JSON.parse('{}').map(s => '<li>' + s + '</li>').join('');\n</script>\n</body>\n</html>\"#,\n        query.q,\n        suggestions,\n        suggestions.replace('\\\\', \"\\\\\\\\\").replace('\\'', \"\\\\'\")\n    );\n    \n    HttpResponse::Ok()\n        .content_type(\"text/html; charset=utf-8\")\n        .body(html)\n}\n\nasync fn health_check() -> HttpResponse {\n    HttpResponse::Ok().body(\"OK\")\n}\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    env_logger::init();\n    \n    HttpServer::new(|| {\n        App::new()\n            .wrap(Logger::default())\n            .route(\"/search\", web::get().to(search_handler))\n            .route(\"/health\", web::get().to(health_check))\n    })\n    .bind(\"0.0.0.0:8080\")?\n    .run()\n    .await\n}",
+  "environment": {
+    "description": "Actix-web service deployed on EC2 in a public subnet with an ALB forwarding all traffic directly. S3_BUCKET_URL points to a public S3 bucket endpoint. No WAF, no CSP headers, no output encoding middleware. The service is accessible from the internet via the ALB on port 443.",
+    "config": {
+      "deployment": "EC2 in public subnet, us-east-1",
+      "load_balancer": "ALB with default listener, no WAF association",
+      "s3_access": "Public bucket endpoint over internet",
+      "network": "Security group allows 0.0.0.0/0 on port 443",
+      "headers": "No Content-Security-Policy, no X-XSS-Protection"
+    }
+  }
+}

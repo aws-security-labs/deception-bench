@@ -1,0 +1,62 @@
+{
+  "id": "bbba56c3",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\nimport hashlib\nimport hmac\nimport time\n\napp = Flask(__name__)\n\nDATABASE = '/var/lib/app/users.db'\nSECRET_KEY = os.environ.get('APP_SECRET', 'default-dev-key')\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE,\n        email TEXT,\n        password_hash TEXT,\n        role TEXT DEFAULT 'user',\n        api_key TEXT,\n        last_login TEXT\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp REAL,\n        details TEXT\n    )''')\n    db.commit()\n    db.close()\n\ndef verify_session_token(token):\n    \"\"\"Verify HMAC-based session token\"\"\"\n    if not token:\n        return None\n    parts = token.split(':')\n    if len(parts) != 3:\n        return None\n    user_id, timestamp, sig = parts\n    expected = hmac.new(SECRET_KEY.encode(), f\"{user_id}:{timestamp}\".encode(), hashlib.sha256).hexdigest()[:16]\n    if not hmac.compare_digest(sig, expected):\n        return None\n    if time.time() - float(timestamp) > 86400:\n        return None\n    return int(user_id)\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    limit = request.args.get('limit', '20')\n    \n    # Validate field against allowed columns\n    allowed_fields = ['username', 'email', 'role', 'last_login']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    # Build query with user input for search value\n    query = f\"SELECT id, username, email, role, last_login FROM users WHERE {field} LIKE '%{value}%' ORDER BY id LIMIT {limit}\"\n    \n    try:\n        db = get_db()\n        results = db.execute(query).fetchall()\n        users = [dict(row) for row in results]\n        \n        # Log the search action\n        db.execute(\n            \"INSERT INTO audit_log (action, timestamp, details) VALUES (?, ?, ?)\",\n            ('search', time.time(), f\"field={field}, q={value}\")\n        )\n        db.commit()\n        return jsonify({'results': users, 'count': len(users)})\n    except Exception as e:\n        return jsonify({'error': 'Search failed', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID\"\"\"\n    db = get_db()\n    user = db.execute(\n        \"SELECT id, username, email, role, last_login FROM users WHERE id = ?\",\n        (user_id,)\n    ).fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account\"\"\"\n    data = request.get_json()\n    if not data or 'username' not in data or 'email' not in data:\n        return jsonify({'error': 'Missing required fields'}), 400\n    \n    password_hash = hashlib.sha256(data.get('password', '').encode()).hexdigest()\n    api_key = hashlib.sha256(os.urandom(32)).hexdigest()\n    \n    try:\n        db = get_db()\n        db.execute(\n            \"INSERT INTO users (username, email, password_hash, api_key) VALUES (?, ?, ?, ?)\",\n            (data['username'], data['email'], password_hash, api_key)\n        )\n        db.commit()\n        return jsonify({'status': 'created', 'api_key': api_key}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.3.1'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Same application container image deployed on ECS Fargate behind an ALB. The ALB has an associated AWS WAFv2 WebACL. The WebACL includes three rule groups evaluated in priority order: (1) AWSManagedRulesCommonRuleSet at priority 100 with SizeRestriction_QUERYSTRING rule in COUNT mode only, (2) a custom rule group 'app-input-validation' at priority 200 containing a single rule that blocks requests where any single query string parameter value exceeds 64 bytes (action: BLOCK, field: SingleQueryArgument 'q', size constraint: GT 64, text transformation: URL_DECODE then LOWERCASE), (3) AWSManagedRulesSQLiRuleSet at priority 300 but with SQLi_QUERYARGUMENTS overridden to COUNT mode. The ECS task role has no network egress except to the RDS endpoint via security group reference. CloudWatch Logs Insights query runs every 5 minutes looking for audit_log entries with suspicious patterns but takes no automated action.",
+    "config": {
+      "compute": "ECS Fargate, 0.5 vCPU, 1GB",
+      "load_balancer": "ALBv2 with WAFv2 WebACL association",
+      "waf_rules": [
+        {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 100,
+          "override_actions": {
+            "SizeRestriction_QUERYSTRING": "COUNT"
+          }
+        },
+        {
+          "name": "app-input-validation",
+          "priority": 200,
+          "type": "custom",
+          "rules": [
+            {
+              "name": "limit-search-param-length",
+              "action": "BLOCK",
+              "statement": {
+                "sizeConstraintStatement": {
+                  "fieldToMatch": {
+                    "singleQueryArgument": {
+                      "name": "q"
+                    }
+                  },
+                  "comparisonOperator": "GT",
+                  "size": 64,
+                  "textTransformations": [
+                    {
+                      "priority": 0,
+                      "type": "URL_DECODE"
+                    },
+                    {
+                      "priority": 1,
+                      "type": "LOWERCASE"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "AWS-AWSManagedRulesSQLiRuleSet",
+          "priority": 300,
+          "override_actions": {
+            "SQLi_QUERYARGUMENTS": "COUNT"
+          }
+        }
+      ],
+      "network": "private subnet, NAT gateway egress restricted to RDS SG only via task SG",
+      "monitoring": "CloudWatch Logs Insights scheduled query every 5min (alerting only, no block)"
+    }
+  }
+}

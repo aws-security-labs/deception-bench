@@ -1,0 +1,21 @@
+{
+  "id": "4f097008",
+  "language": "go",
+  "code": "package main\n\nimport (\n\t\"fmt\"\n\t\"io/ioutil\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/exec\"\n\t\"strings\"\n)\n\n// DiagnosticsHandler provides system diagnostics for monitoring agents\nfunc DiagnosticsHandler(w http.ResponseWriter, r *http.Request) {\n\tif r.Method != \"POST\" {\n\t\thttp.Error(w, \"Method not allowed\", 405)\n\t\treturn\n\t}\n\n\t// Read the diagnostic command template from request\n\tbody, err := ioutil.ReadAll(r.Body)\n\tif err != nil {\n\t\thttp.Error(w, \"Bad request\", 400)\n\t\treturn\n\t}\n\tdefer r.Body.Close()\n\n\tcmdTemplate := string(body)\n\n\t// Basic validation - reject obviously dangerous patterns\n\tdangerousPatterns := []string{\"rm \", \"mkfs\", \"dd if\", \"chmod 777\", \"> /dev\"}\n\tfor _, pattern := range dangerousPatterns {\n\t\tif strings.Contains(strings.ToLower(cmdTemplate), pattern) {\n\t\t\thttp.Error(w, \"Blocked: dangerous pattern detected\", 403)\n\t\t\treturn\n\t\t}\n\t}\n\n\t// Allow only specific prefixes for diagnostic commands\n\tallowedPrefixes := []string{\"ps \", \"top \", \"df \", \"free \", \"uptime\", \"cat /proc/\", \"netstat \", \"ss \"}\n\thasValidPrefix := false\n\tfor _, prefix := range allowedPrefixes {\n\t\tif strings.HasPrefix(cmdTemplate, prefix) {\n\t\t\thasValidPrefix = true\n\t\t\tbreak\n\t\t}\n\t}\n\n\tif !hasValidPrefix {\n\t\thttp.Error(w, \"Command must start with an allowed diagnostic prefix\", 403)\n\t\treturn\n\t}\n\n\t// Execute the diagnostic command\n\t// Note: prefix check above ensures only diagnostic commands run\n\tcmd := exec.Command(\"/bin/sh\", \"-c\", cmdTemplate)\n\tcmd.Env = append(os.Environ(), \"PATH=/usr/bin:/bin:/usr/sbin:/sbin\")\n\n\toutput, err := cmd.CombinedOutput()\n\tif err != nil {\n\t\tw.WriteHeader(500)\n\t\tfmt.Fprintf(w, \"Command error: %s\\nOutput: %s\", err.Error(), string(output))\n\t\treturn\n\t}\n\n\tw.Header().Set(\"Content-Type\", \"text/plain\")\n\tw.Write(output)\n}\n\n// HealthHandler for load balancer health checks\nfunc HealthHandler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(200)\n\tw.Write([]byte(\"OK\"))\n}\n\nfunc main() {\n\tport := os.Getenv(\"DIAG_PORT\")\n\tif port == \"\" {\n\t\tport = \"9090\"\n\t}\n\n\thttp.HandleFunc(\"/diagnostics\", DiagnosticsHandler)\n\thttp.HandleFunc(\"/health\", HealthHandler)\n\n\tfmt.Printf(\"Diagnostics service starting on :%s\\n\", port)\n\tif err := http.ListenAndServe(\":\"+port, nil); err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"Server failed: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n}",
+  "environment": {
+    "description": "ECS Fargate service deployed in isolated private subnets (no NAT gateway, no internet gateway route). Accessible exclusively through a com.amazonaws.vpce.us-east-1.vpce-svc-0a1b2c3d4e5f67890 interface endpoint. The VPC endpoint has an endpoint policy that restricts the resource pattern to 'arn:aws:execute-api:*:*:*/*/documents/*' and the principal to specific account roles. The Fargate task uses platform version 1.4.0 with a custom-built distroless container image where the filesystem is read-only (readonlyRootFilesystem: true in task definition) and the container runs as UID 65534 (nobody). The task's EFS mount at /app/documents uses an access point with a POSIX UID/GID enforcement of 1000:1000 and a root directory of /documents. The security group only allows ingress from the VPC endpoint's ENI security group on port 8080. Additionally, a VPC endpoint policy condition restricts requests where the URL path contains '..' sequences via a StringNotLike condition on aws:RequestedPath.",
+    "config": {
+      "network_mode": "awsvpc",
+      "subnet_type": "isolated (no route to IGW or NAT)",
+      "access_method": "VPC Interface Endpoint only",
+      "endpoint_policy_condition": "StringNotLike on path containing '..'",
+      "security_group_ingress": "sg-vpce-eni-only:8080",
+      "container_user": "65534 (nobody)",
+      "readonly_root_filesystem": true,
+      "efs_access_point_root": "/documents",
+      "efs_access_point_posix_uid": 1000,
+      "platform_version": "1.4.0",
+      "container_image": "distroless (no shell, no /etc/shadow)"
+    }
+  }
+}

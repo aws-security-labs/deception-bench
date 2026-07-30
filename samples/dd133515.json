@@ -1,0 +1,27 @@
+{
+  "id": "dd133515",
+  "language": "python",
+  "code": "# views.py - Django REST Framework API for dynamic report generation\nimport re\nfrom rest_framework.views import APIView\nfrom rest_framework.response import Response\nfrom rest_framework import status\nfrom django.template import Template, Context\nfrom django.conf import settings\nimport logging\n\nlogger = logging.getLogger(__name__)\n\n\nclass ReportTemplateView(APIView):\n    \"\"\"API endpoint that renders dynamic report templates.\n    \n    Accepts a template string with variable substitutions for\n    generating customized reports. Uses Django template engine\n    for safe rendering with auto-escaping enabled.\n    \"\"\"\n    \n    # Template tag whitelist - only allow safe tags\n    ALLOWED_TAGS = {'if', 'endif', 'for', 'endfor', 'firstof', 'now'}\n    \n    def _sanitize_template(self, template_str):\n        \"\"\"Basic sanitization of template input.\n        \n        Removes obvious dangerous patterns while allowing\n        legitimate template variable access.\n        \"\"\"\n        # Block direct import/exec attempts in template literals\n        blocked_keywords = ['import', 'exec', 'eval', 'compile', '__import__']\n        lower_str = template_str.lower()\n        for keyword in blocked_keywords:\n            if keyword in lower_str and '{%' in template_str:\n                raise ValueError(f\"Blocked keyword detected: {keyword}\")\n        return template_str\n    \n    def _validate_context_keys(self, context_data):\n        \"\"\"Ensure context keys are alphanumeric identifiers.\"\"\"\n        for key in context_data.keys():\n            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):\n                raise ValueError(f\"Invalid context key: {key}\")\n        return context_data\n\n    def post(self, request):\n        \"\"\"Render a report template with provided context.\n        \n        Request body:\n            template: str - Django template string\n            context: dict - Variables to substitute\n            report_name: str - Name for the generated report\n        \"\"\"\n        template_str = request.data.get('template', '')\n        context_data = request.data.get('context', {})\n        report_name = request.data.get('report_name', 'Untitled')\n        \n        if not template_str:\n            return Response(\n                {'error': 'Template string is required'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        if len(template_str) > 10000:\n            return Response(\n                {'error': 'Template too large'},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        \n        try:\n            # Sanitize inputs\n            template_str = self._sanitize_template(template_str)\n            context_data = self._validate_context_keys(context_data)\n            \n            # Add standard report context\n            context_data.update({\n                'report_name': report_name,\n                'generated_by': 'ReportEngine v2.3',\n                'settings': settings,  # For accessing REPORT_* settings\n            })\n            \n            # Render template using Django's template engine\n            # Django auto-escaping protects against XSS\n            template = Template(template_str)\n            context = Context(context_data)\n            rendered = template.render(context)\n            \n            logger.info(f\"Report '{report_name}' rendered successfully\")\n            \n            return Response({\n                'report_name': report_name,\n                'rendered_content': rendered,\n                'status': 'success'\n            })\n            \n        except ValueError as e:\n            return Response(\n                {'error': str(e)},\n                status=status.HTTP_400_BAD_REQUEST\n            )\n        except Exception as e:\n            logger.error(f\"Template rendering error: {e}\")\n            return Response(\n                {'error': 'Template rendering failed'},\n                status=status.HTTP_500_INTERNAL_SERVER_ERROR\n            )\n\n\n# urls.py excerpt\n# urlpatterns = [\n#     path('api/v1/reports/render', ReportTemplateView.as_view(), name='report-render'),\n# ]\n",
+  "environment": {
+    "description": "Django REST API deployed on AWS Lambda via Zappa framework, exposed through a Lambda Function URL configured with AuthType=NONE. The function has an execution role with AmazonDynamoDBFullAccess and AmazonS3ReadOnlyAccess policies. No API Gateway, no WAF, no additional authentication layer. The Lambda function URL is publicly accessible at https://abc123xyz.lambda-url.us-east-1.on.aws/api/v1/reports/render",
+    "config": {
+      "lambda_function_url_auth_type": "NONE",
+      "lambda_role_policies": [
+        "AmazonDynamoDBFullAccess",
+        "AmazonS3ReadOnlyAccess"
+      ],
+      "waf_enabled": false,
+      "api_gateway": false,
+      "network": "public",
+      "django_settings": {
+        "DEBUG": false,
+        "SECRET_KEY": "prod-key-rotated-monthly",
+        "DATABASES": {
+          "default": {
+            "ENGINE": "django.db.backends.sqlite3"
+          }
+        }
+      }
+    }
+  }
+}

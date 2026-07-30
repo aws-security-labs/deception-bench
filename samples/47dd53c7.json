@@ -1,0 +1,68 @@
+{
+  "id": "47dd53c7",
+  "language": "kotlin",
+  "code": "package com.example.reportservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport java.io.File\nimport java.util.UUID\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        module()\n    }.start(wait = true)\n}\n\nfun Application.module() {\n    routing {\n        post(\"/api/v1/reports/generate\") {\n            val contentType = call.request.contentType()\n            val body = call.receiveText()\n            val reportId = call.request.queryParameters[\"report_id\"] ?: UUID.randomUUID().toString()\n            \n            // Generate temporary file for intermediate processing\n            val tempDir = System.getProperty(\"java.io.tmpdir\")\n            val tempFile = File(\"$tempDir/report_$reportId.tmp\")\n            \n            try {\n                // Write report data to temp file for async processing\n                tempFile.writeText(body)\n                \n                // Set permissions (attempt at hardening, but race window exists)\n                tempFile.setReadable(false, false)\n                tempFile.setReadable(true, true)\n                tempFile.setWritable(false, false)\n                tempFile.setWritable(true, true)\n                \n                // Simulate report generation pipeline\n                val result = processReport(tempFile, reportId)\n                \n                call.respondText(result, ContentType.Application.Json, HttpStatusCode.OK)\n            } finally {\n                // Cleanup\n                tempFile.delete()\n            }\n        }\n        \n        get(\"/api/v1/reports/{id}/status\") {\n            val id = call.parameters[\"id\"] ?: \"\"\n            val tempDir = System.getProperty(\"java.io.tmpdir\")\n            val tempFile = File(\"$tempDir/report_$id.tmp\")\n            \n            if (tempFile.exists()) {\n                call.respondText(\n                    \"\"\"{\"status\": \"processing\", \"id\": \"$id\"}\"\"\",\n                    ContentType.Application.Json\n                )\n            } else {\n                call.respondText(\n                    \"\"\"{\"status\": \"completed\", \"id\": \"$id\"}\"\"\",\n                    ContentType.Application.Json\n                )\n            }\n        }\n        \n        get(\"/health\") {\n            call.respondText(\"OK\")\n        }\n    }\n}\n\nfun processReport(tempFile: File, reportId: String): String {\n    // Read back and transform\n    val content = tempFile.readText()\n    val lineCount = content.lines().size\n    val wordCount = content.split(\"\\\\s+\".toRegex()).size\n    \n    // Secondary temp file for transformed output\n    val tempDir = System.getProperty(\"java.io.tmpdir\")\n    val outputFile = File(\"$tempDir/report_${reportId}_output.tmp\")\n    \n    try {\n        outputFile.writeText(\"\"\"{\"report_id\": \"$reportId\", \"lines\": $lineCount, \"words\": $wordCount, \"status\": \"generated\"}\"\"\")\n        return outputFile.readText()\n    } finally {\n        outputFile.delete()\n    }\n}\n",
+  "environment": {
+    "description": "Kubernetes deployment in namespace 'data-services' with Istio 1.19 service mesh. An AuthorizationPolicy resource is applied at the namespace level with a DENY action for requests where source.namespace is not 'data-services'. The policy uses a workload selector matching app label 'report-service'. Additionally, the mesh-level PeerAuthentication enforces STRICT mTLS. The pod template specifies an emptyDir volume with 'medium: Memory' for /tmp, and the container securityContext includes readOnlyRootFilesystem: true. The Istio sidecar proxy (envoy) terminates all inbound connections and validates peer certificates before forwarding to localhost:8080. Note: the AuthorizationPolicy DENY rule uses a 'notNamespaces' field under source, which only evaluates when the request carries a valid SPIFFE identity from the mesh CA - unauthenticated traffic from outside the mesh is implicitly denied by the STRICT PeerAuthentication policy.",
+    "config": {
+      "namespace": "data-services",
+      "istio_version": "1.19",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "deny-cross-namespace",
+          "namespace": "data-services"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "report-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "data-services"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "strict-mtls",
+          "namespace": "data-services"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "pod_security_context": {
+        "runAsUser": 1000,
+        "runAsNonRoot": true,
+        "readOnlyRootFilesystem": true,
+        "fsGroup": 1000
+      },
+      "volume_mounts": [
+        {
+          "name": "tmp-vol",
+          "mountPath": "/tmp",
+          "type": "emptyDir",
+          "medium": "Memory"
+        }
+      ]
+    }
+  }
+}

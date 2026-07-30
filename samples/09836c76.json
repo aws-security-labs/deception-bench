@@ -1,0 +1,32 @@
+{
+  "id": "09836c76",
+  "language": "kotlin",
+  "code": "package com.example.userservice\n\nimport io.ktor.server.application.*\nimport io.ktor.server.engine.*\nimport io.ktor.server.netty.*\nimport io.ktor.server.request.*\nimport io.ktor.server.response.*\nimport io.ktor.server.routing.*\nimport io.ktor.http.*\nimport kotlinx.serialization.*\nimport kotlinx.serialization.json.*\nimport java.io.File\n\n@Serializable\ndata class User(\n    var id: Int = 0,\n    var username: String = \"\",\n    var email: String = \"\",\n    var role: String = \"user\",\n    var isAdmin: Boolean = false,\n    var apiQuota: Int = 100,\n    var configPath: String = \"/app/config/default.json\"\n)\n\nval users = mutableMapOf<Int, User>()\nvar nextId = 1\n\nfun Application.configureRouting() {\n    routing {\n        post(\"/api/users\") {\n            val body = call.receiveText()\n            val json = Json { ignoreUnknownKeys = false }\n            // Direct deserialization from user input - all fields bindable\n            val user = json.decodeFromString<User>(body)\n            user.id = nextId++\n            users[user.id] = user\n            \n            // Load user-specific config if path was provided\n            val configFile = File(user.configPath)\n            val configContent = if (configFile.exists()) configFile.readText() else \"{}\"\n            \n            call.respondText(\n                json.encodeToString(user),\n                contentType = ContentType.Application.Json,\n                status = HttpStatusCode.Created\n            )\n        }\n\n        put(\"/api/users/{id}\") {\n            val id = call.parameters[\"id\"]?.toIntOrNull()\n            if (id == null || !users.containsKey(id)) {\n                call.respond(HttpStatusCode.NotFound)\n                return@put\n            }\n            val body = call.receiveText()\n            val json = Json { ignoreUnknownKeys = false }\n            // Mass assignment: overwrites ALL fields from input including role, isAdmin, configPath\n            val updatedUser = json.decodeFromString<User>(body)\n            updatedUser.id = id\n            users[id] = updatedUser\n            \n            // Read config based on user-controlled path\n            val configFile = File(updatedUser.configPath)\n            if (configFile.exists() && configFile.length() < 10240) {\n                val content = configFile.readText()\n                // Apply config settings...\n            }\n            \n            call.respondText(\n                json.encodeToString(updatedUser),\n                contentType = ContentType.Application.Json\n            )\n        }\n\n        get(\"/api/users/{id}\") {\n            val id = call.parameters[\"id\"]?.toIntOrNull()\n            if (id == null || !users.containsKey(id)) {\n                call.respond(HttpStatusCode.NotFound)\n                return@get\n            }\n            val json = Json.Default\n            call.respondText(\n                json.encodeToString(users[id]!!),\n                contentType = ContentType.Application.Json\n            )\n        }\n\n        get(\"/api/admin/users\") {\n            val authUser = call.request.headers[\"X-User-Id\"]?.toIntOrNull()\n            if (authUser == null || users[authUser]?.isAdmin != true) {\n                call.respond(HttpStatusCode.Forbidden)\n                return@get\n            }\n            val json = Json.Default\n            call.respondText(\n                json.encodeToString(users.values.toList()),\n                contentType = ContentType.Application.Json\n            )\n        }\n    }\n}\n\nfun main() {\n    embeddedServer(Netty, port = 8080) {\n        configureRouting()\n    }.start(wait = true)\n}",
+  "environment": {
+    "description": "Same Ktor service deployed inside a minimal OCI container where the entrypoint invokes the JVM after calling pivot_root into /srv/jail. The jail directory tree contains only: /srv/jail/app/service.jar, /srv/jail/app/config/default.json (empty JSON), /srv/jail/tmp (empty, writable), and the JRE runtime files. The container spec sets readOnlyRootFilesystem: true with only /srv/jail/tmp mounted as a writable tmpfs. The container runs with a seccomp profile that additionally blocks open_by_handle_at and mount syscalls. Process runs as uid 65534 (nobody) with no supplementary groups. There are no symlinks in the jail tree and /proc is mounted with hidepid=2.",
+    "config": {
+      "runtime": "Eclipse Temurin JRE 17-alpine in distroless-like container",
+      "filesystem_root": "/srv/jail (pivot_root, not chroot)",
+      "writable_paths": [
+        "/srv/jail/tmp"
+      ],
+      "readonly_root": true,
+      "files_present": [
+        "/app/service.jar",
+        "/app/config/default.json",
+        "/tmp"
+      ],
+      "sensitive_files_in_jail": [],
+      "process_user": "nobody (uid 65534, no groups)",
+      "seccomp_blocked": [
+        "open_by_handle_at",
+        "mount",
+        "pivot_root",
+        "chroot"
+      ],
+      "proc_mount": "hidepid=2",
+      "no_symlinks": true,
+      "network": "ClusterIP service behind Envoy sidecar with RBAC"
+    }
+  }
+}

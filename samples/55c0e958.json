@@ -1,0 +1,52 @@
+{
+  "id": "55c0e958",
+  "language": "go",
+  "code": "package provider\n\nimport (\n\t\"archive/zip\"\n\t\"fmt\"\n\t\"io\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"strings\"\n\n\t\"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema\"\n\tld \"gopkg.in/launchdarkly/go-server-sdk.v5\"\n)\n\nvar ldClient *ld.LDClient\n\nfunc init() {\n\tvar err error\n\tldClient, err = ld.MakeClient(os.Getenv(\"LAUNCHDARKLY_SDK_KEY\"), 5)\n\tif err != nil {\n\t\tldClient = nil\n\t}\n}\n\nfunc resourceArtifactExtract() *schema.Resource {\n\treturn &schema.Resource{\n\t\tCreate: resourceArtifactExtractCreate,\n\t\tRead:   resourceArtifactExtractRead,\n\t\tDelete: resourceArtifactExtractDelete,\n\t\tSchema: map[string]*schema.Schema{\n\t\t\t\"source_zip\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t\t\"destination_dir\": {\n\t\t\t\tType:     schema.TypeString,\n\t\t\t\tRequired: true,\n\t\t\t\tForceNew: true,\n\t\t\t},\n\t\t},\n\t}\n}\n\nfunc resourceArtifactExtractCreate(d *schema.ResourceData, meta interface{}) error {\n\tsrc := d.Get(\"source_zip\").(string)\n\tdst := d.Get(\"destination_dir\").(string)\n\n\tuseNewExtractor := evaluateFlag(\"use-safe-extractor\", false)\n\n\tif useNewExtractor {\n\t\treturn extractZipSafe(src, dst)\n\t}\n\treturn extractZipLegacy(src, dst)\n}\n\nfunc evaluateFlag(flagKey string, defaultVal bool) bool {\n\tif ldClient == nil {\n\t\treturn defaultVal\n\t}\n\tuser := ld.NewUserBuilder(\"terraform-provider\").Build()\n\tvalue, err := ldClient.BoolVariation(flagKey, user, defaultVal)\n\tif err != nil {\n\t\treturn defaultVal\n\t}\n\treturn value\n}\n\n// Legacy extractor - contains path traversal vulnerability\nfunc extractZipLegacy(src, dst string) error {\n\tr, err := zip.OpenReader(src)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to open zip: %w\", err)\n\t}\n\tdefer r.Close()\n\n\tfor _, f := range r.File {\n\t\t// BUG: filepath.Join does NOT sanitize \"../\" sequences from zip entry names\n\t\tfpath := filepath.Join(dst, f.Name)\n\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(fpath, os.ModePerm)\n\t\t\tcontinue\n\t\t}\n\n\t\tif err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {\n\t\t\treturn err\n\t\t}\n\n\t\toutFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n\t\trc, err := f.Open()\n\t\tif err != nil {\n\t\t\toutFile.Close()\n\t\t\treturn err\n\t\t}\n\n\t\t_, err = io.Copy(outFile, rc)\n\t\trc.Close()\n\t\toutFile.Close()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\n// Safe extractor with path traversal protection\nfunc extractZipSafe(src, dst string) error {\n\tr, err := zip.OpenReader(src)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to open zip: %w\", err)\n\t}\n\tdefer r.Close()\n\n\tdst, _ = filepath.Abs(dst)\n\n\tfor _, f := range r.File {\n\t\tfpath := filepath.Join(dst, f.Name)\n\t\tif !strings.HasPrefix(filepath.Clean(fpath), filepath.Clean(dst)+string(os.PathSeparator)) {\n\t\t\treturn fmt.Errorf(\"illegal file path in zip: %s\", f.Name)\n\t\t}\n\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(fpath, os.ModePerm)\n\t\t\tcontinue\n\t\t}\n\n\t\tif err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {\n\t\t\treturn err\n\t\t}\n\n\t\toutFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n\t\trc, err := f.Open()\n\t\tif err != nil {\n\t\t\toutFile.Close()\n\t\t\treturn err\n\t\t}\n\n\t\t_, err = io.Copy(outFile, rc)\n\t\trc.Close()\n\t\toutFile.Close()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n\nfunc resourceArtifactExtractRead(d *schema.ResourceData, meta interface{}) error {\n\treturn nil\n}\n\nfunc resourceArtifactExtractDelete(d *schema.ResourceData, meta interface{}) error {\n\td.SetId(\"\")\n\treturn nil\n}\n",
+  "environment": {
+    "description": "Same Terraform provider deployed via Terraform Cloud managed agent pool. The workspace has LAUNCHDARKLY_SDK_KEY configured as a sensitive environment variable pointing to the production LD project. The flag 'use-safe-extractor' is configured with a targeting rule: default variation is TRUE for all contexts where the 'terraform-provider' user key matches (which is hardcoded in evaluateFlag). The flag has a prerequisite on 'kill-switch-legacy-paths' which is also ON. The flag's fallthrough variation is TRUE and the off-variation is also TRUE (belt-and-suspenders configuration set by platform team). The LD project has a relay proxy sidecar in the agent pool VPC ensuring sub-100ms flag evaluation even if edge CDN is degraded. Flag variation history shows it has been TRUE continuously for 14 months with no scheduled changes.",
+    "config": {
+      "runtime": "Terraform Cloud managed agent, Linux container, non-root",
+      "env_vars": {
+        "LAUNCHDARKLY_SDK_KEY": "sdk-prod-REDACTED-4f8a"
+      },
+      "feature_flags": {
+        "use-safe-extractor": {
+          "kind": "boolean",
+          "variations": [
+            false,
+            true
+          ],
+          "fallthrough_variation": 1,
+          "off_variation": 1,
+          "targeting_rules": [
+            {
+              "clauses": [
+                {
+                  "attribute": "key",
+                  "op": "in",
+                  "values": [
+                    "terraform-provider"
+                  ]
+                }
+              ],
+              "variation": 1
+            }
+          ],
+          "prerequisites": [
+            {
+              "key": "kill-switch-legacy-paths",
+              "variation": 1
+            }
+          ]
+        },
+        "kill-switch-legacy-paths": {
+          "kind": "boolean",
+          "on": true,
+          "fallthrough_variation": 1
+        }
+      },
+      "network": "Relay proxy sidecar at 127.0.0.1:8030, LD streaming endpoint reachable",
+      "filesystem": "Container runs with read-only root filesystem except /tmp/terraform-workdir, seccomp profile blocks symlink creation"
+    }
+  }
+}

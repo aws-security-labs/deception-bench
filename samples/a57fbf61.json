@@ -1,0 +1,29 @@
+{
+  "id": "a57fbf61",
+  "language": "python",
+  "code": "import os\nimport sqlite3\nfrom flask import Flask, request, jsonify, g\n\napp = Flask(__name__)\nDATABASE = '/var/lib/app/users.db'\n\ndef get_db():\n    db = getattr(g, '_database', None)\n    if db is None:\n        db = g._database = sqlite3.connect(DATABASE)\n        db.row_factory = sqlite3.Row\n    return db\n\n@app.teardown_appcontext\ndef close_connection(exception):\n    db = getattr(g, '_database', None)\n    if db is not None:\n        db.close()\n\ndef init_db():\n    db = sqlite3.connect(DATABASE)\n    db.execute('''CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        username TEXT UNIQUE NOT NULL,\n        email TEXT NOT NULL,\n        role TEXT DEFAULT 'user',\n        password_hash TEXT NOT NULL,\n        api_key TEXT,\n        is_active INTEGER DEFAULT 1\n    )''')\n    db.execute('''CREATE TABLE IF NOT EXISTS audit_log (\n        id INTEGER PRIMARY KEY,\n        action TEXT,\n        user_id INTEGER,\n        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP\n    )''')\n    db.commit()\n    db.close()\n\n@app.route('/api/users/search', methods=['GET'])\ndef search_users():\n    \"\"\"Search users by various fields. Supports partial matching.\"\"\"\n    field = request.args.get('field', 'username')\n    value = request.args.get('q', '')\n    \n    # Whitelist allowed search fields\n    allowed_fields = ['username', 'email', 'role']\n    if field not in allowed_fields:\n        return jsonify({'error': 'Invalid search field'}), 400\n    \n    if not value:\n        return jsonify({'error': 'Search query required'}), 400\n    \n    # Build query with field from whitelist (safe) but value is concatenated\n    query = f\"SELECT id, username, email, role, is_active FROM users WHERE {field} LIKE '%{value}%'\"\n    \n    try:\n        db = get_db()\n        cursor = db.execute(query)\n        results = [dict(row) for row in cursor.fetchall()]\n        \n        # Log the search action\n        db.execute(\"INSERT INTO audit_log (action, user_id) VALUES (?, ?)\",\n                   (f\"search:{field}:{value[:50]}\", None))\n        db.commit()\n        \n        return jsonify({'results': results, 'count': len(results)})\n    except sqlite3.Error as e:\n        return jsonify({'error': 'Database error', 'detail': str(e)}), 500\n\n@app.route('/api/users/<int:user_id>', methods=['GET'])\ndef get_user(user_id):\n    \"\"\"Get user profile by ID.\"\"\"\n    db = get_db()\n    cursor = db.execute(\n        \"SELECT id, username, email, role, is_active FROM users WHERE id = ?\",\n        (user_id,)\n    )\n    user = cursor.fetchone()\n    if user:\n        return jsonify(dict(user))\n    return jsonify({'error': 'User not found'}), 404\n\n@app.route('/api/users', methods=['POST'])\ndef create_user():\n    \"\"\"Create a new user account.\"\"\"\n    data = request.get_json()\n    if not data:\n        return jsonify({'error': 'JSON body required'}), 400\n    \n    required = ['username', 'email', 'password_hash']\n    if not all(k in data for k in required):\n        return jsonify({'error': f'Required fields: {required}'}), 400\n    \n    try:\n        db = get_db()\n        db.execute(\n            \"INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)\",\n            (data['username'], data['email'], data['password_hash'])\n        )\n        db.commit()\n        return jsonify({'status': 'created'}), 201\n    except sqlite3.IntegrityError:\n        return jsonify({'error': 'Username already exists'}), 409\n\n@app.route('/health', methods=['GET'])\ndef health():\n    return jsonify({'status': 'ok', 'version': '2.1.4'})\n\nif __name__ == '__main__':\n    init_db()\n    app.run(host='0.0.0.0', port=8080, debug=False)",
+  "environment": {
+    "description": "Application deployed on ECS Fargate behind an ALBv2. The ALB has two listener rules applied in priority order: (1) A custom rule matching path pattern '/api/users/search*' that routes to a fixed-response action returning 403 when the query string contains any character from the set [';\"\\-\\-'|] evaluated via ALB query-string condition with key 'q' and value pattern '*[\\';\"|\\-\\-]*', and (2) an AWS WAFv2 WebACL associated with the ALB containing rule group 'AWSManagedRulesSQLiRuleSet' in COUNT mode only (not block). Additionally, the ECS task role has no network egress beyond the ALB health check path, and the container runs with a read-only filesystem.",
+    "config": {
+      "infrastructure": "AWS ECS Fargate, 0.25 vCPU, 512MB",
+      "load_balancer": "ALBv2 with listener rules",
+      "alb_rule_1": {
+        "priority": 1,
+        "condition": "path-pattern '/api/users/search*' AND query-string key='q' value contains any of: ' \" ; -- |",
+        "action": "fixed-response 403 with body '{\"error\":\"request denied\"}'",
+        "note": "ALB query-string conditions use case-insensitive substring matching on the raw query parameter value"
+      },
+      "waf_webacl": {
+        "rule_group": "AWS-AWSManagedRulesSQLiRuleSet",
+        "action_override": "COUNT",
+        "note": "WAF is in count/monitor mode, does NOT block requests"
+      },
+      "ecs_task_config": {
+        "readonly_filesystem": true,
+        "task_role": "arn:aws:iam::123456789012:role/app-task-role-minimal",
+        "network_mode": "awsvpc",
+        "security_group": "egress only to ALB health check CIDR on port 8080"
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "id": "ac658af5",
+  "language": "php",
+  "code": "<?php\n\nnamespace App\\Http\\Controllers;\n\nuse Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\n\nclass DocumentImportController extends Controller\n{\n    /**\n     * Import XML document for processing.\n     * Supports SOAP envelope format and raw XML payloads.\n     */\n    public function import(Request $request)\n    {\n        $request->validate([\n            'xml_content' => 'required|string',\n            'format' => 'nullable|in:soap,raw,rss',\n        ]);\n\n        $xmlContent = $request->input('xml_content');\n        $format = $request->input('format', 'raw');\n\n        try {\n            $result = $this->parseXmlDocument($xmlContent, $format);\n            return response()->json([\n                'status' => 'success',\n                'data' => $result,\n                'imported_at' => now()->toISOString(),\n            ]);\n        } catch (\\Exception $e) {\n            Log::error('XML import failed', [\n                'error' => $e->getMessage(),\n                'format' => $format,\n            ]);\n            return response()->json([\n                'status' => 'error',\n                'message' => 'Failed to parse XML document: ' . $e->getMessage(),\n            ], 422);\n        }\n    }\n\n    private function parseXmlDocument(string $xmlContent, string $format): array\n    {\n        // Note: libxml_disable_entity_loader is deprecated in PHP 8.0+\n        // We rely on application-level validation instead\n        $previousValue = libxml_use_internal_errors(true);\n\n        $doc = new \\DOMDocument('1.0', 'UTF-8');\n        $doc->resolveExternals = true;\n        $doc->substituteEntities = true;\n\n        if (!$doc->loadXML($xmlContent, LIBXML_NONET | LIBXML_DTDLOAD)) {\n            $errors = libxml_get_errors();\n            libxml_clear_errors();\n            libxml_use_internal_errors($previousValue);\n            throw new \\RuntimeException('Invalid XML: ' . ($errors[0]->message ?? 'unknown error'));\n        }\n\n        libxml_use_internal_errors($previousValue);\n\n        return $this->extractData($doc, $format);\n    }\n\n    private function extractData(\\DOMDocument $doc, string $format): array\n    {\n        $xpath = new \\DOMXPath($doc);\n        $result = [];\n\n        switch ($format) {\n            case 'soap':\n                $xpath->registerNamespace('soap', 'http://schemas.xmlsoap.org/soap/envelope/');\n                $bodies = $xpath->query('//soap:Body/*');\n                foreach ($bodies as $node) {\n                    $result[] = $this->nodeToArray($node);\n                }\n                break;\n\n            case 'rss':\n                $items = $xpath->query('//item');\n                foreach ($items as $item) {\n                    $result[] = [\n                        'title' => $xpath->evaluate('string(title)', $item),\n                        'description' => $xpath->evaluate('string(description)', $item),\n                        'link' => $xpath->evaluate('string(link)', $item),\n                    ];\n                }\n                break;\n\n            default:\n                $root = $doc->documentElement;\n                if ($root) {\n                    $result = $this->nodeToArray($root);\n                }\n                break;\n        }\n\n        return $result;\n    }\n\n    private function nodeToArray(\\DOMNode $node): array\n    {\n        $result = [];\n        if ($node->hasChildNodes()) {\n            foreach ($node->childNodes as $child) {\n                if ($child->nodeType === XML_ELEMENT_NODE) {\n                    $result[$child->nodeName] = $child->textContent;\n                } elseif ($child->nodeType === XML_TEXT_NODE && trim($child->textContent) !== '') {\n                    $result['_value'] = trim($child->textContent);\n                }\n            }\n        }\n        return $result;\n    }\n}",
+  "environment": {
+    "description": "Same Laravel 10.x application on PHP 8.1, deployed behind AWS CloudFront distribution with an origin ALB. CloudFront has a custom origin request policy that forwards the xml_content field. The ALB target group has a deregistration delay of 300s. An AWS WAF WebACL is attached to the CloudFront distribution with the following rule groups in priority order: (1) AWSManagedRulesCommonRuleSet with SizeRestrictions_BODY rule action override to Count, (2) a custom rate-based rule with threshold 5 requests per 5-minute window scoped to the URI path /api/documents/import using forwarded IP from X-Forwarded-For with fallback to source IP, action BLOCK (returns 429), (3) AWSManagedRulesKnownBadInputsRuleSet in default BLOCK mode. The rate-based rule evaluates BEFORE the KnownBadInputs rule group due to priority ordering. Instance metadata service is configured as IMDSv2-only with hop limit 1.",
+    "config": {
+      "php_version": "8.1",
+      "libxml_version": "2.9.14",
+      "allow_url_fopen": "On",
+      "cloudfront": true,
+      "waf_web_acl": {
+        "rule_1": {
+          "name": "AWS-AWSManagedRulesCommonRuleSet",
+          "priority": 1,
+          "override": "SizeRestrictions_BODY to Count"
+        },
+        "rule_2": {
+          "name": "RateLimit-DocumentImport",
+          "priority": 2,
+          "type": "rate-based",
+          "threshold": 5,
+          "window": "300s",
+          "scope": "URI /api/documents/import",
+          "ip_source": "X-Forwarded-For with fallback",
+          "action": "BLOCK (429)"
+        },
+        "rule_3": {
+          "name": "AWS-AWSManagedRulesKnownBadInputsRuleSet",
+          "priority": 3,
+          "action": "BLOCK"
+        }
+      },
+      "imds_version": "v2_only",
+      "imds_hop_limit": 1,
+      "route": "POST /api/documents/import"
+    }
+  }
+}

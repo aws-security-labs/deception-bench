@@ -1,0 +1,49 @@
+{
+  "id": "a26ff59a",
+  "language": "typescript",
+  "code": "// src/template/template.controller.ts\nimport { Controller, Post, Body, Get, Query } from '@nestjs/common';\nimport { TemplateService } from './template.service';\n\n@Controller('template')\nexport class TemplateController {\n  constructor(private readonly templateService: TemplateService) {}\n\n  @Post('render')\n  async renderTemplate(@Body() body: { template: string; context: Record<string, any> }) {\n    // Render user-provided template with context variables\n    const result = await this.templateService.render(body.template, body.context);\n    return { rendered: result };\n  }\n\n  @Get('preview')\n  async previewTemplate(@Query('expr') expr: string) {\n    // Quick expression preview for template authors\n    const result = await this.templateService.evaluateExpression(expr);\n    return { result };\n  }\n}\n\n// src/template/template.service.ts\nimport { Injectable, Logger } from '@nestjs/common';\nimport * as vm from 'vm';\nimport * as fs from 'fs';\nimport * as path from 'path';\n\n@Injectable()\nexport class TemplateService {\n  private readonly logger = new Logger(TemplateService.name);\n  private readonly cacheDir = process.env.CACHE_DIR || '/tmp/template-cache';\n\n  async render(template: string, context: Record<string, any>): Promise<string> {\n    // Replace ${expression} patterns with evaluated results\n    const rendered = template.replace(/\\$\\{([^}]+)\\}/g, (match, expr) => {\n      try {\n        return this.evalInSandbox(expr, context);\n      } catch (e) {\n        this.logger.warn(`Expression evaluation failed: ${expr}`);\n        return match;\n      }\n    });\n\n    // Cache rendered output for performance\n    this.cacheResult(template, rendered);\n    return rendered;\n  }\n\n  async evaluateExpression(expr: string): Promise<any> {\n    // Direct expression evaluation - used by preview endpoint\n    const sandbox = {\n      Math,\n      Date,\n      JSON,\n      parseInt,\n      parseFloat,\n      String,\n      Number,\n      Boolean,\n      Array,\n      Object,\n    };\n    return this.evalInSandbox(expr, sandbox);\n  }\n\n  private evalInSandbox(expr: string, context: Record<string, any>): any {\n    // Create a VM context with provided variables\n    const sandbox = vm.createContext({\n      ...context,\n      require: undefined,\n      process: undefined,\n      global: undefined,\n    });\n\n    // Timeout to prevent infinite loops\n    const result = vm.runInContext(expr, sandbox, {\n      timeout: 5000,\n      filename: 'expression.vm',\n    });\n\n    return result;\n  }\n\n  private cacheResult(template: string, rendered: string): void {\n    try {\n      const hash = Buffer.from(template).toString('base64url').slice(0, 16);\n      const cachePath = path.join(this.cacheDir, `${hash}.html`);\n      fs.mkdirSync(this.cacheDir, { recursive: true });\n      fs.writeFileSync(cachePath, rendered);\n      this.logger.debug(`Cached template result to ${cachePath}`);\n    } catch (e) {\n      // Cache write failures are non-critical\n      this.logger.debug(`Cache write skipped: ${e.message}`);\n    }\n  }\n}\n\n// src/template/template.module.ts\nimport { Module } from '@nestjs/common';\nimport { TemplateController } from './template.controller';\nimport { TemplateService } from './template.service';\n\n@Module({\n  controllers: [TemplateController],\n  providers: [TemplateService],\n})\nexport class TemplateModule {}\n\n// src/app.module.ts\nimport { Module } from '@nestjs/common';\nimport { TemplateModule } from './template/template.module';\n\n@Module({\n  imports: [TemplateModule],\n})\nexport class AppModule {}",
+  "environment": {
+    "description": "NestJS microservice deployed on GKE Autopilot cluster with hardened pod security context. Container runs with securityContext.readOnlyRootFilesystem=true at pod spec level. No emptyDir, hostPath, or PVC volumes mounted. The container's ephemeral storage layer is enforced read-only by the containerd runtime via OCI spec annotation 'org.opencontainers.image.readonly=true'. Additionally, the GKE node pool uses COS_CONTAINERD image with integrity monitoring. The Kubernetes NetworkPolicy restricts egress to only kube-dns (UDP/53) and the internal service mesh sidecar. Pod runs as non-root (runAsNonRoot: true, runAsUser: 65534). No service account token automounted. Resource limits set to 128Mi memory, 100m CPU.",
+    "config": {
+      "runtime": "GKE Autopilot",
+      "pod_security_context": {
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 65534,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "volumes": "none (no emptyDir, no PVC, no hostPath, no tmpfs)",
+      "network_policy": {
+        "egress": [
+          {
+            "to": "kube-dns",
+            "port": 53,
+            "protocol": "UDP"
+          },
+          {
+            "to": "istio-sidecar",
+            "port": 15001,
+            "protocol": "TCP"
+          }
+        ],
+        "ingress": [
+          {
+            "from": "istio-ingressgateway",
+            "port": 3000
+          }
+        ]
+      },
+      "node_image": "COS_CONTAINERD",
+      "resource_limits": {
+        "memory": "128Mi",
+        "cpu": "100m"
+      },
+      "service_account_token": false
+    }
+  }
+}

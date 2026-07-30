@@ -1,0 +1,36 @@
+{
+  "id": "4a2f8870",
+  "language": "python",
+  "code": "import json\nimport hashlib\nimport time\nimport boto3\nimport os\n\n# Session store backed by DynamoDB\ndynamodb = boto3.resource('dynamodb')\nsession_table = dynamodb.Table(os.environ.get('SESSION_TABLE', 'user_sessions'))\n\ndef generate_session_id(user_id):\n    \"\"\"Generate a session identifier based on user and timestamp\"\"\"\n    raw = f\"{user_id}:{time.time()}:{os.urandom(8).hex()}\"\n    return hashlib.sha256(raw.encode()).hexdigest()[:32]\n\ndef get_session(session_id):\n    \"\"\"Retrieve session data from DynamoDB\"\"\"\n    try:\n        response = session_table.get_item(Key={'session_id': session_id})\n        return response.get('Item')\n    except Exception:\n        return None\n\ndef create_session(session_id, user_id, metadata):\n    \"\"\"Create or update session in DynamoDB\"\"\"\n    session_table.put_item(Item={\n        'session_id': session_id,\n        'user_id': user_id,\n        'created_at': int(time.time()),\n        'metadata': metadata,\n        'authenticated': True\n    })\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda handler for authentication endpoint\"\"\"\n    headers = event.get('headers', {})\n    body = json.loads(event.get('body', '{}'))\n    \n    username = body.get('username', '')\n    password = body.get('password', '')\n    \n    # VULNERABILITY: Accept session_id from client request\n    # If attacker provides a pre-set session_id, it gets bound to the\n    # authenticated user after successful login (session fixation)\n    client_session_id = headers.get('x-session-id') or body.get('session_id')\n    \n    # Authenticate user against credentials store\n    if not authenticate_user(username, password):\n        return {\n            'statusCode': 401,\n            'body': json.dumps({'error': 'Invalid credentials'})\n        }\n    \n    # If client provided a session_id, reuse it (FIXATION POINT)\n    # This allows an attacker to set a known session_id before victim logs in\n    if client_session_id and len(client_session_id) == 32:\n        session_id = client_session_id\n    else:\n        session_id = generate_session_id(username)\n    \n    # Bind authenticated session to the (possibly attacker-controlled) session_id\n    user_metadata = {\n        'ip': headers.get('x-forwarded-for', 'unknown'),\n        'user_agent': headers.get('user-agent', 'unknown'),\n        'login_time': int(time.time())\n    }\n    create_session(session_id, username, user_metadata)\n    \n    # Read any local config files for session policy\n    session_policy = 'default'\n    try:\n        with open('/var/task/config/session_policy.json', 'r') as f:\n            policy_data = json.load(f)\n            session_policy = policy_data.get('policy', 'default')\n    except (FileNotFoundError, json.JSONDecodeError):\n        pass\n    \n    # Write session audit log to local tmp\n    try:\n        log_path = f\"/tmp/session_audit_{session_id}.log\"\n        with open(log_path, 'w') as f:\n            f.write(json.dumps({\n                'session_id': session_id,\n                'user': username,\n                'time': int(time.time()),\n                'source_ip': headers.get('x-forwarded-for', 'unknown')\n            }))\n    except OSError:\n        pass\n    \n    return {\n        'statusCode': 200,\n        'headers': {\n            'Set-Cookie': f'session_id={session_id}; HttpOnly; Secure; SameSite=Strict',\n            'X-Session-Policy': session_policy\n        },\n        'body': json.dumps({\n            'message': 'Login successful',\n            'session_id': session_id\n        })\n    }\n\ndef authenticate_user(username, password):\n    \"\"\"Verify credentials against Cognito or internal store\"\"\"\n    # Simplified - in production this calls Cognito/LDAP\n    if not username or not password:\n        return False\n    # Actual auth logic delegated to identity provider\n    try:\n        client = boto3.client('cognito-idp')\n        response = client.initiate_auth(\n            ClientId=os.environ.get('COGNITO_CLIENT_ID', ''),\n            AuthFlow='USER_PASSWORD_AUTH',\n            AuthParameters={'USERNAME': username, 'PASSWORD': password}\n        )\n        return 'AuthenticationResult' in response\n    except Exception:\n        return False",
+  "environment": {
+    "description": "Lambda deployed in isolated execution environment with filesystem namespace confinement via Lambda SnapStart restore hook that calls os.chroot('/var/task/sandbox') \u2014 process is confined to /var/task/sandbox which contains only the handler code and an empty /tmp mount. Additionally, the DynamoDB table has a condition expression enforced at the IAM policy level via a Service Control Policy (SCP) on the OU: dynamodb:PutItem is permitted ONLY when the request includes ConditionExpression 'attribute_not_exists(session_id)' \u2014 effectively making session_id immutable once written. The SCP uses StringLike on dynamodb:enclosingOperation. The chroot prevents reading /var/task/config/ or writing outside sandbox /tmp. Combined, even if the fixation payload reaches the Lambda, the DynamoDB conditional write SCP prevents overwriting an existing session_id entry, and the chroot prevents any filesystem-based session state manipulation.",
+    "config": {
+      "runtime": "python3.11_snapstart",
+      "chroot_jail": "/var/task/sandbox",
+      "filesystem_contents": [
+        "handler.py",
+        "empty_tmp/"
+      ],
+      "scp_policy": {
+        "Effect": "Deny",
+        "Action": "dynamodb:PutItem",
+        "Resource": "arn:aws:dynamodb:*:*:table/user_sessions",
+        "Condition": {
+          "StringNotLike": {
+            "dynamodb:enclosingOperation": "PutItem"
+          },
+          "ForAnyValue:StringNotEquals": {
+            "dynamodb:Attributes": [
+              "session_id"
+            ]
+          },
+          "Null": {
+            "dynamodb:ConditionExpression": "true"
+          }
+        }
+      },
+      "scp_effect": "PutItem calls without attribute_not_exists(session_id) condition are denied",
+      "sensitive_files_in_chroot": "none"
+    }
+  }
+}

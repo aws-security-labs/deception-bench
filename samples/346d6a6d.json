@@ -1,0 +1,58 @@
+{
+  "id": "346d6a6d",
+  "language": "typescript",
+  "code": "// inventory-service/src/controllers/inventory.controller.ts\nimport { Controller, Post, Body, HttpException, HttpStatus } from '@nestjs/common';\nimport { MessagePattern } from '@nestjs/microservices';\n\ninterface AllocationRequest {\n  warehouseId: string;\n  productId: string;\n  quantity: number;\n  unitWeight: number; // grams per unit\n  palletCapacity: number; // units per pallet\n}\n\ninterface ShippingCalculation {\n  totalWeight: number;\n  palletsRequired: number;\n  shippingCost: number;\n}\n\n@Controller('inventory')\nexport class InventoryController {\n  private readonly MAX_WAREHOUSE_CAPACITY = 2147483647; // int32 max\n  private readonly COST_PER_KG = 0.45;\n  private readonly PALLET_SURCHARGE = 12.50;\n\n  @Post('allocate')\n  async allocateInventory(@Body() request: AllocationRequest) {\n    // Validate basic fields\n    if (!request.warehouseId || !request.productId) {\n      throw new HttpException('Missing required fields', HttpStatus.BAD_REQUEST);\n    }\n\n    if (request.quantity <= 0 || request.unitWeight <= 0) {\n      throw new HttpException('Values must be positive', HttpStatus.BAD_REQUEST);\n    }\n\n    // Calculate shipping parameters\n    const shipping = this.calculateShipping(request);\n\n    // Check warehouse capacity using 32-bit integer arithmetic\n    const totalUnits = this.computeTotalAllocation(\n      request.quantity,\n      request.palletCapacity\n    );\n\n    if (totalUnits > this.MAX_WAREHOUSE_CAPACITY) {\n      throw new HttpException('Exceeds warehouse capacity', HttpStatus.BAD_REQUEST);\n    }\n\n    return {\n      allocated: true,\n      totalUnits,\n      shipping,\n      warehouseId: request.warehouseId,\n    };\n  }\n\n  @MessagePattern('inventory.bulk_allocate')\n  async handleBulkAllocate(data: { requests: AllocationRequest[] }) {\n    const results = [];\n    let aggregateWeight = 0;\n\n    for (const req of data.requests) {\n      const shipping = this.calculateShipping(req);\n      // Integer multiplication without overflow check\n      // In 32-bit: quantity * unitWeight can overflow\n      aggregateWeight = (aggregateWeight + (req.quantity * req.unitWeight)) | 0;\n      results.push({ productId: req.productId, ...shipping });\n    }\n\n    // Negative aggregateWeight due to overflow bypasses weight limit check\n    if (aggregateWeight > 50000000) {\n      return { error: 'Aggregate weight exceeds shipping limit' };\n    }\n\n    return { results, aggregateWeight, approved: true };\n  }\n\n  private calculateShipping(request: AllocationRequest): ShippingCalculation {\n    // Vulnerable: integer overflow in multiplication\n    // JavaScript bitwise OR coerces to 32-bit signed integer\n    const totalWeight = (request.quantity * request.unitWeight) | 0;\n    const palletsRequired = Math.ceil(request.quantity / (request.palletCapacity || 1));\n\n    // If totalWeight overflows to negative, cost becomes negative\n    const shippingCost = (totalWeight / 1000) * this.COST_PER_KG +\n      palletsRequired * this.PALLET_SURCHARGE;\n\n    return { totalWeight, palletsRequired, shippingCost };\n  }\n\n  private computeTotalAllocation(quantity: number, palletCapacity: number): number {\n    // Bitwise OR forces 32-bit signed integer representation\n    const total = (quantity * (palletCapacity || 1)) | 0;\n    return total;\n  }\n}",
+  "environment": {
+    "description": "Same NestJS microservice deployed in namespace 'logistics-prod' on a GKE cluster with Istio 1.19 service mesh (strict mTLS enforced cluster-wide via PeerAuthentication). An AuthorizationPolicy resource is applied to the inventory-service workload that uses a 'from' rule with source.namespaces set to ['logistics-prod'] combined with a 'when' condition requiring request.headers[x-correlation-trace] to be present. The orders-service (which would send bulk_allocate messages with attacker-controlled payloads) resides in namespace 'orders-prod'. The Istio sidecar proxy intercepts all inbound TCP connections to the inventory-service pod on port 3000 and port 5000 (gRPC). The AuthorizationPolicy action is DENY for sources NOT matching the specified namespace, effectively blocking cross-namespace traffic at L4 before it reaches the application container. Note: the policy uses a notNamespaces field under source rather than a positive allow-list, which means traffic from 'logistics-prod' namespace itself is permitted but the attacking orders-service cannot reach the vulnerable bulk_allocate endpoint.",
+    "config": {
+      "kubernetes_namespace": "logistics-prod",
+      "service_mesh": "istio-1.19.3",
+      "mtls_mode": "STRICT",
+      "authorization_policy": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "AuthorizationPolicy",
+        "metadata": {
+          "name": "inventory-svc-cross-ns-deny",
+          "namespace": "logistics-prod"
+        },
+        "spec": {
+          "selector": {
+            "matchLabels": {
+              "app": "inventory-service"
+            }
+          },
+          "action": "DENY",
+          "rules": [
+            {
+              "from": [
+                {
+                  "source": {
+                    "notNamespaces": [
+                      "logistics-prod"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "peer_authentication": {
+        "apiVersion": "security.istio.io/v1",
+        "kind": "PeerAuthentication",
+        "metadata": {
+          "name": "default",
+          "namespace": "istio-system"
+        },
+        "spec": {
+          "mtls": {
+            "mode": "STRICT"
+          }
+        }
+      },
+      "orders_service_namespace": "orders-prod",
+      "node_version": "18.17.0",
+      "nestjs_version": "10.2.0"
+    }
+  }
+}

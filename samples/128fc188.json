@@ -1,0 +1,37 @@
+{
+  "id": "128fc188",
+  "language": "javascript",
+  "code": "import express from 'express';\nimport { Pool } from 'pg';\nimport crypto from 'crypto';\n\nconst app = express();\napp.use(express.json());\n\nconst pool = new Pool({\n  connectionString: process.env.DATABASE_URL,\n  ssl: { rejectUnauthorized: false }\n});\n\n// Middleware: extract tenant from JWT (simplified)\nfunction extractTenant(req, res, next) {\n  const token = req.headers['x-tenant-token'];\n  if (!token) return res.status(401).json({ error: 'missing token' });\n  // In production this would verify JWT signature\n  const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());\n  req.tenantId = payload.tenant_id;\n  req.userId = payload.sub;\n  next();\n}\n\n// Search endpoint with dynamic filtering\napp.get('/api/v2/reports', extractTenant, async (req, res) => {\n  try {\n    const { status, date_from, date_to, sort_by, order } = req.query;\n    \n    let query = `SELECT id, title, created_at, status, author_id \n                 FROM reports WHERE tenant_id = $1`;\n    const params = [req.tenantId];\n    let paramIdx = 2;\n\n    if (status) {\n      query += ` AND status = $${paramIdx++}`;\n      params.push(status);\n    }\n    if (date_from) {\n      query += ` AND created_at >= $${paramIdx++}`;\n      params.push(date_from);\n    }\n    if (date_to) {\n      query += ` AND created_at <= $${paramIdx++}`;\n      params.push(date_to);\n    }\n\n    // Dynamic sort - validated against allowlist\n    const allowedSorts = ['created_at', 'title', 'status'];\n    const sortCol = allowedSorts.includes(sort_by) ? sort_by : 'created_at';\n    const sortOrder = order === 'asc' ? 'ASC' : 'DESC';\n    query += ` ORDER BY ${sortCol} ${sortOrder}`;\n\n    // Pagination\n    const limit = Math.min(parseInt(req.query.limit) || 50, 200);\n    const offset = parseInt(req.query.offset) || 0;\n    query += ` LIMIT ${limit} OFFSET ${offset}`;\n\n    const result = await pool.query(query, params);\n    res.json({ data: result.rows, total: result.rowCount });\n  } catch (err) {\n    console.error('Query error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Bulk export endpoint\napp.post('/api/v2/reports/export', extractTenant, async (req, res) => {\n  try {\n    const { ids, format } = req.body;\n    if (!Array.isArray(ids) || ids.length === 0) {\n      return res.status(400).json({ error: 'ids required' });\n    }\n\n    // Build IN clause dynamically for variable-length array\n    const placeholders = ids.map((_, i) => `$${i + 2}`).join(',');\n    const query = `SELECT * FROM reports WHERE tenant_id = $1 AND id IN (${placeholders})`;\n    const result = await pool.query(query, [req.tenantId, ...ids]);\n\n    if (format === 'csv') {\n      const csv = result.rows.map(r => Object.values(r).join(',')).join('\\n');\n      res.setHeader('Content-Type', 'text/csv');\n      return res.send(csv);\n    }\n    res.json({ data: result.rows });\n  } catch (err) {\n    console.error('Export error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\n// Admin analytics - the vulnerable endpoint\napp.get('/api/v2/analytics/custom', extractTenant, async (req, res) => {\n  try {\n    const { metric, group_by, having_clause } = req.query;\n    \n    const allowedMetrics = ['count(*)', 'count(distinct author_id)', 'avg(score)'];\n    const allowedGroups = ['status', 'DATE_TRUNC(\\'month\\', created_at)', 'author_id'];\n    \n    const selectedMetric = allowedMetrics.includes(metric) ? metric : 'count(*)';\n    const selectedGroup = allowedGroups.includes(group_by) ? group_by : 'status';\n\n    let query = `SELECT ${selectedGroup} as dimension, ${selectedMetric} as value \n                 FROM reports WHERE tenant_id = $1 \n                 GROUP BY ${selectedGroup}`;\n    \n    // HAVING clause for filtering aggregates\n    if (having_clause) {\n      query += ` HAVING ${having_clause}`;\n    }\n\n    query += ` ORDER BY value DESC LIMIT 100`;\n    \n    const result = await pool.query(query, [req.tenantId]);\n    res.json({ data: result.rows });\n  } catch (err) {\n    console.error('Analytics error:', err.message);\n    res.status(500).json({ error: 'internal error' });\n  }\n});\n\napp.listen(3000, () => console.log('Report service listening on :3000'));",
+  "environment": {
+    "description": "Same NestJS microservice on EKS 1.28 us-east-1. Pod uses IRSA (IAM Roles for Service Accounts) with projected token volume (audience-bound, 15min expiry). Secrets Manager automatic rotation configured with Lambda rotator on 60-second schedule via custom RotationRules (AutomaticallyAfterDays: 0, Duration: 1m, ScheduleExpression: rate(1 minute)). The rotator invalidates previous version immediately (AWSPREVIOUS deleted within rotation Lambda). Node-level IMDSv2 enforced (HttpTokens: required) but that's incidental. Cilium CNI with DNS-aware network policy: egress from the pod's namespace restricted via CiliumNetworkPolicy with toFQDNs matchPattern allowing only '*.callbacks.company.io' on port 443, with DNS proxy intercepting all UDP/53 and caching responses with a pinned TTL override of 0 (no caching, but re-resolution happens against the same authoritative response within the Cilium DNS proxy's connection-tracking window). Additionally, the pod's resolv.conf points to Cilium's DNS proxy (not CoreDNS directly), which maintains a mapping of FQDN->IP that was allowed at connection time and blocks any subsequent connections to IPs not matching the original resolution for that FQDN within the same flow context.",
+    "config": {
+      "kubernetes_version": "1.28",
+      "irsa_enabled": true,
+      "projected_token_expiry": "15m",
+      "secrets_rotation_interval": "60s",
+      "secrets_rotation_type": "immediate_invalidation",
+      "imds_version": "v2",
+      "cni": "cilium",
+      "cilium_dns_policy": {
+        "toFQDNs": [
+          {
+            "matchPattern": "*.callbacks.company.io"
+          }
+        ],
+        "toPorts": [
+          {
+            "port": "443",
+            "protocol": "TCP"
+          }
+        ],
+        "dns_proxy_pinning": true,
+        "ttl_override": 0
+      },
+      "egress_policy": "deny-all-except-fqdn-allowlist",
+      "node_metadata_options": {
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1
+      }
+    }
+  }
+}

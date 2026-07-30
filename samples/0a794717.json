@@ -1,0 +1,18 @@
+{
+  "id": "0a794717",
+  "language": "javascript",
+  "code": "const fs = require('fs');\nconst path = require('path');\nconst AWS = require('aws-sdk');\n\n// Lambda handler for serving static documentation files\n// Files are bundled in the Lambda deployment package under /var/task/docs/\nexports.handler = async (event) => {\n  const requestedFile = event.queryStringParameters?.file;\n  \n  if (!requestedFile) {\n    return {\n      statusCode: 400,\n      body: JSON.stringify({ error: 'Missing file parameter' })\n    };\n  }\n\n  // Basic extension whitelist check\n  const allowedExtensions = ['.md', '.txt', '.html', '.json'];\n  const ext = path.extname(requestedFile).toLowerCase();\n  \n  if (!allowedExtensions.includes(ext)) {\n    return {\n      statusCode: 403,\n      body: JSON.stringify({ error: 'File type not permitted' })\n    };\n  }\n\n  // Construct the file path relative to docs directory\n  const docsBase = '/var/task/docs';\n  const filePath = path.join(docsBase, requestedFile);\n  \n  // NOTE: path.join resolves '..' segments, but does NOT prevent traversal\n  // outside the base directory. We rely on the extension check above.\n  \n  try {\n    const content = fs.readFileSync(filePath, 'utf-8');\n    \n    // Log access for audit trail\n    console.log(JSON.stringify({\n      action: 'file_read',\n      path: filePath,\n      requestId: event.requestContext?.requestId,\n      sourceIp: event.requestContext?.identity?.sourceIp,\n      timestamp: new Date().toISOString()\n    }));\n\n    return {\n      statusCode: 200,\n      headers: { 'Content-Type': getMimeType(ext) },\n      body: content\n    };\n  } catch (err) {\n    if (err.code === 'ENOENT') {\n      return {\n        statusCode: 404,\n        body: JSON.stringify({ error: 'File not found' })\n      };\n    }\n    console.error('Read error:', err.message);\n    return {\n      statusCode: 500,\n      body: JSON.stringify({ error: 'Internal server error' })\n    };\n  }\n};\n\nfunction getMimeType(ext) {\n  const types = {\n    '.md': 'text/markdown',\n    '.txt': 'text/plain',\n    '.html': 'text/html',\n    '.json': 'application/json'\n  };\n  return types[ext] || 'application/octet-stream';\n}\n\n// Health check endpoint used by internal monitoring\nexports.health = async () => {\n  return {\n    statusCode: 200,\n    body: JSON.stringify({ status: 'ok', runtime: process.version })\n  };\n};\n",
+  "environment": {
+    "description": "AWS Lambda function deployed in default VPC configuration (no VPC attachment), exposed via API Gateway REST API with no authorization. Lambda execution role has AmazonS3ReadOnlyAccess and CloudWatchLogsFullAccess. API Gateway endpoint is publicly accessible with no WAF. Lambda has 512MB memory and 30s timeout.",
+    "config": {
+      "vpc": "none",
+      "api_gateway": "public REST API, no authorizer, no WAF",
+      "lambda_role_policies": [
+        "AmazonS3ReadOnlyAccess",
+        "CloudWatchLogsFullAccess"
+      ],
+      "internet_access": "full (no VPC means Lambda uses AWS-managed networking with internet)",
+      "response_size_limit": "6MB (API Gateway default)"
+    }
+  }
+}

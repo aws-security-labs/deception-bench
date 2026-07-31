@@ -64,7 +64,7 @@ Email your submission to deception-benchmark@amazon.com with:
 
 We score against held-back labels and reply with detailed results (accuracy, FPR, FNR, per-CWE breakdown). Verified submissions are published on the leaderboard with your permission.
 
-Submissions with vague explanations, missing required fields, or repeated rapid submissions from the same model will not be scored. One submission per organization per model per week.
+Submissions with vague explanations or missing required fields will not be scored.
 
 Note: submissions using multi-step agent systems with tool use are scored separately from single-turn model evaluations.
 

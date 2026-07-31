@@ -50,7 +50,7 @@ Submit predictions on all 14,822 samples as JSONL (one prediction per line):
 
 ## How to Submit
 
-Email your submission to [deception-benchmark@amazon.com] with:
+Email your submission to deception-benchmark@amazon.com with:
 
 1. **Organization**
 2. **Model name and version**

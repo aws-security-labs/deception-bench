@@ -64,7 +64,7 @@ Email your submission to deception-benchmark@amazon.com with:
 
 We score against held-back labels and reply with detailed results (accuracy, FPR, FNR, per-CWE breakdown). Verified submissions are published on the leaderboard with your permission.
 
-Submissions with vague explanations or missing required fields will not be scored. We are continuously working with the community to find the most fair and transparent way to publish results.
+Submissions with vague explanations or missing required fields will not be scored. Scoring is currently moderated to ensure quality, with the goal of evolving toward a community-driven, decentralized evaluation process similar to MLPerf.
 
 Note: submissions using multi-step agent systems with tool use are scored separately from single-turn model evaluations.
 

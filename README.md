@@ -44,22 +44,27 @@ For environment-gated samples: the same code may be vulnerable in one deployment
 
 Submit predictions on all 14,822 samples as JSONL (one prediction per line):
 ```json
-{"id": "a7f3c012", "prediction": "vulnerable"}
-{"id": "9e1b44d8", "prediction": "safe"}
+{"id": "a7f3c012", "prediction": "vulnerable", "explanation": "The user-controlled sort parameter is concatenated directly into the ORDER BY clause via f-string without validation. An attacker can inject SQL via: ?sort=id; DROP TABLE users--"}
+{"id": "9e1b44d8", "prediction": "safe", "explanation": "Although the sort parameter reaches the query, the allowlist check on line 34 restricts it to predefined column names. No user input reaches the SQL string."}
 ```
+
+Each prediction MUST include a detailed explanation of why the code is vulnerable or safe. Submissions with vague or missing explanations (e.g., "looks suspicious", "seems safe") will be rejected.
 
 ## How to Submit
 
 Email your submission to deception-benchmark@amazon.com with:
 
 1. **Organization**
-2. **Model name and version**
-3. **Brief description** (2-3 sentences): single model or multi-agent system? Specialized training for security? Tool use or environment access during evaluation?
-4. **Prompting strategy** (attach the prompt text you used)
-5. **Permission to publish** on leaderboard? (yes/no)
-6. **Attached:** predictions.jsonl
+2. **Key point of contact** (name + email)
+3. **Model name and version**
+4. **Brief description** (2-3 sentences): single model or multi-agent system? Specialized training for security? Tool use or environment access during evaluation?
+5. **Prompting strategy** (attach the prompt text you used)
+6. **Permission to publish** on leaderboard? (yes/no)
+7. **Attached:** predictions.jsonl (with explanations for each prediction)
 
 We score against held-back labels and reply with detailed results (accuracy, FPR, FNR, per-CWE breakdown). Verified submissions are published on the leaderboard with your permission.
+
+Submissions with vague explanations, missing required fields, or repeated rapid submissions from the same model will not be scored. One submission per organization per model per week.
 
 Note: submissions using multi-step agent systems with tool use are scored separately from single-turn model evaluations.
 

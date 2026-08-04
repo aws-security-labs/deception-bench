@@ -105,4 +105,17 @@ The dataset includes deliberately ambiguous samples that are not scored but are 
 
 ## License & Citation
 
-[TBD]
+This dataset is licensed under the [Creative Commons Attribution-NonCommercial 4.0 International License (CC-BY-NC-4.0)](http://creativecommons.org/licenses/by-nc/4.0/).
+
+Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+If you use this dataset in your research, please cite:
+
+```bibtex
+@article{shrivastava2026deception,
+  title={Deception Benchmark: A Stress-Test Benchmark for Trusted Vulnerability Detection with Honeypot Anti-Overfitting},
+  author={Shrivastava, Anshumali and Rungta, Neha and Greaves-Tunnell, Alexander},
+  year={2026},
+  url={https://github.com/aws-security-labs/deception-bench}
+}
+```

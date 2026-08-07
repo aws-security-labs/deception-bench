@@ -94,6 +94,8 @@ We evaluated general-purpose frontier models from 5 providers under two strategi
 | Claude Sonnet 5 | PoE | 68.7% | 46.5% | 17.7% |
 | Amazon Nova Pro | Direct | 54.7% | 85.2% | 3.9% |
 | Amazon Nova Pro | PoE | 63.3% | 8.0% | 74.7% |
+| GPT-5.6 Sol | Direct | 52.9% | 92.6% | 1.6% |
+| GPT-5.6 Sol | PoE | 57.0% | 59.3% | 25.7% |
 | Mistral Large | Direct | 50.6% | 98.7% | 0.1% |
 | Mistral Large | PoE | 60.7% | 55.2% | 23.2% |
 

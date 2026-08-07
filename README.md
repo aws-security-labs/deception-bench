@@ -74,6 +74,8 @@ We evaluated general-purpose frontier models from 5 providers under two strategi
 
 | Model | Prompt | Accuracy | FPR | FNR |
 |-------|--------|----------|-----|-----|
+| GPT-5.6 Sol | Direct | 52.9% | 92.6% | 1.6% |
+| GPT-5.6 Sol | PoE | 57.0% | 59.3% | 25.7% |
 | GPT-5.5 | Direct | 54.3% | 88.8% | 2.5% |
 | GPT-5.5 | PoE | 58.9% | 66.6% | 15.6% |
 | GPT-5.4 | Direct | 57.5% | 82.4% | 2.5% |
@@ -94,8 +96,6 @@ We evaluated general-purpose frontier models from 5 providers under two strategi
 | Claude Sonnet 5 | PoE | 68.7% | 46.5% | 17.7% |
 | Amazon Nova Pro | Direct | 54.7% | 85.2% | 3.9% |
 | Amazon Nova Pro | PoE | 63.3% | 8.0% | 74.7% |
-| GPT-5.6 Sol | Direct | 52.9% | 92.6% | 1.6% |
-| GPT-5.6 Sol | PoE | 57.0% | 59.3% | 25.7% |
 | Mistral Large | Direct | 50.6% | 98.7% | 0.1% |
 | Mistral Large | PoE | 60.7% | 55.2% | 23.2% |
 

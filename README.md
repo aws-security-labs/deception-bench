@@ -74,36 +74,36 @@ We evaluated general-purpose frontier models from 5 providers under two strategi
 
 | Model | Prompt | Accuracy | FPR | FNR |
 |-------|--------|----------|-----|-----|
-| GPT-5.6 Sol | Direct | 52.9% | 92.6% | 1.6% |
-| GPT-5.6 Sol | PoE | 57.0% | 59.3% | 25.7% |
-| GPT-5.5 | Direct | 54.3% | 88.8% | 2.5% |
-| GPT-5.5 | PoE | 58.9% | 66.6% | 15.6% |
-| GPT-5.4 | Direct | 57.5% | 82.4% | 2.5% |
-| GPT-5.4 | PoE | 70.1% | 19.9% | 39.9% |
-| Llama 3.3 70B | Direct | 59.4% | 79.8% | 1.3% |
-| Llama 3.3 70B | PoE | 68.2% | 15.5% | 48.1% |
-| Claude Haiku 4.5 | Direct | 55.3% | 89.4% | 0.0% |
-| Claude Haiku 4.5 | PoE | 68.4% | 31.3% | 32.0% |
-| Claude Opus 4.6 | Direct | 54.0% | 91.8% | 0.2% |
-| Claude Opus 4.6 | PoE | 70.6% | 49.0% | 9.9% |
-| Claude Opus 4.7 | Direct | 56.5% | 85.6% | 1.3% |
-| Claude Opus 4.7 | PoE | 70.5% | 38.8% | 20.2% |
-| Claude Opus 4.8 | Direct | 51.7% | 96.3% | 0.5% |
-| Claude Opus 4.8 | PoE | 68.4% | 42.6% | 20.8% |
-| Claude Opus 5 | Direct | 68.7% | 52.1% | 10.6% |
-| Claude Opus 5 | PoE | 68.3% | 38.0% | 25.4% |
-| Claude Sonnet 5 | Direct | 60.4% | 92.2% | 0.7% |
-| Claude Sonnet 5 | PoE | 68.7% | 46.5% | 17.7% |
-| Amazon Nova 2 Lite | Direct | 54.2% | 90.2% | 1.4% |
-| Amazon Nova 2 Lite | PoE | 65.5% | 50.9% | 18.1% |
-| Mistral Large | Direct | 50.6% | 98.7% | 0.1% |
-| Mistral Large | PoE | 60.7% | 55.2% | 23.2% |
+| GPT-5.6 Sol | Direct | 54.9% | 92.5% | 0.9% |
+| GPT-5.6 Sol | PoE | 58.9% | 58.6% | 23.1% |
+| GPT-5.5 | Direct | 56.9% | 87.8% | 1.3% |
+| GPT-5.5 | PoE | 62.9% | 63.6% | 12.4% |
+| GPT-5.4 | Direct | 60.2% | 81.0% | 1.5% |
+| GPT-5.4 | PoE | 77.7% | 10.1% | 33.6% |
+| Llama 3.3 70B | Direct | 58.8% | 84.2% | 1.1% |
+| Llama 3.3 70B | PoE | 72.2% | 10.2% | 44.2% |
+| Claude Haiku 4.5 | Direct | 55.6% | 92.1% | 0.0% |
+| Claude Haiku 4.5 | PoE | 75.6% | 22.4% | 26.3% |
+| Claude Opus 4.6 | Direct | 55.9% | 91.3% | 0.1% |
+| Claude Opus 4.6 | PoE | 75.8% | 42.7% | 7.0% |
+| Claude Opus 4.7 | Direct | 58.3% | 85.5% | 0.9% |
+| Claude Opus 4.7 | PoE | 75.9% | 32.0% | 16.8% |
+| Claude Opus 4.8 | Direct | 53.8% | 95.7% | 0.2% |
+| Claude Opus 4.8 | PoE | 76.4% | 32.3% | 15.7% |
+| Claude Opus 5 | Direct | 77.3% | 41.5% | 5.2% |
+| Claude Opus 5 | PoE | 79.3% | 24.9% | 16.8% |
+| Claude Sonnet 5 | Direct | 66.7% | 89.8% | 0.5% |
+| Claude Sonnet 5 | PoE | 79.3% | 31.9% | 12.6% |
+| Amazon Nova 2 Lite | Direct | 56.3% | 89.2% | 1.2% |
+| Amazon Nova 2 Lite | PoE | 70.1% | 45.2% | 15.5% |
+| Mistral Large | Direct | 52.0% | 98.8% | 0.1% |
+| Mistral Large | PoE | 65.4% | 48.7% | 21.1% |
 
 Random baseline: 50%. Among the general-purpose frontier models tested, no configuration achieves both FPR < 10% and FNR < 10% on this benchmark.
 
 ## Honeypot Samples
 
-The dataset includes deliberately ambiguous samples that are not scored but are indistinguishable from scored samples. This is by design to resist overfitting. Submit predictions on all 14,822 samples; scoring handles the rest.
+Of the 14,822 samples, 9,695 are scored and 5,127 are held out and unscored. The held-out set includes deliberately ambiguous samples and samples withheld during label audit; they are indistinguishable from scored samples by design, to resist overfitting. Submit predictions on all 14,822 samples; scoring handles the rest.
 
 ## License & Citation
 

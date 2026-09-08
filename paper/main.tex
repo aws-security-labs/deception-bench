@@ -283,28 +283,36 @@ GPT-5.4 & PoE & 77.7\% & 87.6\% & 66.4\% & 75.5\% & 10.1\% & 33.6\% \\
 Claude Opus 5 & Direct & 77.3\% & 71.1\% & 94.8\% & 81.2\% & 41.5\% & 5.2\% \\
 Claude Opus 5 & PoE & 79.3\% & 78.2\% & 83.2\% & 80.6\% & 24.9\% & 16.8\% \\
 Claude Opus 4.8 & Direct & 53.8\% & 52.9\% & 99.8\% & 69.1\% & 95.7\% & 0.2\% \\
-Claude Opus 4.8 & PoE & 76.4\% & 74.3\% & 84.3\% & 78.9\% & 32.3\% & 15.7\% \\
+Claude Opus 4.8 & PoE & 75.8\% & 73.4\% & 83.6\% & 78.2\% & 32.5\% & 16.4\% \\
 Claude Opus 4.7 & Direct & 58.3\% & 55.4\% & 99.1\% & 71.1\% & 85.5\% & 0.9\% \\
 Claude Opus 4.7 & PoE & 75.9\% & 73.6\% & 83.2\% & 78.1\% & 32.0\% & 16.8\% \\
 Claude Opus 4.6 & Direct & 55.9\% & 54.0\% & 99.9\% & 70.1\% & 91.3\% & 0.1\% \\
 Claude Opus 4.6 & PoE & 75.8\% & 70.0\% & 93.0\% & 79.9\% & 42.7\% & 7.0\% \\
-Claude Sonnet 5 & Direct & 66.7\% & 65.6\% & 99.5\% & 79.1\% & 89.8\% & 0.5\% \\
-Claude Sonnet 5 & PoE & 79.3\% & 79.0\% & 87.4\% & 83.0\% & 31.9\% & 12.6\% \\
+Claude Sonnet 5 & Direct & 62.9\% & 58.4\% & 97.8\% & 73.2\% & 74.7\% & 2.2\% \\
+Claude Sonnet 5 & PoE & 74.7\% & 73.1\% & 80.8\% & 76.8\% & 31.8\% & 19.2\% \\
 Claude Haiku 4.5 & Direct & 55.6\% & 53.8\% & 100.0\% & 70.0\% & 92.1\% & 0.0\% \\
 Claude Haiku 4.5 & PoE & 75.6\% & 77.9\% & 73.7\% & 75.7\% & 22.4\% & 26.3\% \\
 \midrule
 Llama 3.3 70B & Direct & 58.8\% & 55.7\% & 98.9\% & 71.3\% & 84.2\% & 1.1\% \\
 Llama 3.3 70B & PoE & 72.2\% & 85.5\% & 55.8\% & 67.5\% & 10.2\% & 44.2\% \\
-Mistral Large & Direct & 52.0\% & 51.7\% & 99.9\% & 68.2\% & 98.8\% & 0.1\% \\
-Mistral Large & PoE & 65.4\% & 63.0\% & 78.9\% & 70.1\% & 48.7\% & 21.1\% \\
+Mistral Large & Direct & 52.2\% & 52.0\% & 100.0\% & 68.4\% & 99.0\% & 0.0\% \\
+Mistral Large & PoE & 65.5\% & 63.3\% & 79.4\% & 70.4\% & 49.3\% & 20.6\% \\
 Nova 2 Lite & Direct & 56.3\% & 54.3\% & 98.8\% & 70.1\% & 89.2\% & 1.2\% \\
 Nova 2 Lite & PoE & 70.1\% & 66.6\% & 84.5\% & 74.5\% & 45.2\% & 15.5\% \\
 \bottomrule
+\multicolumn{8}{l}{\footnotesize All configurations scored at $\geq$98\% coverage except GPT-5.6 Sol (PoE) at 93\% (Section~\ref{sec:results}).}
 \end{tabular}
 \label{tab:results}
 \end{table*}
 
-Table~\ref{tab:results} presents the main results. Key findings:
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{pareto_fpr_fnr.png}
+\caption{False positive rate versus false negative rate for every model and prompting strategy. Bottom-left is best. The shaded box is the (lenient) target region where both rates fall below 10\%; it is empty. Direct prompting clusters at the bottom-right (near-zero FNR, very high FPR); Proof-of-Exploit moves points up-left but none into the box.}
+\label{fig:pareto}
+\end{figure}
+
+Table~\ref{tab:results} presents the main results, visualized in Figure~\ref{fig:pareto}. Key findings:
 
 \textbf{Finding 1: Pattern sensing without verification is insufficient.} With Direct prompting, all models achieve 95--100\% recall but 41--99\% FPR. LLMs are exceptional at recognizing potential vulnerability patterns, and this is precisely the problem. Code that \emph{looks} dangerous triggers the same response as code that \emph{is} dangerous.
 
@@ -315,6 +323,8 @@ Table~\ref{tab:results} presents the main results. Key findings:
 \textbf{Finding 4: More capable models are not necessarily better.} GPT-5.6 Sol (OpenAI's most capable model) achieves 58.9\% accuracy with PoE, worse than GPT-5.4 (77.7\%). GPT-5.5 (62.9\%) also underperforms GPT-5.4. Claude Opus 4.8 has the worst FPR (95.7\%) of any Anthropic model on Direct prompting. Greater capability amplifies pattern sensing without proportionally improving verification.
 
 \textbf{Finding 5: The failure is cross-provider.} Every provider exhibits the same tradeoff structure. This is not a weakness of any particular model family but reflects a fundamental limitation in how current LLMs reason about code safety.
+
+\textbf{Coverage.} Each configuration is scored on the samples for which the model returned a parseable verdict. All reach at least 98\% coverage except GPT-5.6 Sol with PoE, at 93\%: the remaining requests were declined by the provider's cybersecurity safety filter, which blocks exploit-construction prompts. This affects only the PoE prompt; the Direct configuration reaches full coverage.
 
 \subsection{Environment-Gated Reasoning}
 

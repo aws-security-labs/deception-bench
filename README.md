@@ -1,4 +1,4 @@
-# Deception Benchmark: Stress-Testing Deep Security Reasoning for Building Trust
+# Deception Benchmark: A Stress-Test Benchmark for Trusted Vulnerability Detection with Honeypot Anti-Overfitting
 
 ## Overview
 
@@ -101,11 +101,15 @@ We evaluated 12 general-purpose frontier models from 5 providers under two strat
 
 Random baseline: 50%. Among the general-purpose frontier models tested, no configuration achieves both FPR < 10% and FNR < 10% on this benchmark.
 
-Each model is scored on the samples for which it returned a valid answer. All configurations reached at least 98% coverage except GPT-5.6 Sol (PoE) at 93%, where the provider's cybersecurity safety filter declined the exploit-construction prompt on some samples. See the [whitepaper](paper/deception_benchmark.pdf) for the full methodology, including the label-audit process.
+Each model is scored on the samples for which it returned a valid answer. All configurations reached at least 98% coverage except GPT-5.6 Sol (PoE) at 93%, where the provider's cybersecurity safety filter declined the exploit-construction prompt on some samples.
 
 ## Honeypot Samples
 
 Of the 14,822 samples, 9,695 are scored and 5,127 are held out and unscored. The held-out set includes deliberately ambiguous samples and samples withheld during label audit; they are indistinguishable from scored samples by design, to resist overfitting. Submit predictions on all 14,822 samples; scoring handles the rest.
+
+## Data Quality
+
+Producing reliable labels at this scale is a hard problem in its own right, so we treat labeling as a convergent audit loop rather than a one-time step. Every label is re-examined by multiple independent reviewers, blind to one another and to the original reasoning; disagreements escalate to head-to-head adjudication and then to human review. We never relabel a disputed sample: when reviewers disagree, the sample moves to the unscored pool rather than receiving a corrected label, so a bad challenge can remove a sample but can never introduce a wrong label into the scored set. A human review of 100 randomly drawn scored samples found no label errors. The [whitepaper](paper/deception_benchmark.pdf) describes the full process.
 
 ## License & Citation
 

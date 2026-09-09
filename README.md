@@ -70,7 +70,7 @@ Note: submissions using multi-step agent systems with tool use are scored separa
 
 ## Baseline Results
 
-We evaluated general-purpose frontier models from 5 providers under two strategies: **Direct** (classify vulnerable/safe) and **PoE** (must construct a concrete exploit before flagging). We set a very generous threshold of FPR < 10% and FNR < 10% to be considered interesting for production use.
+We evaluated 12 general-purpose frontier models from 5 providers under two strategies: **Direct** (classify vulnerable/safe) and **PoE** (Proof-of-Exploit: construct a concrete exploit before flagging). We report the false positive rate (FPR, safe code wrongly flagged) and false negative rate (FNR, real vulnerabilities missed) separately, because they fail in opposite directions. We set a deliberately generous bar of FPR < 10% and FNR < 10% as the minimum for production use.
 
 | Model | Prompt | Accuracy | FPR | FNR |
 |-------|--------|----------|-----|-----|
@@ -89,17 +89,19 @@ We evaluated general-purpose frontier models from 5 providers under two strategi
 | Claude Opus 4.7 | Direct | 58.3% | 85.5% | 0.9% |
 | Claude Opus 4.7 | PoE | 75.9% | 32.0% | 16.8% |
 | Claude Opus 4.8 | Direct | 53.8% | 95.7% | 0.2% |
-| Claude Opus 4.8 | PoE | 76.4% | 32.3% | 15.7% |
+| Claude Opus 4.8 | PoE | 75.8% | 32.5% | 16.4% |
 | Claude Opus 5 | Direct | 77.3% | 41.5% | 5.2% |
 | Claude Opus 5 | PoE | 79.3% | 24.9% | 16.8% |
-| Claude Sonnet 5 | Direct | 66.7% | 89.8% | 0.5% |
-| Claude Sonnet 5 | PoE | 79.3% | 31.9% | 12.6% |
+| Claude Sonnet 5 | Direct | 62.9% | 74.7% | 2.2% |
+| Claude Sonnet 5 | PoE | 74.7% | 31.8% | 19.2% |
 | Amazon Nova 2 Lite | Direct | 56.3% | 89.2% | 1.2% |
 | Amazon Nova 2 Lite | PoE | 70.1% | 45.2% | 15.5% |
-| Mistral Large | Direct | 52.0% | 98.8% | 0.1% |
-| Mistral Large | PoE | 65.4% | 48.7% | 21.1% |
+| Mistral Large | Direct | 52.2% | 99.0% | 0.0% |
+| Mistral Large | PoE | 65.5% | 49.3% | 20.6% |
 
 Random baseline: 50%. Among the general-purpose frontier models tested, no configuration achieves both FPR < 10% and FNR < 10% on this benchmark.
+
+Each model is scored on the samples for which it returned a valid answer. All configurations reached at least 98% coverage except GPT-5.6 Sol (PoE) at 93%, where the provider's cybersecurity safety filter declined the exploit-construction prompt on some samples. See the [whitepaper](paper/deception_benchmark.pdf) for the full methodology, including the label-audit process.
 
 ## Honeypot Samples
 

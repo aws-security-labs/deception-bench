@@ -336,6 +336,8 @@ Environment-gated samples require understanding whether deployment infrastructur
 
 \subsection{Why Sensing Is Not Enough}
 
+Across every model and both strategies, errors are asymmetric: models are far more willing to call code vulnerable than safe (near-perfect recall, false positive rates from 41\% to 99\%). Under a flag-then-verify pipeline this is locally rational, as flagging is cheap because a downstream check can discard the mistake, whereas a missed vulnerability is costly. But a model that resolves uncertainty by defaulting to ``vulnerable'' is exhibiting a bias, not judgment, and its standalone output is dominated by false positives. Recent evaluations of LLMs on vulnerability detection report the same pattern: unreliable and inconsistent judgments with unfaithful reasoning~\cite{secllmholmes}, precision collapsing toward chance once easy negatives are removed~\cite{primevul}, and weak discrimination across model families~\cite{steenhoek2024, khare2023}. Our benchmark isolates that bias directly, scoring the single-turn judgment before any harness can absorb the false positives it produces.
+
 The core failure mode revealed by Deception Benchmark is the gap between \emph{sensing} (identifying a potential vulnerability pattern) and \emph{verification} (confirming the pattern is actually exploitable in context). Orchestration agents have shown that LLMs can effectively generate hypotheses and execute verification steps when the verification is \emph{executable}: running tests, sending requests, observing outputs. But security verification in production is often not executable. You cannot safely attempt to exploit production systems, and replicating the exact environment for offline testing is prohibitively expensive.
 
 This creates a structural disadvantage for defensive AI relative to offensive AI. Offensive agents can verify hypotheses through trial and error. Defensive agents must reason \emph{statically} about whether a mitigation holds, a fundamentally harder problem that current architectures have not solved.
@@ -408,6 +410,18 @@ J.~Wei, Z.~Sun, S.~Papay, S.~McKinney, J.~Han, I.~Fulford, H.~W.~Choi, A.~T.~Pas
 
 \bibitem{gptred}
 E.~Wallace, C.~A.~Choquette-Choo, N.~Kandpal, S.~Toyer, D.~Hunn, S.~Lin, Y.~Wen, X.~Qi, C.~Wolff, Z.~Wang, \emph{et al.}, ``{GPT}-Red: Automated Red Teaming via Self-Play at Scale,'' \emph{arXiv preprint arXiv:2607.26115}, 2026.
+
+\bibitem{secllmholmes}
+S.~Ullah, M.~Han, S.~Pujar, H.~Pearce, A.~Coskun, and G.~Stringhini, ``{LLMs} Cannot Reliably Identify and Reason About Security Vulnerabilities (Yet?): A Comprehensive Evaluation, Framework, and Benchmarks,'' in \emph{Proc. IEEE Symposium on Security and Privacy (S\&P)}, 2024. arXiv:2312.12575.
+
+\bibitem{primevul}
+Y.~Ding, M.~A.~Sghaier, G.~Burati, A.~Serebrenik, and C.~Treude, ``Vulnerability Detection with Code Language Models: How Far Are We?,'' in \emph{Proc. International Conference on Software Engineering (ICSE)}, 2025. arXiv:2403.18624.
+
+\bibitem{steenhoek2024}
+B.~Steenhoek, M.~M.~Rahman, M.~K.~Roy, M.~S.~Alam, and W.~Le, ``A Comprehensive Study of the Capabilities of Large Language Models for Vulnerability Detection,'' \emph{arXiv preprint arXiv:2403.17218}, 2024.
+
+\bibitem{khare2023}
+A.~Khare, S.~Dutta, and M.~Naik, ``Understanding the Effectiveness of Large Language Models in Detecting Security Vulnerabilities,'' \emph{arXiv preprint arXiv:2311.16169}, 2023.
 
 \end{thebibliography}
 
